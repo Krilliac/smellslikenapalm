@@ -59,6 +59,10 @@ std::string GameConfig::GetModesIniPath() const {
     return m_cfg.GetGameModesFile();
 }
 
+std::string GameConfig::GetMapsAssetDirectory() const {
+    return m_cfg.GetDataDirectory() + "/" + m_cfg.GetMapsDataPath();
+}
+
 std::string GameConfig::GetTeamsIniPath() const {
     return m_cfg.GetManager()->GetString("DataPaths.teams_path", "config/teams.ini");
 }

@@ -39,6 +39,9 @@ std::string ServerConfig::GetLogDirectory() const {
 bool ServerConfig::IsAdminRconOnly() const {
     return m_mgr->GetBool("General.admin_rcon_only", false);
 }
+std::string ServerConfig::GetMapsDataPath() const {
+    return m_mgr->GetString("DataPaths.maps_path", "data/maps/");
+}
 
 // Network
 int ServerConfig::GetPort() const {

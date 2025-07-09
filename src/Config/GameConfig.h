@@ -28,6 +28,7 @@ public:
     std::string GetModesIniPath() const;
     std::string GetTeamsIniPath() const;
     std::string GetWeaponsIniPath() const;
+	std::string GetMapsAssetDirectory() const;
 
 private:
     const ServerConfig& m_cfg;

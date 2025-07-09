@@ -20,6 +20,7 @@ public:
     std::string GetDataDirectory() const;
     std::string GetLogDirectory() const;
     bool        IsAdminRconOnly() const;
+	std::string GetMapsDataPath() const;
 
     // Network
     int         GetPort() const;
