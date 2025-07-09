@@ -1,0 +1,20 @@
+#===============================================================================
+# RS2V Custom Server – Custom Auth Tokens
+# Path: config/auth_tokens.txt
+#
+# SteamIDs or custom tokens (one per line) allowed when Steam authentication fails.
+# Lines beginning with '#' are ignored.
+#===============================================================================
+
+# Example SteamID64 fallback tokens:
+76561198000000001
+76561198000000002
+
+# Example custom alphanumeric tokens:
+ABCDEF1234567890
+CLIENTTOKEN-001
+CLIENTTOKEN-002
+
+#===============================================================================
+# End of auth_tokens.txt
+#===============================================================================

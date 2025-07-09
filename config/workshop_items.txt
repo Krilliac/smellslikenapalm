@@ -1,0 +1,47 @@
+#===============================================================================
+# RS2V Custom Server – Workshop Items List
+# Path: config/workshop_items.txt
+#
+# Purpose:
+#   Define Steam Workshop item IDs for custom maps, mods, and assets to auto-download.
+#   Each line specifies one Workshop item to be downloaded by clients on connect.
+#
+# Format per line:
+#   <WorkshopID>    <Type>      <FileName>          <Optional LocalPath>    # <Description>
+#
+# Fields:
+#   WorkshopID     – Steam Workshop numeric ID
+#   Type           – map | mod | asset
+#   FileName       – expected archive or UMAP filename after extraction
+#   Optional LocalPath – relative path inside server’s data directory
+#   Description    – human-readable note (optional)
+#
+# Lines beginning with ‘#’ are ignored.
+#===============================================================================
+
+# Custom Maps
+123456789      map     desert_assault.umap          maps/desert_assault       # Desert Assault map
+987654321      map     jungle_ruins.umap            maps/jungle_ruins         # Jungle Ruins map
+112233445      map     factory_complex.umap         maps/factory_complex      # Factory Complex map
+
+# Gameplay Mods
+223344556      mod     night_ops.pak               mods/night_ops            # Night Operations weather cycle
+334455667      mod     hardcore_damage.pak         mods/hardcore_damage      # Increased weapon damage
+445566778      mod     realistic_ballistics.pak    mods/realistic_ballistics # Realistic bullet drop & travel time
+
+# Cosmetic Assets
+556677889      asset   vietnam_uniforms.pak        assets/uniforms/vietnam   # Vietnam-era soldier uniforms
+667788990      asset   us_army_skin.pak            assets/skins/us_army      # US Army player skin
+778899001      asset   vietnamese_skin.pak         assets/skins/vietnamese   # NVA player skin
+
+# Vehicle Skins
+889900112      asset   m113_skin.pak               assets/vehicle_skins      # M113 APC camo
+990011223      asset   helicopter_camo.pak         assets/vehicle_skins      # UH-1 Huey camo
+
+# Sound Packs
+101010101      asset   radio_chatter.pak           assets/sounds/radio       # Authentic radio chatter
+202020202      asset   weapon_sfx_enhanced.pak     assets/sounds/weapons     # Enhanced weapon sound effects
+
+#===============================================================================
+# End of workshop_items.txt
+#===============================================================================

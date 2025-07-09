@@ -1,0 +1,28 @@
+#===============================================================================
+# RS2V Custom Server – Administrator List
+# Path: config/admin_list.txt
+#
+# Format per line:
+#   SteamID          Level    Name/Comment
+#   ------------     -----    ---------------
+#   <SteamID64>      <0–3>    <Optional display name or comment>
+#
+# Permission Levels:
+#   0 = Player (no admin access)
+#   1 = Helper (basic info commands)
+#   2 = Moderator (kick, broadcast, limited commands)
+#   3 = Administrator (full access)
+#
+# Lines starting with ‘#’ are ignored.
+#===============================================================================
+
+# Example entries:
+76561198000000001    3    Lead Admin – “Krill”
+76561198000000002    2    Moderator – “Alice”
+76561198000000003    2    Moderator – “Bob”
+76561198000000004    1    Helper – “Charlie”
+76561198000000005    3    Co-Admin – “Dana”
+
+#===============================================================================
+# End of admin_list.txt
+#===============================================================================

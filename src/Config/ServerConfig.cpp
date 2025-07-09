@@ -1,190 +1,191 @@
-// src/Config/ServerConfig.cpp – Complete implementation for RS2V ServerConfig
-
 #include "Config/ServerConfig.h"
-#include "Utils/Logger.h"
 #include "Utils/StringUtils.h"
-#include <fstream>
-#include <filesystem>
-#include <sstream>
 
-ServerConfig::ServerConfig() {
-    Logger::Info("ServerConfig initialized");
+ServerConfig::ServerConfig(const std::shared_ptr<ConfigManager>& mgr)
+  : m_mgr(mgr)
+{}
+
+// General
+std::string ServerConfig::GetServerName() const {
+    return m_mgr->GetString("General.server_name", "RS2V Custom Server");
+}
+int ServerConfig::GetMaxPlayers() const {
+    return m_mgr->GetInt("General.max_players", 64);
+}
+std::string ServerConfig::GetMapRotationFile() const {
+    return m_mgr->GetString("General.map_rotation_file", "config/maps.ini");
+}
+std::string ServerConfig::GetGameModesFile() const {
+    return m_mgr->GetString("General.game_modes_file", "config/game_modes.ini");
+}
+std::string ServerConfig::GetMotdFile() const {
+    return m_mgr->GetString("General.motd_file", "config/motd.txt");
+}
+int ServerConfig::GetTickRate() const {
+    return m_mgr->GetInt("General.tick_rate", 60);
+}
+int ServerConfig::GetTimeSyncInterval() const {
+    return m_mgr->GetInt("General.timesync_interval_s", 30);
+}
+bool ServerConfig::IsAnnouncementsEnabled() const {
+    return m_mgr->GetBool("General.enable_announcements", true);
+}
+std::string ServerConfig::GetDataDirectory() const {
+    return m_mgr->GetString("General.data_directory", "data/");
+}
+std::string ServerConfig::GetLogDirectory() const {
+    return m_mgr->GetString("General.log_directory", "logs/");
+}
+bool ServerConfig::IsAdminRconOnly() const {
+    return m_mgr->GetBool("General.admin_rcon_only", false);
 }
 
-ServerConfig::~ServerConfig() = default;
-
-bool ServerConfig::Initialize(const std::string& configFile) {
-    Logger::Info("Initializing ServerConfig from %s", configFile.c_str());
-    m_configFile = configFile;
-    
-    // Ensure config directory exists
-    auto path = std::filesystem::path(configFile).parent_path();
-    if (!path.empty() && !std::filesystem::exists(path)) {
-        std::filesystem::create_directories(path);
-        Logger::Info("Created config directory: %s", path.string().c_str());
-    }
-    
-    // Load or create defaults
-    if (!std::filesystem::exists(configFile)) {
-        Logger::Warn("Config file not found, creating default at %s", configFile.c_str());
-        SetDefaults();
-        return Save();
-    }
-    return Load();
+// Network
+int ServerConfig::GetPort() const {
+    return m_mgr->GetInt("Network.port", 7777);
+}
+std::string ServerConfig::GetBindAddress() const {
+    return m_mgr->GetString("Network.bind_address", "");
+}
+int ServerConfig::GetMaxPacketSize() const {
+    return m_mgr->GetInt("Network.max_packet_size", 1200);
+}
+int ServerConfig::GetClientIdleTimeout() const {
+    return m_mgr->GetInt("Network.client_idle_timeout_s", 300);
+}
+int ServerConfig::GetHeartbeatInterval() const {
+    return m_mgr->GetInt("Network.heartbeat_interval_s", 5);
+}
+bool ServerConfig::IsDualStack() const {
+    return m_mgr->GetBool("Network.dual_stack", true);
+}
+bool ServerConfig::IsReliableTransport() const {
+    return m_mgr->GetBool("Network.reliable_transport", true);
 }
 
-bool ServerConfig::Load() {
-    Logger::Info("Loading server configuration: %s", m_configFile.c_str());
-    std::ifstream file(m_configFile);
-    if (!file.is_open()) {
-        Logger::Error("Failed to open server config: %s", m_configFile.c_str());
-        return false;
-    }
-    
-    std::string line, section;
-    size_t lineno = 0;
-    while (std::getline(file, line)) {
-        ++lineno;
-        line = StringUtils::Trim(line);
-        if (line.empty() || line[0]=='#') continue;
-        if (line.front()=='[' && line.back()==']') {
-            section = line.substr(1, line.size()-2);
-            continue;
-        }
-        auto pos = line.find('=');
-        if (pos==std::string::npos) {
-            Logger::Warn("Invalid line %zu in %s: %s", lineno, m_configFile.c_str(), line.c_str());
-            continue;
-        }
-        std::string key = StringUtils::Trim(line.substr(0,pos));
-        std::string val = StringUtils::Trim(line.substr(pos+1));
-        ApplyProperty(section, key, val);
-    }
-    file.close();
-    LogSummary();
-    return true;
+// Security
+bool ServerConfig::IsSteamAuthEnabled() const {
+    return m_mgr->GetBool("Security.enable_steam_auth", true);
+}
+bool ServerConfig::IsFallbackCustomAuth() const {
+    return m_mgr->GetBool("Security.fallback_custom_auth", false);
+}
+std::string ServerConfig::GetCustomAuthTokensFile() const {
+    return m_mgr->GetString("Security.custom_auth_tokens_file", "config/auth_tokens.txt");
+}
+bool ServerConfig::IsBanManagerEnabled() const {
+    return m_mgr->GetBool("Security.enable_ban_manager", true);
+}
+std::string ServerConfig::GetBanListFile() const {
+    return m_mgr->GetString("Security.ban_list_file", "config/ban_list.txt");
+}
+bool ServerConfig::IsAntiCheatEnabled() const {
+    return m_mgr->GetBool("Security.enable_anti_cheat", true);
+}
+std::string ServerConfig::GetAntiCheatMode() const {
+    return m_mgr->GetString("Security.anti_cheat_mode", "emulate");
+}
+std::string ServerConfig::GetEacScannerConfigFile() const {
+    return m_mgr->GetString("Security.eac_scanner_config_file", "config/eac_scanner.json");
 }
 
-bool ServerConfig::Save() const {
-    Logger::Info("Saving server configuration to %s", m_configFile.c_str());
-    std::ofstream file(m_configFile, std::ios::trunc);
-    if (!file.is_open()) {
-        Logger::Error("Failed to open file for writing: %s", m_configFile.c_str());
-        return false;
-    }
-    file << "# RS2V Server Configuration\n\n";
-    file << "[Server]\n";
-    file << "ServerName=" << serverName << "\n";
-    file << "MaxPlayers=" << maxPlayers << "\n";
-    file << "GamePort=" << gamePort << "\n";
-    file << "QueryPort=" << queryPort << "\n";
-    file << "TickRate=" << tickRate << "\n\n";
-    
-    file << "[Logging]\n";
-    file << "LogLevel=" << logLevel << "\n";
-    file << "LogFile=" << logFile << "\n";
-    file << "PacketLogging=" << (packetLogging? "true":"false") << "\n\n";
-    
-    file << "[EAC]\n";
-    file << "Mode=" << eacMode << "\n";
-    file << "ProxyPort=" << eacProxyPort << "\n";
-    file << "ForwardToEpic=" << (forwardToEpic? "true":"false") << "\n\n";
-    
-    file << "[Security]\n";
-    file << "SecureMode=" << (secureMode? "true":"false") << "\n";
-    file << "PrivacyMode=" << (privacyMode? "true":"false") << "\n";
-    file << "AllowTelemetry=" << (allowTelemetry? "true":"false") << "\n";
-    file.close();
-    Logger::Info("Server configuration saved");
-    return true;
+// Logging
+std::string ServerConfig::GetLogLevel() const {
+    return m_mgr->GetString("Logging.log_level", "info");
+}
+bool ServerConfig::IsConsoleLogging() const {
+    return m_mgr->GetBool("Logging.log_to_console", true);
+}
+bool ServerConfig::IsFileLogging() const {
+    return m_mgr->GetBool("Logging.log_to_file", true);
+}
+std::string ServerConfig::GetLogFileName() const {
+    return m_mgr->GetString("Logging.log_file", "server.log");
+}
+int ServerConfig::GetLogMaxSizeMb() const {
+    return m_mgr->GetInt("Logging.log_max_size_mb", 10);
+}
+int ServerConfig::GetLogMaxFiles() const {
+    return m_mgr->GetInt("Logging.log_max_files", 5);
+}
+std::string ServerConfig::GetLogTimestampFormat() const {
+    return m_mgr->GetString("Logging.log_timestamp_format", "%Y-%m-%d %H:%M:%S");
 }
 
-void ServerConfig::SetDefaults() {
-    Logger::Info("Applying default server configuration");
-    serverName      = "RS2V Custom Server";
-    maxPlayers      = 64;
-    gamePort        = 7777;
-    queryPort       = 27015;
-    tickRate        = 60;
-    logLevel        = "INFO";
-    logFile         = "logs/server.log";
-    packetLogging   = true;
-    eacMode         = "DISABLED";
-    eacProxyPort    = 7957;
-    forwardToEpic   = false;
-    secureMode      = true;
-    privacyMode     = true;
-    allowTelemetry  = false;
+// Performance
+int ServerConfig::GetMaxCpuCores() const {
+    return m_mgr->GetInt("Performance.max_cpu_cores", 0);
+}
+int ServerConfig::GetCpuAffinityMask() const {
+    return m_mgr->GetInt("Performance.cpu_affinity_mask", 0);
+}
+bool ServerConfig::IsDynamicTuningEnabled() const {
+    return m_mgr->GetBool("Performance.dynamic_tuning_enabled", true);
 }
 
-void ServerConfig::ApplyProperty(const std::string& section, const std::string& key, const std::string& val) {
-    if (section=="Server") {
-        if (key=="ServerName")      serverName    = val;
-        else if (key=="MaxPlayers") maxPlayers    = std::stoi(val);
-        else if (key=="GamePort")   gamePort      = std::stoi(val);
-        else if (key=="QueryPort")  queryPort     = std::stoi(val);
-        else if (key=="TickRate")   tickRate      = std::stoi(val);
-        else Logger::Warn("Unknown Server key: %s", key.c_str());
-    }
-    else if (section=="Logging") {
-        if (key=="LogLevel")        logLevel      = val;
-        else if (key=="LogFile")    logFile       = val;
-        else if (key=="PacketLogging") packetLogging = StringUtils::ToBool(val);
-        else Logger::Warn("Unknown Logging key: %s", key.c_str());
-    }
-    else if (section=="EAC") {
-        if (key=="Mode")            eacMode       = val;
-        else if (key=="ProxyPort")  eacProxyPort  = std::stoi(val);
-        else if (key=="ForwardToEpic") forwardToEpic = StringUtils::ToBool(val);
-        else Logger::Warn("Unknown EAC key: %s", key.c_str());
-    }
-    else if (section=="Security") {
-        if (key=="SecureMode")      secureMode    = StringUtils::ToBool(val);
-        else if (key=="PrivacyMode") privacyMode   = StringUtils::ToBool(val);
-        else if (key=="AllowTelemetry") allowTelemetry = StringUtils::ToBool(val);
-        else Logger::Warn("Unknown Security key: %s", key.c_str());
-    }
-    else {
-        Logger::Warn("Unknown config section: %s", section.c_str());
-    }
+// ThreadPool
+int ServerConfig::GetWorkerThreadCount() const {
+    return m_mgr->GetInt("ThreadPool.worker_thread_count", 0);
+}
+int ServerConfig::GetMaxTaskQueueLength() const {
+    return m_mgr->GetInt("ThreadPool.max_task_queue_length", 256);
+}
+int ServerConfig::GetSpillThreshold() const {
+    return m_mgr->GetInt("ThreadPool.spill_threshold", 512);
 }
 
-void ServerConfig::LogSummary() const {
-    Logger::Info("=== ServerConfig Summary ===");
-    Logger::Info("ServerName:      %s", serverName.c_str());
-    Logger::Info("MaxPlayers:      %d", maxPlayers);
-    Logger::Info("GamePort:        %d", gamePort);
-    Logger::Info("QueryPort:       %d", queryPort);
-    Logger::Info("TickRate:        %d", tickRate);
-    Logger::Info("LogLevel:        %s", logLevel.c_str());
-    Logger::Info("LogFile:         %s", logFile.c_str());
-    Logger::Info("PacketLogging:   %s", packetLogging? "yes":"no");
-    Logger::Info("EAC Mode:        %s", eacMode.c_str());
-    Logger::Info("EAC ProxyPort:   %d", eacProxyPort);
-    Logger::Info("ForwardToEpic:   %s", forwardToEpic? "yes":"no");
-    Logger::Info("SecureMode:      %s", secureMode? "yes":"no");
-    Logger::Info("PrivacyMode:     %s", privacyMode? "yes":"no");
-    Logger::Info("AllowTelemetry:  %s", allowTelemetry? "yes":"no");
-    Logger::Info("============================");
+// MemoryPool
+int ServerConfig::GetPreallocateChunks() const {
+    return m_mgr->GetInt("MemoryPool.preallocate_chunks", 4);
+}
+int ServerConfig::GetMaxChunks() const {
+    return m_mgr->GetInt("MemoryPool.max_chunks", 0);
 }
 
-// Getters
-const std::string& ServerConfig::GetServerName() const     { return serverName; }
-int ServerConfig::GetMaxPlayers()       const              { return maxPlayers; }
-int ServerConfig::GetGamePort()         const              { return gamePort; }
-int ServerConfig::GetQueryPort()        const              { return queryPort; }
-int ServerConfig::GetTickRate()         const              { return tickRate; }
-const std::string& ServerConfig::GetLogLevel() const       { return logLevel; }
-const std::string& ServerConfig::GetLogFile() const        { return logFile; }
-bool ServerConfig::IsPacketLogging()    const              { return packetLogging; }
-const std::string& ServerConfig::GetEACMode() const        { return eacMode; }
-int ServerConfig::GetEACProxyPort()     const              { return eacProxyPort; }
-bool ServerConfig::ShouldForwardToEpic() const            { return forwardToEpic; }
-bool ServerConfig::IsSecureMode()       const              { return secureMode; }
-bool ServerConfig::IsPrivacyMode()      const              { return privacyMode; }
-bool ServerConfig::IsTelemetryAllowed() const              { return allowTelemetry; }
+// Profiler
+bool ServerConfig::IsProfilingEnabled() const {
+    return m_mgr->GetBool("Profiler.enable_profiling", true);
+}
+int ServerConfig::GetProfilerMinRecordMs() const {
+    return m_mgr->GetInt("Profiler.min_record_ms", 0);
+}
+int ServerConfig::GetProfilerBufferSize() const {
+    return m_mgr->GetInt("Profiler.buffer_size", 1000);
+}
+int ServerConfig::GetProfilerFlushInterval() const {
+    return m_mgr->GetInt("Profiler.flush_interval_s", 10);
+}
+std::string ServerConfig::GetProfilerOutputFormat() const {
+    return m_mgr->GetString("Profiler.output_format", "json");
+}
+std::string ServerConfig::GetProfilerOutputPath() const {
+    return m_mgr->GetString("Profiler.profiler_output_path", "logs/profiler.json");
+}
 
-bool ServerConfig::Reload() {
-    Logger::Info("Reloading server configuration...");
-    return Load();
+// Telemetry
+int ServerConfig::GetTelemetryBatchSize() const {
+    return m_mgr->GetInt("Telemetry.batch_size", 50);
+}
+int ServerConfig::GetTelemetryFlushInterval() const {
+    return m_mgr->GetInt("Telemetry.flush_interval_s", 5);
+}
+
+// Admin/RCON
+bool ServerConfig::IsRconEnabled() const {
+    return m_mgr->GetBool("Admin.enable_rcon", true);
+}
+int ServerConfig::GetRconPort() const {
+    return m_mgr->GetInt("Admin.rcon_port", 27020);
+}
+std::string ServerConfig::GetRconPassword() const {
+    return m_mgr->GetString("Admin.rcon_password", "ChangeMe123");
+}
+int ServerConfig::GetRconMinLevel() const {
+    return m_mgr->GetInt("Admin.rcon_min_level", 2);
+}
+std::string ServerConfig::GetAdminListFile() const {
+    return m_mgr->GetString("Admin.admin_list_file", "config/admin_list.txt");
+}
+bool ServerConfig::IsChatAuthEnabled() const {
+    return m_mgr->GetBool("Admin.chat_auth_enabled", true);
 }

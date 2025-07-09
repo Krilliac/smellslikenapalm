@@ -1,0 +1,27 @@
+{
+  "scanner": {
+    "scanIntervalMs": 1000,
+    "maxScanThreads": 2,
+    "memoryRegions": [
+      {
+        "name": "GameCode",
+        "pattern": "48 8B ?? ?? ?? ?? ?? 48 85 C0",
+        "offset": 0
+      },
+      {
+        "name": "ClientModule",
+        "pattern": "55 8B EC 83 E4 F8 83 EC 70",
+        "offset": 0
+      }
+    ],
+    "maxRegionsToScan": 4,
+    "readBlockSize": 4096,
+    "suspiciousThreshold": 5,
+    "reportOnThreshold": true
+  },
+  "logging": {
+    "enable": true,
+    "logFile": "logs/eac_scanner.log",
+    "level": "DEBUG"
+  }
+}

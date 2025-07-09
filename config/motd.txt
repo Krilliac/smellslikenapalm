@@ -1,0 +1,38 @@
+#===============================================================================
+# RS2V Custom Server – Message of the Day (MOTD)
+# Path: config/motd.txt
+#
+# This file is displayed to players when they connect to the server.
+# Supports basic formatting codes:
+#   [COLOR=<r,g,b>] ... [/COLOR]   – RGB text color
+#   [B] ... [/B]                   – Bold
+#   [I] ... [/I]                   – Italic
+#   [U] ... [/U]                   – Underline
+#   [URL=<link>] ... [/URL]       – Clickable hyperlink
+#
+# Lines beginning with ‘#’ are ignored.
+# Variables supported:
+#   {server_name}        – Server display name
+#   {player_count}       – Current/Max players
+#   {map_name}           – Current map
+#   {uptime}             – Server uptime since last restart
+#   {next_map}           – Next map in rotation
+#===============================================================================
+
+[COLOR=0,255,0][B]Welcome to {server_name}![/B][/COLOR]
+
+[I]Players:[/I] {player_count}   [I]Map:[/I] {map_name}
+[I]Uptime:[/I] {uptime}   [I]Next Map:[/I] {next_map}
+
+# News & Announcements
+- [COLOR=255,255,0]Double XP Weekend![/COLOR] Earn twice the experience 7/12–7/14.
+- New [URL=https://example.com/events]Summer Event[/URL] live now!
+- Join our Discord: [URL=https://discord.gg/rs2v]discord.gg/rs2v[/URL]
+
+# Rules Reminder
+1. No cheating or exploiting. EAC is enforced.
+2. Be respectful—no harassment or hate speech.
+3. Follow admins’ instructions.  
+4. Have fun and play fair!
+
+[COLOR=128,128,128][I]Type [B]/help[/B] in chat for admin commands.[/I][/COLOR]
