@@ -1,0 +1,51 @@
+RS2V Server Non-Commercial Open Source License
+This license is modeled after open-source, non-commercial, and source-availability requirements used by emulator projects such as TrinityCore and MaNGOS. It strictly forbids closed-source distribution, any form of commercial sale or profit, and addresses anti-cheat emulation (including EAC) and related concerns.
+
+© 2025 Krill
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the “Software”), to use, copy, modify, merge, publish, and distribute the Software, subject to the following conditions:
+
+Source Disclosure
+All redistributions of the Software, including derivative works, must be accompanied by the complete corresponding source code. Binaries may only be distributed if accompanied by that source under this same license.
+
+Non-Commercial Use
+The Software may not be sold, offered for sale, or used in any commercial context. Commercial use—including selling, licensing, sublicensing, or distributing for profit—is strictly prohibited.
+
+No Closed-Source Distribution
+You may not distribute, sublicense, or deploy the Software (or any derivative work) in any form that does not include the complete corresponding source code under this same license.
+
+No Reverse Engineering of Proprietary Clients or Anti-Cheat Systems
+This Software was developed solely from publicly available information and legitimate runtime observations. No code or assets from any proprietary game client, anti-cheat system (including but not limited to Easy Anti-Cheat/EAC, BattlEye, or similar), or third-party software have been used. You may not reverse-engineer, decompile, or disassemble any proprietary client or anti-cheat binary to develop, modify, or use this Software.
+
+No Circumvention of DRM or Access Controls
+This Software does not bypass, remove, disable, or circumvent any digital rights management (DRM) or technological protection measures (TPMs).
+
+Preservation of License
+This license and all copyright and license notices must be included in all copies or substantial portions of the Software and any derivative works.
+
+No Warranty
+THE SOFTWARE IS PROVIDED “AS IS,” WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, TITLE, OR NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER LIABILITY ARISING FROM, OUT OF, OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+Additional Terms
+Non-Infringement Warranty
+The author(s) certify that this Software was developed entirely from public documentation and legitimate network data. No proprietary client code, anti-cheat code, or assets were used. All protocol and anti-cheat implementations are original and based solely on observed network behavior or public information.
+
+Trademark Disclaimer
+All trademarks, service marks, and trade names referenced in this Software or its documentation—including “Tripwire Interactive,” “Rising Storm 2: Vietnam,” “Easy Anti-Cheat,” “Epic Games,” and related marks—are the property of their respective owners. Use of these names does not imply any affiliation, endorsement, or sponsorship by the trademark holders.
+
+Non-Affiliation and Non-Infringement Notice
+This project is an independent, open-source initiative and is not affiliated with, endorsed by, or associated with Tripwire Interactive, Antimatter Games, Epic Games, Easy Anti-Cheat (EAC), BattlEye, or any other company. All implementations are based exclusively on publicly available documentation and/or data legitimately captured at runtime.
+
+User Responsibility
+Users of this Software are solely responsible for ensuring their use complies with all applicable laws, regulations, and third-party agreements, including any End User License Agreements (EULAs) of proprietary software.
+
+Purpose of Software
+This Software is intended solely for interoperability, research, educational, and archival purposes. It is not intended to replace, compete with, or interfere with any official product or service.
+
+Legal Claims and DMCA Safeguard
+Any party asserting that this Software infringes their rights must provide specific, detailed evidence identifying the allegedly infringing content. Baseless or bad-faith takedown requests will be contested. Because no proprietary code or assets are included, any DMCA claim based on infringement is without merit.
+
+Jurisdiction and Severability
+This license shall be governed by and construed in accordance with the laws of the Russian Federation. If any provision of this license is held to be unenforceable under Russian law, that provision shall be reformed only to the extent necessary to make it enforceable, and the remaining provisions shall remain in full force and effect.
+
+By using, modifying, or distributing this Software, you acknowledge and agree to these terms.

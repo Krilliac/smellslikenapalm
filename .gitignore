@@ -1,0 +1,89 @@
+.gitignore for RS2V Server
+Build artifacts
+build/
+bin/
+obj/
+*.o
+*.lo
+*.la
+*.al
+*.lai
+*.so
+.so.
+*.dylib
+*.dll
+*.exe
+*.out
+*.app
+
+CMake / Make
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+install_manifest.txt
+
+Visual Studio
+.vs/
+.vcxproj
+*.sln
+*.user
+*.vcxproj.filters
+*.VC.db
+*.VC.opendb
+
+Xcode
+*.xcworkspace/
+*.xcuserstate
+*.xccheckout
+build/
+
+IDE files
+.idea/
+*.code-workspace
+*.sublime-project
+*.sublime-workspace
+
+Logs and runtime files
+*.log
+*.pid
+*.pid.lock
+
+Configuration backups
+*.swp
+*~
+*.tmp
+*.backup
+*.bak
+
+Third-party dependencies (if vendored)
+vendor/
+third_party/
+
+Generated protocol buffers or code
+*.pb.h
+*.pb.cc
+
+Packaged archives
+*.zip
+*.tar.gz
+*.rar
+*.7z
+
+Coverage and profiling
+coverage/
+*.gcda
+*.gcno
+
+Dependency directories
+node_modules/
+bower_components/
+
+Misc
+.DS_Store
+Thumbs.db
+
+Security: do not ignore config files if needed, but ignore secrets
+*.key
+*.pem
+*.crt
