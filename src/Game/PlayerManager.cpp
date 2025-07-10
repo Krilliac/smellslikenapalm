@@ -6,8 +6,6 @@
 #include "Network/ClientConnection.h"
 #include <chrono>
 
-extern void DumpPacketForAnalysis(const std::vector<uint8_t>& data, const std::string& context);
-
 PlayerManager::PlayerManager(GameServer* server)
     : m_server(server)
 {

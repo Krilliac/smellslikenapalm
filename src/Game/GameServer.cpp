@@ -1,4 +1,4 @@
-// src/Game/GameServer.cpp – Complete implementation for RS2V Server core
+// src/Game/GameServer.cpp
 
 #include "Game/GameServer.h"
 #include "Utils/Logger.h"
@@ -15,21 +15,100 @@
 #include "Game/PlayerManager.h"
 #include "Game/TeamManager.h"
 #include "Game/MapManager.h"
+#include "Utils/PathUtils.h"
+#include "Utils/HandlerLibraryManager.h"
 #include <chrono>
 #include <thread>
+#include <cstdlib> // for std::system
+#include <filesystem>
 
-GameServer::GameServer()
-{
+using namespace GeneratedHandlers;
+
+// --- Handler Regen/Reload Implementation ---
+
+void GameServer::Cmd_RegenHandlers(const std::vector<std::string>& /*args*/) {
+    std::string codeGenExe = PathUtils::ResolveFromExecutable("PacketHandlerCodeGen");
+#ifdef _WIN32
+    if (codeGenExe.find(".exe") == std::string::npos) codeGenExe += ".exe";
+#endif
+    std::string handlersDir = PathUtils::ResolveFromExecutable("src/Generated/Handlers");
+    std::string cmd = codeGenExe + " " + handlersDir;
+
+    Logger::Info("Executing handler regeneration: %s", cmd.c_str());
+    int ret = std::system(cmd.c_str());
+    if (ret == 0) {
+        Logger::Info("Handler stubs regenerated successfully.");
+        DynamicReloadGeneratedHandlers();
+    } else {
+        Logger::Error("Failed to regenerate handler stubs (exit %d)", ret);
+    }
+}
+
+void GameServer::StartAutoRegen(int intervalSeconds) {
+    if (m_regenRunning) return;
+    m_regenRunning = true;
+    m_regenIntervalSeconds = intervalSeconds;
+    m_regenThread = std::thread([this]() {
+        Logger::Info("Auto handler regeneration thread started (interval: %d seconds)", m_regenIntervalSeconds);
+        int regenCounter = 0;
+        const int regenEvery = 1; // regenerate every interval
+        while (m_regenRunning) {
+            if (regenCounter++ >= regenEvery) {
+                Cmd_RegenHandlers();
+                regenCounter = 0;
+            }
+            for (int i = 0; i < m_regenIntervalSeconds && m_regenRunning; ++i) {
+                std::this_thread::sleep_for(std::chrono::seconds(1));
+            }
+        }
+        Logger::Info("Auto handler regeneration thread stopped");
+    });
+    m_regenThread.detach();
+}
+
+void GameServer::StopAutoRegen() {
+    m_regenRunning = false;
+    Logger::Info("Auto handler regeneration requested to stop.");
+}
+
+void GameServer::DynamicReloadGeneratedHandlers() {
+    if (m_handlerLibraryPath.empty()) {
+#ifdef _WIN32
+        m_handlerLibraryPath = PathUtils::ResolveFromExecutable("GeneratedHandlers.dll");
+#elif defined(__APPLE__)
+        m_handlerLibraryPath = PathUtils::ResolveFromExecutable("libGeneratedHandlers.dylib");
+#else
+        m_handlerLibraryPath = PathUtils::ResolveFromExecutable("libGeneratedHandlers.so");
+#endif
+        if (!std::filesystem::exists(m_handlerLibraryPath)) {
+            Logger::Warn("Handler library not found: %s", m_handlerLibraryPath.c_str());
+            return;
+        }
+        if (!HandlerLibraryManager::Instance().Initialize(m_handlerLibraryPath)) {
+            Logger::Error("Failed to initialize handler library manager");
+            return;
+        }
+    }
+    if (HandlerLibraryManager::Instance().ForceReload()) {
+        Logger::Info("Generated handlers reloaded successfully.");
+    } else {
+        Logger::Error("Failed to reload generated handlers.");
+    }
+}
+
+// --- End of Handler Regen/Reload Implementation ---
+
+GameServer::GameServer() {
     Logger::Info("GameServer constructed");
 }
 
-GameServer::~GameServer()
-{
+GameServer::~GameServer() {
     Shutdown();
+    StopAutoRegen();
+    HandlerLibraryManager::Instance().Shutdown();
 }
 
-bool GameServer::Initialize()
-{
+bool GameServer::Initialize() {
     Logger::Info("GameServer initialization starting...");
 
     // Load configurations
@@ -88,12 +167,14 @@ bool GameServer::Initialize()
     m_gameMode = std::make_unique<GameMode>(this, *gmDef);
     m_gameMode->OnStart();
 
+    // Start periodic handler regeneration (every 1 hour by default)
+    StartAutoRegen(3600);
+
     Logger::Info("GameServer initialized successfully");
     return true;
 }
 
-void GameServer::Run()
-{
+void GameServer::Run() {
     Logger::Info("GameServer main loop starting");
     m_running = true;
 
@@ -106,7 +187,6 @@ void GameServer::Run()
         if (delta.count() >= tickInterval) {
             lastTime = now;
 
-            // Network receive
             auto packets = m_networkManager->ReceivePackets();
             for (auto& pkt : packets) {
                 uint32_t clientId = m_networkManager->GetClientId(pkt.source);
@@ -121,13 +201,10 @@ void GameServer::Run()
                 }
             }
 
-            // Game update
             m_gameMode->Update();
-
-            // Periodic tasks
             m_playerManager->Update();
             m_teamManager->Update();
-            m_networkManager->Flush(); 
+            m_networkManager->Flush();
         } else {
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
@@ -136,12 +213,13 @@ void GameServer::Run()
     Logger::Info("GameServer main loop exited");
 }
 
-void GameServer::Shutdown()
-{
+void GameServer::Shutdown() {
     if (!m_running) return;
     Logger::Info("Shutting down GameServer...");
 
     m_running = false;
+    StopAutoRegen();
+
     if (m_gameMode) {
         m_gameMode->OnEnd();
         m_gameMode.reset();
@@ -162,23 +240,19 @@ void GameServer::Shutdown()
     Logger::Info("GameServer shutdown complete");
 }
 
-void GameServer::BroadcastChatMessage(const std::string& msg)
-{
+void GameServer::BroadcastChatMessage(const std::string& msg) {
     m_chatManager->BroadcastChat(msg);
 }
 
-uint32_t GameServer::FindClientBySteamID(const std::string& steamId) const
-{
+uint32_t GameServer::FindClientBySteamID(const std::string& steamId) const {
     return m_networkManager->FindClientBySteamID(steamId);
 }
 
-std::shared_ptr<ClientConnection> GameServer::GetClientConnection(uint32_t clientId) const
-{
+std::shared_ptr<ClientConnection> GameServer::GetClientConnection(uint32_t clientId) const {
     return m_networkManager->GetConnection(clientId);
 }
 
-std::vector<std::shared_ptr<ClientConnection>> GameServer::GetAllConnections() const
-{
+std::vector<std::shared_ptr<ClientConnection>> GameServer::GetAllConnections() const {
     return m_networkManager->GetAllConnections();
 }
 
@@ -189,9 +263,7 @@ std::shared_ptr<GameConfig>    GameServer::GetGameConfig()    const { return m_g
 std::shared_ptr<ServerConfig>  GameServer::GetServerConfig()  const { return m_serverConfig;  }
 std::shared_ptr<ConfigManager> GameServer::GetConfigManager() const { return m_configManager; }
 
-void GameServer::ChangeMap()
-{
-    // Rotate to next map or reload current
+void GameServer::ChangeMap() {
     std::string nextMap = m_mapManager->GetNextMap();
     if (m_mapManager->LoadMap(nextMap)) {
         m_gameMode->OnEnd();
@@ -201,4 +273,8 @@ void GameServer::ChangeMap()
     } else {
         Logger::Error("Failed to change to map: %s", nextMap.c_str());
     }
+}
+
+std::string GameServer::GetExeDir() const {
+    return PathUtils::GetExecutableDirectory();
 }

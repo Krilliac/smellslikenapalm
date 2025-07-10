@@ -1,10 +1,10 @@
-// src/Protocol/ProtocolUtils.h
 #pragma once
 
 #include <string>
 #include <vector>
 #include <cstdint>
 #include <optional>
+#include "PacketTypes.h"    // RS2V PacketType enum
 
 namespace ProtocolUtils {
 
@@ -23,11 +23,16 @@ namespace ProtocolUtils {
     // Compute a simple XOR checksum over a payload
     uint8_t ComputeChecksum(const std::vector<uint8_t>& payload);
 
-    // Verify checksum: last byte of payload is checksum
+    // Verify checksum: last byte of payload is checksum; strips it if valid
     bool VerifyAndStripChecksum(std::vector<uint8_t>& payload);
 
     // Base64 encode/decode for embedding binary in text messages
     std::string Base64Encode(const std::vector<uint8_t>& data);
     std::optional<std::vector<uint8_t>> Base64Decode(const std::string& b64);
 
+    // Map a string tag (Packet::GetTag()) to PacketType enum
+    PacketType TagToType(const std::string& tag);
+
+    // Convert a PacketType enum back to its tag string
+    std::string TypeToTag(PacketType type);
 }
