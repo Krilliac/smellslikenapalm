@@ -1,5 +1,3 @@
-// src/Scripting/CSharpEngine.h
-
 #pragma once
 
 #ifdef _WIN32
@@ -13,56 +11,38 @@
 #endif
 
 #include <string>
-#include <vector>
 
 /// <summary>
-/// CSharpEngine encapsulates the embedding of the .NET CLR and provides
+/// CSharpEngine encapsulates embedding of the .NET CLR and provides
 /// dynamic compilation and execution of C# source code via Roslyn/CodeDom.
 /// </summary>
 class CSharpEngine {
 public:
-    /// <summary>
-    /// Constructor. Does not initialize CLR; call Initialize() first.
-    /// </summary>
+    /// <summary>Constructor. Call Initialize() before other methods.</summary>
     CSharpEngine();
 
-    /// <summary>
-    /// Destructor. Calls Shutdown() to tear down CLR if still running.
-    /// </summary>
+    /// <summary>Destructor. Calls Shutdown().</summary>
     ~CSharpEngine();
 
-    /// <summary>
-    /// Initialize the C# scripting engine and host the CLR in-process.
-    /// Must be called before any other methods.
-    /// </summary>
-    /// <returns>True on success, false on failure.</returns>
+    /// <summary>Initialize the C# scripting engine and host the CLR.</summary>
     bool Initialize();
 
-    /// <summary>
-    /// Shut down the CLR and release all hosting resources.
-    /// Safe to call multiple times.
-    /// </summary>
+    /// <summary>Shut down the CLR and release resources.</summary>
     void Shutdown();
 
-    /// <summary>
-    /// Compile the given C# source code into an assembly on disk or in-memory.
-    /// </summary>
-    /// <param name="sourceCode">Full C# source text.</param>
-    /// <param name="assemblyName">Desired name/path of the output assembly.</param>
-    /// <returns>True if compilation succeeded without errors.</returns>
+    /// <summary>Compile C# source code into an assembly.</summary>
     bool CompileFromSource(const std::wstring& sourceCode,
                            const std::wstring& assemblyName);
 
 private:
 #ifdef _WIN32
-    // CLR hosting interfaces
-    ICLRMetaHost*        m_metaHost;    // CLR MetaHost
-    ICLRRuntimeInfo*     m_runtimeInfo; // .NET runtime info
-    ICorRuntimeHost*     m_clrHost;     // Runtime host interface
-    _AppDomain*          m_appDomain;   // Default AppDomain
+    ICLRMetaHost*    m_metaHost    = nullptr;
+    ICLRRuntimeInfo* m_runtimeInfo = nullptr;
+    ICorRuntimeHost* m_clrHost     = nullptr;
+    _AppDomain*      m_appDomain   = nullptr;
 #endif
 
-    // Disallow copy and assignment
+    // Disallow copy/assignment
     CSharpEngine(const CSharpEngine&) = delete;
     CSharpEngine& operator=(const CSharpEngine&) = delete;
 };

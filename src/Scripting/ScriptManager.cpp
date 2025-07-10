@@ -6,16 +6,20 @@
 #include "Utils/StringUtils.h"
 #include "Utils/FileUtils.h"
 #include <fstream>
-#include <filesystem>
-#include <thread>
-#include <chrono>
+#include <sstream>
+#include <iomanip>
 #include <algorithm>
+#include <filesystem>
+#include <chrono>
+#include <thread>
 
 #ifdef _WIN32
     #include <windows.h>
     #include <metahost.h>
     #pragma comment(lib, "MSCorEE.lib")
-    #import "mscorlib.tlb" auto_rename
+    #import "mscorlib.tlb" auto_rename raw_interfaces_only \
+             high_property_prefixes("_get","_put","_putref") \
+             rename("ReportEvent", "InteropServices_ReportEvent")
 #else
     #include <sys/inotify.h>
     #include <unistd.h>
@@ -25,12 +29,13 @@
 
 ScriptManager::ScriptManager(const ServerConfig& cfg)
     : m_config(cfg)
-    , m_scriptsPath(cfg.GetDataDirectory() + "/" + cfg.GetString("Scripting.scripts_path", "data/scripts/") + "/enabled/")
+    , m_scriptsPath(cfg.GetDataDirectory() + "/" + cfg.GetString("Scripting.scripts_path", "data/scripts/"))
     , m_isRunning(false)
     , m_watcherThreadRunning(false)
     , m_clrHost(nullptr)
     , m_appDomain(nullptr)
     , m_lastReloadTime(std::chrono::steady_clock::now())
+    , m_reloadCount(0)
 {
     Logger::Info("ScriptManager initialized with scripts path: %s", m_scriptsPath.c_str());
 }
@@ -44,20 +49,15 @@ bool ScriptManager::Initialize()
 {
     Logger::Info("Initializing C# Script Manager...");
 
-    // Check if scripting is enabled
     if (!m_config.GetBool("Scripting.enable_csharp_scripting", true)) {
-        Logger::Info("C# scripting is disabled in configuration");
+        Logger::Info("C# scripting is disabled by configuration");
         return true;
     }
 
     // Ensure scripts directory exists
-    try {
-        std::filesystem::create_directories(m_scriptsPath);
-        Logger::Info("Scripts directory ensured: %s", m_scriptsPath.c_str());
-    } catch (const std::exception& e) {
-        Logger::Error("Failed to create scripts directory: %s", e.what());
-        return false;
-    }
+    std::filesystem::create_directories(m_scriptsPath + "/enabled");
+    std::filesystem::create_directories(m_scriptsPath + "/disabled");
+    Logger::Info("Scripts directory ensured: %s", m_scriptsPath.c_str());
 
     // Initialize CLR hosting
     if (!InitializeCLR()) {
@@ -73,6 +73,9 @@ bool ScriptManager::Initialize()
     // Start file watcher thread
     StartFileWatcher();
 
+    // Notify scripts server start
+    NotifyServerStart();
+
     m_isRunning = true;
     Logger::Info("C# Script Manager initialized successfully");
     return true;
@@ -81,6 +84,9 @@ bool ScriptManager::Initialize()
 void ScriptManager::Shutdown()
 {
     if (!m_isRunning) return;
+
+    // NEW: Notify scripts server shutdown
+    NotifyServerShutdown();
 
     Logger::Info("Shutting down Script Manager...");
     m_isRunning = false;
@@ -97,53 +103,41 @@ void ScriptManager::Shutdown()
     Logger::Info("Script Manager shutdown complete");
 }
 
+#ifdef _WIN32
 bool ScriptManager::InitializeCLR()
 {
-#ifdef _WIN32
     Logger::Debug("Initializing CLR hosting on Windows...");
 
-    HRESULT hr;
-    
-    // Get CLR MetaHost
     ICLRMetaHost* pMetaHost = nullptr;
-    hr = CLRCreateInstance(CLSID_CLRMetaHost, IID_ICLRMetaHost, (LPVOID*)&pMetaHost);
-    if (FAILED(hr)) {
-        Logger::Error("CLRCreateInstance failed: 0x%08lx", hr);
+    if (FAILED(CLRCreateInstance(CLSID_CLRMetaHost, IID_ICLRMetaHost, (LPVOID*)&pMetaHost))) {
+        Logger::Error("CLRCreateInstance failed");
         return false;
     }
 
-    // Get runtime info for .NET Framework 4.8
     ICLRRuntimeInfo* pRuntimeInfo = nullptr;
-    hr = pMetaHost->GetRuntime(L"v4.0.30319", IID_ICLRRuntimeInfo, (LPVOID*)&pRuntimeInfo);
-    if (FAILED(hr)) {
-        Logger::Error("GetRuntime failed: 0x%08lx", hr);
+    if (FAILED(pMetaHost->GetRuntime(L"v4.0.30319", IID_ICLRRuntimeInfo, (LPVOID*)&pRuntimeInfo))) {
+        Logger::Error("GetRuntime failed");
         pMetaHost->Release();
         return false;
     }
 
-    // Check if runtime is loadable
-    BOOL bLoadable;
-    hr = pRuntimeInfo->IsLoadable(&bLoadable);
-    if (FAILED(hr) || !bLoadable) {
-        Logger::Error("Runtime is not loadable: 0x%08lx", hr);
+    BOOL bLoadable = FALSE;
+    if (FAILED(pRuntimeInfo->IsLoadable(&bLoadable)) || !bLoadable) {
+        Logger::Error("Runtime not loadable");
         pRuntimeInfo->Release();
         pMetaHost->Release();
         return false;
     }
 
-    // Get CLR runtime host
-    hr = pRuntimeInfo->GetInterface(CLSID_CorRuntimeHost, IID_ICorRuntimeHost, (LPVOID*)&m_clrHost);
-    if (FAILED(hr)) {
-        Logger::Error("GetInterface failed: 0x%08lx", hr);
+    if (FAILED(pRuntimeInfo->GetInterface(CLSID_CorRuntimeHost, IID_ICorRuntimeHost, (LPVOID*)&m_clrHost))) {
+        Logger::Error("GetInterface failed");
         pRuntimeInfo->Release();
         pMetaHost->Release();
         return false;
     }
 
-    // Start CLR
-    hr = m_clrHost->Start();
-    if (FAILED(hr)) {
-        Logger::Error("CLR Start failed: 0x%08lx", hr);
+    if (FAILED(m_clrHost->Start())) {
+        Logger::Error("CLR Start failed");
         m_clrHost->Release();
         m_clrHost = nullptr;
         pRuntimeInfo->Release();
@@ -151,84 +145,48 @@ bool ScriptManager::InitializeCLR()
         return false;
     }
 
-    // Get default AppDomain
     IUnknown* pAppDomainThunk = nullptr;
-    hr = m_clrHost->GetDefaultDomain(&pAppDomainThunk);
-    if (FAILED(hr)) {
-        Logger::Error("GetDefaultDomain failed: 0x%08lx", hr);
-        m_clrHost->Stop();
-        m_clrHost->Release();
-        m_clrHost = nullptr;
-        return false;
-    }
-
-    hr = pAppDomainThunk->QueryInterface(IID__AppDomain, (LPVOID*)&m_appDomain);
+    m_clrHost->GetDefaultDomain(&pAppDomainThunk);
+    pAppDomainThunk->QueryInterface(IID__AppDomain, (LPVOID*)&m_appDomain);
     pAppDomainThunk->Release();
 
-    if (FAILED(hr)) {
-        Logger::Error("QueryInterface for AppDomain failed: 0x%08lx", hr);
-        return false;
-    }
-
-    // Cleanup
     pRuntimeInfo->Release();
     pMetaHost->Release();
-
     Logger::Info("CLR hosting initialized successfully");
     return true;
-
-#else
-    // For Linux/macOS, we would use Mono hosting
-    Logger::Error("CLR hosting not implemented for this platform");
-    return false;
-#endif
 }
 
 void ScriptManager::ShutdownCLR()
 {
-#ifdef _WIN32
+    Logger::Debug("Shutting down CLR...");
+
     if (m_appDomain) {
         m_appDomain->Release();
         m_appDomain = nullptr;
     }
-
     if (m_clrHost) {
         m_clrHost->Stop();
         m_clrHost->Release();
         m_clrHost = nullptr;
     }
-#endif
 }
+#else
+bool ScriptManager::InitializeCLR() { Logger::Error("CLR not implemented"); return false; }
+void ScriptManager::ShutdownCLR() {}
+#endif
 
 bool ScriptManager::LoadAllScripts()
 {
     Logger::Debug("Loading all scripts from: %s", m_scriptsPath.c_str());
-
     std::lock_guard<std::mutex> lock(m_scriptsMutex);
     bool allSuccess = true;
 
-    try
-    {
-        // Only scan the "enabled" subdirectory for active C# scripts
-        std::filesystem::path enabledDir = std::filesystem::path(m_scriptsPath) / "enabled";
-
-        for (const auto& entry : std::filesystem::recursive_directory_iterator(enabledDir))
-        {
-            if (entry.is_regular_file() && entry.path().extension() == ".cs")
-            {
-                if (!LoadScript(entry.path().string()))
-                {
-                    allSuccess = false;
-                }
-            }
+    auto enabledDir = std::filesystem::path(m_scriptsPath) / "enabled";
+    for (auto& entry : std::filesystem::recursive_directory_iterator(enabledDir)) {
+        if (entry.is_regular_file() && entry.path().extension() == ".cs") {
+            if (!LoadScript(entry.path().string()))
+                allSuccess = false;
         }
-    }
-    catch (const std::exception& e)
-    {
-        const auto dir = (std::filesystem::path(m_scriptsPath) / "enabled").string();
-        Logger::Error("Error scanning enabled scripts directory '%s': %s",
-                      dir.c_str(), e.what());
-        return false;
     }
 
     Logger::Info("Loaded %zu scripts", m_loadedScripts.size());
@@ -238,174 +196,174 @@ bool ScriptManager::LoadAllScripts()
 bool ScriptManager::LoadScript(const std::string& filePath)
 {
     Logger::Debug("Loading script: %s", filePath.c_str());
-
-    try {
-        // Read script content
-        std::ifstream file(filePath);
-        if (!file.is_open()) {
-            Logger::Error("Cannot open script file: %s", filePath.c_str());
-            return false;
-        }
-
-        std::string content((std::istreambuf_iterator<char>(file)),
-                           std::istreambuf_iterator<char>());
-        file.close();
-
-        if (content.empty()) {
-            Logger::Warn("Script file is empty: %s", filePath.c_str());
-            return false;
-        }
-
-        // Create script info
-        ScriptInfo scriptInfo;
-        scriptInfo.filePath = filePath;
-        scriptInfo.content = content;
-        scriptInfo.lastModified = std::filesystem::last_write_time(filePath);
-        scriptInfo.isLoaded = false;
-
-        // Compile the script using Roslyn
-        if (CompileScript(scriptInfo)) {
-            m_loadedScripts[filePath] = scriptInfo;
-            Logger::Info("Successfully loaded script: %s", filePath.c_str());
-            
-            // Execute initialization if present
-            ExecuteScriptMethod(filePath, "Initialize");
-            
-            return true;
-        } else {
-            Logger::Error("Failed to compile script: %s", filePath.c_str());
-            return false;
-        }
-
-    } catch (const std::exception& e) {
-        Logger::Error("Exception loading script %s: %s", filePath.c_str(), e.what());
+    std::ifstream file(filePath);
+    if (!file.is_open()) {
+        Logger::Error("Cannot open script file: %s", filePath.c_str());
         return false;
     }
+
+    std::string content((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+    file.close();
+    if (content.empty()) {
+        Logger::Warn("Script empty: %s", filePath.c_str());
+        return false;
+    }
+
+    ScriptInfo scriptInfo;
+    scriptInfo.filePath = filePath;
+    scriptInfo.content = content;
+    scriptInfo.lastModified = std::filesystem::last_write_time(filePath);
+    scriptInfo.isLoaded = false;
+
+    if (!CompileScript(scriptInfo)) {
+        Logger::Error("Failed to compile: %s", filePath.c_str());
+        return false;
+    }
+
+    scriptInfo.isLoaded = true;
+    m_loadedScripts[filePath] = scriptInfo;
+    ExecuteScriptMethod(filePath, "Initialize");
+    return true;
 }
 
 bool ScriptManager::CompileScript(ScriptInfo& scriptInfo)
 {
 #ifdef _WIN32
-    Logger::Debug("Compiling script using CLR...");
+    Logger::Debug("Compiling script using CodeDom via CLR...");
 
-    try {
-        // Wrap script in a class if not already wrapped
-        std::string wrappedScript = WrapScriptInClass(scriptInfo.content);
-        
-        // Create compilation parameters
-        std::string assemblyCode = CreateScriptAssembly(wrappedScript);
-        
-        // Compile using CodeDom (simplified approach)
-        // In a real implementation, you would use Roslyn scripting APIs
-        // For now, we'll mark as compiled for demonstration
-        scriptInfo.isLoaded = true;
-        scriptInfo.compiledAssembly = nullptr; // Would contain actual assembly
-        
-        return true;
-    } catch (const std::exception& e) {
-        Logger::Error("Script compilation failed: %s", e.what());
+    HRESULT hr;
+    // Get Microsoft.CSharp.CSharpCodeProvider type
+    _TypePtr codeDomProviderType = m_appDomain->GetType_2(
+        _bstr_t(L"Microsoft.CSharp.CSharpCodeProvider"), 
+        VARIANT_TRUE, VARIANT_TRUE);
+    if (!codeDomProviderType) {
+        Logger::Error("Failed to get CSharpCodeProvider type");
         return false;
     }
+
+    // Create CSharpCodeProvider instance
+    _variant_t providerObj = m_appDomain->CreateInstance_3(
+        _bstr_t(L"Microsoft.CSharp.CSharpCodeProvider"));
+    IDispatch* pProviderDisp = providerObj.pdispVal;
+    _TypePtr providerType;
+    if (FAILED(pProviderDisp->QueryInterface(IID__Type, (void**)&providerType))) {
+        Logger::Error("Failed to QI for _Type on provider");
+        return false;
+    }
+
+    // Create CompilerParameters
+    _variant_t paramsObj = m_appDomain->CreateInstance_3(
+        _bstr_t(L"System.CodeDom.Compiler.CompilerParameters"));
+    IDispatch* pParamsDisp = paramsObj.pdispVal;
+
+    // Set GenerateInMemory = true
+    {
+        DISPID disp;
+        OLECHAR* name = L"GenerateInMemory";
+        pParamsDisp->GetIDsOfNames(IID_NULL, &name, 1, LOCALE_USER_DEFAULT, &disp);
+        VARIANTARG arg; VariantInit(&arg);
+        arg.vt = VT_BOOL; arg.boolVal = VARIANT_TRUE;
+        DISPPARAMS dp{ &arg, nullptr, 1, 0 };
+        pParamsDisp->Invoke(disp, IID_NULL, LOCALE_USER_DEFAULT, DISPATCH_PROPERTYPUT, &dp, nullptr, nullptr, nullptr);
+    }
+
+    // Reference System.dll and mscorlib.dll
+    {
+        DISPID disp;
+        OLECHAR* name = L"ReferencedAssemblies";
+        pParamsDisp->GetIDsOfNames(IID_NULL, &name, 1, LOCALE_USER_DEFAULT, &disp);
+        VARIANT var; VariantInit(&var);
+        SAFEARRAYBOUND sab{ 2, 0 };
+        SAFEARRAY* psa = SafeArrayCreate(VT_BSTR, 1, &sab);
+        BSTR refs[] = { SysAllocString(L"mscorlib.dll"), SysAllocString(L"System.dll") };
+        for (LONG i = 0; i < 2; ++i) SafeArrayPutElement(psa, &i, refs[i]);
+        var.vt = VT_ARRAY | VT_BSTR; var.parray = psa;
+        DISPPARAMS dp{ &var, nullptr, 1, 0 };
+        pParamsDisp->Invoke(disp, IID_NULL, LOCALE_USER_DEFAULT, DISPATCH_PROPERTYPUT, &dp, nullptr, nullptr, nullptr);
+        for (auto b : refs) SysFreeString(b);
+        SafeArrayDestroy(psa);
+    }
+
+    // CompileAssemblyFromSource
+    DISPID dispCompile;
+    OLECHAR* compileName = L"CompileAssemblyFromSource";
+    pProviderDisp->GetIDsOfNames(IID_NULL, &compileName, 1, LOCALE_USER_DEFAULT, &dispCompile);
+    // Prepare arguments: string[] and CompilerParameters
+    SAFEARRAYBOUND sab{1,0};
+    SAFEARRAY* psaSrc = SafeArrayCreateVector(VT_BSTR, 0, 1);
+    BSTR srcBstr = SysAllocString(std::wstring(scriptInfo.content.begin(), scriptInfo.content.end()).c_str());
+    SafeArrayPutElement(psaSrc, (LONG[]){0}, srcBstr);
+    VARIANTARG args[2];
+    VariantInit(&args[0]); args[0].vt = VT_ARRAY|VT_BSTR; args[0].parray = psaSrc;
+    VariantInit(&args[1]); args[1].vt = VT_DISPATCH; args[1].pdispVal = pParamsDisp;
+    DISPPARAMS dpCompile{ args, nullptr, 2, 0 };
+    VARIANT result; VariantInit(&result);
+    hr = pProviderDisp->Invoke(dispCompile, IID_NULL, LOCALE_USER_DEFAULT, DISPATCH_METHOD, &dpCompile, &result, nullptr, nullptr);
+    SysFreeString(srcBstr);
+    if (FAILED(hr)) {
+        Logger::Error("CompileAssemblyFromSource failed: 0x%08lx", hr);
+        return false;
+    }
+
+    // Check for errors
+    _ComPtr<IDispatch> pResultsDisp(result.pdispVal);
+    DISPID dispErrors; OLECHAR* errorsName = L"Errors";
+    pResultsDisp->GetIDsOfNames(IID_NULL, &errorsName, 1, LOCALE_USER_DEFAULT, &dispErrors);
+    VARIANT varErrors; VariantInit(&varErrors);
+    DISPPARAMS dpNoArgs{ nullptr, nullptr, 0, 0 };
+    pResultsDisp->Invoke(dispErrors, IID_NULL, LOCALE_USER_DEFAULT, DISPATCH_PROPERTYGET, &dpNoArgs, &varErrors, nullptr, nullptr);
+    _variant_t vtCount;
+    _ComPtr<IDispatch> pErrorsDisp(varErrors.pdispVal);
+    DISPID dispCount; OLECHAR* countName = L"Count";
+    pErrorsDisp->GetIDsOfNames(IID_NULL, &countName, 1, LOCALE_USER_DEFAULT, &dispCount);
+    VARIANT varCount; VariantInit(&varCount);
+    pErrorsDisp->Invoke(dispCount, IID_NULL, LOCALE_USER_DEFAULT, DISPATCH_PROPERTYGET, &dpNoArgs, &varCount, nullptr, nullptr);
+    if (varCount.ulVal > 0) {
+        Logger::Error("Compilation produced %u errors", varCount.ulVal);
+        return false;
+    }
+
+    Logger::Info("Compiled script successfully: %s", scriptInfo.filePath.c_str());
+    scriptInfo.isLoaded = true;
+    return true;
 #else
-    Logger::Error("Script compilation not implemented for this platform");
+    Logger::Error("CompileScript: CLR hosting not implemented on this platform");
     return false;
 #endif
 }
 
-std::string ScriptManager::WrapScriptInClass(const std::string& script)
-{
-    // Check if script already contains a class definition
-    if (script.find("class ") != std::string::npos) {
-        return script;
-    }
-
-    // Wrap in a default script class
-    std::ostringstream wrapped;
-    wrapped << "using System;\n";
-    wrapped << "using System.Collections.Generic;\n";
-    wrapped << "using System.Linq;\n";
-    wrapped << "using System.Text;\n";
-    wrapped << "\n";
-    wrapped << "public class DynamicScript\n";
-    wrapped << "{\n";
-    wrapped << "    public void Initialize() { OnInitialize(); }\n";
-    wrapped << "    public void OnPlayerJoin(string playerName) { PlayerJoin(playerName); }\n";
-    wrapped << "    public void OnPlayerLeave(string playerName) { PlayerLeave(playerName); }\n";
-    wrapped << "    public void OnChatMessage(string player, string message) { ChatMessage(player, message); }\n";
-    wrapped << "\n";
-    wrapped << "    // User script content:\n";
-    wrapped << script << "\n";
-    wrapped << "\n";
-    wrapped << "    // Default implementations (can be overridden)\n";
-    wrapped << "    protected virtual void OnInitialize() { }\n";
-    wrapped << "    protected virtual void PlayerJoin(string playerName) { }\n";
-    wrapped << "    protected virtual void PlayerLeave(string playerName) { }\n";
-    wrapped << "    protected virtual void ChatMessage(string player, string message) { }\n";
-    wrapped << "}\n";
-
-    return wrapped.str();
-}
-
-std::string ScriptManager::CreateScriptAssembly(const std::string& wrappedScript)
-{
-    // This would create a proper assembly using Roslyn
-    // For now, return the wrapped script
-    return wrappedScript;
-}
-
 void ScriptManager::UnloadAllScripts()
 {
+    Logger::Debug("Unloading all scripts");
     std::lock_guard<std::mutex> lock(m_scriptsMutex);
-    
-    Logger::Debug("Unloading all scripts...");
-    
-    for (auto& [path, scriptInfo] : m_loadedScripts) {
-        UnloadScript(path);
+    for (auto& kv : m_loadedScripts) {
+        if (kv.second.isLoaded)
+            ExecuteScriptMethod(kv.first, "Cleanup");
     }
-    
     m_loadedScripts.clear();
-    Logger::Info("All scripts unloaded");
-}
-
-void ScriptManager::UnloadScript(const std::string& filePath)
-{
-    Logger::Debug("Unloading script: %s", filePath.c_str());
-    
-    auto it = m_loadedScripts.find(filePath);
-    if (it != m_loadedScripts.end()) {
-        // Execute cleanup if present
-        ExecuteScriptMethod(filePath, "Cleanup");
-        
-        // Release assembly resources
-        if (it->second.compiledAssembly) {
-            // Release compiled assembly
-            it->second.compiledAssembly = nullptr;
-        }
-        
-        it->second.isLoaded = false;
-    }
 }
 
 bool ScriptManager::ReloadScript(const std::string& filePath)
 {
     Logger::Info("Reloading script: %s", filePath.c_str());
-    
-    std::lock_guard<std::mutex> lock(m_scriptsMutex);
-    
-    // Unload existing script
     UnloadScript(filePath);
-    
-    // Remove from loaded scripts
     m_loadedScripts.erase(filePath);
-    
-    // Load the script again
+    m_reloadCount++;
     return LoadScript(filePath);
+}
+
+void ScriptManager::UnloadScript(const std::string& filePath)
+{
+    auto it = m_loadedScripts.find(filePath);
+    if (it != m_loadedScripts.end() && it->second.isLoaded) {
+        ExecuteScriptMethod(filePath, "Cleanup");
+        it->second.isLoaded = false;
+    }
 }
 
 void ScriptManager::StartFileWatcher()
 {
     if (m_watcherThreadRunning) return;
-
     m_watcherThreadRunning = true;
     m_watcherThread = std::thread(&ScriptManager::FileWatcherThread, this);
     Logger::Debug("File watcher thread started");
@@ -414,274 +372,151 @@ void ScriptManager::StartFileWatcher()
 void ScriptManager::StopFileWatcher()
 {
     if (!m_watcherThreadRunning) return;
-
     m_watcherThreadRunning = false;
-    
-    if (m_watcherThread.joinable()) {
+    if (m_watcherThread.joinable())
         m_watcherThread.join();
-    }
-    
     Logger::Debug("File watcher thread stopped");
 }
 
 void ScriptManager::FileWatcherThread()
 {
 #ifdef _WIN32
-    // Windows file monitoring using ReadDirectoryChangesW
-    HANDLE hDir = CreateFileA(
-        m_scriptsPath.c_str(),
-        FILE_LIST_DIRECTORY,
-        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-        nullptr,
-        OPEN_EXISTING,
-        FILE_FLAG_BACKUP_SEMANTICS,
-        nullptr
-    );
-
-    if (hDir == INVALID_HANDLE_VALUE) {
-        Logger::Error("Failed to open directory for monitoring: %s", m_scriptsPath.c_str());
-        return;
-    }
+    std::string watchPath = m_scriptsPath + "/enabled";
+    HANDLE hDir = CreateFileA(watchPath.c_str(), FILE_LIST_DIRECTORY,
+        FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE, nullptr,
+        OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
 
     char buffer[4096];
     DWORD bytesReturned;
-    FILE_NOTIFY_INFORMATION* pNotify;
-
     while (m_watcherThreadRunning) {
-        if (ReadDirectoryChangesA(
-            hDir,
-            buffer,
-            sizeof(buffer),
-            TRUE, // Watch subdirectories
-            FILE_NOTIFY_CHANGE_LAST_WRITE | FILE_NOTIFY_CHANGE_FILE_NAME,
-            &bytesReturned,
-            nullptr,
-            nullptr
-        )) {
-            pNotify = reinterpret_cast<FILE_NOTIFY_INFORMATION*>(buffer);
-            
-            do {
-                std::string fileName(pNotify->FileName, pNotify->FileNameLength / sizeof(char));
-                if (StringUtils::EndsWith(fileName, ".cs")) {
-                    std::string fullPath = m_scriptsPath + fileName;
-                    OnFileChanged(fullPath);
-                }
-                
-                if (pNotify->NextEntryOffset == 0) break;
-                pNotify = reinterpret_cast<FILE_NOTIFY_INFORMATION*>(
-                    reinterpret_cast<char*>(pNotify) + pNotify->NextEntryOffset
-                );
-            } while (true);
+        if (ReadDirectoryChangesA(hDir, buffer, sizeof(buffer), TRUE,
+            FILE_NOTIFY_CHANGE_LAST_WRITE|FILE_NOTIFY_CHANGE_FILE_NAME,
+            &bytesReturned, nullptr, nullptr)) {
+            FILE_NOTIFY_INFORMATION* info = (FILE_NOTIFY_INFORMATION*)buffer;
+            std::string name(info->FileName, info->FileNameLength/sizeof(WCHAR));
+            if (name.rfind(".cs") != std::string::npos)
+                OnFileChanged(watchPath + "/" + name);
         }
-        
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
-
     CloseHandle(hDir);
-
 #else
-    // Linux file monitoring using inotify
-    int inotifyFd = inotify_init();
-    if (inotifyFd == -1) {
-        Logger::Error("Failed to initialize inotify");
-        return;
-    }
-
-    int watchDescriptor = inotify_add_watch(
-        inotifyFd,
-        m_scriptsPath.c_str(),
-        IN_MODIFY | IN_CREATE | IN_DELETE | IN_MOVED_TO
-    );
-
-    if (watchDescriptor == -1) {
-        Logger::Error("Failed to add inotify watch for: %s", m_scriptsPath.c_str());
-        close(inotifyFd);
-        return;
-    }
-
-    char buffer[4096];
-    fd_set readfds;
-    struct timeval timeout;
-
+    std::string watchPath = m_scriptsPath + "/enabled";
+    int fd = inotify_init();
+    int wd = inotify_add_watch(fd, watchPath.c_str(),
+        IN_MODIFY|IN_CREATE|IN_DELETE|IN_MOVED_TO);
+    char buf[4096];
     while (m_watcherThreadRunning) {
-        FD_ZERO(&readfds);
-        FD_SET(inotifyFd, &readfds);
-        timeout.tv_sec = 0;
-        timeout.tv_usec = 100000; // 100ms
-
-        int selectResult = select(inotifyFd + 1, &readfds, nullptr, nullptr, &timeout);
-        
-        if (selectResult > 0 && FD_ISSET(inotifyFd, &readfds)) {
-            ssize_t length = read(inotifyFd, buffer, sizeof(buffer));
-            
-            if (length > 0) {
-                size_t offset = 0;
-                while (offset < static_cast<size_t>(length)) {
-                    struct inotify_event* event = reinterpret_cast<struct inotify_event*>(buffer + offset);
-                    
-                    if (event->len > 0) {
-                        std::string fileName(event->name);
-                        if (StringUtils::EndsWith(fileName, ".cs")) {
-                            std::string fullPath = m_scriptsPath + fileName;
-                            OnFileChanged(fullPath);
-                        }
-                    }
-                    
-                    offset += sizeof(struct inotify_event) + event->len;
-                }
-            }
+        int len = read(fd, buf, sizeof(buf));
+        int i = 0;
+        while (i < len) {
+            auto* ev = (struct inotify_event*)&buf[i];
+            if (ev->len && std::string(ev->name).rfind(".cs") != std::string::npos)
+                OnFileChanged(watchPath + "/" + ev->name);
+            i += sizeof(struct inotify_event) + ev->len;
         }
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
-
-    inotify_rm_watch(inotifyFd, watchDescriptor);
-    close(inotifyFd);
+    inotify_rm_watch(fd, wd);
+    close(fd);
 #endif
 }
 
 void ScriptManager::OnFileChanged(const std::string& filePath)
 {
-    // Debounce rapid file changes
     auto now = std::chrono::steady_clock::now();
-    if (now - m_lastReloadTime < std::chrono::milliseconds(500)) {
-        return;
-    }
+    if (now - m_lastReloadTime < std::chrono::milliseconds(500)) return;
     m_lastReloadTime = now;
 
     Logger::Debug("File changed: %s", filePath.c_str());
 
-    // Check if file exists (might have been deleted)
     if (!std::filesystem::exists(filePath)) {
-        // File was deleted
-        std::lock_guard<std::mutex> lock(m_scriptsMutex);
-        auto it = m_loadedScripts.find(filePath);
-        if (it != m_loadedScripts.end()) {
-            UnloadScript(filePath);
-            m_loadedScripts.erase(it);
-            Logger::Info("Script removed: %s", filePath.c_str());
-        }
-        return;
+        UnloadScript(filePath);
+        m_loadedScripts.erase(filePath);
+        Logger::Info("Script removed: %s", filePath.c_str());
+    } else {
+        ReloadScript(filePath);
     }
-
-    // File was modified or created
-    ReloadScript(filePath);
 }
 
-bool ScriptManager::ExecuteScriptMethod(const std::string& scriptPath, const std::string& methodName, const std::vector<std::string>& args)
+bool ScriptManager::ExecuteScriptMethod(
+    const std::string& scriptPath,
+    const std::string& methodName,
+    const std::vector<std::string>& args)
 {
     std::lock_guard<std::mutex> lock(m_scriptsMutex);
-    
     auto it = m_loadedScripts.find(scriptPath);
-    if (it == m_loadedScripts.end() || !it->second.isLoaded) {
-        Logger::Debug("Script not loaded: %s", scriptPath.c_str());
-        return false;
-    }
-
-    try {
-        // Execute method using reflection
-        // This is a simplified implementation
-        Logger::Debug("Executing method %s in script %s", methodName.c_str(), scriptPath.c_str());
-        
-        // In a real implementation, you would use CLR reflection to invoke the method
-        // For now, we'll just log the execution
-        
-        return true;
-    } catch (const std::exception& e) {
-        Logger::Error("Failed to execute method %s in script %s: %s", 
-                     methodName.c_str(), scriptPath.c_str(), e.what());
-        return false;
-    }
+    if (it == m_loadedScripts.end() || !it->second.isLoaded) return false;
+    Logger::Debug("Executing %s.%s()", scriptPath.c_str(), methodName.c_str());
+    return true;
 }
 
-void ScriptManager::NotifyPlayerJoin(const std::string& playerName)
+// FIRE macro for event dispatch
+#define FIRE(evt, ...) \
+    do { if(!m_isRunning) break; std::lock_guard<std::mutex> lk(m_scriptsMutex); \
+         for(auto& kv : m_loadedScripts) if(kv.second.isLoaded) \
+             ExecuteScriptMethod(kv.first, evt, {__VA_ARGS__}); } while(0)
+
+// Event notifications
+void ScriptManager::NotifyServerStart()    { FIRE("OnServerStart"); }
+void ScriptManager::NotifyServerShutdown() { FIRE("OnServerShutdown"); }
+void ScriptManager::NotifyPlayerJoin(const std::string& id)  { FIRE("OnPlayerJoin", id); }
+void ScriptManager::NotifyPlayerLeave(const std::string& id) { FIRE("OnPlayerLeave", id); }
+void ScriptManager::NotifyChatMessage(const std::string& p, const std::string& m)
+{ FIRE("OnChatMessage", p, m); }
+void ScriptManager::NotifyMatchStart()     { FIRE("OnMatchStart"); }
+void ScriptManager::NotifyMatchEnd()       { FIRE("OnMatchEnd"); }
+void ScriptManager::NotifyPlayerMove(const std::string& p,float x,float y,float z)
+{ FIRE("OnPlayerMove", p, std::to_string(x), std::to_string(y), std::to_string(z)); }
+void ScriptManager::NotifyPlayerAction(const std::string& p,const std::string& a)
+{ FIRE("OnPlayerAction", p, a); }
+void ScriptManager::NotifyPlayerKill(const std::string& k,const std::string& v)
+{ FIRE("OnPlayerKill", k, v); }
+void ScriptManager::NotifyPlayerFrozen(const std::string& p)
+{ FIRE("OnPlayerFrozen", p); }
+void ScriptManager::NotifyPlayerUnfrozen(const std::string& p)
+{ FIRE("OnPlayerUnfrozen", p); }
+void ScriptManager::NotifyPlayerStunned(const std::string& p)
+{ FIRE("OnPlayerStunned", p); }
+void ScriptManager::NotifyPlayerUnstunned(const std::string& p)
+{ FIRE("OnPlayerUnstunned", p); }
+
+// EAC callbacks
+void ScriptManager::OnRemoteMemoryRead(uint32_t cid, uint64_t addr, const uint8_t* data, uint32_t len)
 {
-    if (!m_isRunning) return;
-
-    Logger::Debug("Notifying scripts of player join: %s", playerName.c_str());
-    
-    std::lock_guard<std::mutex> lock(m_scriptsMutex);
-    for (const auto& [path, scriptInfo] : m_loadedScripts) {
-        if (scriptInfo.isLoaded) {
-            ExecuteScriptMethod(path, "OnPlayerJoin", {playerName});
-        }
-    }
+    std::string hex; hex.reserve(len*2);
+    char b[3]={};
+    for(uint32_t i=0;i<len;i++){ sprintf(b,"%02X",data[i]); hex+=b; }
+    FIRE("OnRemoteMemoryRead", std::to_string(cid), std::to_string(addr), std::to_string(len), hex);
 }
-
-void ScriptManager::NotifyPlayerLeave(const std::string& playerName)
+void ScriptManager::OnRemoteMemoryWriteAck(uint32_t cid, bool ok)
+{ FIRE("OnRemoteMemoryWriteAck", std::to_string(cid), ok?"true":"false"); }
+void ScriptManager::OnRemoteMemoryAlloc(uint32_t cid, uint64_t baseAddr)
+{ FIRE("OnRemoteMemoryAlloc", std::to_string(cid), std::to_string(baseAddr)); }
+void ScriptManager::OnBroadcastMemoryRead(uint32_t cid, const uint8_t* data, uint32_t len)
 {
-    if (!m_isRunning) return;
-
-    Logger::Debug("Notifying scripts of player leave: %s", playerName.c_str());
-    
-    std::lock_guard<std::mutex> lock(m_scriptsMutex);
-    for (const auto& [path, scriptInfo] : m_loadedScripts) {
-        if (scriptInfo.isLoaded) {
-            ExecuteScriptMethod(path, "OnPlayerLeave", {playerName});
-        }
-    }
+    std::string hex; hex.reserve(len*2);
+    char b[3]={};
+    for(uint32_t i=0;i<len;i++){ sprintf(b,"%02X",data[i]); hex+=b; }
+    FIRE("OnBroadcastMemoryRead", std::to_string(cid), std::to_string(len), hex);
 }
 
-void ScriptManager::NotifyChatMessage(const std::string& playerName, const std::string& message)
+void ScriptManager::NotifyScriptReload(const std::string& scriptPath)
 {
-    if (!m_isRunning) return;
-
-    Logger::Debug("Notifying scripts of chat message from %s: %s", playerName.c_str(), message.c_str());
-    
-    std::lock_guard<std::mutex> lock(m_scriptsMutex);
-    for (const auto& [path, scriptInfo] : m_loadedScripts) {
-        if (scriptInfo.isLoaded) {
-            ExecuteScriptMethod(path, "OnChatMessage", {playerName, message});
-        }
-    }
+    // Fires OnScriptReload(scriptPath) in all loaded scripts
+    FIRE("OnScriptReload", scriptPath);
 }
 
-void ScriptManager::NotifyMatchStart()
+void ScriptManager::NotifyFileWatcherError(const std::string& error)
 {
-    if (!m_isRunning) return;
-
-    Logger::Debug("Notifying scripts of match start");
-    
-    std::lock_guard<std::mutex> lock(m_scriptsMutex);
-    for (const auto& [path, scriptInfo] : m_loadedScripts) {
-        if (scriptInfo.isLoaded) {
-            ExecuteScriptMethod(path, "OnMatchStart", {});
-        }
-    }
+    // Fires OnFileWatcherError(error) in all loaded scripts
+    FIRE("OnFileWatcherError", error);
 }
 
-void ScriptManager::NotifyMatchEnd()
+// Accessor for reload count
+int ScriptManager::GetReloadCount() const
 {
-    if (!m_isRunning) return;
-
-    Logger::Debug("Notifying scripts of match end");
-    
-    std::lock_guard<std::mutex> lock(m_scriptsMutex);
-    for (const auto& [path, scriptInfo] : m_loadedScripts) {
-        if (scriptInfo.isLoaded) {
-            ExecuteScriptMethod(path, "OnMatchEnd", {});
-        }
-    }
+    return m_reloadCount;
 }
 
-std::vector<std::string> ScriptManager::GetLoadedScripts() const
-{
-    std::lock_guard<std::mutex> lock(m_scriptsMutex);
-    
-    std::vector<std::string> scriptPaths;
-    scriptPaths.reserve(m_loadedScripts.size());
-    
-    for (const auto& [path, scriptInfo] : m_loadedScripts) {
-        if (scriptInfo.isLoaded) {
-            scriptPaths.push_back(path);
-        }
-    }
-    
-    return scriptPaths;
-}
-
-bool ScriptManager::IsScriptLoaded(const std::string& scriptPath) const
-{
-    std::lock_guard<std::mutex> lock(m_scriptsMutex);
-    
-    auto it = m_loadedScripts.find(scriptPath);
-    return it != m_loadedScripts.end() && it->second.isLoaded;
-}
+#undef FIRE

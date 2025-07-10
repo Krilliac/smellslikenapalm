@@ -1,22 +1,28 @@
 using System;
 using System.Runtime.InteropServices;
 
-public static class Native {
+public static class Native
+{
     [DllImport("RS2VNativePlugin", CallingConvention = CallingConvention.Cdecl)]
     public static extern int GetCurrentTickRate();
+
     [DllImport("RS2VNativePlugin", CallingConvention = CallingConvention.Cdecl)]
     public static extern int GetPlayerCount();
+
     [DllImport("RS2VNativePlugin", CallingConvention = CallingConvention.Cdecl)]
     public static extern int GetScriptReloadCount();
 }
 
-public class MetricsReporter {
-    public static void Initialize() {
-        // Schedule first report on server start
+public class MetricsReporter
+{
+    public static void Initialize()
+    {
         ScriptHost.RegisterEventHandler("OnServerStart", nameof(Report));
+        ScriptHelpers.LogInfo("[C#] MetricsReporter initialized: broadcasting every 60s");
     }
 
-    public static void Report() {
+    public static void Report()
+    {
         int ticks   = Native.GetCurrentTickRate();
         int players = Native.GetPlayerCount();
         int reloads = Native.GetScriptReloadCount();
@@ -24,7 +30,6 @@ public class MetricsReporter {
         ScriptHelpers.BroadcastChat(
             $"[Metrics] TickRate={ticks}Hz Players={players} ScriptReloads={reloads}"
         );
-        // Reschedule via helper
         ScriptHelpers.ScheduleCallback(60f, nameof(Report));
     }
 }

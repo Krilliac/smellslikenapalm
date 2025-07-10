@@ -1,582 +1,298 @@
+// data/scripts/ScriptHelpers.cs
+
 using System;
 using System.IO;
+using System.Linq;
 using System.Runtime.InteropServices;
 using System.Collections.Generic;
 using System.Text.Json;
-using System.Linq;
-using System.Threading;
 
+/// <summary>
+/// A “kitchen sink” helper library for RS2V C# scripts:
+/// - Admin checks & chat commands
+/// - Debug draw stubs
+/// - EAC memory read/write/alloc
+/// - Live metrics & history
+/// - JSON persistence
+/// - Throttling, debouncing, scheduling
+/// - File, script toggling & listing
+/// - Utility formatting & random strings
+/// </summary>
 public static class ScriptHelpers
 {
     #region Native Bindings
+
     [DllImport("RS2VNativePlugin", CallingConvention = CallingConvention.Cdecl)]
     private static extern int GetPlayerAdminLevel(string playerId);
-
     [DllImport("RS2VNativePlugin", CallingConvention = CallingConvention.Cdecl)]
     private static extern void SendChatToPlayer(string playerId, string message);
-
     [DllImport("RS2VNativePlugin", CallingConvention = CallingConvention.Cdecl)]
     private static extern void BroadcastChat(string message);
-
     [DllImport("RS2VNativePlugin", CallingConvention = CallingConvention.Cdecl)]
     private static extern void LogInfo(string message);
-
     [DllImport("RS2VNativePlugin", CallingConvention = CallingConvention.Cdecl)]
     private static extern void LogWarning(string message);
-
     [DllImport("RS2VNativePlugin", CallingConvention = CallingConvention.Cdecl)]
     private static extern void LogError(string message);
-
     [DllImport("RS2VNativePlugin", CallingConvention = CallingConvention.Cdecl)]
     private static extern void ScheduleCallback(float delaySeconds, string methodName);
-
     [DllImport("RS2VNativePlugin", CallingConvention = CallingConvention.Cdecl)]
     private static extern string GetDataDirectory();
-
     [DllImport("RS2VNativePlugin", CallingConvention = CallingConvention.Cdecl)]
     private static extern int GetPlayerCount();
-
     [DllImport("RS2VNativePlugin", CallingConvention = CallingConvention.Cdecl)]
     private static extern bool IsPlayerOnline(string playerId);
+
+    // EAC memory
+    [DllImport("RS2VNativePlugin", CallingConvention = CallingConvention.Cdecl)]
+    private static extern bool RemoteRead(uint clientId, ulong address, uint length);
+    [DllImport("RS2VNativePlugin", CallingConvention = CallingConvention.Cdecl)]
+    private static extern bool RemoteWrite(uint clientId, ulong address, byte[] buffer, uint length);
+    [DllImport("RS2VNativePlugin", CallingConvention = CallingConvention.Cdecl)]
+    private static extern bool RemoteAlloc(uint clientId, uint length, ulong protection);
+    [DllImport("RS2VNativePlugin", CallingConvention = CallingConvention.Cdecl)]
+    private static extern void BroadcastRemoteRead(ulong address, uint length);
+
     #endregion
 
-    #region Permission & Access Control
-    /// <summary>
-    /// Requires admin permission and returns false if insufficient
-    /// </summary>
+    #region Permissions
+
     public static bool RequireAdmin(string playerId, int minLevel = 2)
     {
-        int level = GetPlayerAdminLevel(playerId);
-        if (level < minLevel)
+        if (GetPlayerAdminLevel(playerId) < minLevel)
         {
-            SendChatToPlayer(playerId, $"Insufficient permission (need level ≥ {minLevel}).");
+            SendChatToPlayer(playerId, $"Insufficient permission (need ≥{minLevel}).");
             return false;
         }
         return true;
     }
 
-    /// <summary>
-    /// Check if player has specific admin level without notification
-    /// </summary>
-    public static bool HasAdminLevel(string playerId, int level)
+    public static bool HasAdmin(string playerId, int level = 2)
+        => GetPlayerAdminLevel(playerId) >= level;
+
+    public static void AdminOnly(string playerId, int level, Action action)
     {
-        return GetPlayerAdminLevel(playerId) >= level;
+        if (RequireAdmin(playerId, level)) action();
     }
 
-    /// <summary>
-    /// Execute action only if player has admin permission
-    /// </summary>
-    public static void AdminOnly(string playerId, int minLevel, Action action)
-    {
-        if (RequireAdmin(playerId, minLevel))
-            action?.Invoke();
-    }
     #endregion
 
-    #region Command Parsing & Dispatch
-    /// <summary>
-    /// Parse chat commands and invoke handler with admin check
-    /// </summary>
-    public static void OnChatCommand(string playerId, string message, string command, Action<string[], string> handler)
+    #region Chat Command Parsing
+
+    private static Dictionary<string, Action<string[],string>> _cmds
+        = new Dictionary<string, Action<string[],string>>();
+
+    public static void RegisterCommands(Dictionary<string,Action<string[],string>> cmds)
+        => _cmds = cmds;
+
+    public static void ProcessChatCmd(string playerId, string msg)
     {
-        if (!message.StartsWith("!" + command, StringComparison.OrdinalIgnoreCase))
-            return;
-
-        if (!RequireAdmin(playerId)) return;
-
-        var parts = message.Substring(command.Length + 1).Trim().Split(' ', StringSplitOptions.RemoveEmptyEntries);
-        handler(parts, playerId);
-    }
-
-    /// <summary>
-    /// Register multiple commands with a single handler
-    /// </summary>
-    public static void RegisterCommands(Dictionary<string, Action<string[], string>> commands)
-    {
-        // Store commands for later lookup in message handlers
-        _registeredCommands = commands;
-    }
-
-    private static Dictionary<string, Action<string[], string>> _registeredCommands = new();
-
-    /// <summary>
-    /// Process any registered chat command
-    /// </summary>
-    public static void ProcessChatCommand(string playerId, string message)
-    {
-        if (!message.StartsWith("!")) return;
-
-        var cmdPart = message.Substring(1).Split(' ')[0];
-        if (_registeredCommands.ContainsKey(cmdPart))
+        if (!msg.StartsWith("!")) return;
+        var parts = msg.Substring(1).Split(' ');
+        if (_cmds.TryGetValue(parts[0], out var h))
         {
-            OnChatCommand(playerId, message, cmdPart, _registeredCommands[cmdPart]);
+            if (!RequireAdmin(playerId)) return;
+            h(parts.Skip(1).ToArray(), playerId);
         }
     }
+
     #endregion
 
-    #region Script Management
-    /// <summary>
-    /// Toggle script between enabled/disabled folders
-    /// </summary>
-    public static void ToggleScript(string scriptName, string dataDir, string playerId = null)
-    {
-        string root = Path.Combine(dataDir, "scripts");
-        string enabledDir = Path.Combine(root, "enabled");
-        string disabledDir = Path.Combine(root, "disabled");
-        string file = scriptName.EndsWith(".cs") ? scriptName : scriptName + ".cs";
+    #region Debug Draw (Stubs)
 
-        Directory.CreateDirectory(enabledDir);
-        Directory.CreateDirectory(disabledDir);
+    public static void DebugLine(float x1,float y1,float z1,
+                                 float x2,float y2,float z2,
+                                 float dur=1f,float thr=1f,
+                                 float r=1f,float g=1f,float b=1f)
+        => BroadcastChat($"[DbgLine] {x1},{y1},{z1}->{x2},{y2},{z2} dur={dur}");
 
-        string enabledPath = Path.Combine(enabledDir, file);
-        string disabledPath = Path.Combine(disabledDir, file);
+    public static void DebugSphere(float x,float y,float z,
+                                   float rad=1f,float dur=1f,
+                                   float r=1f,float g=1f,float b=1f)
+        => BroadcastChat($"[DbgSphere] {x},{y},{z} r={rad} dur={dur}");
 
-        try
-        {
-            if (File.Exists(enabledPath))
-            {
-                File.Move(enabledPath, disabledPath);
-                SendMessageToPlayer(playerId, $"Script '{file}' disabled.");
-            }
-            else if (File.Exists(disabledPath))
-            {
-                File.Move(disabledPath, enabledPath);
-                SendMessageToPlayer(playerId, $"Script '{file}' enabled.");
-            }
-            else
-            {
-                SendMessageToPlayer(playerId, $"Script '{file}' not found.");
-            }
-        }
-        catch (Exception ex)
-        {
-            LogError($"Failed to toggle script {file}: {ex.Message}");
-            SendMessageToPlayer(playerId, $"Error toggling script: {ex.Message}");
-        }
-    }
+    public static void DebugText(float x,float y,float z,
+                                 string txt,float dur=1f,
+                                 float r=1f,float g=1f,float b=1f)
+        => BroadcastChat($"[DbgText] {txt} @({x},{y},{z})");
 
-    /// <summary>
-    /// List all available scripts (enabled and disabled)
-    /// </summary>
-    public static void ListScripts(string playerId)
-    {
-        if (!RequireAdmin(playerId)) return;
-
-        string dataDir = GetDataDirectory();
-        string scriptsDir = Path.Combine(dataDir, "scripts");
-        string enabledDir = Path.Combine(scriptsDir, "enabled");
-        string disabledDir = Path.Combine(scriptsDir, "disabled");
-
-        var enabled = Directory.Exists(enabledDir) ? 
-            Directory.GetFiles(enabledDir, "*.cs").Select(Path.GetFileNameWithoutExtension) : 
-            Enumerable.Empty<string>();
-
-        var disabled = Directory.Exists(disabledDir) ? 
-            Directory.GetFiles(disabledDir, "*.cs").Select(Path.GetFileNameWithoutExtension) : 
-            Enumerable.Empty<string>();
-
-        SendChatToPlayer(playerId, $"Enabled: {string.Join(", ", enabled)}");
-        SendChatToPlayer(playerId, $"Disabled: {string.Join(", ", disabled)}");
-    }
     #endregion
 
-    #region Throttling & Rate Limiting
-    private static Dictionary<string, DateTime> _lastCallTimes = new();
-    private static readonly object _throttleLock = new object();
+    #region EAC Memory Ops
 
-    /// <summary>
-    /// Throttle execution to prevent spam - returns true if allowed
-    /// </summary>
-    public static bool Throttle(string key, int cooldownSeconds)
+    public static void ReadMem(uint cid,ulong addr,uint len)
     {
-        lock (_throttleLock)
-        {
-            var now = DateTime.UtcNow;
-            if (_lastCallTimes.TryGetValue(key, out DateTime lastCall))
-            {
-                if ((now - lastCall).TotalSeconds < cooldownSeconds)
-                    return false;
-            }
-            _lastCallTimes[key] = now;
-            return true;
-        }
+        if (!RemoteRead(cid,addr,len))
+            LogError($"ReadMem fail cid={cid}, addr=0x{addr:X}, len={len}");
     }
 
-    /// <summary>
-    /// Debounce execution - only execute if not called recently
-    /// </summary>
-    public static void Debounce(string key, int delayMs, Action action)
+    public static void WriteMem(uint cid,ulong addr,byte[] buf)
     {
-        if (!Throttle(key, delayMs / 1000))
-            return;
-
-        ScheduleCallback(delayMs / 1000f, $"ScriptHelpers.ExecuteDebounced_{key.Replace(".", "_")}");
-        _debouncedActions[key] = action;
+        if (!RemoteWrite(cid,addr,buf,(uint)buf.Length))
+            LogError($"WriteMem fail cid={cid}, addr=0x{addr:X}");
     }
 
-    private static Dictionary<string, Action> _debouncedActions = new();
-
-    /// <summary>
-    /// Execute a previously debounced action
-    /// </summary>
-    public static void ExecuteDebouncedAction(string key)
+    public static void AllocMem(uint cid,uint size,ulong prot)
     {
-        if (_debouncedActions.TryGetValue(key, out Action action))
-        {
-            action?.Invoke();
-            _debouncedActions.Remove(key);
-        }
+        if (!RemoteAlloc(cid,size,prot))
+            LogError($"AllocMem fail cid={cid}, size={size}");
     }
+
+    public static void ReadAllMem(ulong addr,uint len)
+        => BroadcastRemoteRead(addr,len);
+
     #endregion
 
-    #region Conditional Execution
-    /// <summary>
-    /// Schedule callback only if condition is met
-    /// </summary>
-    public static void ScheduleIf(Func<bool> condition, float delaySeconds, Action action)
+    #region Throttle & Debounce
+
+    private static Dictionary<string,DateTime> _last = new();
+    private static Dictionary<string,Action> _deb = new();
+    private static readonly object _tl = new();
+
+    public static bool Throttle(string key,int s)
     {
-        if (condition())
-        {
-            var key = Guid.NewGuid().ToString();
-            _conditionalActions[key] = action;
-            ScheduleCallback(delaySeconds, $"ScriptHelpers.ExecuteConditional_{key}");
+        lock(_tl){
+            var n=DateTime.UtcNow;
+            if(_last.TryGetValue(key,out var t)&& (n-t).TotalSeconds<s) return false;
+            _last[key]=n; return true;
         }
     }
 
-    private static Dictionary<string, Action> _conditionalActions = new();
-
-    /// <summary>
-    /// Execute action only if player count exceeds threshold
-    /// </summary>
-    public static void ExecuteIfPlayerCount(int minPlayers, Action action)
+    public static void Debounce(string key,int ms,Action act)
     {
-        if (GetPlayerCount() >= minPlayers)
-            action?.Invoke();
+        if(!Throttle(key,ms/1000))return;
+        _deb[key]=act;
+        ScheduleCallback(ms/1000f,$"ScriptHelpers.ExecuteDeb_{key}");
     }
 
-    /// <summary>
-    /// Broadcast only if issued by admin
-    /// </summary>
-    public static void BroadcastIfAdmin(string playerId, string message, int minLevel = 2)
+    public static void ExecuteDeb(string key)
     {
-        if (HasAdminLevel(playerId, minLevel))
-            BroadcastChat($"[Admin] {message}");
+        if(_deb.TryGetValue(key,out var a)){a();_deb.Remove(key);}
     }
+
     #endregion
 
-    #region Data Persistence
-    /// <summary>
-    /// Save data to JSON file
-    /// </summary>
-    public static void SaveData<T>(string filename, T data)
+    #region Metrics & Persistence
+
+    private static readonly string _metf="metrics";
+    public struct Metric{public DateTime T;public float V;}
+
+    public static void Track(string name,float val)
     {
-        try
-        {
-            string dataDir = Path.Combine(GetDataDirectory(), "persistent");
-            Directory.CreateDirectory(dataDir);
-            string path = Path.Combine(dataDir, filename + ".json");
-            string json = JsonSerializer.Serialize(data, new JsonSerializerOptions { WriteIndented = true });
-            File.WriteAllText(path, json);
-        }
-        catch (Exception ex)
-        {
-            LogError($"Failed to save data to {filename}: {ex.Message}");
-        }
+        var d=Load<Dictionary<string,List<Metric>>>(_metf,new());
+        if(!d.ContainsKey(name))d[name]=new();
+        d[name].Add(new Metric{T=DateTime.UtcNow,V=val});
+        if(d[name].Count>1000)d[name].RemoveRange(0,d[name].Count-1000);
+        Save(_metf,d);
     }
 
-    /// <summary>
-    /// Load data from JSON file
-    /// </summary>
-    public static T LoadData<T>(string filename, T defaultValue = default)
+    public static float Avg(string name,int mins)
     {
-        try
-        {
-            string dataDir = Path.Combine(GetDataDirectory(), "persistent");
-            string path = Path.Combine(dataDir, filename + ".json");
-            if (!File.Exists(path)) return defaultValue;
-
-            string json = File.ReadAllText(path);
-            return JsonSerializer.Deserialize<T>(json);
-        }
-        catch (Exception ex)
-        {
-            LogError($"Failed to load data from {filename}: {ex.Message}");
-            return defaultValue;
-        }
+        var d=Load<Dictionary<string,List<Metric>>>(_metf,new());
+        if(!d.ContainsKey(name))return 0;
+        var co=DateTime.UtcNow.AddMinutes(-mins);
+        var r=d[name].Where(x=>x.T>co).Select(x=>x.V);
+        return r.Any()?r.Average():0;
     }
 
-    /// <summary>
-    /// Append line to log file with timestamp
-    /// </summary>
-    public static void AppendToLog(string logName, string message)
+    public static void Save<T>(string f,T data)
     {
-        try
-        {
-            string logsDir = Path.Combine(GetDataDirectory(), "logs");
-            Directory.CreateDirectory(logsDir);
-            string path = Path.Combine(logsDir, logName + ".log");
-            string timestamped = $"[{DateTime.UtcNow:yyyy-MM-dd HH:mm:ss}] {message}";
-            File.AppendAllText(path, timestamped + Environment.NewLine);
-        }
-        catch (Exception ex)
-        {
-            LogError($"Failed to append to log {logName}: {ex.Message}");
-        }
+        try{
+            var p=Path.Combine(GetDataDirectory(),"persistent");
+            Directory.CreateDirectory(p);
+            File.WriteAllText(Path.Combine(p,f+".json"),
+                JsonSerializer.Serialize(data,new(){WriteIndented=true}));
+        }catch(Exception e){LogError($"Save {f}: {e.Message}");}
     }
+
+    public static T Load<T>(string f,T def)
+    {
+        try{
+            var path=Path.Combine(GetDataDirectory(),"persistent",f+".json");
+            if(!File.Exists(path))return def;
+            return JsonSerializer.Deserialize<T>(File.ReadAllText(path));
+        }catch{ return def; }
+    }
+
     #endregion
 
-    #region Server Monitoring & Metrics
-    /// <summary>
-    /// Track metric over time and save to data
-    /// </summary>
-    public static void TrackMetric(string metricName, float value)
+    #region Script File Management
+
+    public static void ToggleScript(string name)
     {
-        var metrics = LoadData<Dictionary<string, List<MetricEntry>>>("metrics", new());
-        if (!metrics.ContainsKey(metricName))
-            metrics[metricName] = new List<MetricEntry>();
-
-        metrics[metricName].Add(new MetricEntry 
-        { 
-            Timestamp = DateTime.UtcNow, 
-            Value = value 
-        });
-
-        // Keep only last 1000 entries per metric
-        if (metrics[metricName].Count > 1000)
-            metrics[metricName] = metrics[metricName].TakeLast(1000).ToList();
-
-        SaveData("metrics", metrics);
+        var r=Path.Combine(GetDataDirectory(),"scripts");
+        var e=Path.Combine(r,"enabled",name+".cs");
+        var d=Path.Combine(r,"disabled",name+".cs");
+        try{
+            if(File.Exists(e))File.Move(e,d);
+            else if(File.Exists(d))File.Move(d,e);
+            BroadcastChat($"Toggled {name}");
+        }catch(Exception ex){LogError($"ToggleScript: {ex.Message}");}
     }
 
-    public class MetricEntry
+    public static void ListScripts()
     {
-        public DateTime Timestamp { get; set; }
-        public float Value { get; set; }
+        var r=Path.Combine(GetDataDirectory(),"scripts");
+        var e=Directory.GetFiles(Path.Combine(r,"enabled"),"*.cs").Select(Path.GetFileNameWithoutExtension);
+        var d=Directory.GetFiles(Path.Combine(r,"disabled"),"*.cs").Select(Path.GetFileNameWithoutExtension);
+        BroadcastChat($"Enabled: {string.Join(",",e)}");
+        BroadcastChat($"Disabled: {string.Join(",",d)}");
     }
 
-    /// <summary>
-    /// Get average of metric over last N minutes
-    /// </summary>
-    public static float GetMetricAverage(string metricName, int lastMinutes)
-    {
-        var metrics = LoadData<Dictionary<string, List<MetricEntry>>>("metrics", new());
-        if (!metrics.ContainsKey(metricName)) return 0f;
-
-        var cutoff = DateTime.UtcNow.AddMinutes(-lastMinutes);
-        var recent = metrics[metricName].Where(m => m.Timestamp > cutoff);
-        return recent.Any() ? recent.Average(m => m.Value) : 0f;
-    }
-    #endregion
-
-    #region Player Management
-    /// <summary>
-    /// Execute action for all online players with admin level
-    /// </summary>
-    public static void ForEachAdminOnline(int minLevel, Action<string> action)
-    {
-        // This would need a native call to get all online players
-        // For now, placeholder implementation
-        LogInfo($"ForEachAdminOnline called with level {minLevel}");
-    }
-
-    /// <summary>
-    /// Send message to player if online, otherwise queue for next login
-    /// </summary>
-    public static void SendMessageOrQueue(string playerId, string message)
-    {
-        if (IsPlayerOnline(playerId))
-        {
-            SendChatToPlayer(playerId, message);
-        }
-        else
-        {
-            var queue = LoadData<Dictionary<string, List<string>>>("message_queue", new());
-            if (!queue.ContainsKey(playerId))
-                queue[playerId] = new List<string>();
-            queue[playerId].Add(message);
-            SaveData("message_queue", queue);
-        }
-    }
-
-    /// <summary>
-    /// Process queued messages for a player who just joined
-    /// </summary>
-    public static void ProcessQueuedMessages(string playerId)
-    {
-        var queue = LoadData<Dictionary<string, List<string>>>("message_queue", new());
-        if (queue.ContainsKey(playerId) && queue[playerId].Any())
-        {
-            foreach (var message in queue[playerId])
-            {
-                SendChatToPlayer(playerId, $"[Queued] {message}");
-            }
-            queue[playerId].Clear();
-            SaveData("message_queue", queue);
-        }
-    }
-    #endregion
-
-    #region Utility Functions
-    /// <summary>
-    /// Format time span in human readable format
-    /// </summary>
-    public static string FormatTimeSpan(TimeSpan span)
-    {
-        if (span.TotalDays >= 1)
-            return $"{(int)span.TotalDays}d {span.Hours}h {span.Minutes}m";
-        if (span.TotalHours >= 1)
-            return $"{span.Hours}h {span.Minutes}m";
-        if (span.TotalMinutes >= 1)
-            return $"{span.Minutes}m {span.Seconds}s";
-        return $"{span.Seconds}s";
-    }
-
-    /// <summary>
-    /// Format bytes in human readable format
-    /// </summary>
-    public static string FormatBytes(long bytes)
-    {
-        string[] sizes = { "B", "KB", "MB", "GB", "TB" };
-        double len = bytes;
-        int order = 0;
-        while (len >= 1024 && order < sizes.Length - 1)
-        {
-            order++;
-            len /= 1024;
-        }
-        return $"{len:0.##} {sizes[order]}";
-    }
-
-    /// <summary>
-    /// Generate random string for tokens/IDs
-    /// </summary>
-    public static string GenerateRandomString(int length)
-    {
-        const string chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-        var random = new Random();
-        return new string(Enumerable.Repeat(chars, length)
-            .Select(s => s[random.Next(s.Length)]).ToArray());
-    }
-
-    /// <summary>
-    /// Send message to player or broadcast if player is null
-    /// </summary>
-    private static void SendMessageToPlayer(string playerId, string message)
-    {
-        if (!string.IsNullOrEmpty(playerId))
-            SendChatToPlayer(playerId, message);
-        else
-            BroadcastChat(message);
-    }
-
-    /// <summary>
-    /// Safe file deletion with error handling
-    /// </summary>
-    public static bool SafeDeleteFile(string path)
-    {
-        try
-        {
-            if (File.Exists(path))
-            {
-                File.Delete(path);
-                return true;
-            }
-            return false;
-        }
-        catch (Exception ex)
-        {
-            LogError($"Failed to delete file {path}: {ex.Message}");
-            return false;
-        }
-    }
-
-    /// <summary>
-    /// Create backup of file with timestamp
-    /// </summary>
-    public static bool BackupFile(string filePath)
-    {
-        try
-        {
-            if (!File.Exists(filePath)) return false;
-            
-            string backupPath = $"{filePath}.backup_{DateTime.UtcNow:yyyyMMdd_HHmmss}";
-            File.Copy(filePath, backupPath);
-            LogInfo($"Created backup: {backupPath}");
-            return true;
-        }
-        catch (Exception ex)
-        {
-            LogError($"Failed to backup file {filePath}: {ex.Message}");
-            return false;
-        }
-    }
     #endregion
 
     #region Scheduled Tasks
-    private static Dictionary<string, ScheduledTask> _scheduledTasks = new();
 
-    public class ScheduledTask
-    {
-        public string Id { get; set; }
-        public DateTime NextRun { get; set; }
-        public TimeSpan Interval { get; set; }
-        public Action Action { get; set; }
-        public bool Repeating { get; set; }
-    }
+    private static Dictionary<string,(DateTime next,TimeSpan iv,Action a,bool rep)> _tsk
+        = new();
 
-    /// <summary>
-    /// Schedule a recurring task
-    /// </summary>
-    public static string ScheduleRecurring(TimeSpan interval, Action action)
+    public static string ScheduleRecurring(TimeSpan iv,Action a)
     {
-        string id = Guid.NewGuid().ToString();
-        _scheduledTasks[id] = new ScheduledTask
-        {
-            Id = id,
-            NextRun = DateTime.UtcNow.Add(interval),
-            Interval = interval,
-            Action = action,
-            Repeating = true
-        };
+        var id=Guid.NewGuid().ToString();
+        _tsk[id]=(DateTime.UtcNow+iv,iv,a,true);
         return id;
     }
 
-    /// <summary>
-    /// Cancel a scheduled task
-    /// </summary>
-    public static void CancelTask(string taskId)
-    {
-        _scheduledTasks.Remove(taskId);
-    }
+    public static void Cancel(string id)=>_tsk.Remove(id);
 
-    /// <summary>
-    /// Process all scheduled tasks (call this from a tick handler)
-    /// </summary>
-    public static void ProcessScheduledTasks()
+    public static void ProcessTasks()
     {
-        var now = DateTime.UtcNow;
-        var toExecute = _scheduledTasks.Values.Where(t => t.NextRun <= now).ToList();
-        
-        foreach (var task in toExecute)
+        var n=DateTime.UtcNow;
+        foreach(var kv in _tsk.ToList())
         {
-            try
-            {
-                task.Action?.Invoke();
-                
-                if (task.Repeating)
-                {
-                    task.NextRun = now.Add(task.Interval);
-                }
-                else
-                {
-                    _scheduledTasks.Remove(task.Id);
-                }
-            }
-            catch (Exception ex)
-            {
-                LogError($"Scheduled task {task.Id} failed: {ex.Message}");
+            var(id,t)=kv;
+            if(n>=t.next){
+                try{t.a();}catch(Exception e){LogError($"Task {id}: {e.Message}");}
+                if(t.rep)_tsk[id]=(n+t.iv,t.iv,t.a,true);
+                else _tsk.Remove(id);
             }
         }
     }
+
+    #endregion
+
+    #region Utilities
+
+    public static string FmtSpan(TimeSpan ts)
+    {
+        if(ts.TotalDays>=1)return $"{(int)ts.TotalDays}d{ts.Hours}h{ts.Minutes}m";
+        if(ts.TotalHours>=1)return $"{ts.Hours}h{ts.Minutes}m";
+        if(ts.TotalMinutes>=1)return $"{ts.Minutes}m{ts.Seconds}s";
+        return $"{ts.Seconds}s";
+    }
+
+    public static string FmtBytes(long b)
+    {
+        string[] s={"B","KB","MB","GB","TB"};double len=b;int o=0;
+        while(len>=1024&&o<s.Length-1){o++;len/=1024;}return $"{len:0.##}{s[o]}";
+    }
+
+    public static string RandStr(int l)
+    {
+        const string ch="ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+        var r=new Random();
+        return new string(Enumerable.Range(0,l).Select(_=>ch[r.Next(ch.Length)]).ToArray());
+    }
+
     #endregion
 }
