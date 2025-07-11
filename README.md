@@ -1,3 +1,5 @@
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/Krilliac/smellslikenapalm)
+
 RS2V Custom Server
 A highly modular, extensible dedicated server for Rising Storm 2: Vietnam, featuring:
 
