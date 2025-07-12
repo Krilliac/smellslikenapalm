@@ -356,13 +356,13 @@ ctest -R "Telemetry.*" --verbose  # Telemetry tests
 | Document | Description | Status |
 |----------|-------------|--------|
 | **[TODO.md](TODO.md)** | Development roadmap and task tracking | ✅ Complete |
-| **[ARCHITECTURE.md](docs/ARCHITECTURE.md)** | Detailed system architecture | 🚧 In Progress |
-| **[API.md](docs/API.md)** | Complete API reference | 📋 Planned |
-| **[SECURITY.md](docs/SECURITY.md)** | Security architecture and best practices | 📋 Planned |
-| **[TELEMETRY.md](docs/TELEMETRY.md)** | Telemetry system guide | 📋 Planned |
-| **[SCRIPTING.md](docs/SCRIPTING.md)** | Plugin development guide | 📋 Planned |
-| **[DEPLOYMENT.md](docs/DEPLOYMENT.md)** | Production deployment guide | 📋 Planned |
-| **[TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md)** | Common issues and solutions | 📋 Planned |
+| **[ARCHITECTURE.md](docs/ARCHITECTURE.md)** | Detailed system architecture | ✅ Complete |
+| **[API.md](docs/API.md)** | Complete API reference | ✅ Complete |
+| **[SECURITY.md](docs/SECURITY.md)** | Security architecture and best practices | ✅ Complete |
+| **[TELEMETRY.md](docs/TELEMETRY.md)** | Telemetry system guide | ✅ Complete |
+| **[SCRIPTING.md](docs/SCRIPTING.md)** | Plugin development guide | ✅ Complete |
+| **[DEPLOYMENT.md](docs/DEPLOYMENT.md)** | Production deployment guide | ✅ Complete |
+| **[TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md)** | Common issues and solutions | ✅ Complete |
 
 ### Online Resources
 
