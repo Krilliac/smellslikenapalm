@@ -25,6 +25,17 @@ class PlayerManager;
 class TeamManager;
 class MapManager;
 class ClientConnection;
+class RoleSystem;
+class TicketSystem;
+class ObjectiveSystem;
+class CommanderAbilities;
+class SpawnSystem;
+class WeaponDatabase;
+class DamageSystem;
+class HelicopterPhysics;
+class TerritoryMode;
+class SupremacyMode;
+class SkirmishMode;
 
 struct PacketAnalysisResult;
 
@@ -56,14 +67,25 @@ public:
     std::vector<std::shared_ptr<ClientConnection>> GetAllConnections() const;
 
     // Subsystem accessors
-    PlayerManager*                  GetPlayerManager()  const;
-    TeamManager*                    GetTeamManager()    const;
-    MapManager*                     GetMapManager()     const;
-    NetworkManager*                 GetNetworkManager() const;
-    AdminManager*                   GetAdminManager()   const;
-    std::shared_ptr<GameConfig>     GetGameConfig()     const;
-    std::shared_ptr<ServerConfig>   GetServerConfig()   const;
-    std::shared_ptr<ConfigManager>  GetConfigManager()  const;
+    PlayerManager*                  GetPlayerManager()      const;
+    TeamManager*                    GetTeamManager()        const;
+    MapManager*                     GetMapManager()         const;
+    NetworkManager*                 GetNetworkManager()     const;
+    AdminManager*                   GetAdminManager()       const;
+    RoleSystem*                     GetRoleSystem()         const;
+    TicketSystem*                   GetTicketSystem()       const;
+    ObjectiveSystem*                GetObjectiveSystem()    const;
+    CommanderAbilities*             GetCommanderAbilities() const;
+    SpawnSystem*                    GetSpawnSystem()        const;
+    WeaponDatabase*                 GetWeaponDatabase()     const;
+    DamageSystem*                   GetDamageSystem()       const;
+    HelicopterPhysics*              GetHelicopterPhysics()  const;
+    TerritoryMode*                  GetTerritoryMode()      const;
+    SupremacyMode*                  GetSupremacyMode()      const;
+    SkirmishMode*                   GetSkirmishMode()       const;
+    std::shared_ptr<GameConfig>     GetGameConfig()         const;
+    std::shared_ptr<ServerConfig>   GetServerConfig()       const;
+    std::shared_ptr<ConfigManager>  GetConfigManager()      const;
 
     void ChangeMap();
 
@@ -101,6 +123,31 @@ private:
     std::unique_ptr<AdminManager>       m_adminManager;
     std::unique_ptr<ChatManager>        m_chatManager;
     std::unique_ptr<GameMode>           m_gameMode;
+
+    // RS2V game systems
+    std::unique_ptr<RoleSystem>         m_roleSystem;
+    std::unique_ptr<TicketSystem>       m_ticketSystem;
+    std::unique_ptr<ObjectiveSystem>    m_objectiveSystem;
+    std::unique_ptr<CommanderAbilities> m_commanderAbilities;
+    std::unique_ptr<SpawnSystem>        m_spawnSystem;
+    std::unique_ptr<WeaponDatabase>     m_weaponDatabase;
+    std::unique_ptr<DamageSystem>       m_damageSystem;
+    std::unique_ptr<HelicopterPhysics>  m_helicopterPhysics;
+    std::unique_ptr<TerritoryMode>      m_territoryMode;
+    std::unique_ptr<SupremacyMode>      m_supremacyMode;
+    std::unique_ptr<SkirmishMode>       m_skirmishMode;
+
+    // Game tick timing
+    float m_lastTickTime = 0.0f;
+    float m_tickDeltaSeconds = 1.0f / 60.0f;  // 60Hz default
+
+    // Packet handlers for RS2V systems
+    void HandleRoleSelection(uint32_t clientId, const std::vector<uint8_t>& data);
+    void HandleSpawnRequest(uint32_t clientId, const std::vector<uint8_t>& data);
+    void HandleCommanderAbility(uint32_t clientId, const std::vector<uint8_t>& data);
+    void HandleSquadAction(uint32_t clientId, const std::vector<uint8_t>& data);
+    void HandleVehicleAction(uint32_t clientId, const std::vector<uint8_t>& data);
+    void HandleWeaponFire(uint32_t clientId, const std::vector<uint8_t>& data);
 
     std::atomic<bool>                   m_running{false};
 
