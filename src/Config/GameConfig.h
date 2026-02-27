@@ -4,7 +4,10 @@
 
 #include <string>
 #include <vector>
+#include <optional>
+#include <memory>
 #include "Config/ServerConfig.h"
+#include "Config/MapConfig.h"
 
 class GameConfig {
 public:
@@ -28,7 +31,13 @@ public:
     std::string GetModesIniPath() const;
     std::string GetTeamsIniPath() const;
     std::string GetWeaponsIniPath() const;
-	std::string GetMapsAssetDirectory() const;
+    std::string GetMapsAssetDirectory() const;
+
+    // Game settings (used by GameServer to set up initial state)
+    GameSettings GetGameSettings() const;
+
+    // Game mode definitions (loaded from config)
+    std::optional<GameModeDefinition> GetGameModeDefinition(const std::string& modeName) const;
 
 private:
     const ServerConfig& m_cfg;

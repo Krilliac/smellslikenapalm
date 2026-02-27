@@ -3,6 +3,7 @@
 
 #include <string>
 #include <memory>
+#include <unordered_map>
 #include "Network/ClientConnection.h"
 #include "Config/SecurityConfig.h"
 

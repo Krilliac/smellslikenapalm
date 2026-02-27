@@ -1,9 +1,12 @@
-// src/Network/ConnectionManager.cpp – Implementation for ConnectionManager
+// src/Network/ConnectionManager.cpp
 
 #include "Network/ConnectionManager.h"
+#include "Game/GameServer.h"
+#include "Config/ConfigManager.h"
 #include "Utils/Logger.h"
 #include "Network/Packet.h"
 #include "Network/BandwidthManager.h"
+#include "Protocol/ReverseEngineering/ProtocolDecoder.h"
 #include <chrono>
 
 ConnectionManager::ConnectionManager(GameServer* server)
@@ -21,7 +24,11 @@ bool ConnectionManager::Initialize(uint16_t listenPort) {
         Logger::Error("ConnectionManager: Failed to bind UDP socket on port %u", listenPort);
         return false;
     }
-    m_bwManager = std::make_unique<BandwidthManager>(m_server->GetConfigManager()->GetInt("Network.MaxPacketSize", 1200));
+
+    auto cfgMgr = m_server->GetConfigManager();
+    m_bandwidthLimit = cfgMgr ? (uint32_t)cfgMgr->GetInt("Network.bandwidth_limit", 65536) : 65536;
+    m_bwManager = std::make_unique<BandwidthManager>(m_bandwidthLimit);
+
     Logger::Info("ConnectionManager: Initialized successfully");
     return true;
 }
@@ -36,31 +43,52 @@ void ConnectionManager::Shutdown() {
     m_bwManager.reset();
 }
 
+void ConnectionManager::SetPacketCallback(PacketCallback cb) {
+    m_packetCallback = std::move(cb);
+}
+
 void ConnectionManager::PumpNetwork() {
-    std::vector<uint8_t> buffer(1500);
-    std::string srcIp;
-    uint16_t srcPort;
-    int len = m_socket->ReceiveFrom(srcIp, srcPort, buffer.data(), (int)buffer.size());
-    if (len <= 0) return;
+    if (!m_socket || !m_socket->IsOpen()) return;
 
-    buffer.resize(len);
-    ClientAddress addr{srcIp, srcPort};
-    // Bandwidth check
-    if (!m_bwManager->CanReceivePacket(addr, len)) return;
-    m_bwManager->OnPacketSent(addr, len);
+    // Drain all available packets from the socket
+    for (int i = 0; i < 256; ++i) {
+        std::vector<uint8_t> buffer(1500);
+        std::string srcIp;
+        uint16_t srcPort = 0;
+        int len = m_socket->ReceiveFrom(srcIp, srcPort, buffer.data(), (int)buffer.size());
+        if (len <= 0) break;
 
-    HandleIncomingPacket(buffer, addr);
+        buffer.resize(len);
+        ClientAddress addr{srcIp, srcPort};
+        // Bandwidth check
+        if (m_bwManager && !m_bwManager->CanReceivePacket(addr, (uint32_t)len)) continue;
+
+        HandleIncomingPacket(buffer, addr);
+    }
 }
 
 void ConnectionManager::HandleIncomingPacket(const std::vector<uint8_t>& data, const ClientAddress& addr) {
     uint32_t clientId = CreateOrGetClient(addr.ip, addr.port);
+    if (clientId == UINT32_MAX) return;
+
+    // Feed raw UDP data to protocol decoder for UE3 bunch analysis
+    GetProtocolDecoder().OnRawUDPReceived(clientId, data.data(), data.size());
+
     auto conn = m_clients[addr];
     PacketMetadata meta;
+    meta.clientId = clientId;
     Packet pkt = Packet::FromBuffer(data, meta);
     conn->UpdateLastHeartbeat();
 
-    // Dispatch to game server
-    m_server->OnPacketReceived(clientId, pkt, meta);
+    // Feed parsed packet to protocol decoder for structure analysis
+    GetProtocolDecoder().OnPacketReceived(clientId, pkt.RawData(), pkt.GetTag());
+
+    // Dispatch via callback (to NetworkManager -> GameServer) or directly
+    if (m_packetCallback) {
+        m_packetCallback(clientId, pkt, meta);
+    } else if (m_server) {
+        m_server->OnPacketReceived(clientId, pkt, meta);
+    }
 }
 
 bool ConnectionManager::SendToClient(uint32_t clientId, const Packet& pkt) {
@@ -86,6 +114,7 @@ std::shared_ptr<ClientConnection> ConnectionManager::GetConnection(uint32_t clie
 
 std::vector<std::shared_ptr<ClientConnection>> ConnectionManager::GetAllConnections() const {
     std::vector<std::shared_ptr<ClientConnection>> list;
+    list.reserve(m_clients.size());
     for (auto& kv : m_clients) {
         list.push_back(kv.second);
     }
@@ -96,6 +125,15 @@ uint32_t ConnectionManager::FindClientByAddress(const std::string& ip, uint16_t 
     ClientAddress addr{ip, port};
     auto it = m_clients.find(addr);
     return it != m_clients.end() ? it->second->GetClientId() : UINT32_MAX;
+}
+
+uint32_t ConnectionManager::FindClientBySteamID(const std::string& steamId) const {
+    for (auto& kv : m_clients) {
+        if (kv.second->GetSteamID() == steamId) {
+            return kv.second->GetClientId();
+        }
+    }
+    return UINT32_MAX;
 }
 
 uint32_t ConnectionManager::CreateOrGetClient(const std::string& ip, uint16_t port) {
@@ -112,17 +150,25 @@ uint32_t ConnectionManager::CreateOrGetClient(const std::string& ip, uint16_t po
     auto conn = std::make_shared<ClientConnection>(clientId, ip, port, m_socket, this);
     m_clients[addr] = conn;
     Logger::Info("ConnectionManager: New client %u from %s:%u", clientId, ip.c_str(), port);
+
+    // Notify protocol decoder of new client connection
+    GetProtocolDecoder().OnClientConnected(clientId, ip);
+
     return clientId;
 }
 
 void ConnectionManager::RemoveStaleConnections() {
     auto now = std::chrono::steady_clock::now();
+    auto cfgMgr = m_server->GetConfigManager();
+    int timeoutSecs = cfgMgr ? cfgMgr->GetInt("Network.timeout_seconds", 30) : 30;
+
     std::vector<ClientAddress> toRemove;
     for (auto& kv : m_clients) {
         auto conn = kv.second;
         auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - conn->GetLastHeartbeat()).count();
-        if (elapsed > m_server->GetConfigManager()->GetInt("Network.TimeoutSeconds", 30)) {
+        if (elapsed > timeoutSecs) {
             Logger::Info("ConnectionManager: Timing out client %u", conn->GetClientId());
+            GetProtocolDecoder().OnClientDisconnected(conn->GetClientId());
             conn->MarkDisconnected();
             toRemove.push_back(kv.first);
         }
@@ -133,7 +179,11 @@ void ConnectionManager::RemoveStaleConnections() {
 }
 
 void ConnectionManager::UpdateBandwidthWindows() {
-    m_bwManager->Update();
+    if (m_bwManager) m_bwManager->Update();
+}
+
+uint32_t ConnectionManager::GetBandwidthLimit() const {
+    return m_bandwidthLimit;
 }
 
 void ConnectionManager::SetMaxClients(size_t maxClients) {

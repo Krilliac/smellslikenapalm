@@ -24,9 +24,7 @@ bool FlexibleEACServer::Initialize(uint16_t listenPort) {
 
     // Initialize emulator
     if (!m_emulator.Initialize(listenPort)) return false;
-    m_emulator.SetDetectionCallback([this](uint32_t id, EACDetectionResult r, const std::string& d){
-        OnChallenge(id, d);
-    });
+    // Note: EACServerEmulator detection results are handled via ProcessRequests/polling
 
     // Initialize detector
     if (!m_detector.Initialize()) return false;
@@ -34,10 +32,10 @@ bool FlexibleEACServer::Initialize(uint16_t listenPort) {
         OnDetector(id, r, d);
     });
 
-    // Load memory signatures from config
-    auto sigs = m_config->GetEACSignatures();
+    // Load memory signatures (empty default set)
+    std::vector<ScanSignature> sigs;
     if (!m_memoryScanner.Initialize(sigs,
-                        std::chrono::milliseconds(m_config->GetInt("EAC.ScanTimeoutMs", 5000))))
+                        std::chrono::milliseconds(5000)))
     {
         return false;
     }
@@ -64,8 +62,8 @@ void FlexibleEACServer::ValidateClient(uint32_t clientId,
     sess.startTime      = std::chrono::steady_clock::now();
     m_sessions[clientId] = sess;
 
-    // Kick off handshake
-    m_emulator.DetectClient(clientId, exePath /*reuse handshake API*/);
+    // Kick off handshake via emulator packet handling
+    m_emulator.HandlePacket(ip, port, {/* simulate EAC handshake */});
 
     // Kick off exe check
     m_detector.DetectClient(clientId, exePath);

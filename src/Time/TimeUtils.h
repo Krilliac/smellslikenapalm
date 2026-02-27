@@ -1,10 +1,13 @@
 #pragma once
 
 #include <chrono>
+#include <cstdint>
+#include <optional>
 #include <string>
 #include <sstream>
 #include <iomanip>
 #include <ctime>
+#include <thread>
 
 namespace TimeUtils {
 

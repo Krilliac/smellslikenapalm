@@ -37,6 +37,7 @@ public:
     // Utility
     uint32_t FindPlayerBySteamID(const std::string& steamId) const;
     void BroadcastPlayerList() const;
+    void SpawnAllPlayers();
 
 private:
     GameServer* m_server;

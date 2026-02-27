@@ -8,7 +8,7 @@
 #include <optional>
 
 struct ValidationResult {
-    bool isValid;
+    bool isValid = true;
     std::vector<std::string> errors;
     std::vector<std::string> warnings;
 };
@@ -28,6 +28,10 @@ public:
     bool ValidateConfigurationFile(const std::string& configFile);
 
 private:
+    // Internal initialization helpers
+    void InitializeValidationRules();
+    void InitializeCustomValidators();
+
     // Section validators
     void ValidateGeneralSection(const std::map<std::string, std::string>& cfg, ValidationResult& r);
     void ValidateNetworkSection(const std::map<std::string, std::string>& cfg, ValidationResult& r);
@@ -42,6 +46,9 @@ private:
 
     // Helpers for parsing and validation
     std::optional<std::string> GetConfig(const std::map<std::string, std::string>& cfg, const std::string& key);
+    std::optional<std::string> GetConfigValue(const std::map<std::string, std::string>& cfg, const std::string& key);
+    std::string GetString(const std::map<std::string, std::string>& cfg, const std::string& key, const std::string& defaultValue = "");
+    bool GetBool(const std::map<std::string, std::string>& cfg, const std::string& key, bool defaultValue = false);
     bool ValidateBooleanString(const std::string& v);
     bool LoadConfigurationFromFile(const std::string& file, std::map<std::string, std::string>& cfg);
     void LogValidationResults(const ValidationResult& r);

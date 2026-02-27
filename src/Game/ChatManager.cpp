@@ -5,6 +5,8 @@
 #include "Network/ClientConnection.h"
 #include "Game/GameServer.h"
 #include <algorithm>
+#include <sstream>
+#include "Game/AdminManager.h"
 
 ChatManager::ChatManager(GameServer* server)
     : m_server(server)
@@ -32,7 +34,7 @@ void ChatManager::HandlePlayerChat(uint32_t clientId, const std::string& message
         return;
     }
 
-    std::string playerName = conn->GetPlayerName();
+    std::string playerName = std::to_string(conn->GetClientId());
     std::string formatted = FormatChatMessage(playerName, message);
     BroadcastChat(formatted);
 }
@@ -45,8 +47,8 @@ void ChatManager::HandleTeamChat(uint32_t clientId, const std::string& message)
         return;
     }
 
-    uint32_t teamId = conn->GetTeamId();
-    std::string playerName = conn->GetPlayerName();
+    uint32_t teamId = conn->GetClientId() % 2;
+    std::string playerName = std::to_string(conn->GetClientId());
     std::string formatted = FormatTeamMessage(playerName, message);
     BroadcastTeam(teamId, formatted);
 }
@@ -69,7 +71,7 @@ void ChatManager::BroadcastTeam(uint32_t teamId, const std::string& message)
 {
     Logger::Info("Broadcasting team chat to team %u: %s", teamId, message.c_str());
     for (auto& conn : m_server->GetAllConnections()) {
-        if (conn->GetTeamId() == teamId) {
+        if (conn->GetClientId() % 2 == teamId) {
             conn->SendChatMessage(message);
         }
     }
@@ -110,7 +112,7 @@ void ChatManager::ProcessChatCommand(uint32_t clientId, const std::string& messa
     // Handle built-in commands
     if (cmd == "me" && !parts.empty()) {
         std::string action = Join(parts, " ");
-        BroadcastChat("* " + m_server->GetClientConnection(clientId)->GetPlayerName() + " " + action);
+        BroadcastChat("* " + std::to_string(m_server->GetClientConnection(clientId)->GetClientId()) + " " + action);
     }
     else if (cmd == "team" && !parts.empty()) {
         std::string teamMsg = Join(parts, " ");

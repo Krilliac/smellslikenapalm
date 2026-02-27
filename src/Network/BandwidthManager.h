@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <chrono>
+#include <string>
 #include <unordered_map>
 #include <mutex>
 

@@ -2,24 +2,12 @@
 #pragma once
 
 #include <cstdint>
+#include <string>
 #include <chrono>
 #include <unordered_map>
 #include <mutex>
 #include <vector>
-
-struct ClientAddress {
-    std::string ip;
-    uint16_t    port;
-    bool operator==(ClientAddress const& o) const { return ip==o.ip && port==o.port; }
-};
-
-namespace std {
-    template<> struct hash<ClientAddress> {
-        size_t operator()(ClientAddress const& a) const noexcept {
-            return hash<string>()(a.ip) ^ (hash<uint16_t>()(a.port)<<1);
-        }
-    };
-}
+#include "Network/BandwidthManager.h"
 
 // Tracks round‐trip latency and packet timing per client
 class LatencyManager {

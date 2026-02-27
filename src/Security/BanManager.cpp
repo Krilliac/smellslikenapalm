@@ -13,7 +13,7 @@ BanManager::~BanManager() {
 }
 
 bool BanManager::LoadBans() {
-    std::ifstream file(m_config->GetString("Security.BanListFile", "bans.txt"));
+    std::ifstream file(m_config->GetBanListFile());
     if (!file.is_open()) {
         Logger::Warn("BanManager: could not open ban list file");
         return false;
@@ -30,7 +30,7 @@ bool BanManager::LoadBans() {
 }
 
 bool BanManager::SaveBans() const {
-    std::ofstream file(m_config->GetString("Security.BanListFile", "bans.txt"), std::ios::trunc);
+    std::ofstream file(m_config->GetBanListFile(), std::ios::trunc);
     if (!file.is_open()) {
         Logger::Error("BanManager: could not write ban list file");
         return false;

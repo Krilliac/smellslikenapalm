@@ -4,6 +4,8 @@
 
 #include <string>
 #include <vector>
+#include <cstdint>
+#include <iosfwd>
 #include "Math/Vector3.h"
 
 struct MapSettings {

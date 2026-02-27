@@ -50,7 +50,7 @@ void RPCHandler::Handle(uint32_t clientId,
 }
 
 Packet RPCHandler::BuildRequest(const std::string& rpcName, const std::vector<uint8_t>& args) {
-    Packet pkt(m_requestTag);
+    Packet pkt("RPC_CALL");
     pkt.WriteString(rpcName);
     pkt.WriteUInt(static_cast<uint32_t>(args.size()));
     pkt.WriteBytes(args);
@@ -58,7 +58,7 @@ Packet RPCHandler::BuildRequest(const std::string& rpcName, const std::vector<ui
 }
 
 Packet RPCHandler::BuildResponse(const std::string& rpcName, const std::vector<uint8_t>& result) {
-    Packet pkt(m_responseTag);
+    Packet pkt("RPC_RESPONSE");
     pkt.WriteString(rpcName);
     pkt.WriteUInt(static_cast<uint32_t>(result.size()));
     pkt.WriteBytes(result);

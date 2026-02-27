@@ -42,9 +42,12 @@ namespace StringUtils {
         return oss.str();
     }
 
-    // Parse string to integer/double; returns nullopt on failure
+    // Parse string to integer/double/bool; returns nullopt on failure
     std::optional<int>    ToInt(const std::string& s);
     std::optional<double> ToDouble(const std::string& s);
+
+    // Convert "true"/"false"/"yes"/"no"/"1"/"0" to bool
+    bool ToBool(const std::string& s, bool defaultValue = false);
 
     // Trim functions for elements in vector
     void TrimInPlace(std::vector<std::string>& parts);

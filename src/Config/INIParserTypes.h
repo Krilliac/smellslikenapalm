@@ -1,58 +1,68 @@
-// src/Config/INIParserTypes.h
+// src/Config/INIParserTypes.h — Type definitions for INI parser
 
 #pragma once
 
 #include <string>
 #include <vector>
 #include <map>
+#include <utility>
 
-// Severity levels for parsing and validation errors
 enum class ErrorSeverity {
-    INFO,
     WARNING,
     ERROR
 };
 
-// Represents a single key/value pair within a section
+struct ParsingError {
+    std::string message;
+    std::string section;
+    std::string key;
+    size_t      lineNumber = 0;
+    std::string line;              // original line text for error context
+    ErrorSeverity severity = ErrorSeverity::WARNING;
+};
+
 struct INIKeyValue {
     std::string key;
     std::string value;
-    size_t      lineNumber;
+    std::string comment;
+    size_t      lineNumber = 0;
 };
 
-// Represents one section in the INI file, including its key/value pairs
 struct INISection {
     std::string sectionName;
-    std::vector<INIKeyValue> keyValues;
+    std::string name;
+    size_t      lineNumber = 0;
+    std::map<std::string, INIKeyValue> keyValues;
+    std::vector<std::string> comments;
 };
 
-// Represents a parsing or validation error encountered during parsing
-struct ParsingError {
-    ErrorSeverity severity;
-    std::string   message;
-    size_t        lineNumber;
-    std::string   contextSection;
-    std::string   contextKey;
-};
-
-// Configuration options for the INI parser
-struct ParserConfig {
-    bool allowMultilineValues       = true;
-    bool preserveComments           = true;
-    bool caseInsensitiveSections    = false;
-    bool caseInsensitiveKeys        = false;
-    std::string commentDelimiters   = "#;";
-    std::string assignmentOperator  = "=";
-    bool trimWhitespaceAroundValues = true;
-};
-
-// Represents a preserved comment to be re-emitted on save
 struct PreservedComment {
-    std::string section;      // section name, empty for global
-    std::string key;          // key name, empty if comment before section
-    std::string commentText;  // the raw comment (without delimiter)
-    size_t      lineNumber;   // original line number in source
+    std::string section;
+    std::string key;
+    std::string text;
+    size_t      lineNumber = 0;
+    bool        beforeSection = false;
+    bool        beforeKey = false;
 };
 
-// Convenience alias for the full parsed data structure
-using INIData = std::map<std::string, INISection>;
+struct ParserConfig {
+    bool allowEmptyValues        = true;
+    bool allowDuplicateKeys      = false;
+    bool caseSensitive           = false;
+    bool caseInsensitiveKeys     = true;
+    bool trimWhitespace          = true;
+    bool allowMultilineValues    = false;
+    bool preserveComments        = true;
+    bool strictMode              = false;
+
+    std::vector<char> commentChars     = {'#', ';'};
+    std::pair<char, char> sectionBrackets = {'[', ']'};
+    char keyValueSeparator             = '=';
+    char escapeChar                    = '\\';
+    char arraySeparator                = ',';
+    std::vector<char> quotingChars     = {'"', '\''};
+
+    std::string headerComment;
+    std::string footerComment;
+    std::string sectionNamePattern;
+};

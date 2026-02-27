@@ -4,11 +4,12 @@
 
 #include <memory>
 #include <vector>
-#include "Network/ConnectionManager.h"
 #include "Network/BandwidthManager.h"
 #include "Network/Packet.h"
 
 class GameServer;
+class ConnectionManager;
+class ClientConnection;
 
 class NetworkManager {
 public:
@@ -18,7 +19,10 @@ public:
     bool Initialize(uint16_t listenPort);
     void Shutdown();
 
-    std::vector<ReceivedPacket> ReceivePackets();
+    // Poll network I/O (call once per tick from GameServer::Run)
+    void PollNetwork();
+
+    // Flush any buffered outgoing data
     void Flush();
 
     bool SendPacket(uint32_t clientId, const Packet& pkt);
@@ -36,6 +40,7 @@ private:
     GameServer*                                m_server;
     std::unique_ptr<ConnectionManager>         m_connMgr;
     std::unique_ptr<BandwidthManager>          m_bwManager;
+    uint32_t                                   m_bandwidthLimit = 65536;
 
     void OnPacketReceived(uint32_t clientId, const Packet& pkt, const PacketMetadata& meta);
 };

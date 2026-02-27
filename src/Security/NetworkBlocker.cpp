@@ -1,4 +1,4 @@
-#include "Network/NetworkBlocker.h"
+#include "Security/NetworkBlocker.h"
 
 NetworkBlocker::NetworkBlocker() = default;
 
@@ -48,4 +48,15 @@ void NetworkBlocker::Update() {
             ++it;
         }
     }
+}
+
+bool NetworkBlocker::Initialize() {
+    m_blockMap.clear();
+    m_blockedDomains.clear();
+    return true;
+}
+
+void NetworkBlocker::BlockDomain(const std::string& domain) {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    m_blockedDomains.push_back(domain);
 }

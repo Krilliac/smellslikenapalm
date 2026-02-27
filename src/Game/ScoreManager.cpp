@@ -5,6 +5,7 @@
 #include "Game/TeamManager.h"
 #include "Utils/Logger.h"
 #include "Network/NetworkManager.h"
+#include <algorithm>
 
 ScoreManager::ScoreManager(GameServer* server)
     : m_server(server)

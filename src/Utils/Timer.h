@@ -3,6 +3,7 @@
 #include <chrono>
 #include <functional>
 #include <atomic>
+#include <thread>
 
 class Timer {
 public:

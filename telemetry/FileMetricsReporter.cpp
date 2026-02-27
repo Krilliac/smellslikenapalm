@@ -4,7 +4,7 @@
 
 #include "MetricsReporter.h"
 #include "TelemetryManager.h"
-#include "../Utils/Logger.h"
+#include "Utils/Logger.h"
 
 #include <filesystem>
 #include <fstream>
@@ -15,8 +15,7 @@
 #include <chrono>
 #include <thread>
 
-// JSON library - using nlohmann/json for structured output
-#include <nlohmann/json.hpp>
+// Manual JSON serialization (nlohmann/json not available)
 
 // Compression support
 #ifdef ENABLE_COMPRESSION
@@ -295,19 +294,23 @@ void FileMetricsReporter::WriteFileHeader() {
     if (!m_currentFile || !m_currentFile->is_open()) {
         return;
     }
-    
+
     try {
-        nlohmann::json header;
-        header["file_format"] = "rs2v_telemetry_v1";
-        header["created_at"] = std::chrono::duration_cast<std::chrono::seconds>(
+        auto createdAt = std::chrono::duration_cast<std::chrono::seconds>(
             std::chrono::system_clock::now().time_since_epoch()).count();
-        header["generator"] = "FileMetricsReporter";
-        header["server_version"] = "1.0.0"; // Could be read from config
-        header["format_description"] = "Each line after this header is a JSON metrics snapshot";
-        
-        *m_currentFile << "# " << header.dump() << "\n";
-        m_currentFileSize.fetch_add(header.dump().length() + 3, std::memory_order_relaxed);
-        
+
+        std::ostringstream header;
+        header << "{\"file_format\":\"rs2v_telemetry_v1\""
+               << ",\"created_at\":" << createdAt
+               << ",\"generator\":\"FileMetricsReporter\""
+               << ",\"server_version\":\"1.0.0\""
+               << ",\"format_description\":\"Each line after this header is a JSON metrics snapshot\""
+               << "}";
+
+        std::string headerStr = header.str();
+        *m_currentFile << "# " << headerStr << "\n";
+        m_currentFileSize.fetch_add(headerStr.length() + 3, std::memory_order_relaxed);
+
     } catch (const std::exception& ex) {
         ReportError("Error writing file header: " + std::string(ex.what()));
     }
@@ -317,16 +320,19 @@ void FileMetricsReporter::WriteFileFooter() {
     if (!m_currentFile || !m_currentFile->is_open()) {
         return;
     }
-    
+
     try {
-        nlohmann::json footer;
-        footer["file_closed_at"] = std::chrono::duration_cast<std::chrono::seconds>(
+        auto closedAt = std::chrono::duration_cast<std::chrono::seconds>(
             std::chrono::system_clock::now().time_since_epoch()).count();
-        footer["total_snapshots"] = m_reportsGenerated.load();
-        footer["file_size_bytes"] = m_currentFileSize.load();
-        
-        *m_currentFile << "# " << footer.dump() << "\n";
-        
+
+        std::ostringstream footer;
+        footer << "{\"file_closed_at\":" << closedAt
+               << ",\"total_snapshots\":" << m_reportsGenerated.load()
+               << ",\"file_size_bytes\":" << m_currentFileSize.load()
+               << "}";
+
+        *m_currentFile << "# " << footer.str() << "\n";
+
     } catch (const std::exception& ex) {
         Logger::Error("Error writing file footer: %s", ex.what());
     }
@@ -334,76 +340,82 @@ void FileMetricsReporter::WriteFileFooter() {
 
 std::string FileMetricsReporter::FormatSnapshot(const MetricsSnapshot& snapshot) const {
     try {
-        nlohmann::json j;
-        
-        // Timestamp
-        j["timestamp"] = std::chrono::duration_cast<std::chrono::seconds>(
+        auto ts = std::chrono::duration_cast<std::chrono::seconds>(
             snapshot.timestamp.time_since_epoch()).count();
-        j["timestamp_ms"] = std::chrono::duration_cast<std::chrono::milliseconds>(
+        auto ts_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
             snapshot.timestamp.time_since_epoch()).count();
-        
+
+        std::ostringstream j;
+        j << std::fixed << std::setprecision(4);
+        j << "{\"timestamp\":" << ts
+          << ",\"timestamp_ms\":" << ts_ms;
+
         // System metrics
+        j << ",\"system\":{";
         if (snapshot.cpuUsagePercent >= 0) {
-            j["system"]["cpu_usage_percent"] = snapshot.cpuUsagePercent;
+            j << "\"cpu_usage_percent\":" << snapshot.cpuUsagePercent << ",";
         }
         if (snapshot.memoryUsedBytes > 0) {
-            j["system"]["memory_used_bytes"] = snapshot.memoryUsedBytes;
-            j["system"]["memory_total_bytes"] = snapshot.memoryTotalBytes;
-            j["system"]["memory_usage_percent"] = snapshot.memoryTotalBytes > 0 ? 
+            double memPct = snapshot.memoryTotalBytes > 0 ?
                 (static_cast<double>(snapshot.memoryUsedBytes) / snapshot.memoryTotalBytes) * 100.0 : 0.0;
+            j << "\"memory_used_bytes\":" << snapshot.memoryUsedBytes
+              << ",\"memory_total_bytes\":" << snapshot.memoryTotalBytes
+              << ",\"memory_usage_percent\":" << memPct << ",";
         }
-        
-        j["system"]["network_bytes_sent"] = snapshot.networkBytesSent;
-        j["system"]["network_bytes_received"] = snapshot.networkBytesReceived;
-        j["system"]["disk_read_bytes"] = snapshot.diskReadBytes;
-        j["system"]["disk_write_bytes"] = snapshot.diskWriteBytes;
-        
+        j << "\"network_bytes_sent\":" << snapshot.networkBytesSent
+          << ",\"network_bytes_received\":" << snapshot.networkBytesReceived
+          << ",\"disk_read_bytes\":" << snapshot.diskReadBytes
+          << ",\"disk_write_bytes\":" << snapshot.diskWriteBytes
+          << "}";
+
         // Network metrics
-        j["network"]["active_connections"] = snapshot.activeConnections;
-        j["network"]["authenticated_players"] = snapshot.authenticatedPlayers;
-        j["network"]["total_packets_processed"] = snapshot.totalPacketsProcessed;
-        j["network"]["total_packets_dropped"] = snapshot.totalPacketsDropped;
-        j["network"]["average_latency_ms"] = snapshot.averageLatencyMs;
-        j["network"]["packet_loss_rate"] = snapshot.packetLossRate;
-        
-        // Gameplay metrics
-        j["gameplay"]["current_tick"] = snapshot.currentTick;
-        j["gameplay"]["active_matches"] = snapshot.activeMatches;
-        j["gameplay"]["total_kills"] = snapshot.totalKills;
-        j["gameplay"]["total_deaths"] = snapshot.totalDeaths;
-        j["gameplay"]["objectives_captured"] = snapshot.objectivesCaptured;
-        j["gameplay"]["chat_messages_sent"] = snapshot.chatMessagesSent;
-        
-        // Performance metrics
-        j["performance"]["frame_time_ms"] = snapshot.frameTimeMs;
-        j["performance"]["physics_time_ms"] = snapshot.physicsTimeMs;
-        j["performance"]["network_time_ms"] = snapshot.networkTimeMs;
-        j["performance"]["game_logic_time_ms"] = snapshot.gameLogicTimeMs;
-        
-        // Security metrics
-        j["security"]["security_violations"] = snapshot.securityViolations;
-        j["security"]["malformed_packets"] = snapshot.malformedPackets;
-        j["security"]["speed_hack_detections"] = snapshot.speedHackDetections;
-        j["security"]["kicked_players"] = snapshot.kickedPlayers;
-        j["security"]["banned_players"] = snapshot.bannedPlayers;
-        
-        // Additional computed metrics
-        if (snapshot.totalKills + snapshot.totalDeaths > 0) {
-            j["gameplay"]["kill_death_ratio"] = snapshot.totalDeaths > 0 ? 
-                static_cast<double>(snapshot.totalKills) / snapshot.totalDeaths : 
-                static_cast<double>(snapshot.totalKills);
-        }
-        
+        j << ",\"network\":{\"active_connections\":" << snapshot.activeConnections
+          << ",\"authenticated_players\":" << snapshot.authenticatedPlayers
+          << ",\"total_packets_processed\":" << snapshot.totalPacketsProcessed
+          << ",\"total_packets_dropped\":" << snapshot.totalPacketsDropped
+          << ",\"average_latency_ms\":" << snapshot.averageLatencyMs
+          << ",\"packet_loss_rate\":" << snapshot.packetLossRate;
         if (snapshot.totalPacketsProcessed > 0) {
-            j["network"]["packet_loss_percent"] = 
+            j << ",\"packet_loss_percent\":" <<
                 (static_cast<double>(snapshot.totalPacketsDropped) / snapshot.totalPacketsProcessed) * 100.0;
         }
-        
-        return j.dump();
-        
+        j << "}";
+
+        // Gameplay metrics
+        j << ",\"gameplay\":{\"current_tick\":" << snapshot.currentTick
+          << ",\"active_matches\":" << snapshot.activeMatches
+          << ",\"total_kills\":" << snapshot.totalKills
+          << ",\"total_deaths\":" << snapshot.totalDeaths
+          << ",\"objectives_captured\":" << snapshot.objectivesCaptured
+          << ",\"chat_messages_sent\":" << snapshot.chatMessagesSent;
+        if (snapshot.totalKills + snapshot.totalDeaths > 0) {
+            double kd = snapshot.totalDeaths > 0 ?
+                static_cast<double>(snapshot.totalKills) / snapshot.totalDeaths :
+                static_cast<double>(snapshot.totalKills);
+            j << ",\"kill_death_ratio\":" << kd;
+        }
+        j << "}";
+
+        // Performance metrics
+        j << ",\"performance\":{\"frame_time_ms\":" << snapshot.frameTimeMs
+          << ",\"physics_time_ms\":" << snapshot.physicsTimeMs
+          << ",\"network_time_ms\":" << snapshot.networkTimeMs
+          << ",\"game_logic_time_ms\":" << snapshot.gameLogicTimeMs
+          << "}";
+
+        // Security metrics
+        j << ",\"security\":{\"security_violations\":" << snapshot.securityViolations
+          << ",\"malformed_packets\":" << snapshot.malformedPackets
+          << ",\"speed_hack_detections\":" << snapshot.speedHackDetections
+          << ",\"kicked_players\":" << snapshot.kickedPlayers
+          << ",\"banned_players\":" << snapshot.bannedPlayers
+          << "}}";
+
+        return j.str();
+
     } catch (const std::exception& ex) {
         ReportError("Error formatting snapshot to JSON: " + std::string(ex.what()));
-        return "{}"; // Return empty JSON on error
+        return "{}";
     }
 }
 
@@ -523,7 +535,7 @@ void FileMetricsReporter::ScanExistingFiles() {
     }
 }
 
-void FileMetricsReporter::ReportError(const std::string& error) {
+void FileMetricsReporter::ReportError(const std::string& error) const {
     std::lock_guard<std::mutex> lock(m_errorMutex);
     
     auto now = std::chrono::system_clock::now();

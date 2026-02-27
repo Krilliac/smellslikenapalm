@@ -4,8 +4,9 @@
 
 #include <chrono>
 #include <string>
+#include <vector>
+#include <cstdint>
 #include "Config/GameConfig.h"
-#include "Network/PacketData.h"
 
 class GameServer;
 
@@ -19,7 +20,7 @@ public:
     void OnStart();
     void OnEnd();
     void Update();
-    void HandlePlayerAction(uint32_t playerId, const std::string& action, const PacketData& data);
+    void HandlePlayerAction(uint32_t playerId, const std::string& action, const std::vector<uint8_t>& data);
     bool ReloadConfiguration(const GameModeDefinition& def);
 
     const std::string& GetName() const;

@@ -7,6 +7,7 @@
 #include "Game/MapManager.h"
 #include "Game/GameMode.h"
 #include "Utils/Logger.h"
+#include <algorithm>
 
 GameSession::GameSession(NetworkManager* network,
                          TeamManager* teams,
@@ -48,8 +49,8 @@ void GameSession::InitializePlayers()
     for (auto& conn : m_network->GetAllConnections()) {
         SessionPlayerInfo info;
         info.playerId = conn->GetClientId();
-        info.playerName = conn->GetPlayerName();
-        info.teamId = conn->GetTeamId();
+        info.playerName = std::to_string(conn->GetClientId());
+        info.teamId = conn->GetClientId() % 2;
         info.isAlive = false;
         info.lastSpawnTime = m_sessionStart;
         m_players.push_back(info);
@@ -62,8 +63,8 @@ void GameSession::HandlePlayerConnect(uint32_t playerId)
     Logger::Info("Player %u connected - adding to session", playerId);
     SessionPlayerInfo info;
     info.playerId = playerId;
-    info.playerName = m_network->GetConnection(playerId)->GetPlayerName();
-    info.teamId = m_network->GetConnection(playerId)->GetTeamId();
+    info.playerName = std::to_string(m_network->GetConnection(playerId)->GetClientId());
+    info.teamId = m_network->GetConnection(playerId)->GetClientId() % 2;
     info.isAlive = false;
     info.lastSpawnTime = std::chrono::steady_clock::now();
     m_players.push_back(info);

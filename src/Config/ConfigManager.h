@@ -7,7 +7,12 @@
 #include <vector>
 #include <memory>
 
-class IConfigurationListener;
+// Interface for receiving config change notifications
+class IConfigurationListener {
+public:
+    virtual ~IConfigurationListener() = default;
+    virtual void OnConfigurationChanged() = 0;
+};
 
 class ConfigManager {
 public:
@@ -16,6 +21,9 @@ public:
 
     // Initialize configuration system, loads config/server.ini
     bool Initialize();
+
+    // Load a specific configuration file
+    bool LoadConfiguration(const std::string& configFile);
 
     // Reload the current configuration from disk
     bool ReloadConfiguration();
@@ -62,8 +70,6 @@ public:
     void RemoveConfigurationListener(std::shared_ptr<IConfigurationListener> listener);
 
 private:
-    // Core load routine
-    bool LoadConfiguration(const std::string& configFile);
 
     // Validation and application steps
     bool ValidateConfiguration();

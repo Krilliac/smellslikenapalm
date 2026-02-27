@@ -30,17 +30,17 @@ public:
     void LoadBanList();
     void SaveBanList() const;
 
-private:
-    GameServer* m_server;
-    std::shared_ptr<ServerConfig> m_config;
-    std::vector<std::string> m_admins;
-    std::map<std::string, std::chrono::system_clock::time_point> m_bans;
-
     bool KickPlayer(uint32_t adminClientId, const std::string& targetSteamId);
     bool BanPlayer(uint32_t adminClientId, const std::string& targetSteamId, int durationMinutes);
     bool BroadcastMessage(uint32_t adminClientId, const std::string& message);
     bool ReloadConfig(uint32_t adminClientId, const std::string& section);
     bool ListAdmins(uint32_t adminClientId);
+
+private:
+    GameServer* m_server;
+    std::shared_ptr<ServerConfig> m_config;
+    std::vector<std::string> m_admins;
+    std::map<std::string, std::chrono::system_clock::time_point> m_bans;
 
     std::string JoinArgs(const std::vector<std::string>& args, const std::string& sep) const;
 };

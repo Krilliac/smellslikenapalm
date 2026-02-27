@@ -1,6 +1,7 @@
 // src/Game/SecureGameServer.cpp – Implementation for SecureGameServer
 
 #include "Game/SecureGameServer.h"
+#include "Config/SecurityConfig.h"
 #include "Utils/Logger.h"
 
 SecureGameServer::SecureGameServer() {
@@ -53,8 +54,8 @@ bool SecureGameServer::Initialize() {
 
     // Initialize enhanced anti-cheat over EAC protocol
     m_enhancedAntiCheat = std::make_unique<EnhancedEACAntiCheat>(
-        m_serverConfig, m_gameConfig);
-    if (!m_enhancedAntiCheat->Initialize(7957)) {
+        std::make_shared<SecurityConfig>(*m_serverConfig));
+    if (!m_enhancedAntiCheat->Initialize()) {
         Logger::Error("EnhancedEACAntiCheat initialization failed");
         return false;
     }

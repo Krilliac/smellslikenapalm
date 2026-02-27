@@ -1,6 +1,7 @@
 // src/Protocol/PacketTypes.cpp
 #include "Protocol/PacketTypes.h"
 #include "Utils/Logger.h"
+#include <string>
 
 // Map PacketType enum to string tags and back.
 // Used by MessageEncoder/Decoder and PacketHandler registry.
@@ -27,8 +28,28 @@ static const char* PacketTypeTags[] = {
     "COMPRESSION",
     "RPC_CALL",
     "RPC_RESPONSE",
-    "CUSTOM_START",
-    "MAX"
+    // RS2V Game System packet types
+    "ROLE_SELECT",
+    "ROLE_UPDATE",
+    "SPAWN_REQUEST",
+    "SPAWN_LOCATIONS",
+    "COMMANDER_ABILITY",
+    "COMMANDER_ABILITY_ACK",
+    "FIRE_SUPPORT_UPDATE",
+    "SQUAD_ACTION",
+    "SQUAD_UPDATE",
+    "TICKET_UPDATE",
+    "WEAPON_FIRE",
+    "DAMAGE_EVENT",
+    "KILL_EVENT",
+    "VEHICLE_ACTION",
+    "VEHICLE_STATE",
+    "HELICOPTER_STATE",
+    "GAMEMODE_STATE",
+    "CAPTURE_PROGRESS",
+    "LOADOUT_UPDATE",
+    "SUPPRESSION_EVENT",
+    "CUSTOM_START"
 };
 
 static_assert(sizeof(PacketTypeTags)/sizeof(*PacketTypeTags) == static_cast<size_t>(PacketType::PT_MAX),

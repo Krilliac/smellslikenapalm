@@ -296,7 +296,7 @@ bool ConfigManager::ValidateNetworkConfig() {
 bool ConfigManager::ValidateSecurityConfig() {
     if (GetBool("Security.fallback_custom_auth", false)) {
         auto f = GetString("Security.custom_auth_tokens_file", "");
-        if (!Utils::FileExists(f)) {
+        if (!std::filesystem::exists(f)) {
             Logger::Error("Token file missing: %s", f.c_str());
             return false;
         }
@@ -316,7 +316,7 @@ bool ConfigManager::ValidateEACConfig() {
 
 bool ConfigManager::ValidateGameConfig() {
     auto mf = GetString("General.map_rotation_file", "config/maps.ini");
-    if (!Utils::FileExists(mf)) {
+    if (!std::filesystem::exists(mf)) {
         Logger::Error("Map rotation file missing: %s", mf.c_str());
         return false;
     }

@@ -1,14 +1,16 @@
 // src/Network/ClientConnection.cpp
 
 #include "Network/ClientConnection.h"
-#include "Network/NetworkManager.h"
+#include "Network/ConnectionManager.h"
+#include "Game/Player.h"
 #include "Utils/Logger.h"
+#include "Protocol/ReverseEngineering/ProtocolDecoder.h"
 
 ClientConnection::ClientConnection(uint32_t clientId,
                                    const std::string& ip,
                                    uint16_t port,
                                    std::shared_ptr<UDPSocket> socket,
-                                   NetworkManager* manager)
+                                   ConnectionManager* manager)
     : m_clientId(clientId)
     , m_ip(ip)
     , m_port(port)
@@ -27,7 +29,6 @@ const std::string& ClientConnection::GetIP() const { return m_ip; }
 uint16_t ClientConnection::GetPort() const { return m_port; }
 
 std::string ClientConnection::GetSteamID() const {
-    // Example placeholder
     return std::to_string(m_clientId);
 }
 
@@ -35,13 +36,19 @@ bool ClientConnection::SendPacket(const Packet& pkt) {
     auto data = pkt.Serialize();
     if (!CanSend((uint32_t)data.size())) return false;
     bool ok = m_socket->SendTo(m_ip, m_port, data.data(), data.size());
-    if (ok) OnBytesSent((uint32_t)data.size());
+    if (ok) {
+        OnBytesSent((uint32_t)data.size());
+        // Feed outbound packet to protocol decoder
+        GetProtocolDecoder().OnPacketSent(m_clientId, pkt.RawData(), pkt.GetTag());
+    }
     return ok;
 }
 
 bool ClientConnection::ReceiveRaw(std::vector<uint8_t>& outData, PacketMetadata& meta) {
     outData.resize(1500);
-    int len = m_socket->ReceiveFrom(m_ip, m_port, outData.data(), (int)outData.size());
+    std::string fromIp;
+    uint16_t fromPort = 0;
+    int len = m_socket->ReceiveFrom(fromIp, fromPort, outData.data(), (int)outData.size());
     if (len <= 0) return false;
     outData.resize(len);
     m_lastRaw = outData;
@@ -59,7 +66,28 @@ void ClientConnection::UpdateLastHeartbeat() {
     m_lastHeartbeat = std::chrono::steady_clock::now();
 }
 
+std::chrono::steady_clock::time_point ClientConnection::GetLastHeartbeat() const {
+    return m_lastHeartbeat;
+}
+
+// Player name/team management
+
+void ClientConnection::SetPlayerName(const std::string& name) { m_playerName = name; }
+const std::string& ClientConnection::GetPlayerName() const { return m_playerName; }
+uint32_t ClientConnection::GetTeamId() const { return m_teamId; }
+void ClientConnection::SetTeamId(uint32_t teamId) { m_teamId = teamId; }
+
 // Game-layer helpers
+
+void ClientConnection::SendInventoryUpdate(const std::vector<InventoryItem>& items) {
+    Packet p("INVENTORY_UPDATE");
+    p.WriteUInt(static_cast<uint32_t>(items.size()));
+    for (const auto& item : items) {
+        p.WriteString(item.name);
+        p.WriteInt(item.quantity);
+    }
+    SendPacket(p);
+}
 
 void ClientConnection::SendChatMessage(const std::string& msg) {
     Packet p("CHAT_MESSAGE");

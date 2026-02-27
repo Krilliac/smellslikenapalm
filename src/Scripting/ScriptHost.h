@@ -38,8 +38,7 @@ public:
     // Get singleton instance for internal use
     static ScriptHost* Instance();
 
-private:
-    // Core system references
+    // Core system references (accessible from extern "C" exports)
     static ScriptManager* s_scriptManager;
     static std::shared_ptr<ConfigManager> s_configManager;
     static GameServer* s_gameServer;
@@ -73,182 +72,189 @@ private:
     static NetworkManager* GetNetworkManager();
     static EACServerEmulator* GetEACServer();
 
-    // Disable construction
-    ScriptHost() = delete;
-    ~ScriptHost() = delete;
+    // Construction (private - use Instance() for singleton)
+    ScriptHost() = default;
+    ~ScriptHost() = default;
     ScriptHost(const ScriptHost&) = delete;
     ScriptHost& operator=(const ScriptHost&) = delete;
 };
 
+// Cross-platform export macro
+#ifdef _WIN32
+  #define RS2V_EXPORT __declspec(dllexport)
+#else
+  #define RS2V_EXPORT __attribute__((visibility("default")))
+#endif
+
 // Native C exports for C# DllImport
 extern "C" {
-    
+
     // Event registration and execution
-    __declspec(dllexport) void RegisterEventHandler(const char* eventName, const char* methodName);
-    __declspec(dllexport) void UnregisterEventHandler(const char* eventName, const char* methodName);
-    __declspec(dllexport) bool ExecuteScriptMethod(const char* scriptPath, const char* methodName);
-    __declspec(dllexport) bool ExecuteScriptMethodWithArgs(const char* scriptPath, const char* methodName, 
+    RS2V_EXPORT void RegisterEventHandler(const char* eventName, const char* methodName);
+    RS2V_EXPORT void UnregisterEventHandler(const char* eventName, const char* methodName);
+    RS2V_EXPORT bool ExecuteScriptMethod(const char* scriptPath, const char* methodName);
+    RS2V_EXPORT bool ExecuteScriptMethodWithArgs(const char* scriptPath, const char* methodName,
                                                           const char** args, int argCount);
     
     // Logging functions
-    __declspec(dllexport) void LogInfo(const char* message);
-    __declspec(dllexport) void LogWarning(const char* message);
-    __declspec(dllexport) void LogError(const char* message);
-    __declspec(dllexport) void LogDebug(const char* message);
+    RS2V_EXPORT void LogInfo(const char* message);
+    RS2V_EXPORT void LogWarning(const char* message);
+    RS2V_EXPORT void LogError(const char* message);
+    RS2V_EXPORT void LogDebug(const char* message);
     
     // Chat and communication
-    __declspec(dllexport) void SendChatToPlayer(const char* playerId, const char* message);
-    __declspec(dllexport) void BroadcastChat(const char* message);
-    __declspec(dllexport) void SendPrivateMessage(const char* fromPlayerId, const char* toPlayerId, const char* message);
+    RS2V_EXPORT void SendChatToPlayer(const char* playerId, const char* message);
+    RS2V_EXPORT void BroadcastChat(const char* message);
+    RS2V_EXPORT void SendPrivateMessage(const char* fromPlayerId, const char* toPlayerId, const char* message);
     
     // Player management
-    __declspec(dllexport) void KickPlayer(const char* playerId, const char* reason);
-    __declspec(dllexport) void BanPlayer(const char* playerId, const char* reason, int durationHours);
-    __declspec(dllexport) void UnbanPlayer(const char* playerId);
-    __declspec(dllexport) int GetPlayerAdminLevel(const char* playerId);
-    __declspec(dllexport) bool IsPlayerOnline(const char* playerId);
-    __declspec(dllexport) const char* GetPlayerName(const char* playerId);
-    __declspec(dllexport) void GetPlayerPosition(const char* playerId, float* x, float* y, float* z);
-    __declspec(dllexport) void SetPlayerPosition(const char* playerId, float x, float y, float z);
-    __declspec(dllexport) int GetPlayerTeam(const char* playerId);
-    __declspec(dllexport) void SetPlayerTeam(const char* playerId, int teamId);
-    __declspec(dllexport) int GetPlayerHealth(const char* playerId);
-    __declspec(dllexport) void SetPlayerHealth(const char* playerId, int health);
+    RS2V_EXPORT void KickPlayer(const char* playerId, const char* reason);
+    RS2V_EXPORT void BanPlayer(const char* playerId, const char* reason, int durationHours);
+    RS2V_EXPORT void UnbanPlayer(const char* playerId);
+    RS2V_EXPORT int GetPlayerAdminLevel(const char* playerId);
+    RS2V_EXPORT bool IsPlayerOnline(const char* playerId);
+    RS2V_EXPORT const char* GetPlayerName(const char* playerId);
+    RS2V_EXPORT void GetPlayerPosition(const char* playerId, float* x, float* y, float* z);
+    RS2V_EXPORT void SetPlayerPosition(const char* playerId, float x, float y, float z);
+    RS2V_EXPORT int GetPlayerTeam(const char* playerId);
+    RS2V_EXPORT void SetPlayerTeam(const char* playerId, int teamId);
+    RS2V_EXPORT int GetPlayerHealth(const char* playerId);
+    RS2V_EXPORT void SetPlayerHealth(const char* playerId, int health);
     
     // Server information
-    __declspec(dllexport) const char* GetDataDirectory();
-    __declspec(dllexport) const char* GetServerName();
-    __declspec(dllexport) int GetPlayerCount();
-    __declspec(dllexport) int GetMaxPlayers();
-    __declspec(dllexport) int GetCurrentTickRate();
-    __declspec(dllexport) int GetScriptReloadCount();
-    __declspec(dllexport) const char* GetCurrentMap();
-    __declspec(dllexport) const char* GetCurrentGameMode();
-    __declspec(dllexport) long GetServerUptime();
-    __declspec(dllexport) const char* GetServerVersion();
+    RS2V_EXPORT const char* GetDataDirectory();
+    RS2V_EXPORT const char* GetServerName();
+    RS2V_EXPORT int GetPlayerCount();
+    RS2V_EXPORT int GetMaxPlayers();
+    RS2V_EXPORT int GetCurrentTickRate();
+    RS2V_EXPORT int GetScriptReloadCount();
+    RS2V_EXPORT const char* GetCurrentMap();
+    RS2V_EXPORT const char* GetCurrentGameMode();
+    RS2V_EXPORT long GetServerUptime();
+    RS2V_EXPORT const char* GetServerVersion();
     
     // Player lists (returns count, use GetConnectedPlayerAt to iterate)
-    __declspec(dllexport) int GetConnectedPlayerCount();
-    __declspec(dllexport) const char* GetConnectedPlayerAt(int index);
-    __declspec(dllexport) int GetPlayerCountPerTeam(int teamId);
+    RS2V_EXPORT int GetConnectedPlayerCount();
+    RS2V_EXPORT const char* GetConnectedPlayerAt(int index);
+    RS2V_EXPORT int GetPlayerCountPerTeam(int teamId);
     
     // Team management
-    __declspec(dllexport) int GetTeamCount();
-    __declspec(dllexport) const char* GetTeamName(int teamId);
-    __declspec(dllexport) void SetTeamSize(int teamId, int maxSize);
-    __declspec(dllexport) int GetTeamSize(int teamId);
-    __declspec(dllexport) int GetTeamScore(int teamId);
-    __declspec(dllexport) void SetTeamScore(int teamId, int score);
+    RS2V_EXPORT int GetTeamCount();
+    RS2V_EXPORT const char* GetTeamName(int teamId);
+    RS2V_EXPORT void SetTeamSize(int teamId, int maxSize);
+    RS2V_EXPORT int GetTeamSize(int teamId);
+    RS2V_EXPORT int GetTeamScore(int teamId);
+    RS2V_EXPORT void SetTeamScore(int teamId, int score);
     
     // Entity spawning and management
-    __declspec(dllexport) bool SpawnEntity(const char* className, float x, float y, float z);
-    __declspec(dllexport) bool SpawnEntityWithId(const char* className, float x, float y, float z, int* outEntityId);
-    __declspec(dllexport) void RemoveEntity(int entityId);
-    __declspec(dllexport) bool IsEntityValid(int entityId);
-    __declspec(dllexport) void MoveEntityTo(int entityId, float x, float y, float z);
-    __declspec(dllexport) void GetEntityPosition(int entityId, float* x, float* y, float* z);
-    __declspec(dllexport) float GetEntityHealth(int entityId);
-    __declspec(dllexport) void SetEntityHealth(int entityId, float health);
-    __declspec(dllexport) const char* GetEntityClass(int entityId);
-    __declspec(dllexport) int GetEntityCount();
-    __declspec(dllexport) int GetEntityCountByClass(const char* className);
+    RS2V_EXPORT bool SpawnEntity(const char* className, float x, float y, float z);
+    RS2V_EXPORT bool SpawnEntityWithId(const char* className, float x, float y, float z, int* outEntityId);
+    RS2V_EXPORT void RemoveEntity(int entityId);
+    RS2V_EXPORT bool IsEntityValid(int entityId);
+    RS2V_EXPORT void MoveEntityTo(int entityId, float x, float y, float z);
+    RS2V_EXPORT void GetEntityPosition(int entityId, float* x, float* y, float* z);
+    RS2V_EXPORT float GetEntityHealth(int entityId);
+    RS2V_EXPORT void SetEntityHealth(int entityId, float health);
+    RS2V_EXPORT const char* GetEntityClass(int entityId);
+    RS2V_EXPORT int GetEntityCount();
+    RS2V_EXPORT int GetEntityCountByClass(const char* className);
     
     // Configuration management
-    __declspec(dllexport) void SetConfigInt(const char* key, int value);
-    __declspec(dllexport) int GetConfigInt(const char* key, int defaultValue);
-    __declspec(dllexport) void SetConfigFloat(const char* key, float value);
-    __declspec(dllexport) float GetConfigFloat(const char* key, float defaultValue);
-    __declspec(dllexport) void SetConfigBool(const char* key, bool value);
-    __declspec(dllexport) bool GetConfigBool(const char* key, bool defaultValue);
-    __declspec(dllexport) void SetConfigString(const char* key, const char* value);
-    __declspec(dllexport) const char* GetConfigString(const char* key, const char* defaultValue);
-    __declspec(dllexport) void ReloadConfig();
-    __declspec(dllexport) bool SaveConfig();
+    RS2V_EXPORT void SetConfigInt(const char* key, int value);
+    RS2V_EXPORT int GetConfigInt(const char* key, int defaultValue);
+    RS2V_EXPORT void SetConfigFloat(const char* key, float value);
+    RS2V_EXPORT float GetConfigFloat(const char* key, float defaultValue);
+    RS2V_EXPORT void SetConfigBool(const char* key, bool value);
+    RS2V_EXPORT bool GetConfigBool(const char* key, bool defaultValue);
+    RS2V_EXPORT void SetConfigString(const char* key, const char* value);
+    RS2V_EXPORT const char* GetConfigString(const char* key, const char* defaultValue);
+    RS2V_EXPORT void ReloadConfig();
+    RS2V_EXPORT bool SaveConfig();
     
     // Scheduling and timing
-    __declspec(dllexport) void ScheduleCallback(float delaySeconds, const char* methodName);
-    __declspec(dllexport) void CancelScheduledCallbacks(const char* methodName);
-    __declspec(dllexport) void ProcessScheduledCallbacks();
-    __declspec(dllexport) long GetCurrentTimeMillis();
-    __declspec(dllexport) const char* GetCurrentTimeString();
+    RS2V_EXPORT void ScheduleCallback(float delaySeconds, const char* methodName);
+    RS2V_EXPORT void CancelScheduledCallbacks(const char* methodName);
+    RS2V_EXPORT void ProcessScheduledCallbacks();
+    RS2V_EXPORT long GetCurrentTimeMillis();
+    RS2V_EXPORT const char* GetCurrentTimeString();
     
     // Debug drawing and visualization
-    __declspec(dllexport) void DebugDrawLine(float x1, float y1, float z1, float x2, float y2, float z2, 
+    RS2V_EXPORT void DebugDrawLine(float x1, float y1, float z1, float x2, float y2, float z2, 
                                            float duration, float thickness, float r, float g, float b);
-    __declspec(dllexport) void DebugDrawSphere(float x, float y, float z, float radius, float duration, 
+    RS2V_EXPORT void DebugDrawSphere(float x, float y, float z, float radius, float duration, 
                                              float r, float g, float b);
-    __declspec(dllexport) void DebugDrawBox(float x, float y, float z, float sizeX, float sizeY, float sizeZ, 
+    RS2V_EXPORT void DebugDrawBox(float x, float y, float z, float sizeX, float sizeY, float sizeZ, 
                                           float duration, float r, float g, float b);
-    __declspec(dllexport) void DebugDrawArrow(float x1, float y1, float z1, float x2, float y2, float z2, 
+    RS2V_EXPORT void DebugDrawArrow(float x1, float y1, float z1, float x2, float y2, float z2, 
                                             float duration, float thickness, float r, float g, float b);
-    __declspec(dllexport) void DebugDrawText(float x, float y, float z, const char* text, float duration, 
+    RS2V_EXPORT void DebugDrawText(float x, float y, float z, const char* text, float duration, 
                                            float r, float g, float b);
-    __declspec(dllexport) void ClearDebugDrawings();
+    RS2V_EXPORT void ClearDebugDrawings();
     
     // Script management
-    __declspec(dllexport) bool ReloadScript(const char* scriptPath);
-    __declspec(dllexport) bool IsScriptLoaded(const char* scriptPath);
-    __declspec(dllexport) int GetLoadedScriptCount();
-    __declspec(dllexport) const char* GetLoadedScriptAt(int index);
-    __declspec(dllexport) bool EnableScript(const char* scriptName);
-    __declspec(dllexport) bool DisableScript(const char* scriptName);
+    RS2V_EXPORT bool ReloadScript(const char* scriptPath);
+    RS2V_EXPORT bool IsScriptLoaded(const char* scriptPath);
+    RS2V_EXPORT int GetLoadedScriptCount();
+    RS2V_EXPORT const char* GetLoadedScriptAt(int index);
+    RS2V_EXPORT bool EnableScript(const char* scriptName);
+    RS2V_EXPORT bool DisableScript(const char* scriptName);
     
     // Game state management
-    __declspec(dllexport) void StartMatch();
-    __declspec(dllexport) void EndMatch();
-    __declspec(dllexport) void PauseMatch();
-    __declspec(dllexport) void ResumeMatch();
-    __declspec(dllexport) bool IsMatchActive();
-    __declspec(dllexport) bool IsMatchPaused();
-    __declspec(dllexport) int GetMatchTimeRemaining();
-    __declspec(dllexport) void SetMatchTimeLimit(int seconds);
-    __declspec(dllexport) void ChangeMap(const char* mapName);
-    __declspec(dllexport) void ChangeGameMode(const char* gameMode);
+    RS2V_EXPORT void StartMatch();
+    RS2V_EXPORT void EndMatch();
+    RS2V_EXPORT void PauseMatch();
+    RS2V_EXPORT void ResumeMatch();
+    RS2V_EXPORT bool IsMatchActive();
+    RS2V_EXPORT bool IsMatchPaused();
+    RS2V_EXPORT int GetMatchTimeRemaining();
+    RS2V_EXPORT void SetMatchTimeLimit(int seconds);
+    RS2V_EXPORT void ChangeMap(const char* mapName);
+    RS2V_EXPORT void ChangeGameMode(const char* gameMode);
     
     // Network and performance
-    __declspec(dllexport) int GetAveragePlayerPing();
-    __declspec(dllexport) int GetPlayerPing(const char* playerId);
-    __declspec(dllexport) float GetServerCpuUsage();
-    __declspec(dllexport) long GetServerMemoryUsage();
-    __declspec(dllexport) int GetNetworkPacketsPerSecond();
-    __declspec(dllexport) float GetServerFrameRate();
+    RS2V_EXPORT int GetAveragePlayerPing();
+    RS2V_EXPORT int GetPlayerPing(const char* playerId);
+    RS2V_EXPORT float GetServerCpuUsage();
+    RS2V_EXPORT long GetServerMemoryUsage();
+    RS2V_EXPORT int GetNetworkPacketsPerSecond();
+    RS2V_EXPORT float GetServerFrameRate();
     
     // File and data management
-    __declspec(dllexport) bool FileExists(const char* path);
-    __declspec(dllexport) bool WriteFile(const char* path, const char* content);
-    __declspec(dllexport) const char* ReadFile(const char* path);
-    __declspec(dllexport) bool DeleteFile(const char* path);
-    __declspec(dllexport) bool CreateDirectory(const char* path);
-    __declspec(dllexport) long GetFileSize(const char* path);
-    __declspec(dllexport) long GetFileModificationTime(const char* path);
+    RS2V_EXPORT bool FileExists(const char* path);
+    RS2V_EXPORT bool WriteFile(const char* path, const char* content);
+    RS2V_EXPORT const char* ReadFile(const char* path);
+    RS2V_EXPORT bool DeleteFile(const char* path);
+    RS2V_EXPORT bool CreateDirectory(const char* path);
+    RS2V_EXPORT long GetFileSize(const char* path);
+    RS2V_EXPORT long GetFileModificationTime(const char* path);
     
     // Weapon and inventory management
-    __declspec(dllexport) void GivePlayerWeapon(const char* playerId, const char* weaponClass);
-    __declspec(dllexport) void RemovePlayerWeapon(const char* playerId, const char* weaponClass);
-    __declspec(dllexport) bool PlayerHasWeapon(const char* playerId, const char* weaponClass);
-    __declspec(dllexport) const char* GetPlayerPrimaryWeapon(const char* playerId);
-    __declspec(dllexport) void SetPlayerAmmo(const char* playerId, const char* weaponClass, int ammo);
-    __declspec(dllexport) int GetPlayerAmmo(const char* playerId, const char* weaponClass);
+    RS2V_EXPORT void GivePlayerWeapon(const char* playerId, const char* weaponClass);
+    RS2V_EXPORT void RemovePlayerWeapon(const char* playerId, const char* weaponClass);
+    RS2V_EXPORT bool PlayerHasWeapon(const char* playerId, const char* weaponClass);
+    RS2V_EXPORT const char* GetPlayerPrimaryWeapon(const char* playerId);
+    RS2V_EXPORT void SetPlayerAmmo(const char* playerId, const char* weaponClass, int ammo);
+    RS2V_EXPORT int GetPlayerAmmo(const char* playerId, const char* weaponClass);
     
     // Statistics and scoring
-    __declspec(dllexport) int GetPlayerKills(const char* playerId);
-    __declspec(dllexport) int GetPlayerDeaths(const char* playerId);
-    __declspec(dllexport) void SetPlayerKills(const char* playerId, int kills);
-    __declspec(dllexport) void SetPlayerDeaths(const char* playerId, int deaths);
-    __declspec(dllexport) void AddPlayerKill(const char* playerId);
-    __declspec(dllexport) void AddPlayerDeath(const char* playerId);
-    __declspec(dllexport) int GetPlayerScore(const char* playerId);
-    __declspec(dllexport) void SetPlayerScore(const char* playerId, int score);
-    __declspec(dllexport) void AddPlayerScore(const char* playerId, int points);
+    RS2V_EXPORT int GetPlayerKills(const char* playerId);
+    RS2V_EXPORT int GetPlayerDeaths(const char* playerId);
+    RS2V_EXPORT void SetPlayerKills(const char* playerId, int kills);
+    RS2V_EXPORT void SetPlayerDeaths(const char* playerId, int deaths);
+    RS2V_EXPORT void AddPlayerKill(const char* playerId);
+    RS2V_EXPORT void AddPlayerDeath(const char* playerId);
+    RS2V_EXPORT int GetPlayerScore(const char* playerId);
+    RS2V_EXPORT void SetPlayerScore(const char* playerId, int score);
+    RS2V_EXPORT void AddPlayerScore(const char* playerId, int points);
     
     // EAC Memory Operations
-    __declspec(dllexport) bool RemoteRead(uint32_t clientId, uint64_t address, uint32_t length);
-    __declspec(dllexport) bool RemoteWrite(uint32_t clientId, uint64_t address, const uint8_t* buf, uint32_t length);
-    __declspec(dllexport) bool RemoteAlloc(uint32_t clientId, uint32_t length, uint64_t protect);
-    __declspec(dllexport) void BroadcastRemoteRead(uint64_t address, uint32_t length);
-    __declspec(dllexport) uint32_t GetConnectedClientId(int index);
-    __declspec(dllexport) int GetConnectedClientCount();
+    RS2V_EXPORT bool RemoteRead(uint32_t clientId, uint64_t address, uint32_t length);
+    RS2V_EXPORT bool RemoteWrite(uint32_t clientId, uint64_t address, const uint8_t* buf, uint32_t length);
+    RS2V_EXPORT bool RemoteAlloc(uint32_t clientId, uint32_t length, uint64_t protect);
+    RS2V_EXPORT void BroadcastRemoteRead(uint64_t address, uint32_t length);
+    RS2V_EXPORT uint32_t GetConnectedClientId(int index);
+    RS2V_EXPORT int GetConnectedClientCount();
     
     // Memory management for strings
-    __declspec(dllexport) void FreeString(const char* str);
+    RS2V_EXPORT void FreeString(const char* str);
 }

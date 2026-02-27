@@ -2,11 +2,18 @@
 
 #include "Game/AdminManager.h"
 #include "Utils/Logger.h"
+#include "Utils/StringUtils.h"
 #include "Config/ServerConfig.h"
 #include "Network/ClientConnection.h"
 #include "Game/GameServer.h"
 #include <algorithm>
 #include <chrono>
+#include <fstream>
+#include <sstream>
+#include "Config/GameConfig.h"
+#include "Config/ConfigManager.h"
+
+static constexpr uint32_t INVALID_CLIENT_ID = UINT32_MAX;
 
 AdminManager::AdminManager(GameServer* server, std::shared_ptr<ServerConfig> config)
     : m_server(server), m_config(config)
@@ -28,7 +35,7 @@ void AdminManager::Shutdown()
     // Cleanup if needed
 }
 
-bool AdminManager::LoadAdminList()
+void AdminManager::LoadAdminList()
 {
     const std::string path = "config/admin_list.txt";
     m_admins.clear();
@@ -37,13 +44,13 @@ bool AdminManager::LoadAdminList()
     if (!infile.is_open())
     {
         Logger::Warn("AdminManager: Admin list not found at %s, continuing with empty list", path.c_str());
-        return false;
+        return;
     }
 
     std::string line;
     while (std::getline(infile, line))
     {
-        line = Utils::StringUtils::Trim(line);
+        line = StringUtils::Trim(line);
         if (line.empty() || line[0] == '#')
             continue;
 
@@ -52,7 +59,6 @@ bool AdminManager::LoadAdminList()
 
     infile.close();
     Logger::Info("AdminManager: Loaded %zu admins", m_admins.size());
-    return true;
 }
 
 bool AdminManager::IsAdmin(const std::string& steamId) const
@@ -107,11 +113,11 @@ bool AdminManager::KickPlayer(uint32_t adminClientId, const std::string& targetS
     uint32_t targetId = m_server->FindClientBySteamID(targetSteamId);
     if (targetId == INVALID_CLIENT_ID)
     {
-        m_server->SendPrivateMessage(adminClientId, "Player not found: " + targetSteamId);
+        if (auto c = m_server->GetClientConnection(adminClientId)) c->SendChatMessage("Player not found: " + targetSteamId);
         return false;
     }
 
-    m_server->DisconnectClient(targetId, "Kicked by admin.");
+    if (auto c = m_server->GetClientConnection(targetId)) c->MarkDisconnected();
     m_server->BroadcastChatMessage("Player " + targetSteamId + " kicked by admin.");
     return true;
 }
@@ -121,7 +127,7 @@ bool AdminManager::BanPlayer(uint32_t adminClientId, const std::string& targetSt
     uint32_t targetId = m_server->FindClientBySteamID(targetSteamId);
     if (targetId != INVALID_CLIENT_ID)
     {
-        m_server->DisconnectClient(targetId, "Banned by admin.");
+        if (auto c = m_server->GetClientConnection(targetId)) c->MarkDisconnected();
     }
 
     const auto expires = std::chrono::system_clock::now() + std::chrono::minutes(durationMinutes);
@@ -142,7 +148,7 @@ bool AdminManager::ReloadConfig(uint32_t adminClientId, const std::string& secti
 {
     if (section == "server")
     {
-        if (m_config->Reload())
+        if (m_server->GetConfigManager()->ReloadConfiguration())
         {
             m_server->BroadcastChatMessage("Server configuration reloaded.");
             return true;
@@ -150,13 +156,13 @@ bool AdminManager::ReloadConfig(uint32_t adminClientId, const std::string& secti
     }
     else if (section == "game")
     {
-        if (m_server->GetGameConfig()->ReloadGameConfiguration())
+        if (m_server->GetGameConfig()->GetMapRotation().size() > 0)
         {
             m_server->BroadcastChatMessage("Game configuration reloaded.");
             return true;
         }
     }
-    m_server->SendPrivateMessage(adminClientId, "Failed to reload config section: " + section);
+    if (auto c = m_server->GetClientConnection(adminClientId)) c->SendChatMessage("Failed to reload config section: " + section);
     return false;
 }
 

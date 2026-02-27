@@ -1,9 +1,11 @@
 #pragma once
 
 #include <string>
+#include <vector>
 #include <unordered_set>
 #include <mutex>
 #include <chrono>
+#include <unordered_map>
 
 struct ClientAddress {
     std::string ip;
@@ -44,7 +46,14 @@ public:
     // Must be called periodically (e.g., once per tick) to expire temporary blocks
     void Update();
 
+    // Initialization
+    bool Initialize();
+
+    // Block a domain name (e.g., for DNS-level blocking)
+    void BlockDomain(const std::string& domain);
+
 private:
+    std::vector<std::string> m_blockedDomains;
     struct Entry {
         bool permanent;
         std::chrono::steady_clock::time_point expiresAt;

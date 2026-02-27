@@ -47,7 +47,7 @@ public:
 
 private:
     GameServer*                 m_server;
-    std::shared_ptr<TeamManager> m_teamManager;
+    TeamManager*                m_teamManager;
     std::map<uint32_t, TeamScore> m_scores;
 
     // Internal helper

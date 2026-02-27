@@ -61,7 +61,7 @@ bool SteamAuth::IsAuthenticated(uint32_t clientId) const {
 
 void SteamAuth::CleanupExpired() {
     auto now = std::chrono::steady_clock::now();
-    auto timeout = std::chrono::seconds(m_config->GetInt("SteamAuth.TicketTimeoutSec", 30));
+    auto timeout = std::chrono::seconds(30); // default ticket timeout
     for (auto it = m_sessions.begin(); it != m_sessions.end(); ) {
         if (!it->second.authenticated &&
             now - it->second.timestamp > timeout)

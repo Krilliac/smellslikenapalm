@@ -4,6 +4,7 @@
 #include "Utils/Logger.h"
 #include "Utils/FileUtils.h"
 #include "Utils/StringUtils.h"
+#include <algorithm>
 #include <fstream>
 #include <sstream>
 #include <filesystem>

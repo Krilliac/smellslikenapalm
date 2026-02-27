@@ -5,6 +5,7 @@
 #include <string>
 #include <vector>
 #include <chrono>
+#include <memory>
 
 #ifdef _WIN32
   #include <winsock2.h>

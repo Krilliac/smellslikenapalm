@@ -7,6 +7,8 @@
 #include <atomic>
 #include <string>
 #include <thread>
+#include <mutex>
+#include <queue>
 #include "Network/Packet.h"
 
 class NetworkManager;
@@ -22,22 +24,41 @@ class MapConfig;
 class PlayerManager;
 class TeamManager;
 class MapManager;
-class EACProxy;
-struct ClientConnection;
+class ClientConnection;
+class RoleSystem;
+class TicketSystem;
+class ObjectiveSystem;
+class CommanderAbilities;
+class SpawnSystem;
+class WeaponDatabase;
+class DamageSystem;
+class HelicopterPhysics;
+class TerritoryMode;
+class SupremacyMode;
+class SkirmishMode;
+
+struct PacketAnalysisResult;
 
 namespace GeneratedHandlers {
     using HandlerFunction = void(*)(const PacketAnalysisResult&);
     class HandlerLibraryManager;
 }
 
+// Internal packet queue entry
+struct QueuedPacket {
+    uint32_t       clientId;
+    Packet         packet;
+    PacketMetadata metadata;
+};
+
 class GameServer {
 public:
     GameServer();
-    ~GameServer();
+    virtual ~GameServer();
 
-    bool Initialize();
-    void Run();
-    void Shutdown();
+    virtual bool Initialize();
+    void Run();       // Run one tick of the game loop (called from main GameClock callback)
+    virtual void Shutdown();
 
     void BroadcastChatMessage(const std::string& msg);
 
@@ -45,31 +66,55 @@ public:
     std::shared_ptr<ClientConnection> GetClientConnection(uint32_t clientId) const;
     std::vector<std::shared_ptr<ClientConnection>> GetAllConnections() const;
 
-    std::shared_ptr<PlayerManager> GetPlayerManager() const;
-    std::shared_ptr<TeamManager>   GetTeamManager()   const;
-    std::shared_ptr<MapManager>    GetMapManager()    const;
-    std::shared_ptr<GameConfig>    GetGameConfig()    const;
-    std::shared_ptr<ServerConfig>  GetServerConfig()  const;
-    std::shared_ptr<ConfigManager> GetConfigManager() const;
+    // Subsystem accessors
+    PlayerManager*                  GetPlayerManager()      const;
+    TeamManager*                    GetTeamManager()        const;
+    MapManager*                     GetMapManager()         const;
+    NetworkManager*                 GetNetworkManager()     const;
+    AdminManager*                   GetAdminManager()       const;
+    RoleSystem*                     GetRoleSystem()         const;
+    TicketSystem*                   GetTicketSystem()       const;
+    ObjectiveSystem*                GetObjectiveSystem()    const;
+    CommanderAbilities*             GetCommanderAbilities() const;
+    SpawnSystem*                    GetSpawnSystem()        const;
+    WeaponDatabase*                 GetWeaponDatabase()     const;
+    DamageSystem*                   GetDamageSystem()       const;
+    HelicopterPhysics*              GetHelicopterPhysics()  const;
+    TerritoryMode*                  GetTerritoryMode()      const;
+    SupremacyMode*                  GetSupremacyMode()      const;
+    SkirmishMode*                   GetSkirmishMode()       const;
+    std::shared_ptr<GameConfig>     GetGameConfig()         const;
+    std::shared_ptr<ServerConfig>   GetServerConfig()       const;
+    std::shared_ptr<ConfigManager>  GetConfigManager()      const;
 
     void ChangeMap();
 
-    // --- Packet handler regeneration/reload --- TODO: Enable/Disable by config
+    // Packet queue — used by NetworkManager/ConnectionManager to push received packets
+    void EnqueuePacket(const QueuedPacket& pkt);
+    std::vector<QueuedPacket> FetchPendingPackets();
+
+    // Callback from ConnectionManager when a raw packet arrives
+    void OnPacketReceived(uint32_t clientId, const Packet& pkt, const PacketMetadata& meta);
+
+    // --- Packet handler regeneration/reload ---
     void Cmd_RegenHandlers(const std::vector<std::string>& args = {});
-    void StartAutoRegen(int intervalSeconds = 600); // Production should be once every 3600 seconds (1 hour), but for development, we'll keep it at every 600 seconds (10 minutes.) TODO: Make this into a config.
+    void StartAutoRegen(int intervalSeconds = 600);
     void StopAutoRegen();
     void DynamicReloadGeneratedHandlers();
+
+protected:
+    virtual void ProcessNetworkMessages();
+
+    std::shared_ptr<ServerConfig>       m_serverConfig;
+    std::shared_ptr<GameConfig>         m_gameConfig;
 
 private:
     std::string GetExeDir() const;
 
     std::unique_ptr<NetworkManager>     m_networkManager;
-    std::unique_ptr<EACProxy>           m_eacProxy;
     std::shared_ptr<ConfigManager>      m_configManager;
-    std::shared_ptr<ServerConfig>       m_serverConfig;
     std::shared_ptr<NetworkConfig>      m_networkConfig;
     std::shared_ptr<SecurityConfig>     m_securityConfig;
-    std::shared_ptr<GameConfig>         m_gameConfig;
     std::shared_ptr<MapConfig>          m_mapConfig;
 
     std::unique_ptr<PlayerManager>      m_playerManager;
@@ -79,7 +124,36 @@ private:
     std::unique_ptr<ChatManager>        m_chatManager;
     std::unique_ptr<GameMode>           m_gameMode;
 
+    // RS2V game systems
+    std::unique_ptr<RoleSystem>         m_roleSystem;
+    std::unique_ptr<TicketSystem>       m_ticketSystem;
+    std::unique_ptr<ObjectiveSystem>    m_objectiveSystem;
+    std::unique_ptr<CommanderAbilities> m_commanderAbilities;
+    std::unique_ptr<SpawnSystem>        m_spawnSystem;
+    std::unique_ptr<WeaponDatabase>     m_weaponDatabase;
+    std::unique_ptr<DamageSystem>       m_damageSystem;
+    std::unique_ptr<HelicopterPhysics>  m_helicopterPhysics;
+    std::unique_ptr<TerritoryMode>      m_territoryMode;
+    std::unique_ptr<SupremacyMode>      m_supremacyMode;
+    std::unique_ptr<SkirmishMode>       m_skirmishMode;
+
+    // Game tick timing
+    float m_lastTickTime = 0.0f;
+    float m_tickDeltaSeconds = 1.0f / 60.0f;  // 60Hz default
+
+    // Packet handlers for RS2V systems
+    void HandleRoleSelection(uint32_t clientId, const std::vector<uint8_t>& data);
+    void HandleSpawnRequest(uint32_t clientId, const std::vector<uint8_t>& data);
+    void HandleCommanderAbility(uint32_t clientId, const std::vector<uint8_t>& data);
+    void HandleSquadAction(uint32_t clientId, const std::vector<uint8_t>& data);
+    void HandleVehicleAction(uint32_t clientId, const std::vector<uint8_t>& data);
+    void HandleWeaponFire(uint32_t clientId, const std::vector<uint8_t>& data);
+
     std::atomic<bool>                   m_running{false};
+
+    // Packet receive queue (thread-safe)
+    std::mutex                          m_packetQueueMutex;
+    std::queue<QueuedPacket>            m_packetQueue;
 
     // Handler regen/reload
     std::atomic<bool>                   m_regenRunning{false};

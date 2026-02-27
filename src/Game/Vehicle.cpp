@@ -365,6 +365,16 @@ VehicleOccupant* Vehicle::FindOccupant(uint32_t playerId)
     return it != m_occupants.end() ? &(*it) : nullptr;
 }
 
+const VehicleOccupant* Vehicle::FindOccupant(uint32_t playerId) const
+{
+    auto it = std::find_if(m_occupants.begin(), m_occupants.end(),
+                          [playerId](const VehicleOccupant& occ) {
+                              return occ.playerId == playerId;
+                          });
+
+    return it != m_occupants.end() ? &(*it) : nullptr;
+}
+
 bool Vehicle::IsSeatOccupied(uint32_t seatIndex) const
 {
     return std::any_of(m_occupants.begin(), m_occupants.end(),

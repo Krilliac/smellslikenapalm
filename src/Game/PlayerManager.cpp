@@ -2,7 +2,9 @@
 
 #include "Game/PlayerManager.h"
 #include "Utils/Logger.h"
+#include "Utils/PacketAnalysis.h"
 #include "Game/GameServer.h"
+#include "Config/ServerConfig.h"
 #include "Network/ClientConnection.h"
 #include <chrono>
 
@@ -86,23 +88,8 @@ void PlayerManager::Update()
             DumpPacketForAnalysis(conn->LastRawPacket(), "Update_PlayerTelemetry");
         }
 
-        // Weapon firing example integration:
-        if (pl->IsAlive()) {
-            auto weapon = pl->GetActiveWeapon();
-            if (weapon) {
-                weapon->UpdateFireTimer(deltaSeconds);
-                weapon->UpdateReloadTimer(deltaSeconds);
-                if (pl->WantsToFire()) {
-                    Vector3 origin = pl->GetPosition();
-                    Vector3 dir    = pl->GetOrientation();
-                    weapon->Fire(origin, dir, pl.get());
-                }
-            }
-        }
-
         // Handle respawns
         if (!pl->IsAlive() && pl->CanRespawn(m_respawnDelaySec)) {
-            m_server->GetGameWorld()->RespawnPlayer(id);
             OnPlayerSpawn(id);
         }
         pl->Update(deltaSeconds);
@@ -159,6 +146,15 @@ void PlayerManager::BroadcastPlayerList() const
         msg += " " + pl->GetConnection()->GetPlayerName();
     }
     m_server->BroadcastChatMessage(msg);
+}
+
+void PlayerManager::SpawnAllPlayers()
+{
+    for (auto& [id, pl] : m_players) {
+        if (!pl->IsAlive()) {
+            OnPlayerSpawn(id);
+        }
+    }
 }
 
 void PlayerManager::RemoveStalePlayers()
