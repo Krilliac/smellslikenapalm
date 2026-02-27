@@ -150,4 +150,41 @@ uint32_t CollisionDetection::Raycast(const Vector3& o,const Vector3& d,float max
     return hitId;
 }
 
-// Ray–object tests omitted for brevity; implement slab method for AABB and geometric for sphere.
+bool CollisionDetection::RayIntersectsAABB(const Vector3& o, const Vector3& d, const AABB& box, float& t) const {
+    float tmin = -std::numeric_limits<float>::infinity();
+    float tmax = std::numeric_limits<float>::infinity();
+
+    auto slab = [&](float origin, float dir, float bmin, float bmax) -> bool {
+        if (std::fabs(dir) < 1e-8f) {
+            return (origin >= bmin && origin <= bmax);
+        }
+        float t1 = (bmin - origin) / dir;
+        float t2 = (bmax - origin) / dir;
+        if (t1 > t2) std::swap(t1, t2);
+        if (t1 > tmin) tmin = t1;
+        if (t2 < tmax) tmax = t2;
+        return tmin <= tmax;
+    };
+
+    if (!slab(o.x, d.x, box.min.x, box.max.x)) return false;
+    if (!slab(o.y, d.y, box.min.y, box.max.y)) return false;
+    if (!slab(o.z, d.z, box.min.z, box.max.z)) return false;
+
+    t = tmin >= 0 ? tmin : tmax;
+    return t >= 0;
+}
+
+bool CollisionDetection::RayIntersectsSphere(const Vector3& o, const Vector3& d, const Sphere& s, float& t) const {
+    Vector3 oc = o - s.center;
+    float a = d.Dot(d);
+    float b = 2.0f * oc.Dot(d);
+    float c = oc.Dot(oc) - s.radius * s.radius;
+    float disc = b * b - 4.0f * a * c;
+    if (disc < 0) return false;
+    float sqrtDisc = std::sqrt(disc);
+    float t0 = (-b - sqrtDisc) / (2.0f * a);
+    float t1 = (-b + sqrtDisc) / (2.0f * a);
+    if (t0 >= 0) { t = t0; return true; }
+    if (t1 >= 0) { t = t1; return true; }
+    return false;
+}

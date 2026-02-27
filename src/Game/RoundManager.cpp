@@ -8,12 +8,13 @@
 
 RoundManager::RoundManager(GameServer* server)
     : m_server(server)
+    , m_gameState(nullptr)
+    , m_preparationDuration(std::chrono::seconds(30))
+    , m_roundDuration(std::chrono::seconds(900))
+    , m_postRoundDuration(std::chrono::seconds(10))
 {
-    m_gameState = m_server->GetGameState();
     auto settings = m_server->GetGameConfig()->GetGameSettings();
-    m_preparationDuration = std::chrono::seconds(settings.preparationTime);
     m_roundDuration       = std::chrono::seconds(settings.roundTimeLimit);
-    m_postRoundDuration   = std::chrono::seconds(10);  // fixed summary time
 }
 
 RoundManager::~RoundManager() = default;
@@ -66,7 +67,7 @@ void RoundManager::Update()
 void RoundManager::OnObjectiveCaptured(uint32_t objectiveId, uint32_t teamId)
 {
     // If score limit reached, end round early
-    if (m_gameState->CheckWinCondition()) {
+    if (m_gameState && m_gameState->CheckWinCondition()) {
         EndRound();
     }
 }
@@ -106,19 +107,19 @@ void RoundManager::TransitionToPhase(RoundPhase newPhase)
         case RoundPhase::Preparation:
             m_phaseEndTime = now + m_preparationDuration;
             Logger::Info("Round %u: Preparation phase started", m_roundNumber + 1);
-            m_gameState->SetPhase(GamePhase::Preparation);
+            if (m_gameState) m_gameState->SetPhase(GamePhase::Preparation);
             break;
         case RoundPhase::Active:
             m_roundNumber++;
             m_phaseEndTime = now + m_roundDuration;
             Logger::Info("Round %u: Active phase started", m_roundNumber);
-            m_gameState->StartRound();
+            if (m_gameState) m_gameState->StartRound();
             if (m_onRoundStart) m_onRoundStart();
             break;
         case RoundPhase::PostRound:
             m_phaseEndTime = now + m_postRoundDuration;
             Logger::Info("Round %u: Post-round phase started", m_roundNumber);
-            m_gameState->EndRound();
+            if (m_gameState) m_gameState->EndRound();
             if (m_onRoundEnd) m_onRoundEnd();
             break;
     }

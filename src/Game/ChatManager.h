@@ -22,10 +22,10 @@ public:
 
     void ProcessChatCommand(uint32_t clientId, const std::string& message);
 
+    void BroadcastChat(const std::string& message);
+
 private:
     GameServer* m_server;
-
-    void BroadcastChat(const std::string& message);
     void BroadcastTeam(uint32_t teamId, const std::string& message);
 
     std::string FormatChatMessage(const std::string& playerName, const std::string& message) const;

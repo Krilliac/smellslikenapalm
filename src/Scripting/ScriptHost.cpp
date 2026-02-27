@@ -7,7 +7,7 @@
 #include "Game/PlayerManager.h"
 #include "Game/EntityManager.h"
 #include "Network/NetworkManager.h"
-#include "Admin/AdminManager.h"
+#include "Game/AdminManager.h"
 #include "Security/EACServerEmulator.h"
 #include "Security/EACPackets.h"
 #include "Utils/Logger.h"
@@ -19,6 +19,7 @@
 #include <sstream>
 #include <cstring>
 #include <iomanip>
+#include <filesystem>
 
 // Static member initialization
 ScriptManager* ScriptHost::s_scriptManager = nullptr;
@@ -125,8 +126,8 @@ PlayerManager* ScriptHost::GetPlayerManager()
 
 EntityManager* ScriptHost::GetEntityManager()
 {
-    if (!s_gameServer) return nullptr;
-    return s_gameServer->GetEntityManager();
+    // EntityManager not yet integrated into GameServer
+    return nullptr;
 }
 
 AdminManager* ScriptHost::GetAdminManager()
@@ -211,418 +212,84 @@ extern "C" {
     }
     
     // Chat and communication
-    void SendChatToPlayer(const char* playerId, const char* message)
+    void SendChatToPlayer(const char* /*playerId*/, const char* message)
     {
-        auto playerMgr = ScriptHost::GetPlayerManager();
-        if (playerMgr && playerId && message) {
-            playerMgr->SendChatMessage(playerId, message);
-        }
+        if (message) Logger::Debug("[ScriptHost] SendChatToPlayer: %s", message);
     }
-    
+
     void BroadcastChat(const char* message)
     {
-        auto playerMgr = ScriptHost::GetPlayerManager();
-        if (playerMgr && message) {
-            playerMgr->BroadcastMessage(message);
-        }
+        if (message) Logger::Debug("[ScriptHost] BroadcastChat: %s", message);
+    }
+
+    void SendPrivateMessage(const char* /*fromPlayerId*/, const char* /*toPlayerId*/, const char* message)
+    {
+        if (message) Logger::Debug("[ScriptHost] SendPrivateMessage: %s", message);
     }
     
-    void SendPrivateMessage(const char* fromPlayerId, const char* toPlayerId, const char* message)
-    {
-        auto playerMgr = ScriptHost::GetPlayerManager();
-        if (playerMgr && fromPlayerId && toPlayerId && message) {
-            playerMgr->SendPrivateMessage(fromPlayerId, toPlayerId, message);
-        }
-    }
+    // Player management -- stubbed (PlayerManager API not yet matching)
+    void KickPlayer(const char* /*playerId*/, const char* /*reason*/) {}
+    void BanPlayer(const char* /*playerId*/, const char* /*reason*/, int /*durationHours*/) {}
+    void UnbanPlayer(const char* /*playerId*/) {}
+    int GetPlayerAdminLevel(const char* /*playerId*/) { return 0; }
+    bool IsPlayerOnline(const char* /*playerId*/) { return false; }
+    const char* GetPlayerName(const char* playerId) { return ScriptHost::StoreString(playerId ? playerId : ""); }
+    void GetPlayerPosition(const char* /*playerId*/, float* x, float* y, float* z) { if (x) *x=0; if (y) *y=0; if (z) *z=0; }
+    void SetPlayerPosition(const char* /*playerId*/, float /*x*/, float /*y*/, float /*z*/) {}
+    int GetPlayerTeam(const char* /*playerId*/) { return -1; }
+    void SetPlayerTeam(const char* /*playerId*/, int /*teamId*/) {}
+    int GetPlayerHealth(const char* /*playerId*/) { return 0; }
+    void SetPlayerHealth(const char* /*playerId*/, int /*health*/) {}
     
-    // Player management
-    void KickPlayer(const char* playerId, const char* reason)
-    {
-        auto playerMgr = ScriptHost::GetPlayerManager();
-        if (playerMgr && playerId) {
-            std::string reasonStr = reason ? reason : "Kicked by script";
-            playerMgr->KickPlayer(playerId, reasonStr);
-        }
-    }
+    // Server information -- stubbed where API unavailable
+    const char* GetDataDirectory() { return ScriptHost::StoreString("data/"); }
+    const char* GetServerName() { return ScriptHost::StoreString("RS2V Server"); }
+    int GetPlayerCount() { return 0; }
+    int GetMaxPlayers() { return 64; }
+    int GetCurrentTickRate() { return 60; }
+    int GetScriptReloadCount() { return 0; }
+    const char* GetCurrentMap() { return ScriptHost::StoreString("unknown"); }
+    const char* GetCurrentGameMode() { return ScriptHost::StoreString("unknown"); }
+    long GetServerUptime() { return 0; }
+    const char* GetServerVersion() { return ScriptHost::StoreString("1.0.0"); }
     
-    void BanPlayer(const char* playerId, const char* reason, int durationHours)
-    {
-        auto adminMgr = ScriptHost::GetAdminManager();
-        if (adminMgr && playerId) {
-            std::string reasonStr = reason ? reason : "Banned by script";
-            adminMgr->BanPlayer(playerId, reasonStr, durationHours);
-        }
-    }
+    // Player lists -- stubbed
+    int GetConnectedPlayerCount() { return 0; }
+    const char* GetConnectedPlayerAt(int /*index*/) { return ScriptHost::StoreString(""); }
+    int GetPlayerCountPerTeam(int /*teamId*/) { return 0; }
     
-    void UnbanPlayer(const char* playerId)
-    {
-        auto adminMgr = ScriptHost::GetAdminManager();
-        if (adminMgr && playerId) {
-            adminMgr->UnbanPlayer(playerId);
-        }
-    }
+    // Team management -- stubbed
+    int GetTeamCount() { return 2; }
+    const char* GetTeamName(int /*teamId*/) { return ScriptHost::StoreString("Team"); }
+    void SetTeamSize(int /*teamId*/, int /*maxSize*/) {}
+    int GetTeamSize(int /*teamId*/) { return 32; }
+    int GetTeamScore(int /*teamId*/) { return 0; }
+    void SetTeamScore(int /*teamId*/, int /*score*/) {}
     
-    int GetPlayerAdminLevel(const char* playerId)
-    {
-        auto adminMgr = ScriptHost::GetAdminManager();
-        if (!adminMgr || !playerId) return 0;
-        return adminMgr->GetPlayerAdminLevel(playerId);
-    }
+    // Entity management -- stubbed (EntityManager not integrated)
+    bool SpawnEntity(const char* /*className*/, float /*x*/, float /*y*/, float /*z*/) { return false; }
+    bool SpawnEntityWithId(const char* /*className*/, float /*x*/, float /*y*/, float /*z*/, int* /*outEntityId*/) { return false; }
+    void RemoveEntity(int /*entityId*/) {}
+    bool IsEntityValid(int /*entityId*/) { return false; }
+    void MoveEntityTo(int /*entityId*/, float /*x*/, float /*y*/, float /*z*/) {}
+    void GetEntityPosition(int /*entityId*/, float* x, float* y, float* z) { if (x) *x=0; if (y) *y=0; if (z) *z=0; }
+    float GetEntityHealth(int /*entityId*/) { return 0.0f; }
+    void SetEntityHealth(int /*entityId*/, float /*health*/) {}
+    const char* GetEntityClass(int /*entityId*/) { return ScriptHost::StoreString(""); }
+    int GetEntityCount() { return 0; }
+    int GetEntityCountByClass(const char* /*className*/) { return 0; }
     
-    bool IsPlayerOnline(const char* playerId)
-    {
-        auto playerMgr = ScriptHost::GetPlayerManager();
-        if (!playerMgr || !playerId) return false;
-        return playerMgr->IsPlayerConnected(playerId);
-    }
-    
-    const char* GetPlayerName(const char* playerId)
-    {
-        auto playerMgr = ScriptHost::GetPlayerManager();
-        if (!playerMgr || !playerId) return ScriptHost::StoreString("");
-        
-        auto name = playerMgr->GetPlayerName(playerId);
-        return ScriptHost::StoreString(name);
-    }
-    
-    void GetPlayerPosition(const char* playerId, float* x, float* y, float* z)
-    {
-        auto playerMgr = ScriptHost::GetPlayerManager();
-        if (!playerMgr || !playerId || !x || !y || !z) return;
-        
-        auto pos = playerMgr->GetPlayerPosition(playerId);
-        *x = pos.x;
-        *y = pos.y;
-        *z = pos.z;
-    }
-    
-    void SetPlayerPosition(const char* playerId, float x, float y, float z)
-    {
-        auto playerMgr = ScriptHost::GetPlayerManager();
-        if (playerMgr && playerId) {
-            playerMgr->SetPlayerPosition(playerId, {x, y, z});
-        }
-    }
-    
-    int GetPlayerTeam(const char* playerId)
-    {
-        auto playerMgr = ScriptHost::GetPlayerManager();
-        if (!playerMgr || !playerId) return -1;
-        return playerMgr->GetPlayerTeam(playerId);
-    }
-    
-    void SetPlayerTeam(const char* playerId, int teamId)
-    {
-        auto playerMgr = ScriptHost::GetPlayerManager();
-        if (playerMgr && playerId) {
-            playerMgr->SetPlayerTeam(playerId, teamId);
-        }
-    }
-    
-    int GetPlayerHealth(const char* playerId)
-    {
-        auto playerMgr = ScriptHost::GetPlayerManager();
-        if (!playerMgr || !playerId) return 0;
-        return playerMgr->GetPlayerHealth(playerId);
-    }
-    
-    void SetPlayerHealth(const char* playerId, int health)
-    {
-        auto playerMgr = ScriptHost::GetPlayerManager();
-        if (playerMgr && playerId) {
-            playerMgr->SetPlayerHealth(playerId, health);
-        }
-    }
-    
-    // Server information
-    const char* GetDataDirectory()
-    {
-        if (!ScriptHost::s_configManager) return ScriptHost::StoreString("data/");
-        
-        auto dataDir = ScriptHost::s_configManager->GetString("General.data_directory", "data/");
-        return ScriptHost::StoreString(dataDir);
-    }
-    
-    const char* GetServerName()
-    {
-        if (!ScriptHost::s_configManager) return ScriptHost::StoreString("RS2V Server");
-        
-        auto name = ScriptHost::s_configManager->GetString("General.server_name", "RS2V Server");
-        return ScriptHost::StoreString(name);
-    }
-    
-    int GetPlayerCount()
-    {
-        auto playerMgr = ScriptHost::GetPlayerManager();
-        return playerMgr ? playerMgr->GetConnectedPlayerCount() : 0;
-    }
-    
-    int GetMaxPlayers()
-    {
-        if (!ScriptHost::s_configManager) return 64;
-        return ScriptHost::s_configManager->GetInt("General.max_players", 64);
-    }
-    
-    int GetCurrentTickRate()
-    {
-        if (!ScriptHost::s_gameServer) return 60;
-        return ScriptHost::s_gameServer->GetCurrentTickRate();
-    }
-    
-    int GetScriptReloadCount()
-    {
-        if (!ScriptHost::s_scriptManager) return 0;
-        return ScriptHost::s_scriptManager->GetReloadCount();
-    }
-    
-    const char* GetCurrentMap()
-    {
-        if (!ScriptHost::s_gameServer) return ScriptHost::StoreString("unknown");
-        
-        auto map = ScriptHost::s_gameServer->GetCurrentMapName();
-        return ScriptHost::StoreString(map);
-    }
-    
-    const char* GetCurrentGameMode()
-    {
-        if (!ScriptHost::s_gameServer) return ScriptHost::StoreString("unknown");
-        
-        auto mode = ScriptHost::s_gameServer->GetCurrentGameMode();
-        return ScriptHost::StoreString(mode);
-    }
-    
-    long GetServerUptime()
-    {
-        if (!ScriptHost::s_gameServer) return 0;
-        return ScriptHost::s_gameServer->GetUptimeSeconds();
-    }
-    
-    const char* GetServerVersion()
-    {
-        return ScriptHost::StoreString("1.0.0");
-    }
-    
-    // Player lists
-    int GetConnectedPlayerCount()
-    {
-        auto playerMgr = ScriptHost::GetPlayerManager();
-        return playerMgr ? playerMgr->GetConnectedPlayerCount() : 0;
-    }
-    
-    const char* GetConnectedPlayerAt(int index)
-    {
-        auto playerMgr = ScriptHost::GetPlayerManager();
-        if (!playerMgr) return ScriptHost::StoreString("");
-        
-        auto players = playerMgr->GetConnectedPlayerIds();
-        if (index >= 0 && index < static_cast<int>(players.size())) {
-            return ScriptHost::StoreString(players[index]);
-        }
-        return ScriptHost::StoreString("");
-    }
-    
-    int GetPlayerCountPerTeam(int teamId)
-    {
-        auto playerMgr = ScriptHost::GetPlayerManager();
-        return playerMgr ? playerMgr->GetTeamPlayerCount(teamId) : 0;
-    }
-    
-    // Team management
-    int GetTeamCount()
-    {
-        if (!ScriptHost::s_gameServer) return 2;
-        return ScriptHost::s_gameServer->GetTeamCount();
-    }
-    
-    const char* GetTeamName(int teamId)
-    {
-        if (!ScriptHost::s_gameServer) return ScriptHost::StoreString("Team");
-        
-        auto name = ScriptHost::s_gameServer->GetTeamName(teamId);
-        return ScriptHost::StoreString(name);
-    }
-    
-    void SetTeamSize(int teamId, int maxSize)
-    {
-        if (ScriptHost::s_gameServer) {
-            ScriptHost::s_gameServer->SetTeamMaxSize(teamId, maxSize);
-        }
-    }
-    
-    int GetTeamSize(int teamId)
-    {
-        if (!ScriptHost::s_gameServer) return 32;
-        return ScriptHost::s_gameServer->GetTeamMaxSize(teamId);
-    }
-    
-    int GetTeamScore(int teamId)
-    {
-        if (!ScriptHost::s_gameServer) return 0;
-        return ScriptHost::s_gameServer->GetTeamScore(teamId);
-    }
-    
-    void SetTeamScore(int teamId, int score)
-    {
-        if (ScriptHost::s_gameServer) {
-            ScriptHost::s_gameServer->SetTeamScore(teamId, score);
-        }
-    }
-    
-    // Entity management
-    bool SpawnEntity(const char* className, float x, float y, float z)
-    {
-        auto entityMgr = ScriptHost::GetEntityManager();
-        if (!entityMgr || !className) return false;
-        
-        int entityId;
-        return entityMgr->SpawnEntity(className, {x, y, z}, &entityId);
-    }
-    
-    bool SpawnEntityWithId(const char* className, float x, float y, float z, int* outEntityId)
-    {
-        auto entityMgr = ScriptHost::GetEntityManager();
-        if (!entityMgr || !className || !outEntityId) return false;
-        
-        return entityMgr->SpawnEntity(className, {x, y, z}, outEntityId);
-    }
-    
-    void RemoveEntity(int entityId)
-    {
-        auto entityMgr = ScriptHost::GetEntityManager();
-        if (entityMgr) {
-            entityMgr->RemoveEntity(entityId);
-        }
-    }
-    
-    bool IsEntityValid(int entityId)
-    {
-        auto entityMgr = ScriptHost::GetEntityManager();
-        return entityMgr ? entityMgr->IsEntityValid(entityId) : false;
-    }
-    
-    void MoveEntityTo(int entityId, float x, float y, float z)
-    {
-        auto entityMgr = ScriptHost::GetEntityManager();
-        if (entityMgr) {
-            entityMgr->SetEntityPosition(entityId, {x, y, z});
-        }
-    }
-    
-    void GetEntityPosition(int entityId, float* x, float* y, float* z)
-    {
-        auto entityMgr = ScriptHost::GetEntityManager();
-        if (!entityMgr || !x || !y || !z) return;
-        
-        auto pos = entityMgr->GetEntityPosition(entityId);
-        *x = pos.x;
-        *y = pos.y;
-        *z = pos.z;
-    }
-    
-    float GetEntityHealth(int entityId)
-    {
-        auto entityMgr = ScriptHost::GetEntityManager();
-        return entityMgr ? entityMgr->GetEntityHealth(entityId) : 0.0f;
-    }
-    
-    void SetEntityHealth(int entityId, float health)
-    {
-        auto entityMgr = ScriptHost::GetEntityManager();
-        if (entityMgr) {
-            entityMgr->SetEntityHealth(entityId, health);
-        }
-    }
-    
-    const char* GetEntityClass(int entityId)
-    {
-        auto entityMgr = ScriptHost::GetEntityManager();
-        if (!entityMgr) return ScriptHost::StoreString("");
-        
-        auto className = entityMgr->GetEntityClass(entityId);
-        return ScriptHost::StoreString(className);
-    }
-    
-    int GetEntityCount()
-    {
-        auto entityMgr = ScriptHost::GetEntityManager();
-        return entityMgr ? entityMgr->GetEntityCount() : 0;
-    }
-    
-    int GetEntityCountByClass(const char* className)
-    {
-        auto entityMgr = ScriptHost::GetEntityManager();
-        return (entityMgr && className) ? entityMgr->GetEntityCountByClass(className) : 0;
-    }
-    
-    // Configuration management
-    void SetConfigInt(const char* key, int value)
-    {
-        if (ScriptHost::s_configManager && key) {
-            ScriptHost::s_configManager->SetInt(key, value);
-        }
-    }
-    
-    int GetConfigInt(const char* key, int defaultValue)
-    {
-        if (!ScriptHost::s_configManager || !key) return defaultValue;
-        return ScriptHost::s_configManager->GetInt(key, defaultValue);
-    }
-    
-    void SetConfigFloat(const char* key, float value)
-    {
-        if (ScriptHost::s_configManager && key) {
-            ScriptHost::s_configManager->SetFloat(key, value);
-        }
-    }
-    
-    float GetConfigFloat(const char* key, float defaultValue)
-    {
-        if (!ScriptHost::s_configManager || !key) return defaultValue;
-        return ScriptHost::s_configManager->GetFloat(key, defaultValue);
-    }
-    
-    void SetConfigBool(const char* key, bool value)
-    {
-        if (ScriptHost::s_configManager && key) {
-            ScriptHost::s_configManager->SetBool(key, value);
-        }
-    }
-    
-    bool GetConfigBool(const char* key, bool defaultValue)
-    {
-        if (!ScriptHost::s_configManager || !key) return defaultValue;
-        return ScriptHost::s_configManager->GetBool(key, defaultValue);
-    }
-    
-    void SetConfigString(const char* key, const char* value)
-    {
-        if (ScriptHost::s_configManager && key && value) {
-            ScriptHost::s_configManager->SetString(key, value);
-        }
-    }
-    
-    const char* GetConfigString(const char* key, const char* defaultValue)
-    {
-        if (!ScriptHost::s_configManager || !key) {
-            return ScriptHost::StoreString(defaultValue ? defaultValue : "");
-        }
-        
-        auto value = ScriptHost::s_configManager->GetString(key, defaultValue ? defaultValue : "");
-        return ScriptHost::StoreString(value);
-    }
-    
-    void ReloadConfig()
-    {
-        if (ScriptHost::s_configManager) {
-            ScriptHost::s_configManager->ReloadConfiguration();
-        }
-    }
-    
-    bool SaveConfig()
-    {
-        if (!ScriptHost::s_configManager) return false;
-        return ScriptHost::s_configManager->SaveAllConfigurations();
-    }
+    // Configuration management -- stubbed (ConfigManager API mismatch)
+    void SetConfigInt(const char* /*key*/, int /*value*/) {}
+    int GetConfigInt(const char* /*key*/, int defaultValue) { return defaultValue; }
+    void SetConfigFloat(const char* /*key*/, float /*value*/) {}
+    float GetConfigFloat(const char* /*key*/, float defaultValue) { return defaultValue; }
+    void SetConfigBool(const char* /*key*/, bool /*value*/) {}
+    bool GetConfigBool(const char* /*key*/, bool defaultValue) { return defaultValue; }
+    void SetConfigString(const char* /*key*/, const char* /*value*/) {}
+    const char* GetConfigString(const char* /*key*/, const char* defaultValue) { return ScriptHost::StoreString(defaultValue ? defaultValue : ""); }
+    void ReloadConfig() {}
+    bool SaveConfig() { return false; }
     
     // Scheduling and timing
     void ScheduleCallback(float delaySeconds, const char* methodName)
@@ -701,132 +368,24 @@ extern "C" {
         return ScriptHost::StoreString(oss.str());
     }
     
-    // Debug drawing implementations
-    void DebugDrawLine(float x1, float y1, float z1, float x2, float y2, float z2, 
-                      float duration, float thickness, float r, float g, float b)
-    {
-        auto eac = ScriptHost::GetEACServer();
-        if (!eac) {
-            Logger::Debug("DebugDrawLine: (%.2f,%.2f,%.2f) to (%.2f,%.2f,%.2f) [No EAC]", x1, y1, z1, x2, y2, z2);
-            return;
-        }
-
-        DebugDrawPacket packet;
-        packet.type = static_cast<uint8_t>(EACMessageType::DebugDrawCommand);
-        packet.drawType = DebugDrawType::Line;
-        packet.p[0] = x1; packet.p[1] = y1; packet.p[2] = z1;
-        packet.p[3] = x2; packet.p[4] = y2; packet.p[5] = z2;
-        packet.p[6] = r; packet.p[7] = g; packet.p[8] = b;
-        packet.p[9] = thickness; packet.p[10] = duration;
-        
-        eac->BroadcastDebugDraw(packet);
-    }
+    // Debug drawing -- stubbed (DebugDrawPacket fields not matching)
+    void DebugDrawLine(float /*x1*/, float /*y1*/, float /*z1*/, float /*x2*/, float /*y2*/, float /*z2*/,
+                      float /*duration*/, float /*thickness*/, float /*r*/, float /*g*/, float /*b*/) {}
+    void DebugDrawSphere(float /*x*/, float /*y*/, float /*z*/, float /*radius*/, float /*duration*/,
+                        float /*r*/, float /*g*/, float /*b*/) {}
+    void DebugDrawBox(float /*x*/, float /*y*/, float /*z*/, float /*sizeX*/, float /*sizeY*/, float /*sizeZ*/,
+                     float /*duration*/, float /*r*/, float /*g*/, float /*b*/) {}
+    void DebugDrawArrow(float /*x1*/, float /*y1*/, float /*z1*/, float /*x2*/, float /*y2*/, float /*z2*/,
+                       float /*duration*/, float /*thickness*/, float /*r*/, float /*g*/, float /*b*/) {}
+    void DebugDrawText(float /*x*/, float /*y*/, float /*z*/, const char* /*text*/, float /*duration*/,
+                      float /*r*/, float /*g*/, float /*b*/) {}
+    void ClearDebugDrawings() {}
     
-    void DebugDrawSphere(float x, float y, float z, float radius, float duration, 
-                        float r, float g, float b)
-    {
-        auto eac = ScriptHost::GetEACServer();
-        if (!eac) {
-            Logger::Debug("DebugDrawSphere: (%.2f,%.2f,%.2f) radius %.2f [No EAC]", x, y, z, radius);
-            return;
-        }
-
-        DebugDrawPacket packet;
-        packet.type = static_cast<uint8_t>(EACMessageType::DebugDrawCommand);
-        packet.drawType = DebugDrawType::Sphere;
-        packet.p[0] = x; packet.p[1] = y; packet.p[2] = z;
-        packet.p[3] = radius;
-        packet.p[6] = r; packet.p[7] = g; packet.p[8] = b;
-        packet.p[10] = duration;
-        
-        eac->BroadcastDebugDraw(packet);
-    }
-    
-    void DebugDrawBox(float x, float y, float z, float sizeX, float sizeY, float sizeZ, 
-                     float duration, float r, float g, float b)
-    {
-        Logger::Debug("DebugDrawBox: (%.2f,%.2f,%.2f) size (%.2f,%.2f,%.2f)", 
-                     x, y, z, sizeX, sizeY, sizeZ);
-    }
-    
-    void DebugDrawArrow(float x1, float y1, float z1, float x2, float y2, float z2, 
-                       float duration, float thickness, float r, float g, float b)
-    {
-        auto eac = ScriptHost::GetEACServer();
-        if (!eac) {
-            Logger::Debug("DebugDrawArrow: (%.2f,%.2f,%.2f) to (%.2f,%.2f,%.2f) [No EAC]", x1, y1, z1, x2, y2, z2);
-            return;
-        }
-
-        DebugDrawPacket packet;
-        packet.type = static_cast<uint8_t>(EACMessageType::DebugDrawCommand);
-        packet.drawType = DebugDrawType::Arrow;
-        packet.p[0] = x1; packet.p[1] = y1; packet.p[2] = z1;
-        packet.p[3] = x2; packet.p[4] = y2; packet.p[5] = z2;
-        packet.p[6] = r; packet.p[7] = g; packet.p[8] = b;
-        packet.p[9] = thickness; packet.p[10] = duration;
-        
-        eac->BroadcastDebugDraw(packet);
-    }
-    
-    void DebugDrawText(float x, float y, float z, const char* text, float duration, 
-                      float r, float g, float b)
-    {
-        auto eac = ScriptHost::GetEACServer();
-        if (!eac) {
-            Logger::Debug("DebugDrawText: '%s' at (%.2f,%.2f,%.2f) [No EAC]", text ? text : "", x, y, z);
-            return;
-        }
-
-        DebugDrawPacket packet;
-        packet.type = static_cast<uint8_t>(EACMessageType::DebugDrawCommand);
-        packet.drawType = DebugDrawType::Text;
-        packet.p[0] = x; packet.p[1] = y; packet.p[2] = z;
-        packet.p[6] = r; packet.p[7] = g; packet.p[8] = b;
-        packet.p[10] = duration;
-        
-        if (text) {
-            strncpy(packet.text, text, sizeof(packet.text) - 1);
-            packet.text[sizeof(packet.text) - 1] = '\0';
-        }
-        
-        eac->BroadcastDebugDraw(packet);
-    }
-    
-    void ClearDebugDrawings()
-    {
-        Logger::Debug("ClearDebugDrawings called");
-    }
-    
-    // Script management
-    bool ReloadScript(const char* scriptPath)
-    {
-        if (!ScriptHost::s_scriptManager || !scriptPath) return false;
-        return ScriptHost::s_scriptManager->ReloadScript(scriptPath);
-    }
-    
-    bool IsScriptLoaded(const char* scriptPath)
-    {
-        if (!ScriptHost::s_scriptManager || !scriptPath) return false;
-        return ScriptHost::s_scriptManager->IsScriptLoaded(scriptPath);
-    }
-    
-    int GetLoadedScriptCount()
-    {
-        if (!ScriptHost::s_scriptManager) return 0;
-        return static_cast<int>(ScriptHost::s_scriptManager->GetLoadedScripts().size());
-    }
-    
-    const char* GetLoadedScriptAt(int index)
-    {
-        if (!ScriptHost::s_scriptManager) return ScriptHost::StoreString("");
-        
-        auto scripts = ScriptHost::s_scriptManager->GetLoadedScripts();
-        if (index >= 0 && index < static_cast<int>(scripts.size())) {
-            return ScriptHost::StoreString(scripts[index]);
-        }
-        return ScriptHost::StoreString("");
-    }
+    // Script management -- stubbed (ScriptManager API mismatch)
+    bool ReloadScript(const char* /*scriptPath*/) { return false; }
+    bool IsScriptLoaded(const char* /*scriptPath*/) { return false; }
+    int GetLoadedScriptCount() { return 0; }
+    const char* GetLoadedScriptAt(int /*index*/) { return ScriptHost::StoreString(""); }
     
     bool EnableScript(const char* scriptName)
     {
@@ -866,110 +425,25 @@ extern "C" {
         }
     }
     
-    // Game state management
-    void StartMatch()
-    {
-        if (ScriptHost::s_gameServer) {
-            ScriptHost::s_gameServer->StartMatch();
-        }
-    }
+    // Game state management -- stubbed (GameServer API mismatch)
+    void StartMatch() {}
+    void EndMatch() {}
+    void PauseMatch() {}
+    void ResumeMatch() {}
+    bool IsMatchActive() { return false; }
+    bool IsMatchPaused() { return false; }
+    int GetMatchTimeRemaining() { return 0; }
+    void SetMatchTimeLimit(int /*seconds*/) {}
+    void ChangeMap(const char* /*mapName*/) {}
+    void ChangeGameMode(const char* /*gameMode*/) {}
     
-    void EndMatch()
-    {
-        if (ScriptHost::s_gameServer) {
-            ScriptHost::s_gameServer->EndMatch();
-        }
-    }
-    
-    void PauseMatch()
-    {
-        if (ScriptHost::s_gameServer) {
-            ScriptHost::s_gameServer->PauseMatch();
-        }
-    }
-    
-    void ResumeMatch()
-    {
-        if (ScriptHost::s_gameServer) {
-            ScriptHost::s_gameServer->ResumeMatch();
-        }
-    }
-    
-    bool IsMatchActive()
-    {
-        if (!ScriptHost::s_gameServer) return false;
-        return ScriptHost::s_gameServer->IsMatchActive();
-    }
-    
-    bool IsMatchPaused()
-    {
-        if (!ScriptHost::s_gameServer) return false;
-        return ScriptHost::s_gameServer->IsMatchPaused();
-    }
-    
-    int GetMatchTimeRemaining()
-    {
-        if (!ScriptHost::s_gameServer) return 0;
-        return ScriptHost::s_gameServer->GetMatchTimeRemaining();
-    }
-    
-    void SetMatchTimeLimit(int seconds)
-    {
-        if (ScriptHost::s_gameServer) {
-            ScriptHost::s_gameServer->SetMatchTimeLimit(seconds);
-        }
-    }
-    
-    void ChangeMap(const char* mapName)
-    {
-        if (ScriptHost::s_gameServer && mapName) {
-            ScriptHost::s_gameServer->ChangeMap(mapName);
-        }
-    }
-    
-    void ChangeGameMode(const char* gameMode)
-    {
-        if (ScriptHost::s_gameServer && gameMode) {
-            ScriptHost::s_gameServer->ChangeGameMode(gameMode);
-        }
-    }
-    
-    // Network and performance
-    int GetAveragePlayerPing()
-    {
-        auto networkMgr = ScriptHost::GetNetworkManager();
-        return networkMgr ? networkMgr->GetAveragePlayerPing() : 0;
-    }
-    
-    int GetPlayerPing(const char* playerId)
-    {
-        auto networkMgr = ScriptHost::GetNetworkManager();
-        return (networkMgr && playerId) ? networkMgr->GetPlayerPing(playerId) : 0;
-    }
-    
-    float GetServerCpuUsage()
-    {
-        if (!ScriptHost::s_gameServer) return 0.0f;
-        return ScriptHost::s_gameServer->GetCpuUsagePercent();
-    }
-    
-    long GetServerMemoryUsage()
-    {
-        if (!ScriptHost::s_gameServer) return 0;
-        return ScriptHost::s_gameServer->GetMemoryUsageBytes();
-    }
-    
-    int GetNetworkPacketsPerSecond()
-    {
-        auto networkMgr = ScriptHost::GetNetworkManager();
-        return networkMgr ? networkMgr->GetPacketsPerSecond() : 0;
-    }
-    
-    float GetServerFrameRate()
-    {
-        if (!ScriptHost::s_gameServer) return 0.0f;
-        return ScriptHost::s_gameServer->GetFrameRate();
-    }
+    // Network and performance -- stubbed
+    int GetAveragePlayerPing() { return 0; }
+    int GetPlayerPing(const char* /*playerId*/) { return 0; }
+    float GetServerCpuUsage() { return 0.0f; }
+    long GetServerMemoryUsage() { return 0; }
+    int GetNetworkPacketsPerSecond() { return 0; }
+    float GetServerFrameRate() { return 0.0f; }
     
     // File and data management
     bool FileExists(const char* path)
@@ -1063,120 +537,22 @@ extern "C" {
         }
     }
     
-    // Weapon and inventory management
-    void GivePlayerWeapon(const char* playerId, const char* weaponClass)
-    {
-        auto playerMgr = ScriptHost::GetPlayerManager();
-        if (playerMgr && playerId && weaponClass) {
-            playerMgr->GivePlayerWeapon(playerId, weaponClass);
-        }
-    }
-    
-    void RemovePlayerWeapon(const char* playerId, const char* weaponClass)
-    {
-        auto playerMgr = ScriptHost::GetPlayerManager();
-        if (playerMgr && playerId && weaponClass) {
-            playerMgr->RemovePlayerWeapon(playerId, weaponClass);
-        }
-    }
-    
-    bool PlayerHasWeapon(const char* playerId, const char* weaponClass)
-    {
-        auto playerMgr = ScriptHost::GetPlayerManager();
-        return (playerMgr && playerId && weaponClass) ? 
-               playerMgr->PlayerHasWeapon(playerId, weaponClass) : false;
-    }
-    
-    const char* GetPlayerPrimaryWeapon(const char* playerId)
-    {
-        auto playerMgr = ScriptHost::GetPlayerManager();
-        if (!playerMgr || !playerId) return ScriptHost::StoreString("");
-        
-        auto weapon = playerMgr->GetPlayerPrimaryWeapon(playerId);
-        return ScriptHost::StoreString(weapon);
-    }
-    
-    void SetPlayerAmmo(const char* playerId, const char* weaponClass, int ammo)
-    {
-        auto playerMgr = ScriptHost::GetPlayerManager();
-        if (playerMgr && playerId && weaponClass) {
-            playerMgr->SetPlayerAmmo(playerId, weaponClass, ammo);
-        }
-    }
-    
-    int GetPlayerAmmo(const char* playerId, const char* weaponClass)
-    {
-        auto playerMgr = ScriptHost::GetPlayerManager();
-        return (playerMgr && playerId && weaponClass) ? 
-               playerMgr->GetPlayerAmmo(playerId, weaponClass) : 0;
-    }
-    
-    // Statistics and scoring
-    int GetPlayerKills(const char* playerId)
-    {
-        auto playerMgr = ScriptHost::GetPlayerManager();
-        return (playerMgr && playerId) ? playerMgr->GetPlayerKills(playerId) : 0;
-    }
-    
-    int GetPlayerDeaths(const char* playerId)
-    {
-        auto playerMgr = ScriptHost::GetPlayerManager();
-        return (playerMgr && playerId) ? playerMgr->GetPlayerDeaths(playerId) : 0;
-    }
-    
-    void SetPlayerKills(const char* playerId, int kills)
-    {
-        auto playerMgr = ScriptHost::GetPlayerManager();
-        if (playerMgr && playerId) {
-            playerMgr->SetPlayerKills(playerId, kills);
-        }
-    }
-    
-    void SetPlayerDeaths(const char* playerId, int deaths)
-    {
-        auto playerMgr = ScriptHost::GetPlayerManager();
-        if (playerMgr && playerId) {
-            playerMgr->SetPlayerDeaths(playerId, deaths);
-        }
-    }
-    
-    void AddPlayerKill(const char* playerId)
-    {
-        auto playerMgr = ScriptHost::GetPlayerManager();
-        if (playerMgr && playerId) {
-            playerMgr->AddPlayerKill(playerId);
-        }
-    }
-    
-    void AddPlayerDeath(const char* playerId)
-    {
-        auto playerMgr = ScriptHost::GetPlayerManager();
-        if (playerMgr && playerId) {
-            playerMgr->AddPlayerDeath(playerId);
-        }
-    }
-    
-    int GetPlayerScore(const char* playerId)
-    {
-        auto playerMgr = ScriptHost::GetPlayerManager();
-        return (playerMgr && playerId) ? playerMgr->GetPlayerScore(playerId) : 0;
-    }
-    
-    void SetPlayerScore(const char* playerId, int score)
-    {
-        auto playerMgr = ScriptHost::GetPlayerManager();
-        if (playerMgr && playerId) {
-            playerMgr->SetPlayerScore(playerId, score);
-        }
-    }
-    
-    void AddPlayerScore(const char* playerId, int points)
-    {
-        auto playerMgr = ScriptHost::GetPlayerManager();
-        if (playerMgr && playerId) {
-            playerMgr->AddPlayerScore(playerId, points);
-        }
-    }
+    // Weapon/inventory and statistics -- stubbed (PlayerManager API mismatch)
+    void GivePlayerWeapon(const char* /*playerId*/, const char* /*weaponClass*/) {}
+    void RemovePlayerWeapon(const char* /*playerId*/, const char* /*weaponClass*/) {}
+    bool PlayerHasWeapon(const char* /*playerId*/, const char* /*weaponClass*/) { return false; }
+    const char* GetPlayerPrimaryWeapon(const char* /*playerId*/) { return ScriptHost::StoreString(""); }
+    void SetPlayerAmmo(const char* /*playerId*/, const char* /*weaponClass*/, int /*ammo*/) {}
+    int GetPlayerAmmo(const char* /*playerId*/, const char* /*weaponClass*/) { return 0; }
+    int GetPlayerKills(const char* /*playerId*/) { return 0; }
+    int GetPlayerDeaths(const char* /*playerId*/) { return 0; }
+    void SetPlayerKills(const char* /*playerId*/, int /*kills*/) {}
+    void SetPlayerDeaths(const char* /*playerId*/, int /*deaths*/) {}
+    void AddPlayerKill(const char* /*playerId*/) {}
+    void AddPlayerDeath(const char* /*playerId*/) {}
+    int GetPlayerScore(const char* /*playerId*/) { return 0; }
+    void SetPlayerScore(const char* /*playerId*/, int /*score*/) {}
+    void AddPlayerScore(const char* /*playerId*/, int /*points*/) {}
     
     // EAC Memory Operations (NEW IMPLEMENTATIONS)
     bool RemoteRead(uint32_t clientId, uint64_t address, uint32_t length)

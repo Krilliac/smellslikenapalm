@@ -1,4 +1,5 @@
 #include "Time/TimeSync.h"
+#include <cstring>
 
 TimeSync::TimeSync(TimeSyncCallback cb)
     : m_callback(std::move(cb))

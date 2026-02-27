@@ -4,6 +4,10 @@
 #include "Utils/Logger.h"
 #include <cstring>
 #include <chrono>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <unistd.h>
 
 SteamQuery::SteamQuery(const std::string& masterServerIp, uint16_t masterServerPort)
     : m_masterIp(masterServerIp), m_masterPort(masterServerPort)

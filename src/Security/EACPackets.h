@@ -38,8 +38,19 @@ struct MemoryReplyPacket
     MemOp      op;              // Mirrors the request’s op
     uint64_t   address;         // Same address, or new base for Alloc
     uint32_t   length;          // Number of data bytes that follow
-    // Immediately after this header, 'length' bytes of data follow in the UDP payload
+    // Immediately after this header, ‘length’ bytes of data follow in the UDP payload
     // uint8_t data[length];
+};
+
+/// Debug drawing packet sent from server to client for visualization
+struct DebugDrawPacket
+{
+    uint8_t    type;            // = 0x10 (DebugDrawCommand)
+    uint8_t    drawType;        // 0=line, 1=sphere, 2=box, 3=text
+    float      x1, y1, z1;     // Start position / center
+    float      x2, y2, z2;     // End position / extents
+    uint8_t    r, g, b, a;     // Color
+    float      duration;        // Display time in seconds
 };
 
 #pragma pack(pop)

@@ -4,6 +4,17 @@
 #include <thread>
 #include <future>
 #include <cstring>
+#include <sstream>
+#include <iomanip>
+#include <algorithm>
+
+namespace {
+    std::string FormatHexAddr(uintptr_t addr) {
+        std::ostringstream oss;
+        oss << std::hex << std::setfill('0') << std::setw(sizeof(uintptr_t)*2) << addr;
+        return oss.str();
+    }
+}
 
 EACMemoryScanner::EACMemoryScanner() = default;
 EACMemoryScanner::~EACMemoryScanner() {
@@ -82,7 +93,7 @@ EACScanResult EACMemoryScanner::PerformScan(const Session& s, std::string& outDe
             uintptr_t matchAddr = 0;
             if (MatchPattern(buffer.data(), pageSize, sig.pattern, sig.mask, addr, matchAddr)) {
                 outDetails = "Signature '" + sig.name + "' matched at 0x"
-                             + Utils::FormatHex(matchAddr);
+                             + FormatHexAddr(matchAddr);
                 return EACScanResult::SignatureMatch;
             }
         }

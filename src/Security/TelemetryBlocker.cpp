@@ -1,5 +1,11 @@
 // src/Telemetry/TelemetryBlocker.cpp
-#include "Telemetry/TelemetryBlocker.h"
+#include "Security/TelemetryBlocker.h"
+
+TelemetryBlocker::TelemetryBlocker()
+    : m_maxEvents(100)
+    , m_interval(Duration(60))
+    , m_blockDuration(Duration(300))
+{}
 
 TelemetryBlocker::TelemetryBlocker(size_t maxEventsPerInterval,
                                    Duration intervalDuration,
@@ -81,4 +87,26 @@ void TelemetryBlocker::Update() {
             ++it;
         }
     }
+}
+
+bool TelemetryBlocker::Initialize() {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    m_clients.clear();
+    return true;
+}
+
+void TelemetryBlocker::BlockAllTelemetry() {
+    // Block all current clients with a very long duration
+    std::lock_guard<std::mutex> lock(m_mutex);
+    auto now = Clock::now();
+    for (auto& [client, data] : m_clients) {
+        data.blocked = true;
+        data.blockExpires = now + Duration(86400 * 365); // ~1 year
+    }
+}
+
+void TelemetryBlocker::BlockCrashReporting() {
+    // Block the crash reporter client specifically
+    TelemetryClient crashClient{"__crash_reporter__"};
+    BlockClient(crashClient, Duration(86400 * 365));
 }

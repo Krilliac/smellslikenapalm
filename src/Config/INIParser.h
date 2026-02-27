@@ -51,9 +51,17 @@ public:
     std::vector<std::string>  GetSectionNames() const;
     std::vector<std::string>  GetKeyNames(const std::string& section) const;
 
-    // Remove entries
+    // Remove and clear
     void RemoveSection(const std::string& section);
     void RemoveKey(const std::string& section, const std::string& key);
+    void Clear();
+
+    // Statistics
+    bool   IsEmpty() const;
+    size_t GetSectionCount() const;
+    size_t GetTotalKeyCount() const;
+    std::vector<std::string> GetAllSections() const;
+    std::vector<std::string> GetSectionKeys(const std::string& section) const;
 
     // Debug and error reporting
     const std::vector<ParsingError>& GetParsingErrors() const;
@@ -64,6 +72,11 @@ public:
     // Raw data access
     std::map<std::string, std::map<std::string, std::string>> GetAllData() const;
     void                                                     SetAllData(const std::map<std::string, std::map<std::string, std::string>>& data);
+
+    // Parser configuration
+    void SetParserConfig(const ParserConfig& config);
+    const ParserConfig& GetParserConfig() const;
+    size_t GetKeyCount(const std::string& section) const;
 
 private:
     // Core parse routines

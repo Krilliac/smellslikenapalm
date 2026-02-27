@@ -76,7 +76,8 @@ std::optional<int> ToInt(const std::string& s) {
     try {
         size_t idx = 0;
         int v = std::stoi(s, &idx);
-        return idx == s.size() ? v : std::nullopt;
+        if (idx == s.size()) return v;
+        return std::nullopt;
     } catch (...) {
         return std::nullopt;
     }
@@ -86,7 +87,8 @@ std::optional<double> ToDouble(const std::string& s) {
     try {
         size_t idx = 0;
         double v = std::stod(s, &idx);
-        return idx == s.size() ? v : std::nullopt;
+        if (idx == s.size()) return v;
+        return std::nullopt;
     } catch (...) {
         return std::nullopt;
     }
@@ -108,3 +110,12 @@ std::string RemoveWhitespace(const std::string& s) {
     }
     return out;
 }
+
+bool ToBool(const std::string& s, bool defaultValue) {
+    std::string lower = ToLower(Trim(s));
+    if (lower == "true" || lower == "yes" || lower == "1" || lower == "on") return true;
+    if (lower == "false" || lower == "no" || lower == "0" || lower == "off") return false;
+    return defaultValue;
+}
+
+} // namespace StringUtils

@@ -4,7 +4,7 @@
 
 #include "MetricsReporter.h"
 #include "TelemetryManager.h"
-#include "../Utils/Logger.h"
+#include "Utils/Logger.h"
 
 #include <sstream>
 #include <iomanip>
@@ -12,6 +12,8 @@
 #include <regex>
 #include <chrono>
 #include <thread>
+#include <cstring>
+#include <cmath>
 
 // Platform-specific networking includes
 #ifdef _WIN32

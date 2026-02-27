@@ -3,22 +3,7 @@
 
 #include <memory>
 #include <string>
-#include <chrono>
-
-#ifdef _WIN32
-  #include <winsock2.h>
-  using SocketHandle = SOCKET;
-#else
-  using SocketHandle = int;
-#endif
-
-struct SocketConfig {
-    std::chrono::milliseconds recvTimeout{500};  
-    std::chrono::milliseconds sendTimeout{500};
-    bool nonBlocking = true;
-    size_t recvBufferSize = 65536;
-    size_t sendBufferSize = 65536;
-};
+#include "Network/UDPSocket.h"  // SocketHandle + SocketConfig defined here
 
 class SocketFactory {
 public:

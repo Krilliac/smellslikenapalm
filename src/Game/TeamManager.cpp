@@ -4,6 +4,7 @@
 #include "Game/GameServer.h"
 #include "Game/PlayerManager.h"
 #include "Utils/Logger.h"
+#include <algorithm>
 
 TeamManager::TeamManager(GameServer* server)
     : m_server(server)

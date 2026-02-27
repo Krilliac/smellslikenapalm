@@ -1,7 +1,9 @@
 #pragma once
 
 #include <cstdint>
+#include <string>
 #include <chrono>
+#include <vector>
 #include <unordered_map>
 #include <mutex>
 #include <functional>

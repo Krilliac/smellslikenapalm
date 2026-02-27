@@ -5,6 +5,7 @@
 #include "Config/MapConfig.h"
 #include "Network/NetworkManager.h"
 #include "Math/Vector3.h"
+#include <algorithm>
 #include <filesystem>
 #include <random>
 
@@ -34,16 +35,25 @@ bool MapManager::LoadMap(const std::string& mapName)
         return false;
     }
 
-    // Initialize spawn points
-    m_spawnPoints = m_currentMap.spawnPoints;
+    // Initialize spawn points from map definition's Vector3 list
+    m_spawnPoints.clear();
+    for (const auto& pos : m_currentMap.spawnPoints) {
+        SpawnPoint sp;
+        sp.position = pos;
+        sp.teamId = 0;
+        m_spawnPoints.push_back(sp);
+    }
     if (m_spawnPoints.empty()) {
         // Fallback: random points in bounds
         GenerateFallbackSpawns();
     }
     Logger::Info("MapManager: %zu spawn points loaded", m_spawnPoints.size());
 
-    // Initialize objectives
-    m_objectives = m_currentMap.objectiveIds;
+    // Initialize objectives (convert from int to uint32_t)
+    m_objectives.clear();
+    for (int objId : m_currentMap.objectiveIds) {
+        m_objectives.push_back(static_cast<uint32_t>(objId));
+    }
     Logger::Info("MapManager: %zu objectives loaded", m_objectives.size());
 
     return true;
@@ -89,8 +99,11 @@ std::vector<uint32_t> MapManager::GetMapObjectives() const
 
 Bounds MapManager::GetMapBounds() const
 {
-    // TODO: derive from geometry; return default if unknown
-    return m_currentMap.bounds;
+    // Convert MapDefinition::Bounds to Bounds
+    Bounds b;
+    b.min = m_currentMap.bounds.min;
+    b.max = m_currentMap.bounds.max;
+    return b;
 }
 
 std::string MapManager::GetNextMap()

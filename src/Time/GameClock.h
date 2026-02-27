@@ -1,7 +1,9 @@
 // src/Time/GameClock.h
 #pragma once
 
+#include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <functional>
 #include <vector>
 #include <mutex>

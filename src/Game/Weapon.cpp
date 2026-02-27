@@ -117,13 +117,10 @@ void Weapon::SetFireMode(FireMode mode) {
     m_fireMode = mode;
 }
 
-void Weapon::SpawnProjectile(const Vector3& origin, const Vector3& direction, Player* shooter) {
+void Weapon::SpawnProjectile(const Vector3& /*origin*/, const Vector3& /*direction*/, Player* shooter) {
     // For hitscan or projectile; send network packet or instantiate in world
-    if (auto net = shooter->GetConnection()->GetNetworkManager()) {
-        // Example packet: FIRE_WEAPON, weapon name, origin, direction
-        std::vector<uint8_t> data;
-        // serialize strings and vectors here...
-        net->SendPacketToAll("FIRE_WEAPON", data);
+    if (auto conn = shooter->GetConnection()) {
+        // TODO: broadcast fire event via GameServer once projectile system is in place
     }
     // Actual game logic would handle hit detection, damage application, recoil, etc.
 }

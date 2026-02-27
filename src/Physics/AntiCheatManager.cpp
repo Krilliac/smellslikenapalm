@@ -1,6 +1,9 @@
-#include "AntiCheat/AntiCheatManager.h"
+#include "Physics/AntiCheatManager.h"
 #include "Game/GameServer.h"
+#include "Game/AdminManager.h"
+#include "Network/ClientConnection.h"
 #include "Utils/Logger.h"
+#include <algorithm>
 
 AntiCheatManager::AntiCheatManager(GameServer* server, std::shared_ptr<SecurityConfig> cfg)
     : m_server(server), m_config(cfg) 
@@ -9,7 +12,7 @@ AntiCheatManager::AntiCheatManager(GameServer* server, std::shared_ptr<SecurityC
         "CHAT_MESSAGE","PLAYER_ACTION","HEARTBEAT",
         "MOVE","SHOOT","RELOAD"
     };
-    m_maxViolations = m_config->GetInt("AntiCheat.MaxViolations", 5);
+    m_maxViolations = 5; // default max violations
 }
 
 AntiCheatManager::~AntiCheatManager() = default;
@@ -50,6 +53,9 @@ void AntiCheatManager::InspectPacket(uint32_t clientId, const Packet& pkt, bool 
 void AntiCheatManager::BanIfNeeded(uint32_t clientId) {
     if (m_violations[clientId] >= m_maxViolations) {
         Logger::Error("AntiCheat: client %u exceeded max violations, banning", clientId);
-        m_server->GetAdminManager()->BanPlayer(0 /*system*/, m_server->FindClientBySteamID(std::to_string(clientId)), 60);
+        auto conn = m_server->GetClientConnection(clientId);
+        if (conn) {
+            m_server->GetAdminManager()->BanPlayer(0 /*system*/, conn->GetSteamID(), 60);
+        }
     }
 }

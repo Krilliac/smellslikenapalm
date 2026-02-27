@@ -1,6 +1,7 @@
 // src/Protocol/PacketTypes.cpp
 #include "Protocol/PacketTypes.h"
 #include "Utils/Logger.h"
+#include <string>
 
 // Map PacketType enum to string tags and back.
 // Used by MessageEncoder/Decoder and PacketHandler registry.
@@ -27,8 +28,7 @@ static const char* PacketTypeTags[] = {
     "COMPRESSION",
     "RPC_CALL",
     "RPC_RESPONSE",
-    "CUSTOM_START",
-    "MAX"
+    "CUSTOM_START"
 };
 
 static_assert(sizeof(PacketTypeTags)/sizeof(*PacketTypeTags) == static_cast<size_t>(PacketType::PT_MAX),

@@ -108,5 +108,6 @@ private:
     // Internal helpers
     void InitializeVehicleProperties();
     VehicleOccupant* FindOccupant(uint32_t playerId);
+    const VehicleOccupant* FindOccupant(uint32_t playerId) const;
     bool IsSeatOccupied(uint32_t seatIndex) const;
 };

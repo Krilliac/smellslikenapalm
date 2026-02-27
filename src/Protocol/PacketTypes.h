@@ -2,6 +2,7 @@
 #pragma once
 
 #include <cstdint>
+#include <string>
 
 // PacketTypes enumerates all high‐level packet tags used in RS2V networking.
 // Each value corresponds to a Packet::GetTag() string.
@@ -38,3 +39,7 @@ enum class PacketType : uint16_t {
     // Sentinel
     PT_MAX
 };
+
+// Convert PacketType to string tag and back
+const char* ToString(PacketType pt);
+PacketType FromString(const std::string& tag);

@@ -73,26 +73,76 @@ void Packet::WriteBytes(const std::vector<uint8_t>& data) {
     m_payload.insert(m_payload.end(), data.begin(), data.end());
 }
 
-uint32_t Packet::ReadUInt() {
+uint32_t Packet::ReadUInt() const {
     uint32_t v=0;
     std::memcpy(&v, &m_payload[m_readOffset],4);
     m_readOffset+=4; return v;
 }
-int32_t Packet::ReadInt()    { return (int32_t)ReadUInt(); }
-float Packet::ReadFloat() {
+int32_t Packet::ReadInt() const    { return (int32_t)ReadUInt(); }
+float Packet::ReadFloat() const {
     float f=0; std::memcpy(&f, &m_payload[m_readOffset],4);
     m_readOffset+=4; return f;
 }
-std::string Packet::ReadString() {
+std::string Packet::ReadString() const {
     return DecodeString(m_payload, m_readOffset);
 }
-Vector3 Packet::ReadVector3() {
+Vector3 Packet::ReadVector3() const {
     Vector3 v; v.x=ReadFloat(); v.y=ReadFloat(); v.z=ReadFloat(); return v;
 }
-std::vector<uint8_t> Packet::ReadBytes(size_t count) {
+std::vector<uint8_t> Packet::ReadBytes(size_t count) const {
     std::vector<uint8_t> out(m_payload.begin()+m_readOffset,
                               m_payload.begin()+m_readOffset+count);
     m_readOffset+=count; return out;
+}
+
+// Typed read methods (const — use mutable read offset)
+uint8_t Packet::ReadUInt8() const {
+    if (m_readOffset >= m_payload.size()) return 0;
+    return m_payload[m_readOffset++];
+}
+
+uint16_t Packet::ReadUInt16() const {
+    uint16_t v = 0;
+    if (m_readOffset + 2 <= m_payload.size()) {
+        std::memcpy(&v, &m_payload[m_readOffset], 2);
+        m_readOffset += 2;
+    }
+    return v;
+}
+
+uint32_t Packet::ReadUInt32() const {
+    uint32_t v = 0;
+    if (m_readOffset + 4 <= m_payload.size()) {
+        std::memcpy(&v, &m_payload[m_readOffset], 4);
+        m_readOffset += 4;
+    }
+    return v;
+}
+
+uint64_t Packet::ReadUInt64() const {
+    uint64_t v = 0;
+    if (m_readOffset + 8 <= m_payload.size()) {
+        std::memcpy(&v, &m_payload[m_readOffset], 8);
+        m_readOffset += 8;
+    }
+    return v;
+}
+
+size_t Packet::BytesRemaining() const {
+    return (m_readOffset < m_payload.size()) ? (m_payload.size() - m_readOffset) : 0;
+}
+
+size_t Packet::ReadBytesRemaining() const {
+    return BytesRemaining();
+}
+
+std::vector<uint8_t> Packet::ReadBytesRemainingVector() const {
+    if (m_readOffset >= m_payload.size()) return {};
+    return std::vector<uint8_t>(m_payload.begin() + m_readOffset, m_payload.end());
+}
+
+void Packet::ResetRead() {
+    m_readOffset = 0;
 }
 
 std::vector<uint8_t> Packet::EncodeString(const std::string& s) {

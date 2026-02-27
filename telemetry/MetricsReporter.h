@@ -20,11 +20,9 @@
 #include <chrono>
 #include <queue>
 #include <unordered_map>
+#include <functional>
 
-// Forward declaration
-namespace Telemetry {
-struct MetricsSnapshot;
-}
+#include "TelemetryManager.h"
 
 namespace Telemetry {
 
@@ -87,11 +85,15 @@ public:
 
 private:
     void RotateFile();
+    bool CreateNewFile();
     std::string GenerateFilename() const;
     std::string FormatSnapshot(const MetricsSnapshot& snapshot) const;
+    void WriteFileHeader();
+    void WriteFileFooter();
     void CompressFile(const std::string& filepath);
     void CleanupOldFiles();
-    void ReportError(const std::string& error);
+    void ScanExistingFiles();
+    void ReportError(const std::string& error) const;
 
     FileReporterConfig m_config;
     std::string m_outputDirectory;
@@ -100,15 +102,15 @@ private:
     mutable std::mutex m_fileMutex;
     
     // Statistics and health
-    std::atomic<bool> m_healthy{true};
+    mutable std::atomic<bool> m_healthy{true};
     std::atomic<uint64_t> m_reportsGenerated{0};
     std::atomic<uint64_t> m_reportsFailed{0};
     std::atomic<size_t> m_currentFileSize{0};
     std::chrono::steady_clock::time_point m_lastRotation;
-    
+
     // Error tracking
     mutable std::mutex m_errorMutex;
-    std::vector<std::string> m_errors;
+    mutable std::vector<std::string> m_errors;
     static constexpr size_t MAX_ERRORS = 50;
     
     // File management
@@ -262,12 +264,13 @@ private:
     std::string FormatMetricLine(const std::string& name, double value, 
                                 const std::unordered_map<std::string, std::string>& labels = {}) const;
     void ReportError(const std::string& error);
+    std::string EscapePrometheusString(const std::string& str) const;
 
     PrometheusReporterConfig m_config;
     std::atomic<bool> m_healthy{true};
     std::atomic<bool> m_serverRunning{false};
     std::thread m_serverThread;
-    
+
     // Latest snapshot for HTTP responses
     mutable std::mutex m_snapshotMutex;
     MetricsSnapshot m_latestSnapshot;

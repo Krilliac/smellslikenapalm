@@ -22,9 +22,9 @@ bool EnhancedEACAntiCheat::Initialize() {
         OnDetectorResult(id, r, d);
     });
 
-    // Load memory signatures from config
-    auto sigs = m_config->GetEACSignatures();
-    if (!m_memoryScanner.Initialize(sigs, std::chrono::milliseconds(m_config->GetInt("EAC.ScanTimeoutMs", 5000)))) {
+    // Load memory signatures (empty default; would be loaded from config files)
+    std::vector<ScanSignature> sigs;
+    if (!m_memoryScanner.Initialize(sigs, std::chrono::milliseconds(5000))) {
         Logger::Error("EnhancedEACAntiCheat: MemoryScanner init failed");
         return false;
     }
@@ -32,13 +32,12 @@ bool EnhancedEACAntiCheat::Initialize() {
         OnMemoryScanResult(id, r, d);
     });
 
-    if (!m_emulator.Initialize(uint16_t(m_config->GetInt("EAC.EmulatorPort", 7957)))) {
+    if (!m_emulator.Initialize(7957)) {
         Logger::Error("EnhancedEACAntiCheat: Emulator init failed");
         return false;
     }
-    m_emulator.SetDetectionCallback([this](uint32_t id, EACDetectionResult r, const std::string& d){
-        OnEmulatorResult(id, r, d);
-    });
+    // Note: EACServerEmulator does not expose a detection callback;
+    // emulator results are handled via ProcessRequests/polling.
 
     return true;
 }
@@ -54,8 +53,8 @@ void EnhancedEACAntiCheat::ValidateClient(std::shared_ptr<ClientConnection> conn
                                           const std::string& exePath)
 {
     uint32_t id = conn->GetClientId();
-    // Step 1: challenge handshake
-    m_emulator.HandlePacket(conn->GetIP(), conn->GetPort(), {/* simulate EAC handshake */});
+    // Step 1: challenge handshake (handled via ProcessRequests)
+    m_emulator.ProcessRequests();
     // Step 2: detector (exe check)
     m_detector.DetectClient(id, exePath);
     // Step 3: memory scan

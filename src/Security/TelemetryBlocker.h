@@ -28,6 +28,7 @@ public:
     using Clock = std::chrono::steady_clock;
     using Duration = std::chrono::seconds;
 
+    TelemetryBlocker();
     TelemetryBlocker(size_t maxEventsPerInterval,
                      Duration intervalDuration,
                      Duration blockDuration);
@@ -45,6 +46,15 @@ public:
 
     // Periodic maintenance to reset counters and expire blocks.
     void Update();
+
+    // Initialization
+    bool Initialize();
+
+    // Block all telemetry reporting
+    void BlockAllTelemetry();
+
+    // Block crash reporting
+    void BlockCrashReporting();
 
 private:
     struct ClientData {

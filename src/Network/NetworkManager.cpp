@@ -1,9 +1,12 @@
 // src/Network/NetworkManager.cpp
 
 #include "Network/NetworkManager.h"
+#include "Network/ConnectionManager.h"
+#include "Network/ClientConnection.h"
 #include "Game/GameServer.h"
+#include "Config/ConfigManager.h"
 #include "Utils/Logger.h"
-#include "Network/PacketHandler.h"  // if using PacketHandler for dispatch
+#include "Utils/PacketAnalysis.h"
 
 NetworkManager::NetworkManager(GameServer* server)
     : m_server(server)
@@ -20,9 +23,10 @@ bool NetworkManager::Initialize(uint16_t listenPort) {
     m_connMgr = std::make_unique<ConnectionManager>(m_server);
     if (!m_connMgr->Initialize(listenPort)) return false;
 
-    // Bandwidth limit
-    uint32_t bwLimit = m_server->GetConfigManager()->GetInt("Network.MaxPacketSize", 1200);
-    m_bwManager = std::make_unique<BandwidthManager>(bwLimit);
+    // Bandwidth limit from config
+    auto cfgMgr = m_server->GetConfigManager();
+    m_bandwidthLimit = cfgMgr ? (uint32_t)cfgMgr->GetInt("Network.bandwidth_limit", 65536) : 65536;
+    m_bwManager = std::make_unique<BandwidthManager>(m_bandwidthLimit);
 
     // Register our packet callback on ConnectionManager
     m_connMgr->SetPacketCallback([this](uint32_t clientId, const Packet& pkt, const PacketMetadata& meta) {
@@ -42,18 +46,15 @@ void NetworkManager::Shutdown() {
     m_bwManager.reset();
 }
 
-std::vector<ReceivedPacket> NetworkManager::ReceivePackets() {
-    // Poll network I/O
+void NetworkManager::PollNetwork() {
+    if (!m_connMgr) return;
     m_connMgr->PumpNetwork();
     m_connMgr->RemoveStaleConnections();
-    m_connMgr->UpdateBandwidthWindows();
-
-    // Return all packets queued via EnqueuePacket
-    return m_server->FetchPendingPackets();
+    if (m_bwManager) m_bwManager->Update();
 }
 
 void NetworkManager::Flush() {
-    // If you buffer outgoing, flush here
+    // If outgoing data is buffered, flush here
 }
 
 bool NetworkManager::SendPacket(uint32_t clientId, const Packet& pkt) {
@@ -74,30 +75,29 @@ void NetworkManager::BroadcastPacket(const std::string& tag, const std::vector<u
 }
 
 uint32_t NetworkManager::GetClientId(const ClientAddress& addr) const {
-    return m_connMgr->FindClientByAddress(addr.ip, addr.port);
+    return m_connMgr ? m_connMgr->FindClientByAddress(addr.ip, addr.port) : UINT32_MAX;
 }
 
 uint32_t NetworkManager::FindClientBySteamID(const std::string& steamId) const {
-    // Use ConnectionManager’s mapping via SteamID if implemented
-    return m_connMgr->FindClientBySteamID(steamId);
+    return m_connMgr ? m_connMgr->FindClientBySteamID(steamId) : UINT32_MAX;
 }
 
 std::shared_ptr<ClientConnection> NetworkManager::GetConnection(uint32_t clientId) const {
-    return m_connMgr->GetConnection(clientId);
+    return m_connMgr ? m_connMgr->GetConnection(clientId) : nullptr;
 }
 
 std::vector<std::shared_ptr<ClientConnection>> NetworkManager::GetAllConnections() const {
-    return m_connMgr->GetAllConnections();
+    return m_connMgr ? m_connMgr->GetAllConnections() : std::vector<std::shared_ptr<ClientConnection>>{};
 }
 
 uint32_t NetworkManager::GetBandwidthLimit() const {
-    return m_bwManager ? m_bwManager->m_maxBytesPerSec : 0;
+    return m_bandwidthLimit;
 }
 
 void NetworkManager::OnPacketReceived(uint32_t clientId, const Packet& pkt, const PacketMetadata& meta) {
     // Dump for analysis
     DumpPacketForAnalysis(pkt.RawData(), "NetworkManager_OnReceive");
 
-    // Enqueue into GameServer’s receive queue
+    // Enqueue into GameServer's receive queue
     m_server->EnqueuePacket({ clientId, pkt, meta });
 }

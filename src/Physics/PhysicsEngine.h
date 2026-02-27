@@ -1,7 +1,10 @@
 #pragma once
 
+#include <cstdint>
 #include <vector>
 #include <memory>
+#include <functional>
+#include <unordered_map>
 #include "Math/Vector3.h"
 #include "Game/ParticleEffect.h"
 

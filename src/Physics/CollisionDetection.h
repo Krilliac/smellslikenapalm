@@ -1,8 +1,10 @@
 // src/Physics/CollisionDetection.h
 #pragma once
 
+#include <cstdint>
 #include <vector>
 #include <functional>
+#include <unordered_map>
 #include "Math/Vector3.h"
 
 struct AABB {

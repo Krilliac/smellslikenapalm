@@ -192,3 +192,13 @@ std::string ServerConfig::GetAdminListFile() const {
 bool ServerConfig::IsChatAuthEnabled() const {
     return m_mgr->GetBool("Admin.chat_auth_enabled", true);
 }
+
+// EAC
+int ServerConfig::GetEACListenPort() const {
+    return m_mgr->GetInt("EAC.listen_port", 7957);
+}
+
+// Access underlying ConfigManager
+std::shared_ptr<ConfigManager> ServerConfig::GetManager() const {
+    return m_mgr;
+}

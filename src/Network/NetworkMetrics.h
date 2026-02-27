@@ -7,6 +7,7 @@
 #include <unordered_map>
 #include <vector>
 #include "Network/ClientConnection.h"
+#include "Network/BandwidthManager.h"
 
 struct ClientMetrics {
     uint32_t packetsSent       = 0;

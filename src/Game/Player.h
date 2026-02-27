@@ -3,6 +3,7 @@
 #pragma once
 
 #include <string>
+#include <vector>
 #include <chrono>
 #include <memory>
 #include "Math/Vector3.h"

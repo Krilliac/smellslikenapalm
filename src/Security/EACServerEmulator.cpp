@@ -6,6 +6,7 @@
 #include <cstring>
 #include <chrono>
 #include <algorithm>
+#include <random>
 
 EACServerEmulator::EACServerEmulator()
     : m_listenPort(0)
@@ -296,7 +297,7 @@ void EACServerEmulator::BroadcastDebugDraw(const DebugDrawPacket& packet) {
     std::lock_guard<std::mutex> lock(m_mutex);
     for (const auto& [clientId, session] : m_sessions) {
         if (session.authenticated) {
-            m_socket.SendTo(session.ip, session.port, &packet, sizeof(packet));
+            m_socket.SendTo(session.ip, session.port, reinterpret_cast<const uint8_t*>(&packet), sizeof(packet));
         }
     }
 }

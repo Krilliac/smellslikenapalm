@@ -24,13 +24,7 @@ GameWorld::~GameWorld() = default;
 
 bool GameWorld::Initialize()
 {
-    Logger::Info("Loading world geometry and spawn points");
-    if (!m_mapManager->LoadMapGeometry())
-    {
-        Logger::Error("Failed to load map geometry");
-        return false;
-    }
-
+    Logger::Info("Loading world spawn points");
     m_spawnPoints = m_mapManager->GetSpawnPoints();
     Logger::Info("Loaded %zu spawn points", m_spawnPoints.size());
     return true;
@@ -49,21 +43,28 @@ void GameWorld::RespawnPlayer(uint32_t playerId)
     if (!conn) return;
 
     // Choose spawn point for player's team
-    uint32_t teamId = conn->GetTeamId();
+    auto* tm = m_server->GetTeamManager();
+    uint32_t teamId = tm ? tm->GetPlayerTeam(playerId) : 0;
     auto pts = GetTeamSpawnPoints(teamId);
     if (pts.empty())
     {
         Logger::Warn("No spawn points for team %u, using fallback", teamId);
-        pts = m_spawnPoints;  // fallback
+        // Use all spawn point positions as fallback
+        for (const auto& sp : m_spawnPoints) {
+            pts.push_back(sp.position);
+        }
     }
+
+    if (pts.empty()) return;
 
     // Round-robin spawn
     size_t idx = m_nextSpawnIndex[teamId] % pts.size();
     Vector3 spawnPos = pts[idx];
     m_nextSpawnIndex[teamId]++;
 
-    conn->SendSpawnPosition(spawnPos);
-    Logger::Debug("Respawned player %u at (%.1f, %.1f, %.1f)", 
+    conn->SendPositionUpdate(spawnPos);
+    conn->SendSpawnPlayer();
+    Logger::Debug("Respawned player %u at (%.1f, %.1f, %.1f)",
                   playerId, spawnPos.x, spawnPos.y, spawnPos.z);
 }
 
@@ -80,8 +81,9 @@ void GameWorld::UpdateDynamicObjects(double deltaTime)
     for (auto& obj : m_dynamicObjects)
     {
         obj.Update(deltaTime);
-        if (obj.HasStateChanged())
-            m_server->BroadcastGameWorldUpdate(obj.Serialize());
+        if (obj.HasStateChanged()) {
+            // Dynamic object state updates are serialized in the world snapshot
+        }
     }
 }
 

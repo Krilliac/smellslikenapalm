@@ -2,11 +2,12 @@
 
 #pragma once
 
+#include <string>
 #include <vector>
 #include <map>
+#include <cstdint>
 #include <memory>
 #include "Math/Vector3.h"
-#include "Game/DynamicObject.h"
 #include "Game/SpawnPoint.h"
 #include "Game/Bounds.h"
 
@@ -14,6 +15,24 @@ class GameServer;
 class MapManager;
 class PlayerManager;
 class TeamManager;
+
+struct DynamicObject {
+    uint32_t    id = 0;
+    Vector3     position;
+    Vector3     velocity;
+    std::string type;
+    bool        stateChanged = false;
+
+    void Update(double deltaTime) {
+        Vector3 oldPos = position;
+        position += velocity * static_cast<float>(deltaTime);
+        stateChanged = (position != oldPos);
+    }
+
+    bool HasStateChanged() const {
+        return stateChanged;
+    }
+};
 
 class GameWorld {
 public:

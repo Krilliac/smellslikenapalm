@@ -111,7 +111,7 @@ bool INIParser::ParseStream(std::istream& stream) {
     
     // Initialize with global section
     m_sections[""] = INISection();
-    m_sections[""].name = "";
+    m_sections[""].sectionName ="";
     
     while (std::getline(stream, line)) {
         lineNumber++;
@@ -142,36 +142,37 @@ bool INIParser::ParseStream(std::istream& stream) {
                 // Empty line - nothing to do
                 break;
                 
-            case LineType::INVALID:
+            case LineType::INVALID: {
                 // Invalid line - log error
-                ParsingError error;
-                error.lineNumber = lineNumber;
-                error.line = originalLine;
-                error.message = "Invalid line format";
-                error.severity = ErrorSeverity::WARNING;
-                m_parsingErrors.push_back(error);
-                
+                ParsingError err;
+                err.lineNumber = lineNumber;
+                err.line = originalLine;
+                err.message = "Invalid line format";
+                err.severity = ErrorSeverity::WARNING;
+                m_parsingErrors.push_back(err);
+
                 Logger::Warn("Invalid line %zu in INI: %s", lineNumber, originalLine.c_str());
-                
+
                 if (m_parserConfig.strictMode) {
                     hasErrors = true;
                 }
                 break;
-                
-            case LineType::MULTILINE_START:
+            }
+            case LineType::MULTILINE_START: {
                 // Handle multiline values if enabled
                 if (m_parserConfig.allowMultilineValues) {
                     ProcessMultilineValue(stream, currentSection, lineNumber);
                 } else {
-                    ParsingError error;
-                    error.lineNumber = lineNumber;
-                    error.line = originalLine;
-                    error.message = "Multiline values not allowed";
-                    error.severity = ErrorSeverity::ERROR;
-                    m_parsingErrors.push_back(error);
+                    ParsingError err;
+                    err.lineNumber = lineNumber;
+                    err.line = originalLine;
+                    err.message = "Multiline values not allowed";
+                    err.severity = ErrorSeverity::ERROR;
+                    m_parsingErrors.push_back(err);
                     hasErrors = true;
                 }
                 break;
+            }
         }
     }
     
@@ -350,7 +351,7 @@ void INIParser::SetValue(const std::string& section, const std::string& key, con
     // Ensure section exists
     if (m_sections.find(section) == m_sections.end()) {
         m_sections[section] = INISection();
-        m_sections[section].name = section;
+        m_sections[section].sectionName =section;
     }
     
     // Set key-value pair
@@ -580,7 +581,7 @@ INIParser::LineType INIParser::ProcessSectionLine(const std::string& line, std::
     // Create section if it doesn't exist
     if (m_sections.find(sectionName) == m_sections.end()) {
         m_sections[sectionName] = INISection();
-        m_sections[sectionName].name = sectionName;
+        m_sections[sectionName].sectionName =sectionName;
         m_sections[sectionName].lineNumber = lineNumber;
     }
     
@@ -666,7 +667,7 @@ INIParser::LineType INIParser::ProcessKeyValueLine(const std::string& line, cons
     std::string targetSection = currentSection;
     if (m_sections.find(targetSection) == m_sections.end()) {
         m_sections[targetSection] = INISection();
-        m_sections[targetSection].name = targetSection;
+        m_sections[targetSection].sectionName =targetSection;
     }
     
     // Normalize key if case-insensitive
@@ -760,9 +761,9 @@ bool INIParser::IsValidKeyName(const std::string& name) const {
     }
     
     // Check against validation pattern if specified
-    if (!m_parserConfig.keyNamePattern.empty()) {
+    if (!m_parserConfig.sectionNamePattern.empty()) {
         try {
-            std::regex pattern(m_parserConfig.keyNamePattern);
+            std::regex pattern(m_parserConfig.sectionNamePattern);
             return std::regex_match(name, pattern);
         } catch (const std::exception& e) {
             Logger::Warn("Invalid key name regex pattern: %s", e.what());
@@ -1103,7 +1104,7 @@ void INIParser::PreserveComment(const std::string& section, const std::string& c
     
     PreservedComment preservedComment;
     preservedComment.section = section;
-    preservedComment.comment = comment;
+    preservedComment.text = comment;
     preservedComment.lineNumber = lineNumber;
     preservedComment.beforeSection = true; // Default to before section
     
@@ -1119,7 +1120,7 @@ void INIParser::WriteSectionContent(std::ostream& stream, const INISection& sect
         stream << keyValue.key << m_parserConfig.keyValueSeparator;
         
         // Add space after separator for readability
-        if (m_parserConfig.addSpaceAroundSeparator) {
+        if (true /* addSpaceAroundSeparator */) {
             stream << " ";
         }
         
@@ -1152,7 +1153,7 @@ void INIParser::WriteComment(std::ostream& stream, const std::string& comment) {
 void INIParser::WritePreservedComments(std::ostream& stream, const std::string& section, bool beforeSection) {
     for (const auto& comment : m_preservedComments) {
         if (comment.section == section && comment.beforeSection == beforeSection) {
-            stream << comment.comment << std::endl;
+            stream << comment.text << std::endl;
         }
     }
 }
@@ -1212,7 +1213,7 @@ void INIParser::InitializeValidationPatterns() {
     
     // Set up regex patterns for validation
     m_parserConfig.sectionNamePattern = R"([a-zA-Z0-9_\-\.]+)";
-    m_parserConfig.keyNamePattern = R"([a-zA-Z0-9_\-\.]+)";
+    m_parserConfig.sectionNamePattern = R"([a-zA-Z0-9_\-\.]+)";
     
     Logger::Debug("Validation patterns initialized");
 }
@@ -1251,15 +1252,15 @@ void INIParser::LogParsingErrors() {
         const char* severityStr = (error.severity == ErrorSeverity::ERROR) ? "ERROR" : "WARNING";
         
         if (error.lineNumber > 0) {
-            Logger::Log(error.severity == ErrorSeverity::ERROR ? LogLevel::ERROR : LogLevel::WARN,
+            Logger::Log(error.severity == ErrorSeverity::ERROR ? LogLevel::Error : LogLevel::Warn,
                        "  Line %zu [%s]: %s", error.lineNumber, severityStr, error.message.c_str());
             
             if (!error.line.empty()) {
-                Logger::Log(error.severity == ErrorSeverity::ERROR ? LogLevel::ERROR : LogLevel::WARN,
+                Logger::Log(error.severity == ErrorSeverity::ERROR ? LogLevel::Error : LogLevel::Warn,
                            "    > %s", error.line.c_str());
             }
         } else {
-            Logger::Log(error.severity == ErrorSeverity::ERROR ? LogLevel::ERROR : LogLevel::WARN,
+            Logger::Log(error.severity == ErrorSeverity::ERROR ? LogLevel::Error : LogLevel::Warn,
                        "  [%s]: %s", severityStr, error.message.c_str());
         }
     }

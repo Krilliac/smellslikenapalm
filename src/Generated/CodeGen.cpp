@@ -4,6 +4,7 @@
 #include <sstream>
 #include <filesystem>
 #include "Protocol/PacketTypes.h"
+#include "Protocol/ProtocolUtils.h"
 #include "Utils/Logger.h"
 
 int main(int argc, char** argv) {

@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <thread>
 #include <chrono>
+#include <atomic>
 
 // Core systems
 #include "Config/ConfigManager.h"
@@ -25,21 +26,19 @@
 // Security / EAC emulator
 #include "Security/EACServerEmulator.h"
 
-// Scripting systems
-#include "Scripting/ScriptManager.h"
-#include "Scripting/ScriptHost.h"
-
 // Global server and subsystems for signal handling
 static std::unique_ptr<GameServer>         g_server;
 static std::unique_ptr<EACServerEmulator>  g_eacServer;
-static std::unique_ptr<ScriptManager>      g_scriptMgr;
+static GameClock*                          g_gameClock = nullptr;
+static std::atomic<bool>                   g_shutdownRequested{false};
 
 // Signal handler for graceful shutdown
 void SignalHandler(int signal)
 {
     Logger::Info("Received signal %d, initiating graceful shutdown...", signal);
-    if (g_server)
-        g_server->RequestShutdown();
+    g_shutdownRequested = true;
+    if (g_gameClock)
+        g_gameClock->Stop();
 }
 
 // Setup signal handlers
@@ -53,35 +52,36 @@ void SetupSignalHandlers()
 #endif
 }
 
-// Initialize logging
+// Initialize logging from a config file path
 bool InitializeLogging(const std::string& configPath)
 {
     try {
         auto cfgMgr = std::make_shared<ConfigManager>();
-        if (!cfgMgr->Initialize())
-            std::cerr << "Warning: ConfigManager init failed; using defaults\n";
-
-        if (!cfgMgr->LoadConfiguration(configPath))
-            std::cerr << "Warning: Could not load config file; using defaults\n";
+        // Don't fail hard on init — we may not have a config dir yet
+        cfgMgr->Initialize();
+        cfgMgr->LoadConfiguration(configPath);
 
         ServerConfig cfg(cfgMgr);
         std::string logfile  = cfg.GetLogDirectory() + "/" + cfg.GetLogFileName();
         std::string loglevel = cfg.GetLogLevel();
 
         Logger::Initialize(logfile);
-        if      (loglevel == "TRACE") Logger::SetLevel(LogLevel::Trace);
-        else if (loglevel == "DEBUG") Logger::SetLevel(LogLevel::Debug);
-        else if (loglevel == "INFO")  Logger::SetLevel(LogLevel::Info);
-        else if (loglevel == "WARN")  Logger::SetLevel(LogLevel::Warn);
-        else if (loglevel == "ERROR") Logger::SetLevel(LogLevel::Error);
-        else                           Logger::SetLevel(LogLevel::Info);
+        if      (loglevel == "TRACE" || loglevel == "trace") Logger::SetLevel(LogLevel::Trace);
+        else if (loglevel == "DEBUG" || loglevel == "debug") Logger::SetLevel(LogLevel::Debug);
+        else if (loglevel == "INFO"  || loglevel == "info")  Logger::SetLevel(LogLevel::Info);
+        else if (loglevel == "WARN"  || loglevel == "warn")  Logger::SetLevel(LogLevel::Warn);
+        else if (loglevel == "ERROR" || loglevel == "error") Logger::SetLevel(LogLevel::Error);
+        else                                                  Logger::SetLevel(LogLevel::Info);
 
         Logger::Info("RS2V Server starting up...");
         return true;
     }
     catch (const std::exception& e) {
         std::cerr << "Failed to initialize logging: " << e.what() << "\n";
-        return false;
+        // Fall back to console logging
+        Logger::Initialize("");
+        Logger::SetLevel(LogLevel::Info);
+        return true;
     }
 }
 
@@ -97,7 +97,7 @@ void PrintUsage(const char* prog)
                  "  -v, --version          Show version\n\n";
 }
 
-// Command‐line parsing
+// Command-line parsing
 struct CmdArgs {
     std::string configFile = "config/server.ini";
     uint16_t    port       = 0;
@@ -144,77 +144,64 @@ int main(int argc, char* argv[])
 
     SetupSignalHandlers();
 
-    // Load configurations
-    auto cfgMgr = std::make_shared<ConfigManager>();
-    if (!cfgMgr->Initialize() || !cfgMgr->LoadConfiguration(args.configFile)) {
-        Logger::Error("Failed to load configuration");
-        return EXIT_FAILURE;
-    }
-    ServerConfig serverCfg(cfgMgr);
-
-    // Override port if specified
-    if (args.port) {
-        cfgMgr->SetInt("Network.port", args.port);
-    }
-
-    // Initialize network
+    // Initialize network platform (WSAStartup on Windows, no-op on POSIX)
     if (!SocketFactory::Initialize()) {
         Logger::Error("Networking platform init failed");
         return EXIT_FAILURE;
     }
 
-    // Start GameServer
-    g_server = std::make_unique<GameServer>(serverCfg);
+    // Start GameServer — it internally loads configs and creates subsystems
+    g_server = std::make_unique<GameServer>();
     if (!g_server->Initialize()) {
         Logger::Error("GameServer initialization failed");
         SocketFactory::Shutdown();
         return EXIT_FAILURE;
     }
 
-    // Start EAC emulator
-    g_eacServer = std::make_unique<EACServerEmulator>();
-    if (!g_eacServer->Initialize(serverCfg.GetEACListenPort())) {
-        Logger::Error("EAC emulator failed to start");
+    auto serverCfg = g_server->GetServerConfig();
+
+    // Override port if specified on command line
+    if (args.port && g_server->GetConfigManager()) {
+        g_server->GetConfigManager()->SetInt("Network.port", args.port);
     }
 
-    // Initialize scripting
-    g_scriptMgr = std::make_unique<ScriptManager>(serverCfg);
-    if (!g_scriptMgr->Initialize()) {
-        Logger::Warn("C# scripting init failed; continuing without scripts");
-    } else {
-        // Wire ScriptHost facade
-        if (!ScriptHost::Initialize(g_scriptMgr.get(), cfgMgr, g_server.get(), g_eacServer.get())) {
-            Logger::Error("ScriptHost initialization failed");
-        }
+    // Start EAC emulator on configured port (default 7957)
+    uint16_t eacPort = (uint16_t)g_server->GetConfigManager()->GetInt("EAC.listen_port", 7957);
+    g_eacServer = std::make_unique<EACServerEmulator>();
+    if (!g_eacServer->Initialize(eacPort)) {
+        Logger::Warn("EAC emulator failed to start on port %u; continuing without EAC", eacPort);
     }
 
     Logger::Info("Server initialized successfully");
-    Logger::Info("Listening on port: %d", serverCfg.GetPort());
+    Logger::Info("Listening on port: %d", serverCfg ? serverCfg->GetPort() : 7777);
 
     // GameClock for fixed timestep updates
     GameClock gameClock;
-    gameClock.SetTickRate(serverCfg.GetTickRate());
-    gameClock.RegisterTickCallback([&](GameClock::Duration delta) {
-        // Update server logic
-        g_server->Update(delta);
+    g_gameClock = &gameClock;
+    int tickRate = serverCfg ? serverCfg->GetTickRate() : 60;
+    gameClock.SetTickRate(tickRate);
 
-        // Process EAC and scripting events
-        g_eacServer->ProcessRequests();
-        ProcessScheduledCallbacks();
+    gameClock.RegisterTickCallback([&](GameClock::Duration /*delta*/) {
+        if (g_shutdownRequested) {
+            gameClock.Stop();
+            return;
+        }
+
+        // Run one tick of the game server
+        g_server->Run();
+
+        // Process EAC requests (no-op if threaded mode active)
+        if (g_eacServer) {
+            g_eacServer->ProcessRequests();
+        }
     });
 
-    Logger::Info("Entering main loop at %d ticks/sec", serverCfg.GetTickRate());
+    Logger::Info("Entering main loop at %d ticks/sec", tickRate);
     gameClock.RunLoop();
 
     Logger::Info("Main loop exited, shutting down...");
 
     // Shutdown sequence
-    ScriptHost::Shutdown();
-    if (g_scriptMgr) {
-        g_scriptMgr->Shutdown();
-        g_scriptMgr.reset();
-    }
-
     if (g_eacServer) {
         g_eacServer->Shutdown();
         g_eacServer.reset();
@@ -226,6 +213,7 @@ int main(int argc, char* argv[])
     }
 
     SocketFactory::Shutdown();
+    g_gameClock = nullptr;
     Logger::Info("RS2V Server shutdown complete");
     Logger::Shutdown();
     return EXIT_SUCCESS;

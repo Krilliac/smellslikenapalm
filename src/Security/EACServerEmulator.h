@@ -50,6 +50,9 @@ public:
     // Debug drawing support
     void BroadcastDebugDraw(const DebugDrawPacket& packet);
 
+    // Packet handling (used by EnhancedEACAntiCheat)
+    void HandlePacket(const std::string& ip, uint16_t port, const std::vector<uint8_t>& data);
+
 private:
     UDPSocket m_socket;
     uint16_t m_listenPort;
@@ -80,7 +83,6 @@ private:
 
     // Internal handlers
     void RunLoop();
-    void HandlePacket(const std::string& ip, uint16_t port, const std::vector<uint8_t>& data);
     void HandleMemoryReply(uint32_t clientId, const uint8_t* data, size_t dataSize);
     
     // EAC protocol handlers

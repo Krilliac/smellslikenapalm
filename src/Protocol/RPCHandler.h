@@ -1,7 +1,9 @@
 // src/Protocol/RPCHandler.h
 #pragma once
 
+#include <optional>
 #include <string>
+#include <vector>
 #include <unordered_map>
 #include <functional>
 #include "Network/Packet.h"
@@ -34,6 +36,6 @@ public:
 
 private:
     std::unordered_map<std::string, RPCFunc> m_rpcMap;
-    std::string m_requestTag   = "RPC_CALL";
-    std::string m_responseTag  = "RPC_RESPONSE";
+    static constexpr const char* m_requestTag   = "RPC_CALL";
+    static constexpr const char* m_responseTag  = "RPC_RESPONSE";
 };

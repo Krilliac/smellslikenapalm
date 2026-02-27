@@ -3,12 +3,15 @@
 #include "Game/GameState.h"
 #include "Game/GameServer.h"
 #include "Game/GameMode.h"
+#include "Game/PlayerManager.h"
 #include "Game/TeamManager.h"
 #include "Game/MapManager.h"
 #include "Config/GameConfig.h"
 #include "Utils/Logger.h"
 #include "Network/NetworkManager.h"
 #include <algorithm>
+#include <cstring>
+#include <cstring>
 
 GameState::GameState(GameServer* server)
     : m_server(server),
@@ -41,7 +44,7 @@ void GameState::Initialize()
         auto gameModedef = gameConfig->GetGameModeDefinition(settings.gameMode);
         if (gameModedef) {
             m_scoreLimit = gameModedef->scoreLimit;
-            m_objectiveLimit = gameModedef->objectiveLimit;
+            m_objectiveLimit = 5; // default objective limit
         }
     }
     
@@ -201,7 +204,10 @@ void GameState::StartRound()
     // Spawn all players
     auto playerManager = m_server->GetPlayerManager();
     if (playerManager) {
-        playerManager->SpawnAllPlayers();
+        for (auto& p : playerManager->GetDeadPlayers()) {
+            uint32_t id = p->GetConnection()->GetClientId();
+            playerManager->OnPlayerSpawn(id);
+        }
     }
     
     BroadcastGameState();

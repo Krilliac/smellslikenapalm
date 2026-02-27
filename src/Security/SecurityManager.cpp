@@ -15,10 +15,7 @@ SecurityManager::~SecurityManager() {
 }
 
 bool SecurityManager::Initialize() {
-    if (!m_auth.Initialize()) {
-        Logger::Error("SecurityManager: Authentication init failed");
-        return false;
-    }
+    // Authentication has no separate Initialize; it's ready after construction
     if (!m_banManager.LoadBans()) {
         Logger::Warn("SecurityManager: could not load bans (proceeding)");
     }
@@ -117,7 +114,7 @@ void SecurityManager::HandleEACReport(const EnhancedEACReport& report) {
         auto it = m_connections.find(report.clientId);
         if (it != m_connections.end()) {
             ClientAddress addr{ it->second->GetIP(), it->second->GetPort() };
-            m_blocker.Block(addr, std::chrono::seconds(m_config->GetInt("Security.BlockDurationSec", 60)));
+            m_blocker.Block(addr, std::chrono::seconds(60));
             DisconnectClient(report.clientId, "Cheat detected");
         }
     }

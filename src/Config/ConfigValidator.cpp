@@ -14,6 +14,14 @@ ConfigValidator::ConfigValidator() {
     InitializeValidationRules();
 }
 
+void ConfigValidator::InitializeValidationRules() {
+    Logger::Debug("Initializing validation rules");
+}
+
+void ConfigValidator::InitializeCustomValidators() {
+    Logger::Debug("Initializing custom validators");
+}
+
 ConfigValidator::~ConfigValidator() = default;
 
 bool ConfigValidator::Initialize() {
@@ -115,7 +123,7 @@ void ConfigValidator::ValidateSecuritySection(const std::map<std::string, std::s
     // custom_auth_tokens_file must exist if fallback_custom_auth is true
     if (GetBool(cfg, "Security.fallback_custom_auth", false)) {
         std::string f = GetString(cfg, "Security.custom_auth_tokens_file", "");
-        if (!Utils::FileExists(f)) {
+        if (!std::filesystem::exists(f)) {
             r.errors.push_back("Security.custom_auth_tokens_file does not exist: " + f);
             r.isValid = false;
         }
@@ -200,13 +208,43 @@ void ConfigValidator::CheckDeprecatedSettings(const std::map<std::string, std::s
     }
 }
 
-std::optional<std::string> ConfigValidator::GetConfigValue(
+std::optional<std::string> ConfigValidator::GetConfig(
     const std::map<std::string, std::string>& cfg,
     const std::string& key)
 {
     auto it = cfg.find(key);
     if (it != cfg.end()) return it->second;
     return std::nullopt;
+}
+
+std::optional<std::string> ConfigValidator::GetConfigValue(
+    const std::map<std::string, std::string>& cfg,
+    const std::string& key)
+{
+    return GetConfig(cfg, key);
+}
+
+std::string ConfigValidator::GetString(
+    const std::map<std::string, std::string>& cfg,
+    const std::string& key,
+    const std::string& defaultValue)
+{
+    auto it = cfg.find(key);
+    if (it != cfg.end()) return it->second;
+    return defaultValue;
+}
+
+bool ConfigValidator::GetBool(
+    const std::map<std::string, std::string>& cfg,
+    const std::string& key,
+    bool defaultValue)
+{
+    auto it = cfg.find(key);
+    if (it == cfg.end()) return defaultValue;
+    auto s = StringUtils::ToLower(it->second);
+    if (s == "true" || s == "1") return true;
+    if (s == "false" || s == "0") return false;
+    return defaultValue;
 }
 
 bool ConfigValidator::ValidateBooleanString(const std::string& v) {

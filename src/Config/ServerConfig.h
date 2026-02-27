@@ -84,6 +84,12 @@ public:
     std::string GetAdminListFile() const;
     bool        IsChatAuthEnabled() const;
 
+    // EAC
+    int         GetEACListenPort() const;
+
+    // Access to underlying ConfigManager
+    std::shared_ptr<ConfigManager> GetManager() const;
+
 private:
     std::shared_ptr<ConfigManager> m_mgr;
 };

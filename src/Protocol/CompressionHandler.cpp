@@ -3,9 +3,10 @@
 #include "Utils/Logger.h"
 #include <cstring>
 
-// Include compression library headers
+// Include compression library headers conditionally
+#ifdef RS2V_HAS_ZLIB
 #include <zlib.h>
-#include <lz4.h>
+#endif
 
 bool CompressionHandler::Compress(const std::vector<uint8_t>& input,
                                   std::vector<uint8_t>& output,
@@ -18,6 +19,7 @@ bool CompressionHandler::Compress(const std::vector<uint8_t>& input,
             return true;
 
         case CompressionAlgorithm::ZLIB: {
+#ifdef RS2V_HAS_ZLIB
             uLongf destLen = compressBound(input.size());
             output.resize(destLen);
             int ret = ::compress2(output.data(), &destLen,
@@ -29,21 +31,18 @@ bool CompressionHandler::Compress(const std::vector<uint8_t>& input,
             }
             output.resize(destLen);
             return true;
+#else
+            Logger::Error("CompressionHandler: zlib not available");
+            output = input;
+            return false;
+#endif
         }
 
         case CompressionAlgorithm::LZ4: {
-            int maxDst = LZ4_compressBound(input.size());
-            output.resize(maxDst);
-            int compressedSize = LZ4_compress_default(
-                reinterpret_cast<const char*>(input.data()),
-                reinterpret_cast<char*>(output.data()),
-                input.size(), maxDst);
-            if (compressedSize <= 0) {
-                Logger::Error("CompressionHandler: LZ4_compress_default failed");
-                return false;
-            }
-            output.resize(compressedSize);
-            return true;
+            // LZ4 not available in this build
+            Logger::Error("CompressionHandler: LZ4 not available");
+            output = input;
+            return false;
         }
     }
     return false;
@@ -59,7 +58,7 @@ bool CompressionHandler::Decompress(const std::vector<uint8_t>& input,
             return true;
 
         case CompressionAlgorithm::ZLIB: {
-            // Need to know or guess decompressed size; here we try doubling until success
+#ifdef RS2V_HAS_ZLIB
             uLongf destLen = input.size() * 2;
             output.resize(destLen);
             int ret = Z_BUF_ERROR;
@@ -77,26 +76,17 @@ bool CompressionHandler::Decompress(const std::vector<uint8_t>& input,
             }
             output.resize(destLen);
             return true;
+#else
+            Logger::Error("CompressionHandler: zlib not available");
+            output = input;
+            return false;
+#endif
         }
 
         case CompressionAlgorithm::LZ4: {
-            // LZ4 requires original size; assume first 4 bytes prefix it
-            if (input.size() < 4) {
-                Logger::Error("CompressionHandler: LZ4 input too small for size prefix");
-                return false;
-            }
-            uint32_t origSize;
-            std::memcpy(&origSize, input.data(), 4);
-            output.resize(origSize);
-            int decoded = LZ4_decompress_safe(
-                reinterpret_cast<const char*>(input.data()) + 4,
-                reinterpret_cast<char*>(output.data()),
-                input.size() - 4, origSize);
-            if (decoded < 0) {
-                Logger::Error("CompressionHandler: LZ4_decompress_safe failed (code %d)", decoded);
-                return false;
-            }
-            return true;
+            Logger::Error("CompressionHandler: LZ4 not available");
+            output = input;
+            return false;
         }
     }
     return false;

@@ -8,7 +8,7 @@
 #include "Security/Authentication.h"
 #include "Security/BanManager.h"
 #include "Security/EnhancedEACAntiCheat.h"
-#include "Network/NetworkBlocker.h"
+#include "Security/NetworkBlocker.h"
 
 class SecurityManager {
 public:
