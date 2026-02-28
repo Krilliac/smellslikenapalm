@@ -40,6 +40,7 @@ using namespace GeneratedHandlers;
 // --- Handler Regen/Reload Implementation ---
 
 void GameServer::Cmd_RegenHandlers(const std::vector<std::string>& /*args*/) {
+    Logger::Trace("[GameServer::Cmd_RegenHandlers] Entry");
     std::string codeGenExe = PathUtils::ResolveFromExecutable("PacketHandlerCodeGen");
 #ifdef _WIN32
     if (codeGenExe.find(".exe") == std::string::npos) codeGenExe += ".exe";
@@ -47,20 +48,28 @@ void GameServer::Cmd_RegenHandlers(const std::vector<std::string>& /*args*/) {
     std::string handlersDir = PathUtils::ResolveFromExecutable("src/Generated/Handlers");
     std::string cmd = codeGenExe + " " + handlersDir;
 
-    Logger::Info("Executing handler regeneration: %s", cmd.c_str());
+    Logger::Info("[GameServer::Cmd_RegenHandlers] Executing handler regeneration: %s", cmd.c_str());
     int ret = std::system(cmd.c_str());
     if (ret == 0) {
+        Logger::Debug("[GameServer::Cmd_RegenHandlers] System command succeeded, reloading handlers");
         Logger::Info("Handler stubs regenerated successfully.");
         DynamicReloadGeneratedHandlers();
     } else {
-        Logger::Error("Failed to regenerate handler stubs (exit %d)", ret);
+        Logger::Error("[GameServer::Cmd_RegenHandlers] Failed to regenerate handler stubs (exit %d)", ret);
     }
+    Logger::Trace("[GameServer::Cmd_RegenHandlers] Exit");
 }
 
 void GameServer::StartAutoRegen(int intervalSeconds) {
-    if (m_regenRunning) return;
+    Logger::Trace("[GameServer::StartAutoRegen] Entry, intervalSeconds=%d", intervalSeconds);
+    if (m_regenRunning) {
+        Logger::Debug("[GameServer::StartAutoRegen] Already running, skipping");
+        Logger::Trace("[GameServer::StartAutoRegen] Exit (already running)");
+        return;
+    }
     m_regenRunning = true;
     m_regenIntervalSeconds = intervalSeconds;
+    Logger::Debug("[GameServer::StartAutoRegen] Starting regen thread with interval %d seconds", intervalSeconds);
     m_regenThread = std::thread([this]() {
         Logger::Info("Auto handler regeneration thread started (interval: %d seconds)", m_regenIntervalSeconds);
         while (m_regenRunning) {
@@ -69,21 +78,27 @@ void GameServer::StartAutoRegen(int intervalSeconds) {
                 std::this_thread::sleep_for(std::chrono::seconds(1));
             }
             if (m_regenRunning) {
+                Logger::Debug("[GameServer::StartAutoRegen] Triggering periodic handler regeneration");
                 Cmd_RegenHandlers();
             }
         }
         Logger::Info("Auto handler regeneration thread stopped");
     });
     m_regenThread.detach();
+    Logger::Trace("[GameServer::StartAutoRegen] Exit");
 }
 
 void GameServer::StopAutoRegen() {
+    Logger::Trace("[GameServer::StopAutoRegen] Entry");
     m_regenRunning = false;
     Logger::Info("Auto handler regeneration requested to stop.");
+    Logger::Trace("[GameServer::StopAutoRegen] Exit");
 }
 
 void GameServer::DynamicReloadGeneratedHandlers() {
+    Logger::Trace("[GameServer::DynamicReloadGeneratedHandlers] Entry");
     if (m_handlerLibraryPath.empty()) {
+        Logger::Debug("[GameServer::DynamicReloadGeneratedHandlers] Library path empty, resolving platform-specific path");
 #ifdef _WIN32
         m_handlerLibraryPath = PathUtils::ResolveFromExecutable("GeneratedHandlers.dll");
 #elif defined(__APPLE__)
@@ -91,46 +106,60 @@ void GameServer::DynamicReloadGeneratedHandlers() {
 #else
         m_handlerLibraryPath = PathUtils::ResolveFromExecutable("libGeneratedHandlers.so");
 #endif
+        Logger::Debug("[GameServer::DynamicReloadGeneratedHandlers] Resolved library path: %s", m_handlerLibraryPath.c_str());
         if (!std::filesystem::exists(m_handlerLibraryPath)) {
             Logger::Warn("Handler library not found: %s", m_handlerLibraryPath.c_str());
+            Logger::Trace("[GameServer::DynamicReloadGeneratedHandlers] Exit (library not found)");
             return;
         }
         if (!HandlerLibraryManager::Instance().Initialize(m_handlerLibraryPath)) {
-            Logger::Error("Failed to initialize handler library manager");
+            Logger::Error("[GameServer::DynamicReloadGeneratedHandlers] Failed to initialize handler library manager");
+            Logger::Trace("[GameServer::DynamicReloadGeneratedHandlers] Exit (init failed)");
             return;
         }
+        Logger::Debug("[GameServer::DynamicReloadGeneratedHandlers] Handler library manager initialized");
     }
     if (HandlerLibraryManager::Instance().ForceReload()) {
         Logger::Info("Generated handlers reloaded successfully.");
     } else {
-        Logger::Error("Failed to reload generated handlers.");
+        Logger::Error("[GameServer::DynamicReloadGeneratedHandlers] Failed to reload generated handlers.");
     }
+    Logger::Trace("[GameServer::DynamicReloadGeneratedHandlers] Exit");
 }
 
 // --- Core GameServer Implementation ---
 
 GameServer::GameServer() {
+    Logger::Trace("[GameServer::GameServer] Entry");
     Logger::Info("GameServer constructed");
+    Logger::Trace("[GameServer::GameServer] Exit");
 }
 
 GameServer::~GameServer() {
+    Logger::Trace("[GameServer::~GameServer] Entry");
     Shutdown();
     StopAutoRegen();
     GetProtocolDecoder().Shutdown();
     HandlerLibraryManager::Instance().Shutdown();
+    Logger::Trace("[GameServer::~GameServer] Exit");
 }
 
 bool GameServer::Initialize() {
+    Logger::Trace("[GameServer::Initialize] Entry");
     Logger::Info("GameServer initialization starting...");
 
     // Load configurations
+    Logger::Debug("[GameServer::Initialize] Creating ConfigManager");
     m_configManager = std::make_shared<ConfigManager>();
     if (!m_configManager->Initialize()) {
-        Logger::Warn("ConfigManager init failed — using defaults");
+        Logger::Warn("[GameServer::Initialize] ConfigManager init failed — using defaults");
+    } else {
+        Logger::Debug("[GameServer::Initialize] ConfigManager initialized successfully");
     }
 
     // Create config wrappers — ServerConfig wraps ConfigManager directly,
     // the rest wrap ServerConfig
+    Logger::Debug("[GameServer::Initialize] Creating config wrappers");
     m_serverConfig   = std::make_shared<ServerConfig>(m_configManager);
     m_networkConfig  = std::make_shared<NetworkConfig>(*m_serverConfig);
     m_securityConfig = std::make_shared<SecurityConfig>(*m_serverConfig);
@@ -140,12 +169,16 @@ bool GameServer::Initialize() {
     // Initialize network manager
     m_networkManager = std::make_unique<NetworkManager>(this);
     uint16_t listenPort = (uint16_t)m_serverConfig->GetPort();
+    Logger::Debug("[GameServer::Initialize] Initializing NetworkManager on port %u", listenPort);
     if (!m_networkManager->Initialize(listenPort)) {
-        Logger::Error("NetworkManager init failed on port %u", listenPort);
+        Logger::Error("[GameServer::Initialize] NetworkManager init failed on port %u", listenPort);
+        Logger::Trace("[GameServer::Initialize] Exit, returning false");
         return false;
     }
+    Logger::Debug("[GameServer::Initialize] NetworkManager initialized successfully");
 
     // Initialize game managers
+    Logger::Debug("[GameServer::Initialize] Creating game managers");
     m_playerManager = std::make_unique<PlayerManager>(this);
     m_teamManager   = std::make_unique<TeamManager>(this);
     m_mapManager    = std::make_unique<MapManager>(this, m_mapConfig);
@@ -157,6 +190,7 @@ bool GameServer::Initialize() {
     m_chatManager->Initialize();
 
     // Initialize RS2V game systems
+    Logger::Debug("[GameServer::Initialize] Initializing RS2V game systems");
     m_weaponDatabase = std::make_unique<WeaponDatabase>();
     m_weaponDatabase->Initialize();
 
@@ -219,16 +253,20 @@ bool GameServer::Initialize() {
 
     // Start first map and game mode
     std::string mapName = m_gameConfig->GetGameSettings().mapName;
+    Logger::Debug("[GameServer::Initialize] Attempting to load initial map: '%s'", mapName.c_str());
     if (!mapName.empty() && !m_mapManager->LoadMap(mapName)) {
-        Logger::Warn("Failed to load map: %s — continuing without map", mapName.c_str());
+        Logger::Warn("[GameServer::Initialize] Failed to load map: %s — continuing without map", mapName.c_str());
+    } else if (!mapName.empty()) {
+        Logger::Debug("[GameServer::Initialize] Map '%s' loaded successfully", mapName.c_str());
     }
 
     const auto& gmDef = m_gameConfig->GetGameModeDefinition(m_gameConfig->GetGameSettings().gameMode);
     if (gmDef) {
+        Logger::Debug("[GameServer::Initialize] Creating GameMode from definition");
         m_gameMode = std::make_unique<GameMode>(this, *gmDef);
         m_gameMode->OnStart();
     } else {
-        Logger::Warn("No valid game mode definition found — continuing without game mode");
+        Logger::Warn("[GameServer::Initialize] No valid game mode definition found — continuing without game mode");
     }
 
     // Initialize protocol reverse-engineering decoder
@@ -249,15 +287,22 @@ bool GameServer::Initialize() {
     }
 
     // Start periodic handler regeneration (every 1 hour by default)
+    Logger::Debug("[GameServer::Initialize] Starting periodic handler regeneration (3600s interval)");
     StartAutoRegen(3600);
 
     m_running = true;
     Logger::Info("GameServer initialized successfully");
+    Logger::Trace("[GameServer::Initialize] Exit, returning true");
     return true;
 }
 
 void GameServer::Run() {
-    if (!m_running) return;
+    Logger::Trace("[GameServer::Run] Entry");
+    if (!m_running) {
+        Logger::Debug("[GameServer::Run] Server not running, skipping tick");
+        Logger::Trace("[GameServer::Run] Exit (not running)");
+        return;
+    }
 
     // Poll network and process received packets
     if (m_networkManager) {
@@ -266,11 +311,16 @@ void GameServer::Run() {
 
     // Process queued packets
     auto packets = FetchPendingPackets();
+    Logger::Trace("[GameServer::Run] Processing %zu queued packets", packets.size());
     for (auto& qpkt : packets) {
         auto conn = GetClientConnection(qpkt.clientId);
-        if (!conn) continue;
+        if (!conn) {
+            Logger::Debug("[GameServer::Run] No connection for clientId=%u, skipping packet", qpkt.clientId);
+            continue;
+        }
 
         std::string tag = qpkt.packet.GetTag();
+        Logger::Debug("[GameServer::Run] Processing packet tag='%s' from clientId=%u", tag.c_str(), qpkt.clientId);
         if (tag == "CHAT_MESSAGE" && m_chatManager) {
             Packet pktCopy = qpkt.packet;
             std::string chatText = pktCopy.ReadString();
@@ -288,7 +338,10 @@ void GameServer::Run() {
         } else if (tag == "WEAPON_FIRE") {
             HandleWeaponFire(qpkt.clientId, qpkt.packet.RawData());
         } else if (m_gameMode) {
+            Logger::Debug("[GameServer::Run] Forwarding unhandled tag '%s' to GameMode", tag.c_str());
             m_gameMode->HandlePlayerAction(qpkt.clientId, tag, qpkt.packet.RawData());
+        } else {
+            Logger::Debug("[GameServer::Run] Unhandled packet tag '%s' and no GameMode available", tag.c_str());
         }
     }
 
@@ -312,16 +365,23 @@ void GameServer::Run() {
     if (m_skirmishMode) m_skirmishMode->Update(dt);
 
     if (m_networkManager) m_networkManager->Flush();
+    Logger::Trace("[GameServer::Run] Exit");
 }
 
 void GameServer::Shutdown() {
-    if (!m_running) return;
+    Logger::Trace("[GameServer::Shutdown] Entry");
+    if (!m_running) {
+        Logger::Debug("[GameServer::Shutdown] Already shut down, skipping");
+        Logger::Trace("[GameServer::Shutdown] Exit (already shut down)");
+        return;
+    }
     Logger::Info("Shutting down GameServer...");
 
     m_running = false;
     StopAutoRegen();
 
     // Shutdown RS2V systems
+    Logger::Debug("[GameServer::Shutdown] Destroying RS2V game systems");
     m_skirmishMode.reset();
     m_supremacyMode.reset();
     m_territoryMode.reset();
@@ -335,11 +395,15 @@ void GameServer::Shutdown() {
     m_weaponDatabase.reset();
 
     if (m_gameMode) {
+        Logger::Debug("[GameServer::Shutdown] Ending active GameMode");
         m_gameMode->OnEnd();
         m_gameMode.reset();
+    } else {
+        Logger::Debug("[GameServer::Shutdown] No active GameMode to end");
     }
     m_chatManager.reset();
     if (m_adminManager) {
+        Logger::Debug("[GameServer::Shutdown] Shutting down AdminManager");
         m_adminManager->Shutdown();
         m_adminManager.reset();
     }
@@ -347,27 +411,53 @@ void GameServer::Shutdown() {
     m_teamManager.reset();
     m_playerManager.reset();
     if (m_networkManager) {
+        Logger::Debug("[GameServer::Shutdown] Shutting down NetworkManager");
         m_networkManager->Shutdown();
         m_networkManager.reset();
     }
 
     Logger::Info("GameServer shutdown complete");
+    Logger::Trace("[GameServer::Shutdown] Exit");
 }
 
 void GameServer::BroadcastChatMessage(const std::string& msg) {
-    if (m_chatManager) m_chatManager->BroadcastChat(msg);
+    Logger::Trace("[GameServer::BroadcastChatMessage] Entry, msg='%s'", msg.c_str());
+    if (m_chatManager) {
+        Logger::Debug("[GameServer::BroadcastChatMessage] Broadcasting via ChatManager");
+        m_chatManager->BroadcastChat(msg);
+    } else {
+        Logger::Debug("[GameServer::BroadcastChatMessage] No ChatManager available, message dropped");
+    }
+    Logger::Trace("[GameServer::BroadcastChatMessage] Exit");
 }
 
 uint32_t GameServer::FindClientBySteamID(const std::string& steamId) const {
-    return m_networkManager ? m_networkManager->FindClientBySteamID(steamId) : UINT32_MAX;
+    Logger::Trace("[GameServer::FindClientBySteamID] Entry, steamId='%s'", steamId.c_str());
+    uint32_t result = m_networkManager ? m_networkManager->FindClientBySteamID(steamId) : UINT32_MAX;
+    if (result == UINT32_MAX) {
+        Logger::Debug("[GameServer::FindClientBySteamID] No client found for steamId='%s'", steamId.c_str());
+    } else {
+        Logger::Debug("[GameServer::FindClientBySteamID] Found clientId=%u for steamId='%s'", result, steamId.c_str());
+    }
+    Logger::Trace("[GameServer::FindClientBySteamID] Exit, returning %u", result);
+    return result;
 }
 
 std::shared_ptr<ClientConnection> GameServer::GetClientConnection(uint32_t clientId) const {
-    return m_networkManager ? m_networkManager->GetConnection(clientId) : nullptr;
+    Logger::Trace("[GameServer::GetClientConnection] Entry, clientId=%u", clientId);
+    auto result = m_networkManager ? m_networkManager->GetConnection(clientId) : nullptr;
+    if (!result) {
+        Logger::Debug("[GameServer::GetClientConnection] No connection found for clientId=%u", clientId);
+    }
+    Logger::Trace("[GameServer::GetClientConnection] Exit, result=%s", result ? "valid" : "null");
+    return result;
 }
 
 std::vector<std::shared_ptr<ClientConnection>> GameServer::GetAllConnections() const {
-    return m_networkManager ? m_networkManager->GetAllConnections() : std::vector<std::shared_ptr<ClientConnection>>{};
+    Logger::Trace("[GameServer::GetAllConnections] Entry");
+    auto result = m_networkManager ? m_networkManager->GetAllConnections() : std::vector<std::shared_ptr<ClientConnection>>{};
+    Logger::Trace("[GameServer::GetAllConnections] Exit, returning %zu connections", result.size());
+    return result;
 }
 
 // Subsystem accessors
@@ -393,47 +483,70 @@ std::shared_ptr<ServerConfig>  GameServer::GetServerConfig()  const { return m_s
 std::shared_ptr<ConfigManager> GameServer::GetConfigManager() const { return m_configManager; }
 
 void GameServer::ChangeMap() {
+    Logger::Trace("[GameServer::ChangeMap] Entry");
     std::string nextMap = m_mapManager->GetNextMap();
+    Logger::Info("[GameServer::ChangeMap] Changing to next map: '%s'", nextMap.c_str());
     if (m_mapManager->LoadMap(nextMap)) {
-        if (m_gameMode) m_gameMode->OnEnd();
+        Logger::Debug("[GameServer::ChangeMap] Map loaded successfully, transitioning GameMode");
+        if (m_gameMode) {
+            Logger::Debug("[GameServer::ChangeMap] Ending current GameMode");
+            m_gameMode->OnEnd();
+        }
         const auto& gmDef = m_gameConfig->GetGameModeDefinition(m_gameConfig->GetGameSettings().gameMode);
         if (gmDef) {
+            Logger::Debug("[GameServer::ChangeMap] Creating new GameMode instance");
             m_gameMode = std::make_unique<GameMode>(this, *gmDef);
             m_gameMode->OnStart();
+        } else {
+            Logger::Warn("[GameServer::ChangeMap] No valid game mode definition found after map change");
         }
     } else {
-        Logger::Error("Failed to change to map: %s", nextMap.c_str());
+        Logger::Error("[GameServer::ChangeMap] Failed to change to map: %s", nextMap.c_str());
     }
+    Logger::Trace("[GameServer::ChangeMap] Exit");
 }
 
 // Packet queue implementation
 void GameServer::EnqueuePacket(const QueuedPacket& pkt) {
+    Logger::Trace("[GameServer::EnqueuePacket] Entry, clientId=%u", pkt.clientId);
     std::lock_guard<std::mutex> lock(m_packetQueueMutex);
     m_packetQueue.push(pkt);
+    Logger::Trace("[GameServer::EnqueuePacket] Exit");
 }
 
 std::vector<QueuedPacket> GameServer::FetchPendingPackets() {
+    Logger::Trace("[GameServer::FetchPendingPackets] Entry");
     std::vector<QueuedPacket> out;
     std::lock_guard<std::mutex> lock(m_packetQueueMutex);
     while (!m_packetQueue.empty()) {
         out.push_back(std::move(m_packetQueue.front()));
         m_packetQueue.pop();
     }
+    Logger::Trace("[GameServer::FetchPendingPackets] Exit, returning %zu packets", out.size());
     return out;
 }
 
 void GameServer::OnPacketReceived(uint32_t clientId, const Packet& pkt, const PacketMetadata& meta) {
+    Logger::Trace("[GameServer::OnPacketReceived] Entry, clientId=%u", clientId);
     EnqueuePacket({clientId, pkt, meta});
+    Logger::Trace("[GameServer::OnPacketReceived] Exit");
 }
 
 void GameServer::ProcessNetworkMessages() {
+    Logger::Trace("[GameServer::ProcessNetworkMessages] Entry");
     if (m_networkManager) {
         m_networkManager->PollNetwork();
+    } else {
+        Logger::Debug("[GameServer::ProcessNetworkMessages] No NetworkManager available");
     }
+    Logger::Trace("[GameServer::ProcessNetworkMessages] Exit");
 }
 
 std::string GameServer::GetExeDir() const {
-    return PathUtils::GetExecutableDirectory();
+    Logger::Trace("[GameServer::GetExeDir] Entry");
+    std::string result = PathUtils::GetExecutableDirectory();
+    Logger::Trace("[GameServer::GetExeDir] Exit, returning '%s'", result.c_str());
+    return result;
 }
 
 // ============================================================================
@@ -441,9 +554,15 @@ std::string GameServer::GetExeDir() const {
 // ============================================================================
 
 void GameServer::HandleRoleSelection(uint32_t clientId, const std::vector<uint8_t>& data) {
-    if (!m_roleSystem || data.size() < 1) return;
+    Logger::Trace("[GameServer::HandleRoleSelection] Entry, clientId=%u, dataSize=%zu", clientId, data.size());
+    if (!m_roleSystem || data.size() < 1) {
+        Logger::Debug("[GameServer::HandleRoleSelection] No role system or insufficient data");
+        Logger::Trace("[GameServer::HandleRoleSelection] Exit (early return)");
+        return;
+    }
 
     CombatRole role = static_cast<CombatRole>(data[0]);
+    Logger::Debug("[GameServer::HandleRoleSelection] Player %u requesting role %d", clientId, static_cast<int>(role));
     if (m_roleSystem->AssignRole(clientId, role)) {
         Logger::Info("Player %u selected role: %s", clientId, m_roleSystem->GetRoleName(role).c_str());
 
@@ -451,6 +570,8 @@ void GameServer::HandleRoleSelection(uint32_t clientId, const std::vector<uint8_
         auto* tm = GetTeamManager();
         Faction faction = m_roleSystem->GetTeamFaction(tm->GetPlayerTeam(clientId));
         RoleLoadout loadout = m_roleSystem->GetRoleLoadout(role, faction);
+        Logger::Debug("[GameServer::HandleRoleSelection] Applying loadout: primary='%s', secondary='%s'",
+                     loadout.primaryWeapon.c_str(), loadout.secondaryWeapon.c_str());
 
         auto* pm = GetPlayerManager();
         auto player = pm->GetPlayer(clientId);
@@ -463,114 +584,176 @@ void GameServer::HandleRoleSelection(uint32_t clientId, const std::vector<uint8_
             for (const auto& eq : loadout.equipment) {
                 player->AddItem(eq, 1);
             }
+            Logger::Debug("[GameServer::HandleRoleSelection] Loadout applied to player %u", clientId);
+        } else {
+            Logger::Warn("[GameServer::HandleRoleSelection] Player %u not found in PlayerManager", clientId);
         }
     } else {
         Logger::Warn("Player %u role selection failed: role %d", clientId, static_cast<int>(role));
     }
+    Logger::Trace("[GameServer::HandleRoleSelection] Exit");
 }
 
 void GameServer::HandleSpawnRequest(uint32_t clientId, const std::vector<uint8_t>& data) {
-    if (!m_spawnSystem) return;
+    Logger::Trace("[GameServer::HandleSpawnRequest] Entry, clientId=%u, dataSize=%zu", clientId, data.size());
+    if (!m_spawnSystem) {
+        Logger::Debug("[GameServer::HandleSpawnRequest] No spawn system available");
+        Logger::Trace("[GameServer::HandleSpawnRequest] Exit (no spawn system)");
+        return;
+    }
 
     if (data.size() >= 4) {
         uint32_t spawnLocId = 0;
         memcpy(&spawnLocId, data.data(), sizeof(uint32_t));
+        Logger::Debug("[GameServer::HandleSpawnRequest] Player %u requesting spawn at location %u", clientId, spawnLocId);
         if (m_spawnSystem->SpawnPlayer(clientId, spawnLocId)) {
             Logger::Debug("Player %u spawned at location %u", clientId, spawnLocId);
         } else {
+            Logger::Debug("[GameServer::HandleSpawnRequest] Spawn at location %u failed, trying default spawn", spawnLocId);
             // Try default spawn
             m_spawnSystem->SpawnPlayerAtDefault(clientId);
         }
     } else {
+        Logger::Debug("[GameServer::HandleSpawnRequest] Insufficient data for location, using default spawn");
         m_spawnSystem->SpawnPlayerAtDefault(clientId);
     }
+    Logger::Trace("[GameServer::HandleSpawnRequest] Exit");
 }
 
 void GameServer::HandleCommanderAbility(uint32_t clientId, const std::vector<uint8_t>& data) {
-    if (!m_commanderAbilities || !m_roleSystem) return;
+    Logger::Trace("[GameServer::HandleCommanderAbility] Entry, clientId=%u, dataSize=%zu", clientId, data.size());
+    if (!m_commanderAbilities || !m_roleSystem) {
+        Logger::Debug("[GameServer::HandleCommanderAbility] Missing commander abilities or role system");
+        Logger::Trace("[GameServer::HandleCommanderAbility] Exit (missing systems)");
+        return;
+    }
 
     // Verify player is commander
     if (m_roleSystem->GetPlayerRole(clientId) != CombatRole::Commander) {
         Logger::Warn("Player %u tried commander ability but is not commander", clientId);
+        Logger::Trace("[GameServer::HandleCommanderAbility] Exit (not commander)");
         return;
     }
 
-    if (data.size() < 13) return;  // 1 byte type + 12 bytes position
+    if (data.size() < 13) {
+        Logger::Debug("[GameServer::HandleCommanderAbility] Insufficient data (need 13, got %zu)", data.size());
+        Logger::Trace("[GameServer::HandleCommanderAbility] Exit (insufficient data)");
+        return;
+    }  // 1 byte type + 12 bytes position
 
     AbilityType type = static_cast<AbilityType>(data[0]);
     Vector3 target;
     memcpy(&target.x, data.data() + 1, sizeof(float));
     memcpy(&target.y, data.data() + 5, sizeof(float));
     memcpy(&target.z, data.data() + 9, sizeof(float));
+    Logger::Debug("[GameServer::HandleCommanderAbility] Ability type=%d, target=(%.1f, %.1f, %.1f)",
+                 static_cast<int>(type), target.x, target.y, target.z);
 
     Vector3 direction;
     if (data.size() >= 25) {
         memcpy(&direction.x, data.data() + 13, sizeof(float));
         memcpy(&direction.y, data.data() + 17, sizeof(float));
         memcpy(&direction.z, data.data() + 21, sizeof(float));
+        Logger::Debug("[GameServer::HandleCommanderAbility] Direction=(%.1f, %.1f, %.1f)",
+                     direction.x, direction.y, direction.z);
+    } else {
+        Logger::Debug("[GameServer::HandleCommanderAbility] No direction data provided");
     }
 
     if (m_commanderAbilities->RequestAbility(clientId, type, target, direction)) {
         Logger::Info("Commander %u called %s at (%.1f, %.1f, %.1f)",
                      clientId, m_commanderAbilities->GetAbilityName(type).c_str(),
                      target.x, target.y, target.z);
+    } else {
+        Logger::Debug("[GameServer::HandleCommanderAbility] Ability request denied for commander %u", clientId);
     }
+    Logger::Trace("[GameServer::HandleCommanderAbility] Exit");
 }
 
 void GameServer::HandleSquadAction(uint32_t clientId, const std::vector<uint8_t>& data) {
-    if (!m_roleSystem || data.size() < 1) return;
+    Logger::Trace("[GameServer::HandleSquadAction] Entry, clientId=%u, dataSize=%zu", clientId, data.size());
+    if (!m_roleSystem || data.size() < 1) {
+        Logger::Debug("[GameServer::HandleSquadAction] No role system or insufficient data");
+        Logger::Trace("[GameServer::HandleSquadAction] Exit (early return)");
+        return;
+    }
 
     uint8_t action = data[0];
+    Logger::Debug("[GameServer::HandleSquadAction] Player %u squad action=%u", clientId, action);
     switch (action) {
         case 0: {  // Create squad
+            Logger::Debug("[GameServer::HandleSquadAction] Action: Create squad");
             uint32_t teamId = GetTeamManager()->GetPlayerTeam(clientId);
             uint32_t squadId = m_roleSystem->CreateSquad(teamId);
             if (squadId > 0) {
                 m_roleSystem->JoinSquad(clientId, squadId);
                 Logger::Info("Player %u created and joined squad %u", clientId, squadId);
+            } else {
+                Logger::Warn("[GameServer::HandleSquadAction] Squad creation failed for player %u on team %u", clientId, teamId);
             }
             break;
         }
         case 1: {  // Join squad
+            Logger::Debug("[GameServer::HandleSquadAction] Action: Join squad");
             if (data.size() >= 5) {
                 uint32_t squadId = 0;
                 memcpy(&squadId, data.data() + 1, sizeof(uint32_t));
+                Logger::Debug("[GameServer::HandleSquadAction] Player %u joining squad %u", clientId, squadId);
                 m_roleSystem->JoinSquad(clientId, squadId);
+            } else {
+                Logger::Debug("[GameServer::HandleSquadAction] Insufficient data for join squad action");
             }
             break;
         }
         case 2:  // Leave squad
+            Logger::Debug("[GameServer::HandleSquadAction] Action: Leave squad, player %u", clientId);
             m_roleSystem->LeaveSquad(clientId);
             break;
         case 3:  // Volunteer as commander
+            Logger::Debug("[GameServer::HandleSquadAction] Action: Volunteer as commander, player %u", clientId);
             m_roleSystem->VolunteerAsCommander(clientId);
             break;
         case 4:  // Resign as commander
+            Logger::Debug("[GameServer::HandleSquadAction] Action: Resign as commander, player %u", clientId);
             m_roleSystem->ResignAsCommander(clientId);
             break;
         default:
+            Logger::Debug("[GameServer::HandleSquadAction] Unknown squad action %u from player %u", action, clientId);
             break;
     }
+    Logger::Trace("[GameServer::HandleSquadAction] Exit");
 }
 
 void GameServer::HandleVehicleAction(uint32_t clientId, const std::vector<uint8_t>& data) {
-    if (!m_helicopterPhysics || data.size() < 1) return;
+    Logger::Trace("[GameServer::HandleVehicleAction] Entry, clientId=%u, dataSize=%zu", clientId, data.size());
+    if (!m_helicopterPhysics || data.size() < 1) {
+        Logger::Debug("[GameServer::HandleVehicleAction] No helicopter physics or insufficient data");
+        Logger::Trace("[GameServer::HandleVehicleAction] Exit (early return)");
+        return;
+    }
 
     uint8_t action = data[0];
+    Logger::Debug("[GameServer::HandleVehicleAction] Player %u vehicle action=%u", clientId, action);
     switch (action) {
         case 0: {  // Enter helicopter
+            Logger::Debug("[GameServer::HandleVehicleAction] Action: Enter helicopter");
             if (data.size() >= 9) {
                 uint32_t heliId = 0, seat = 0;
                 memcpy(&heliId, data.data() + 1, sizeof(uint32_t));
                 memcpy(&seat, data.data() + 5, sizeof(uint32_t));
+                Logger::Debug("[GameServer::HandleVehicleAction] Player %u entering heli %u seat %u", clientId, heliId, seat);
                 m_helicopterPhysics->EnterHelicopter(clientId, heliId, seat);
+            } else {
+                Logger::Debug("[GameServer::HandleVehicleAction] Insufficient data for enter helicopter");
             }
             break;
         }
         case 1:  // Exit helicopter
+            Logger::Debug("[GameServer::HandleVehicleAction] Action: Exit helicopter, player %u", clientId);
             m_helicopterPhysics->ExitHelicopter(clientId);
             break;
         case 2: {  // Control input
+            Logger::Trace("[GameServer::HandleVehicleAction] Action: Control input");
             if (data.size() >= 18) {
                 HeliControlInput input;
                 memcpy(&input.collective, data.data() + 1, sizeof(float));
@@ -579,43 +762,69 @@ void GameServer::HandleVehicleAction(uint32_t clientId, const std::vector<uint8_
                 memcpy(&input.pedal, data.data() + 13, sizeof(float));
                 input.fireWeapon = (data.size() > 17 && data[17] != 0);
                 // Find helicopter this player is piloting
+                bool found = false;
                 for (auto* h : m_helicopterPhysics->GetAllHelicopters()) {
                     if (h->pilotId == clientId) {
                         m_helicopterPhysics->SetControlInput(h->vehicleId, input);
+                        found = true;
                         break;
                     }
                 }
+                if (!found) {
+                    Logger::Debug("[GameServer::HandleVehicleAction] Player %u not piloting any helicopter", clientId);
+                }
+            } else {
+                Logger::Debug("[GameServer::HandleVehicleAction] Insufficient data for control input");
             }
             break;
         }
         case 3: {  // Start engine
+            Logger::Debug("[GameServer::HandleVehicleAction] Action: Start engine");
             if (data.size() >= 5) {
                 uint32_t heliId = 0;
                 memcpy(&heliId, data.data() + 1, sizeof(uint32_t));
+                Logger::Debug("[GameServer::HandleVehicleAction] Starting engine on heli %u", heliId);
                 m_helicopterPhysics->StartEngine(heliId);
+            } else {
+                Logger::Debug("[GameServer::HandleVehicleAction] Insufficient data for start engine");
             }
             break;
         }
         case 4: {  // Stop engine
+            Logger::Debug("[GameServer::HandleVehicleAction] Action: Stop engine");
             if (data.size() >= 5) {
                 uint32_t heliId = 0;
                 memcpy(&heliId, data.data() + 1, sizeof(uint32_t));
+                Logger::Debug("[GameServer::HandleVehicleAction] Stopping engine on heli %u", heliId);
                 m_helicopterPhysics->StopEngine(heliId);
+            } else {
+                Logger::Debug("[GameServer::HandleVehicleAction] Insufficient data for stop engine");
             }
             break;
         }
         default:
+            Logger::Debug("[GameServer::HandleVehicleAction] Unknown vehicle action %u from player %u", action, clientId);
             break;
     }
+    Logger::Trace("[GameServer::HandleVehicleAction] Exit");
 }
 
 void GameServer::HandleWeaponFire(uint32_t clientId, const std::vector<uint8_t>& data) {
-    if (!m_damageSystem || data.size() < 29) return;
+    Logger::Trace("[GameServer::HandleWeaponFire] Entry, clientId=%u, dataSize=%zu", clientId, data.size());
+    if (!m_damageSystem || data.size() < 29) {
+        Logger::Debug("[GameServer::HandleWeaponFire] No damage system or insufficient data (need 29, got %zu)", data.size());
+        Logger::Trace("[GameServer::HandleWeaponFire] Exit (early return)");
+        return;
+    }
 
     // Parse weapon fire data: weaponId(variable) + origin(12) + direction(12) + hitZone(1) + victimId(4)
     // Simplified: first byte = weapon id string length
     uint8_t weaponIdLen = data[0];
-    if (data.size() < static_cast<size_t>(1 + weaponIdLen + 29)) return;
+    if (data.size() < static_cast<size_t>(1 + weaponIdLen + 29)) {
+        Logger::Debug("[GameServer::HandleWeaponFire] Data too short for weapon id len %u", weaponIdLen);
+        Logger::Trace("[GameServer::HandleWeaponFire] Exit (data too short)");
+        return;
+    }
 
     std::string weaponId(data.begin() + 1, data.begin() + 1 + weaponIdLen);
     size_t offset = 1 + weaponIdLen;
@@ -632,17 +841,29 @@ void GameServer::HandleWeaponFire(uint32_t clientId, const std::vector<uint8_t>&
     uint32_t victimId = 0;
     memcpy(&victimId, data.data() + offset, sizeof(uint32_t));
 
-    if (victimId == 0) return;  // Miss — no damage
+    Logger::Debug("[GameServer::HandleWeaponFire] Player %u fired '%s' at victim %u, hitZone=%d",
+                 clientId, weaponId.c_str(), victimId, static_cast<int>(hitZone));
+
+    if (victimId == 0) {
+        Logger::Debug("[GameServer::HandleWeaponFire] Miss (victimId=0), no damage applied");
+        Logger::Trace("[GameServer::HandleWeaponFire] Exit (miss)");
+        return;  // Miss — no damage
+    }
 
     // Calculate damage using weapon database
     float distance = origin.Distance(m_playerManager->GetPlayer(victimId) ?
                      m_playerManager->GetPlayer(victimId)->GetPosition() : origin);
 
     auto* weaponDef = m_weaponDatabase ? m_weaponDatabase->GetWeapon(weaponId) : nullptr;
+    if (!weaponDef) {
+        Logger::Warn("[GameServer::HandleWeaponFire] Weapon '%s' not found in database, using default damage", weaponId.c_str());
+    }
     float baseDmg = weaponDef ? m_weaponDatabase->CalculateDamage(
         weaponId, distance, hitZone == HitZone::Head,
         hitZone == HitZone::LeftArm || hitZone == HitZone::RightArm ||
         hitZone == HitZone::LeftLeg || hitZone == HitZone::RightLeg) : 50.0f;
+
+    Logger::Debug("[GameServer::HandleWeaponFire] Calculated damage=%.1f, distance=%.1f", baseDmg, distance);
 
     DamageEvent event;
     event.attackerId = clientId;
@@ -656,4 +877,5 @@ void GameServer::HandleWeaponFire(uint32_t clientId, const std::vector<uint8_t>&
     event.hitDirection = direction;
 
     m_damageSystem->ApplyDamage(event);
+    Logger::Trace("[GameServer::HandleWeaponFire] Exit");
 }

@@ -35,21 +35,35 @@ static std::atomic<bool>                   g_shutdownRequested{false};
 // Signal handler for graceful shutdown
 void SignalHandler(int signal)
 {
-    Logger::Info("Received signal %d, initiating graceful shutdown...", signal);
+    Logger::Info("[main::SignalHandler] Received signal %d, initiating graceful shutdown...", signal);
+    Logger::Debug("[main::SignalHandler] Setting g_shutdownRequested=true");
     g_shutdownRequested = true;
-    if (g_gameClock)
+    if (g_gameClock) {
+        Logger::Debug("[main::SignalHandler] Stopping GameClock via g_gameClock->Stop()");
         g_gameClock->Stop();
+    } else {
+        Logger::Warn("[main::SignalHandler] g_gameClock is null, cannot stop game clock from signal handler");
+    }
+    Logger::Info("[main::SignalHandler] Signal handler completed for signal %d", signal);
 }
 
 // Setup signal handlers
 void SetupSignalHandlers()
 {
+    Logger::Trace("[main::SetupSignalHandlers] Entering SetupSignalHandlers()");
+    Logger::Debug("[main::SetupSignalHandlers] Registering SIGINT handler");
     std::signal(SIGINT,  SignalHandler);
+    Logger::Debug("[main::SetupSignalHandlers] Registering SIGTERM handler");
     std::signal(SIGTERM, SignalHandler);
 #ifndef _WIN32
+    Logger::Debug("[main::SetupSignalHandlers] Registering SIGHUP handler (POSIX)");
     std::signal(SIGHUP,  SignalHandler);
+    Logger::Debug("[main::SetupSignalHandlers] Registering SIGQUIT handler (POSIX)");
     std::signal(SIGQUIT, SignalHandler);
+#else
+    Logger::Debug("[main::SetupSignalHandlers] Skipping POSIX-only signals (SIGHUP, SIGQUIT) on Windows");
 #endif
+    Logger::Info("[main::SetupSignalHandlers] All signal handlers registered successfully");
 }
 
 // Initialize logging from a config file path
@@ -73,7 +87,9 @@ bool InitializeLogging(const std::string& configPath)
         else if (loglevel == "ERROR" || loglevel == "error") Logger::SetLevel(LogLevel::Error);
         else                                                  Logger::SetLevel(LogLevel::Info);
 
-        Logger::Info("RS2V Server starting up...");
+        Logger::Info("[main::InitializeLogging] RS2V Server logging initialized successfully");
+        Logger::Info("[main::InitializeLogging] Log file: '%s', Log level: '%s'", logfile.c_str(), loglevel.c_str());
+        Logger::Debug("[main::InitializeLogging] Config path used for logging init: '%s'", configPath.c_str());
         return true;
     }
     catch (const std::exception& e) {
@@ -81,6 +97,7 @@ bool InitializeLogging(const std::string& configPath)
         // Fall back to console logging
         Logger::Initialize("");
         Logger::SetLevel(LogLevel::Info);
+        Logger::Warn("[main::InitializeLogging] Fell back to console-only logging due to exception: %s", e.what());
         return true;
     }
 }
@@ -107,23 +124,41 @@ struct CmdArgs {
 
 CmdArgs ParseArgs(int argc, char* argv[])
 {
+    Logger::Trace("[main::ParseArgs] Entering ParseArgs with argc=%d", argc);
     CmdArgs a;
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
-        if (arg == "-h" || arg == "--help")     a.help = true;
-        else if (arg == "-v" || arg == "--version") a.version = true;
-        else if ((arg == "-c" || arg == "--config") && i+1<argc) a.configFile = argv[++i];
-        else if ((arg == "-p" || arg == "--port")   && i+1<argc) a.port = (uint16_t)std::stoi(argv[++i]);
+        Logger::Trace("[main::ParseArgs] Processing argument [%d]: '%s'", i, arg.c_str());
+        if (arg == "-h" || arg == "--help") {
+            Logger::Debug("[main::ParseArgs] Help flag detected");
+            a.help = true;
+        }
+        else if (arg == "-v" || arg == "--version") {
+            Logger::Debug("[main::ParseArgs] Version flag detected");
+            a.version = true;
+        }
+        else if ((arg == "-c" || arg == "--config") && i+1<argc) {
+            a.configFile = argv[++i];
+            Logger::Debug("[main::ParseArgs] Config file set to: '%s'", a.configFile.c_str());
+        }
+        else if ((arg == "-p" || arg == "--port")   && i+1<argc) {
+            a.port = (uint16_t)std::stoi(argv[++i]);
+            Logger::Debug("[main::ParseArgs] Port override set to: %u", a.port);
+        }
         else {
             std::cerr << "Unknown argument: " << arg << "\n";
+            Logger::Warn("[main::ParseArgs] Unknown argument encountered: '%s'", arg.c_str());
             a.help = true;
         }
     }
+    Logger::Debug("[main::ParseArgs] Parsed args: config='%s', port=%u, help=%d, version=%d",
+                  a.configFile.c_str(), a.port, a.help, a.version);
     return a;
 }
 
 int main(int argc, char* argv[])
 {
+    // Pre-logging initialization: parse args first since logging depends on config
     auto args = ParseArgs(argc, argv);
     if (args.help) {
         PrintUsage(argv[0]);
@@ -137,52 +172,72 @@ int main(int argc, char* argv[])
     if (!InitializeLogging(args.configFile))
         return EXIT_FAILURE;
 
-    Logger::Info("========================================");
+    Logger::Info("================================================================");
     Logger::Info("RS2V Custom Server v1.0.0 Starting");
-    Logger::Info("Configuration: %s", args.configFile.c_str());
-    Logger::Info("========================================");
+    Logger::Info("Configuration file: %s", args.configFile.c_str());
+    Logger::Info("Command-line port override: %s", args.port ? std::to_string(args.port).c_str() : "none");
+    Logger::Info("Build date: %s %s", __DATE__, __TIME__);
+    Logger::Info("================================================================");
 
+    Logger::Trace("[main] Setting up signal handlers...");
     SetupSignalHandlers();
+    Logger::Debug("[main] Signal handlers configured successfully");
 
     // Initialize network platform (WSAStartup on Windows, no-op on POSIX)
+    Logger::Info("[main] Initializing networking platform via SocketFactory::Initialize()...");
     if (!SocketFactory::Initialize()) {
-        Logger::Error("Networking platform init failed");
+        Logger::Error("[main] Networking platform initialization FAILED - cannot continue");
         return EXIT_FAILURE;
     }
+    Logger::Info("[main] Networking platform initialized successfully");
 
     // Start GameServer — it internally loads configs and creates subsystems
+    Logger::Info("[main] Creating GameServer instance...");
     g_server = std::make_unique<GameServer>();
+    Logger::Debug("[main] GameServer instance created at %p, calling Initialize()...", (void*)g_server.get());
     if (!g_server->Initialize()) {
-        Logger::Error("GameServer initialization failed");
+        Logger::Error("[main] GameServer::Initialize() FAILED - shutting down networking and exiting");
         SocketFactory::Shutdown();
         return EXIT_FAILURE;
     }
+    Logger::Info("[main] GameServer initialized successfully");
 
     auto serverCfg = g_server->GetServerConfig();
+    Logger::Debug("[main] Retrieved ServerConfig pointer: %p", (void*)serverCfg.get());
 
     // Override port if specified on command line
     if (args.port && g_server->GetConfigManager()) {
+        Logger::Info("[main] Overriding server port to %u from command-line argument", args.port);
         g_server->GetConfigManager()->SetInt("Network.port", args.port);
     }
 
     // Start EAC emulator on configured port (default 7957)
     uint16_t eacPort = (uint16_t)g_server->GetConfigManager()->GetInt("EAC.listen_port", 7957);
+    Logger::Info("[main] Starting EAC Server Emulator on port %u...", eacPort);
     g_eacServer = std::make_unique<EACServerEmulator>();
+    Logger::Debug("[main] EACServerEmulator instance created at %p", (void*)g_eacServer.get());
     if (!g_eacServer->Initialize(eacPort)) {
-        Logger::Warn("EAC emulator failed to start on port %u; continuing without EAC", eacPort);
+        Logger::Warn("[main] EAC emulator FAILED to start on port %u; continuing without EAC anti-cheat", eacPort);
+    } else {
+        Logger::Info("[main] EAC emulator started successfully on port %u", eacPort);
     }
 
-    Logger::Info("Server initialized successfully");
-    Logger::Info("Listening on port: %d", serverCfg ? serverCfg->GetPort() : 7777);
+    Logger::Info("[main] Server initialization complete");
+    int serverPort = serverCfg ? serverCfg->GetPort() : 7777;
+    Logger::Info("[main] Listening on game port: %d", serverPort);
 
     // GameClock for fixed timestep updates
+    Logger::Debug("[main] Creating GameClock for fixed-timestep game loop...");
     GameClock gameClock;
     g_gameClock = &gameClock;
     int tickRate = serverCfg ? serverCfg->GetTickRate() : 60;
+    Logger::Info("[main] Setting tick rate to %d ticks/sec", tickRate);
     gameClock.SetTickRate(tickRate);
 
+    Logger::Trace("[main] Registering tick callback for main game loop...");
     gameClock.RegisterTickCallback([&](GameClock::Duration /*delta*/) {
         if (g_shutdownRequested) {
+            Logger::Debug("[main::TickCallback] Shutdown requested, stopping game clock");
             gameClock.Stop();
             return;
         }
@@ -196,25 +251,40 @@ int main(int argc, char* argv[])
         }
     });
 
-    Logger::Info("Entering main loop at %d ticks/sec", tickRate);
+    Logger::Info("[main] ========================================");
+    Logger::Info("[main] Entering main game loop at %d ticks/sec", tickRate);
+    Logger::Info("[main] ========================================");
     gameClock.RunLoop();
 
-    Logger::Info("Main loop exited, shutting down...");
+    Logger::Info("[main] Main game loop exited, beginning shutdown sequence...");
 
     // Shutdown sequence
+    Logger::Debug("[main] Shutting down EAC emulator...");
     if (g_eacServer) {
         g_eacServer->Shutdown();
         g_eacServer.reset();
+        Logger::Info("[main] EAC emulator shut down successfully");
+    } else {
+        Logger::Debug("[main] No EAC emulator to shut down");
     }
 
+    Logger::Debug("[main] Shutting down GameServer...");
     if (g_server) {
         g_server->Shutdown();
         g_server.reset();
+        Logger::Info("[main] GameServer shut down successfully");
+    } else {
+        Logger::Debug("[main] No GameServer to shut down");
     }
 
+    Logger::Debug("[main] Shutting down networking platform...");
     SocketFactory::Shutdown();
+    Logger::Info("[main] Networking platform shut down successfully");
+
     g_gameClock = nullptr;
-    Logger::Info("RS2V Server shutdown complete");
+    Logger::Info("[main] ========================================");
+    Logger::Info("[main] RS2V Server shutdown complete");
+    Logger::Info("[main] ========================================");
     Logger::Shutdown();
     return EXIT_SUCCESS;
 }
