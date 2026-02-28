@@ -1,37 +1,40 @@
+// DynamicSpawner.cs — Periodically spawns NPC patrol bots at predefined locations.
+// Demonstrates: entity spawning, recurring scheduled tasks, admin checks.
+
 using System;
 using System.Collections.Generic;
-using System.Runtime.InteropServices;
 
 public class DynamicSpawner
 {
-    private static readonly List<(float x, float y, float z)> spawnPoints = new()
+    private static readonly List<(float x, float y, float z)> _spawnPoints = new()
     {
         (100, 50, 10), (200, 75, 10), (150, 100, 10)
     };
 
-    private static class Native
-    {
-        [DllImport("RS2VNativePlugin", CallingConvention = CallingConvention.Cdecl)]
-        public static extern bool SpawnEntity(string className, float x, float y, float z);
-
-        [DllImport("RS2VNativePlugin", CallingConvention = CallingConvention.Cdecl)]
-        public static extern void BroadcastChat(string message);
-    }
+    private static string _taskId;
 
     public static void Initialize()
     {
-        ScriptHelpers.LogInfo("[C#] DynamicSpawner initialized");
-        ScriptHelpers.ScheduleRecurring(TimeSpan.FromSeconds(60), SpawnPatrol);
+        ScriptHelpers.Log("[DynamicSpawner] Initialized, will spawn patrols every 60s");
+        _taskId = ScriptHelpers.ScheduleRecurring(TimeSpan.FromSeconds(60), SpawnPatrol);
     }
 
-    public static void SpawnPatrol()
+    public static void Cleanup()
     {
-        if (!ScriptHelpers.HasAdmin("SERVER")) return;
+        if (_taskId != null) ScriptHelpers.CancelTask(_taskId);
+    }
 
-        foreach (var (x, y, z) in spawnPoints)
+    private static void SpawnPatrol()
+    {
+        int spawned = 0;
+        foreach (var (x, y, z) in _spawnPoints)
         {
-            if (Native.SpawnEntity("NPC_PatrolBot", x, y, z))
-                Native.BroadcastChat($"[C#] Spawned PatrolBot at ({x},{y},{z})");
+            if (ScriptHelpers.Spawn("NPC_PatrolBot", x, y, z))
+            {
+                spawned++;
+                ScriptHelpers.Debug($"[DynamicSpawner] Spawned PatrolBot at ({x},{y},{z})");
+            }
         }
+        ScriptHelpers.Log($"[DynamicSpawner] Spawned {spawned} patrol bots");
     }
 }

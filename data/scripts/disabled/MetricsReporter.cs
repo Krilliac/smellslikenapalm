@@ -1,35 +1,48 @@
+// MetricsReporter.cs — Periodically broadcasts server metrics to chat and tracks them.
+// Demonstrates: server info queries, performance monitoring, recurring tasks, metrics tracking.
+
 using System;
-using System.Runtime.InteropServices;
-
-public static class Native
-{
-    [DllImport("RS2VNativePlugin", CallingConvention = CallingConvention.Cdecl)]
-    public static extern int GetCurrentTickRate();
-
-    [DllImport("RS2VNativePlugin", CallingConvention = CallingConvention.Cdecl)]
-    public static extern int GetPlayerCount();
-
-    [DllImport("RS2VNativePlugin", CallingConvention = CallingConvention.Cdecl)]
-    public static extern int GetScriptReloadCount();
-}
 
 public class MetricsReporter
 {
+    private static string _taskId;
+
     public static void Initialize()
     {
-        ScriptHost.RegisterEventHandler("OnServerStart", nameof(Report));
-        ScriptHelpers.LogInfo("[C#] MetricsReporter initialized: broadcasting every 60s");
+        ScriptHelpers.OnEvent("OnServerStart", nameof(OnServerStart));
+        ScriptHelpers.Log("[MetricsReporter] Initialized, reporting every 60s after server start");
     }
 
-    public static void Report()
+    public static void Cleanup()
     {
-        int ticks   = Native.GetCurrentTickRate();
-        int players = Native.GetPlayerCount();
-        int reloads = Native.GetScriptReloadCount();
+        if (_taskId != null) ScriptHelpers.CancelTask(_taskId);
+        ScriptHelpers.OffEvent("OnServerStart", nameof(OnServerStart));
+    }
 
-        ScriptHelpers.BroadcastChat(
-            $"[Metrics] TickRate={ticks}Hz Players={players} ScriptReloads={reloads}"
-        );
-        ScriptHelpers.ScheduleCallback(60f, nameof(Report));
+    public static void OnServerStart()
+    {
+        _taskId = ScriptHelpers.ScheduleRecurring(TimeSpan.FromSeconds(60), Report);
+    }
+
+    private static void Report()
+    {
+        int tickRate = ScriptHelpers.TickRate();
+        int players = ScriptHelpers.Players();
+        int reloads = ScriptHelpers.ScriptReloads();
+        int pps = ScriptHelpers.PacketsPerSec();
+        float fps = ScriptHelpers.FrameRate();
+        float cpu = ScriptHelpers.CpuUsage();
+        long mem = ScriptHelpers.MemUsage();
+        int avgPing = ScriptHelpers.AvgPing();
+
+        ScriptHelpers.Track("tickRate", tickRate);
+        ScriptHelpers.Track("playerCount", players);
+        ScriptHelpers.Track("avgPing", avgPing);
+        ScriptHelpers.Track("cpu", cpu);
+
+        ScriptHelpers.ChatAll(
+            $"[Metrics] Tick={tickRate}Hz Players={players} FPS={fps:0} " +
+            $"CPU={cpu:0.0}% Mem={ScriptHelpers.FmtBytes(mem)} " +
+            $"PPS={pps} Ping={avgPing}ms Reloads={reloads}");
     }
 }

@@ -1,60 +1,59 @@
+// FactionBalancer.cs — Dynamically rebalances teams based on player count and average ping.
+// Demonstrates: team management, player list iteration, ping queries, recurring tasks.
+
 using System;
 using System.Collections.Generic;
 using System.Linq;
 
 public static class FactionBalancer
 {
-    // Native bindings still used for counts and latencies
-    private static class Native
-    {
-        [DllImport("RS2VNativePlugin", CallingConvention = CallingConvention.Cdecl)]
-        public static extern Dictionary<string,int> GetPlayerCountsPerTeam();
-
-        [DllImport("RS2VNativePlugin", CallingConvention = CallingConvention.Cdecl)]
-        public static extern Dictionary<string,float> GetPlayerLatencies();
-
-        [DllImport("RS2VNativePlugin", CallingConvention = CallingConvention.Cdecl)]
-        public static extern void SetTeamSize(string teamId, int size);
-
-        [DllImport("RS2VNativePlugin", CallingConvention = CallingConvention.Cdecl)]
-        public static extern void BroadcastChat(string message);
-    }
+    private static string _taskId;
 
     public static void Initialize()
     {
-        ScriptHelpers.LogInfo("[C#] FactionBalancer initializing dynamic balancing");
-        ScriptHelpers.ScheduleRecurring(TimeSpan.FromMinutes(2), BalanceTeams);
+        ScriptHelpers.Log("[FactionBalancer] Initializing dynamic team balancing");
+        _taskId = ScriptHelpers.ScheduleRecurring(TimeSpan.FromMinutes(2), BalanceTeams);
     }
 
-    public static void BalanceTeams()
+    public static void Cleanup()
     {
-        if (!ScriptHelpers.HasAdminLevel("SERVER", 1)) return;  // require server or admin
+        if (_taskId != null) ScriptHelpers.CancelTask(_taskId);
+    }
 
-        var counts = Native.GetPlayerCountsPerTeam();
-        var lats   = Native.GetPlayerLatencies();
+    private static void BalanceTeams()
+    {
+        int teamCount = ScriptHelpers.TeamCount();
+        if (teamCount < 2) return;
 
-        // Compute average latency per team
-        var avgLat = counts.Keys.ToDictionary(
-            team => team,
-            team => lats
-                .Where(kv => kv.Key.StartsWith(team))
-                .Select(kv => kv.Value)
-                .DefaultIfEmpty(50f)
-                .Average()
-        );
+        var players = ScriptHelpers.GetAllPlayers();
+        if (players.Count == 0) return;
 
-        float totalInv    = avgLat.Sum(kv => 1f / Math.Max(kv.Value, 1f));
-        int totalPlayers  = counts.Values.Sum();
+        var teamData = new Dictionary<int, (int count, float avgPing)>();
+        for (int t = 0; t < teamCount; t++)
+        {
+            int count = ScriptHelpers.TeamPlayerCount(t);
+            var teamPlayers = players.Where(p => ScriptHelpers.PlayerTeam(p) == t).ToList();
+            float avgPing = teamPlayers.Count > 0
+                ? teamPlayers.Average(p => (float)ScriptHelpers.PlayerPing(p))
+                : 50f;
+            teamData[t] = (count, avgPing);
+        }
 
-        foreach (var team in counts.Keys)
+        float totalInverse = teamData.Sum(kv => 1f / Math.Max(kv.Value.avgPing, 1f));
+        int totalPlayers = players.Count;
+
+        foreach (var (teamId, data) in teamData)
         {
             int target = (int)Math.Round(
-                (1f / Math.Max(avgLat[team], 1f)) / totalInv * totalPlayers
-            );
-            Native.SetTeamSize(team, target);
-            Native.BroadcastChat(
-                $"[C#] {team} size → {target} (avg latency {avgLat[team]:0}ms)"
-            );
+                (1f / Math.Max(data.avgPing, 1f)) / totalInverse * totalPlayers);
+            target = Math.Max(target, 1);
+
+            ScriptHelpers.ResizeTeam(teamId, target);
+            string teamName = ScriptHelpers.TeamName(teamId);
+            ScriptHelpers.ChatAll(
+                $"[Balance] {teamName}: {data.count} -> target {target} (avg ping {data.avgPing:0}ms)");
         }
+
+        ScriptHelpers.Log($"[FactionBalancer] Balanced {teamCount} teams across {totalPlayers} players");
     }
 }
