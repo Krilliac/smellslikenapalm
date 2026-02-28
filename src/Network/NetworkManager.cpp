@@ -198,7 +198,12 @@ uint32_t NetworkManager::GetBandwidthLimit() const {
     return m_bandwidthLimit;
 }
 
+int NetworkManager::GetPacketsPerSecond() const {
+    return m_packetsThisTick;
+}
+
 void NetworkManager::OnPacketReceived(uint32_t clientId, const Packet& pkt, const PacketMetadata& meta) {
+    m_packetsThisTick++;
     Logger::Trace("[NetworkManager::OnPacketReceived] Entry: clientId=%u, tag='%s', payloadSize=%u",
                   clientId, pkt.GetTag().c_str(), pkt.GetPayloadSize());
     // Dump for analysis

@@ -35,12 +35,14 @@ public:
     std::vector<std::shared_ptr<ClientConnection>> GetAllConnections() const;
 
     uint32_t GetBandwidthLimit() const;
+    int GetPacketsPerSecond() const;
 
 private:
     GameServer*                                m_server;
     std::unique_ptr<ConnectionManager>         m_connMgr;
     std::unique_ptr<BandwidthManager>          m_bwManager;
     uint32_t                                   m_bandwidthLimit = 65536;
+    mutable int                                m_packetsThisTick = 0;
 
     void OnPacketReceived(uint32_t clientId, const Packet& pkt, const PacketMetadata& meta);
 };

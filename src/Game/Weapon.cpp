@@ -3,13 +3,19 @@
 #include "Game/Weapon.h"
 #include "Utils/Logger.h"
 #include "Game/Player.h"
+#include "Game/GameServer.h"
+#include "Game/ProjectileManager.h"
+#include "Game/WeaponDatabase.h"
 #include "Network/NetworkManager.h"
 #include <algorithm>
 
-Weapon::Weapon(const std::string& name, const WeaponStats& stats)
+Weapon::Weapon(const std::string& name, const WeaponStats& stats,
+               const std::string& weaponId, GameServer* server)
     : m_name(name)
+    , m_weaponId(weaponId)
     , m_stats(stats)
     , m_fireMode(FireMode::SemiAuto)
+    , m_server(server)
     , m_ammoInMagazine(stats.magazineSize)
     , m_remainingAmmo(stats.maxAmmo - stats.magazineSize)
     , m_timeSinceLastShot(0.0f)
@@ -117,10 +123,104 @@ void Weapon::SetFireMode(FireMode mode) {
     m_fireMode = mode;
 }
 
-void Weapon::SpawnProjectile(const Vector3& /*origin*/, const Vector3& /*direction*/, Player* shooter) {
-    // For hitscan or projectile; send network packet or instantiate in world
-    if (auto conn = shooter->GetConnection()) {
-        // TODO: broadcast fire event via GameServer once projectile system is in place
+void Weapon::SpawnProjectile(const Vector3& origin, const Vector3& direction, Player* shooter) {
+    if (!shooter) return;
+
+    uint32_t shooterId = shooter->GetConnection() ? shooter->GetConnection()->GetClientId() : 0;
+    std::string weaponId = m_weaponId.empty() ? m_name : m_weaponId;
+
+    // Look up weapon definition for ballistic properties
+    const WeaponDefinition* weaponDef = nullptr;
+    if (m_server) {
+        auto* wdb = m_server->GetWeaponDatabase();
+        if (wdb) {
+            weaponDef = wdb->GetWeapon(weaponId);
+        }
     }
-    // Actual game logic would handle hit detection, damage application, recoil, etc.
+
+    // Broadcast fire event to all clients for visual/audio effects
+    if (m_server) {
+        auto* projMgr = m_server->GetProjectileManager();
+        if (projMgr) {
+            projMgr->BroadcastFireEvent(shooterId, weaponId, origin, direction);
+        }
+    }
+
+    // Determine if this is a physical projectile or hitscan
+    bool isPhysicalProjectile = false;
+    float projectileSpeed = 0.0f;
+    float explosionRadius = 0.0f;
+    float maxExplosionDamage = 0.0f;
+    float gravity = 9.81f;
+    DamageSource damageSource = DamageSource::Bullet;
+
+    if (weaponDef) {
+        isPhysicalProjectile = weaponDef->ballistics.isProjectile;
+        projectileSpeed = weaponDef->ballistics.projectileSpeed;
+        gravity = weaponDef->ballistics.bulletDrop;
+
+        // Determine explosion properties from weapon category
+        if (weaponDef->category == WeaponCategory::RocketLauncher ||
+            weaponDef->category == WeaponCategory::GrenadeLauncher) {
+            explosionRadius = weaponDef->ballistics.suppressionRadius;
+            maxExplosionDamage = weaponDef->stats.damage;
+            damageSource = DamageSource::Explosion;
+        }
+        if (weaponDef->category == WeaponCategory::Flamethrower) {
+            damageSource = DamageSource::Fire;
+        }
+    }
+
+    if (isPhysicalProjectile && m_server) {
+        // Spawn a physical projectile (rocket, grenade, etc.)
+        auto* projMgr = m_server->GetProjectileManager();
+        if (projMgr) {
+            projMgr->SpawnProjectile(shooterId, weaponId, origin, direction,
+                                      projectileSpeed, m_stats.damage, gravity,
+                                      explosionRadius, maxExplosionDamage, damageSource);
+            Logger::Debug("[Weapon::SpawnProjectile] Physical projectile spawned for '%s' by player %u",
+                          weaponId.c_str(), shooterId);
+        }
+    } else if (m_server) {
+        // Hitscan weapon - perform instant ray trace
+        auto* projMgr = m_server->GetProjectileManager();
+        if (projMgr) {
+            HitscanResult result = projMgr->PerformHitscan(shooterId, origin, direction,
+                                                            m_stats.range, m_stats.accuracy);
+            if (result.hit) {
+                // Apply damage through the DamageSystem
+                auto* ds = m_server->GetDamageSystem();
+                auto* wdb = m_server->GetWeaponDatabase();
+                if (ds) {
+                    float baseDmg = m_stats.damage;
+                    if (wdb) {
+                        bool isHeadshot = (result.hitZone == HitZone::Head);
+                        bool isLimb = (result.hitZone == HitZone::LeftArm || result.hitZone == HitZone::RightArm ||
+                                       result.hitZone == HitZone::LeftLeg || result.hitZone == HitZone::RightLeg);
+                        baseDmg = wdb->CalculateDamage(weaponId, result.distance, isHeadshot, isLimb);
+                    }
+
+                    DamageEvent event;
+                    event.attackerId = shooterId;
+                    event.victimId = result.victimId;
+                    event.source = damageSource;
+                    event.weaponId = weaponId;
+                    event.hitZone = result.hitZone;
+                    event.baseDamage = baseDmg;
+                    event.distance = result.distance;
+                    event.hitPosition = result.hitPosition;
+                    event.hitDirection = direction.Normalized();
+                    ds->ApplyDamage(event);
+                }
+                Logger::Debug("[Weapon::SpawnProjectile] Hitscan hit player %u at dist=%.1f, zone=%d",
+                              result.victimId, result.distance, static_cast<int>(result.hitZone));
+            } else {
+                Logger::Debug("[Weapon::SpawnProjectile] Hitscan miss by player %u with '%s'",
+                              shooterId, weaponId.c_str());
+            }
+        }
+    } else {
+        // No server context (standalone weapon) - log only
+        Logger::Debug("[Weapon::SpawnProjectile] No server context for '%s', fire event logged only", m_name.c_str());
+    }
 }

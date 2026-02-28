@@ -5,6 +5,8 @@
 #include "Game/GameServer.h"
 #include "Game/PlayerManager.h"
 #include "Game/TeamManager.h"
+#include "Network/NetworkManager.h"
+#include "Network/Packet.h"
 #include "Utils/Logger.h"
 #include <algorithm>
 #include <cmath>
@@ -286,12 +288,58 @@ void DamageSystem::ProcessKill(const DamageEvent& event) {
     Logger::Trace("[DamageSystem::ProcessKill] Exit");
 }
 
-void DamageSystem::BroadcastDamageEvent(const DamageEvent& /*event*/) const {
-    Logger::Trace("[DamageSystem::BroadcastDamageEvent] Entry/Exit (stub)");
-    // Network broadcast handled by packet system
+void DamageSystem::BroadcastDamageEvent(const DamageEvent& event) const {
+    Logger::Trace("[DamageSystem::BroadcastDamageEvent] Entry: attackerId=%u, victimId=%u", event.attackerId, event.victimId);
+
+    auto* nm = m_server->GetNetworkManager();
+    if (!nm) {
+        Logger::Debug("[DamageSystem::BroadcastDamageEvent] No NetworkManager available");
+        Logger::Trace("[DamageSystem::BroadcastDamageEvent] Exit (no NetworkManager)");
+        return;
+    }
+
+    Packet pkt("DAMAGE_EVENT");
+    pkt.WriteUInt(event.attackerId);
+    pkt.WriteUInt(event.victimId);
+    pkt.WriteFloat(event.finalDamage);
+    pkt.WriteUInt(static_cast<uint32_t>(event.hitZone));
+    pkt.WriteUInt(static_cast<uint32_t>(event.source));
+    pkt.WriteVector3(event.hitPosition);
+    pkt.WriteVector3(event.hitDirection);
+    pkt.WriteUInt(event.isHeadshot ? 1 : 0);
+    pkt.WriteUInt(event.isKill ? 1 : 0);
+    nm->BroadcastPacket(pkt);
+
+    Logger::Debug("[DamageSystem::BroadcastDamageEvent] Broadcast damage: %u->%u, dmg=%.1f, zone=%d, kill=%d",
+                  event.attackerId, event.victimId, event.finalDamage,
+                  static_cast<int>(event.hitZone), event.isKill);
+    Logger::Trace("[DamageSystem::BroadcastDamageEvent] Exit");
 }
 
-void DamageSystem::BroadcastKillEvent(const KillEvent& /*event*/) const {
-    Logger::Trace("[DamageSystem::BroadcastKillEvent] Entry/Exit (stub)");
-    // Network broadcast handled by packet system
+void DamageSystem::BroadcastKillEvent(const KillEvent& event) const {
+    Logger::Trace("[DamageSystem::BroadcastKillEvent] Entry: killerId=%u, victimId=%u", event.killerId, event.victimId);
+
+    auto* nm = m_server->GetNetworkManager();
+    if (!nm) {
+        Logger::Debug("[DamageSystem::BroadcastKillEvent] No NetworkManager available");
+        Logger::Trace("[DamageSystem::BroadcastKillEvent] Exit (no NetworkManager)");
+        return;
+    }
+
+    Packet pkt("KILL_EVENT");
+    pkt.WriteUInt(event.killerId);
+    pkt.WriteUInt(event.victimId);
+    pkt.WriteString(event.weaponId);
+    pkt.WriteUInt(static_cast<uint32_t>(event.source));
+    pkt.WriteFloat(event.distance);
+    pkt.WriteUInt(event.isHeadshot ? 1 : 0);
+    pkt.WriteUInt(event.isFriendlyFire ? 1 : 0);
+    pkt.WriteUInt(event.isTeamKill ? 1 : 0);
+    nm->BroadcastPacket(pkt);
+
+    Logger::Debug("[DamageSystem::BroadcastKillEvent] Broadcast kill: %u killed %u with '%s'%s%s",
+                  event.killerId, event.victimId, event.weaponId.c_str(),
+                  event.isHeadshot ? " [HEADSHOT]" : "",
+                  event.isTeamKill ? " [TK]" : "");
+    Logger::Trace("[DamageSystem::BroadcastKillEvent] Exit");
 }

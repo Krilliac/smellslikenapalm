@@ -6,6 +6,8 @@
 #include <vector>
 #include "Math/Vector3.h"
 
+class GameServer;
+
 enum class FireMode {
     SemiAuto,
     Burst,
@@ -28,7 +30,8 @@ class Player;
 
 class Weapon {
 public:
-    Weapon(const std::string& name, const WeaponStats& stats);
+    Weapon(const std::string& name, const WeaponStats& stats,
+           const std::string& weaponId = "", GameServer* server = nullptr);
     ~Weapon();
 
     // Firing
@@ -54,8 +57,10 @@ public:
 
 private:
     std::string  m_name;
+    std::string  m_weaponId;
     WeaponStats  m_stats;
     FireMode     m_fireMode;
+    GameServer*  m_server;
 
     int          m_ammoInMagazine;
     int          m_remainingAmmo;

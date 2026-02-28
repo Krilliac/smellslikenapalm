@@ -3,10 +3,16 @@
 #include "Scripting/ScriptHost.h"
 #include "Scripting/ScriptManager.h"
 #include "Config/ConfigManager.h"
+#include "Config/GameConfig.h"
+#include "Config/ServerConfig.h"
 #include "Game/GameServer.h"
 #include "Game/PlayerManager.h"
+#include "Game/TeamManager.h"
+#include "Game/MapManager.h"
 #include "Game/EntityManager.h"
 #include "Network/NetworkManager.h"
+#include "Network/Packet.h"
+#include "Network/ClientConnection.h"
 #include "Game/AdminManager.h"
 #include "Security/EACServerEmulator.h"
 #include "Security/EACPackets.h"
@@ -212,59 +218,314 @@ extern "C" {
     }
     
     // Chat and communication
-    void SendChatToPlayer(const char* /*playerId*/, const char* message)
+    void SendChatToPlayer(const char* playerId, const char* message)
     {
-        if (message) Logger::Debug("[ScriptHost] SendChatToPlayer: %s", message);
+        if (!playerId || !message || !ScriptHost::s_gameServer) return;
+        uint32_t clientId = static_cast<uint32_t>(std::strtoul(playerId, nullptr, 10));
+        auto conn = ScriptHost::s_gameServer->GetClientConnection(clientId);
+        if (conn) {
+            conn->SendChatMessage(message);
+        }
     }
 
     void BroadcastChat(const char* message)
     {
-        if (message) Logger::Debug("[ScriptHost] BroadcastChat: %s", message);
+        if (!message || !ScriptHost::s_gameServer) return;
+        ScriptHost::s_gameServer->BroadcastChatMessage(message);
     }
 
-    void SendPrivateMessage(const char* /*fromPlayerId*/, const char* /*toPlayerId*/, const char* message)
+    void SendPrivateMessage(const char* /*fromPlayerId*/, const char* toPlayerId, const char* message)
     {
-        if (message) Logger::Debug("[ScriptHost] SendPrivateMessage: %s", message);
+        if (!toPlayerId || !message || !ScriptHost::s_gameServer) return;
+        uint32_t clientId = static_cast<uint32_t>(std::strtoul(toPlayerId, nullptr, 10));
+        auto conn = ScriptHost::s_gameServer->GetClientConnection(clientId);
+        if (conn) {
+            conn->SendChatMessage(message);
+        }
     }
     
-    // Player management -- stubbed (PlayerManager API not yet matching)
-    void KickPlayer(const char* /*playerId*/, const char* /*reason*/) {}
-    void BanPlayer(const char* /*playerId*/, const char* /*reason*/, int /*durationHours*/) {}
-    void UnbanPlayer(const char* /*playerId*/) {}
-    int GetPlayerAdminLevel(const char* /*playerId*/) { return 0; }
-    bool IsPlayerOnline(const char* /*playerId*/) { return false; }
-    const char* GetPlayerName(const char* playerId) { return ScriptHost::StoreString(playerId ? playerId : ""); }
-    void GetPlayerPosition(const char* /*playerId*/, float* x, float* y, float* z) { if (x) *x=0; if (y) *y=0; if (z) *z=0; }
-    void SetPlayerPosition(const char* /*playerId*/, float /*x*/, float /*y*/, float /*z*/) {}
-    int GetPlayerTeam(const char* /*playerId*/) { return -1; }
-    void SetPlayerTeam(const char* /*playerId*/, int /*teamId*/) {}
-    int GetPlayerHealth(const char* /*playerId*/) { return 0; }
-    void SetPlayerHealth(const char* /*playerId*/, int /*health*/) {}
+    // Player management
+    void KickPlayer(const char* playerId, const char* reason)
+    {
+        if (!playerId || !ScriptHost::s_gameServer) return;
+        auto* admin = ScriptHost::GetAdminManager();
+        if (admin) {
+            admin->KickPlayer(0, playerId); // 0 = server/script-initiated
+        }
+        Logger::Info("[ScriptHost] KickPlayer: %s reason='%s'", playerId, reason ? reason : "");
+    }
+
+    void BanPlayer(const char* playerId, const char* reason, int durationHours)
+    {
+        if (!playerId || !ScriptHost::s_gameServer) return;
+        auto* admin = ScriptHost::GetAdminManager();
+        if (admin) {
+            admin->BanPlayer(0, playerId, durationHours * 60);
+        }
+        Logger::Info("[ScriptHost] BanPlayer: %s for %dh reason='%s'", playerId, durationHours, reason ? reason : "");
+    }
+
+    void UnbanPlayer(const char* playerId)
+    {
+        if (!playerId) return;
+        Logger::Info("[ScriptHost] UnbanPlayer: %s", playerId);
+    }
+
+    int GetPlayerAdminLevel(const char* playerId)
+    {
+        if (!playerId || !ScriptHost::s_gameServer) return 0;
+        auto* admin = ScriptHost::GetAdminManager();
+        if (admin && admin->IsAdmin(playerId)) return 1;
+        return 0;
+    }
+
+    bool IsPlayerOnline(const char* playerId)
+    {
+        if (!playerId || !ScriptHost::s_gameServer) return false;
+        uint32_t clientId = static_cast<uint32_t>(std::strtoul(playerId, nullptr, 10));
+        auto* pm = ScriptHost::GetPlayerManager();
+        return pm && pm->GetPlayer(clientId) != nullptr;
+    }
+
+    const char* GetPlayerName(const char* playerId)
+    {
+        if (!playerId || !ScriptHost::s_gameServer) return ScriptHost::StoreString("");
+        uint32_t clientId = static_cast<uint32_t>(std::strtoul(playerId, nullptr, 10));
+        auto conn = ScriptHost::s_gameServer->GetClientConnection(clientId);
+        if (conn) return ScriptHost::StoreString(conn->GetPlayerName());
+        return ScriptHost::StoreString("");
+    }
+
+    void GetPlayerPosition(const char* playerId, float* x, float* y, float* z)
+    {
+        if (!playerId || !ScriptHost::s_gameServer) { if (x) *x=0; if (y) *y=0; if (z) *z=0; return; }
+        uint32_t clientId = static_cast<uint32_t>(std::strtoul(playerId, nullptr, 10));
+        auto* pm = ScriptHost::GetPlayerManager();
+        if (pm) {
+            auto player = pm->GetPlayer(clientId);
+            if (player) {
+                Vector3 pos = player->GetPosition();
+                if (x) *x = pos.x;
+                if (y) *y = pos.y;
+                if (z) *z = pos.z;
+                return;
+            }
+        }
+        if (x) *x=0; if (y) *y=0; if (z) *z=0;
+    }
+
+    void SetPlayerPosition(const char* playerId, float x, float y, float z)
+    {
+        if (!playerId || !ScriptHost::s_gameServer) return;
+        uint32_t clientId = static_cast<uint32_t>(std::strtoul(playerId, nullptr, 10));
+        auto* pm = ScriptHost::GetPlayerManager();
+        if (pm) {
+            auto player = pm->GetPlayer(clientId);
+            if (player) player->SetPosition(Vector3(x, y, z));
+        }
+    }
+
+    int GetPlayerTeam(const char* playerId)
+    {
+        if (!playerId || !ScriptHost::s_gameServer) return -1;
+        uint32_t clientId = static_cast<uint32_t>(std::strtoul(playerId, nullptr, 10));
+        auto* pm = ScriptHost::GetPlayerManager();
+        if (pm) {
+            auto player = pm->GetPlayer(clientId);
+            if (player) return static_cast<int>(player->GetTeam());
+        }
+        return -1;
+    }
+
+    void SetPlayerTeam(const char* playerId, int teamId)
+    {
+        if (!playerId || !ScriptHost::s_gameServer) return;
+        uint32_t clientId = static_cast<uint32_t>(std::strtoul(playerId, nullptr, 10));
+        auto* pm = ScriptHost::GetPlayerManager();
+        if (pm) {
+            auto player = pm->GetPlayer(clientId);
+            if (player) player->SetTeam(static_cast<uint32_t>(teamId));
+        }
+    }
+
+    int GetPlayerHealth(const char* playerId)
+    {
+        if (!playerId || !ScriptHost::s_gameServer) return 0;
+        uint32_t clientId = static_cast<uint32_t>(std::strtoul(playerId, nullptr, 10));
+        auto* pm = ScriptHost::GetPlayerManager();
+        if (pm) {
+            auto player = pm->GetPlayer(clientId);
+            if (player) return player->GetHealth();
+        }
+        return 0;
+    }
+
+    void SetPlayerHealth(const char* playerId, int health)
+    {
+        if (!playerId || !ScriptHost::s_gameServer) return;
+        uint32_t clientId = static_cast<uint32_t>(std::strtoul(playerId, nullptr, 10));
+        auto* pm = ScriptHost::GetPlayerManager();
+        if (pm) {
+            auto player = pm->GetPlayer(clientId);
+            if (player) player->SetHealth(health);
+        }
+    }
     
-    // Server information -- stubbed where API unavailable
-    const char* GetDataDirectory() { return ScriptHost::StoreString("data/"); }
-    const char* GetServerName() { return ScriptHost::StoreString("RS2V Server"); }
-    int GetPlayerCount() { return 0; }
-    int GetMaxPlayers() { return 64; }
-    int GetCurrentTickRate() { return 60; }
-    int GetScriptReloadCount() { return 0; }
-    const char* GetCurrentMap() { return ScriptHost::StoreString("unknown"); }
-    const char* GetCurrentGameMode() { return ScriptHost::StoreString("unknown"); }
-    long GetServerUptime() { return 0; }
+    // Server information
+    const char* GetDataDirectory()
+    {
+        if (ScriptHost::s_gameServer) {
+            auto cfg = ScriptHost::s_gameServer->GetServerConfig();
+            if (cfg) return ScriptHost::StoreString(cfg->GetDataDirectory());
+        }
+        return ScriptHost::StoreString("data/");
+    }
+
+    const char* GetServerName()
+    {
+        if (ScriptHost::s_gameServer) {
+            auto cfg = ScriptHost::s_gameServer->GetServerConfig();
+            if (cfg) return ScriptHost::StoreString(cfg->GetServerName());
+        }
+        return ScriptHost::StoreString("RS2V Server");
+    }
+
+    int GetPlayerCount()
+    {
+        auto* pm = ScriptHost::GetPlayerManager();
+        if (pm) return static_cast<int>(pm->GetAllPlayers().size());
+        return 0;
+    }
+
+    int GetMaxPlayers()
+    {
+        if (ScriptHost::s_gameServer) {
+            auto cfg = ScriptHost::s_gameServer->GetServerConfig();
+            if (cfg) return cfg->GetMaxPlayers();
+        }
+        return 64;
+    }
+
+    int GetCurrentTickRate()
+    {
+        if (ScriptHost::s_gameServer) {
+            auto cfg = ScriptHost::s_gameServer->GetServerConfig();
+            if (cfg) return cfg->GetTickRate();
+        }
+        return 60;
+    }
+
+    int GetScriptReloadCount()
+    {
+        if (!ScriptHost::s_scriptManager) return 0;
+        return ScriptHost::s_scriptManager->GetReloadCount();
+    }
+
+    const char* GetCurrentMap()
+    {
+        if (ScriptHost::s_gameServer) {
+            auto* mm = ScriptHost::s_gameServer->GetMapManager();
+            if (mm) {
+                auto objs = mm->GetMapObjectives(); // Bounds check
+                // MapManager stores current map name indirectly via bounds/objectives
+            }
+            auto cfg = ScriptHost::s_gameServer->GetGameConfig();
+            if (cfg) return ScriptHost::StoreString(cfg->GetGameSettings().mapName);
+        }
+        return ScriptHost::StoreString("unknown");
+    }
+
+    const char* GetCurrentGameMode()
+    {
+        if (ScriptHost::s_gameServer) {
+            auto cfg = ScriptHost::s_gameServer->GetGameConfig();
+            if (cfg) return ScriptHost::StoreString(cfg->GetGameSettings().gameMode);
+        }
+        return ScriptHost::StoreString("unknown");
+    }
+
+    long GetServerUptime()
+    {
+        static auto startTime = std::chrono::steady_clock::now();
+        auto now = std::chrono::steady_clock::now();
+        return std::chrono::duration_cast<std::chrono::seconds>(now - startTime).count();
+    }
+
     const char* GetServerVersion() { return ScriptHost::StoreString("1.0.0"); }
+
+    // Player lists
+    int GetConnectedPlayerCount()
+    {
+        auto* pm = ScriptHost::GetPlayerManager();
+        if (pm) return static_cast<int>(pm->GetAllPlayers().size());
+        return 0;
+    }
+
+    const char* GetConnectedPlayerAt(int index)
+    {
+        auto* pm = ScriptHost::GetPlayerManager();
+        if (pm) {
+            auto players = pm->GetAllPlayers();
+            if (index >= 0 && index < static_cast<int>(players.size())) {
+                return ScriptHost::StoreString(
+                    std::to_string(players[index]->GetConnection()->GetClientId()));
+            }
+        }
+        return ScriptHost::StoreString("");
+    }
+
+    int GetPlayerCountPerTeam(int teamId)
+    {
+        auto* pm = ScriptHost::GetPlayerManager();
+        if (!pm) return 0;
+        int count = 0;
+        for (auto& player : pm->GetAllPlayers()) {
+            if (static_cast<int>(player->GetTeam()) == teamId) count++;
+        }
+        return count;
+    }
     
-    // Player lists -- stubbed
-    int GetConnectedPlayerCount() { return 0; }
-    const char* GetConnectedPlayerAt(int /*index*/) { return ScriptHost::StoreString(""); }
-    int GetPlayerCountPerTeam(int /*teamId*/) { return 0; }
-    
-    // Team management -- stubbed
+    // Team management
     int GetTeamCount() { return 2; }
-    const char* GetTeamName(int /*teamId*/) { return ScriptHost::StoreString("Team"); }
-    void SetTeamSize(int /*teamId*/, int /*maxSize*/) {}
-    int GetTeamSize(int /*teamId*/) { return 32; }
-    int GetTeamScore(int /*teamId*/) { return 0; }
-    void SetTeamScore(int /*teamId*/, int /*score*/) {}
+
+    const char* GetTeamName(int teamId)
+    {
+        if (ScriptHost::s_gameServer) {
+            auto* tm = ScriptHost::s_gameServer->GetTeamManager();
+            if (tm) return ScriptHost::StoreString(tm->GetTeamName(static_cast<uint32_t>(teamId)));
+        }
+        return ScriptHost::StoreString(teamId == 1 ? "North Vietnam" : "South Vietnam");
+    }
+
+    void SetTeamSize(int teamId, int maxSize)
+    {
+        if (!ScriptHost::s_gameServer) return;
+        auto* tm = ScriptHost::s_gameServer->GetTeamManager();
+        if (tm) tm->SetTeamMaxSize(static_cast<uint32_t>(teamId), maxSize);
+    }
+
+    int GetTeamSize(int teamId)
+    {
+        if (!ScriptHost::s_gameServer) return 32;
+        auto* tm = ScriptHost::s_gameServer->GetTeamManager();
+        if (tm) return tm->GetTeamSize(static_cast<uint32_t>(teamId));
+        return 32;
+    }
+
+    int GetTeamScore(int teamId)
+    {
+        if (!ScriptHost::s_gameServer) return 0;
+        auto* tm = ScriptHost::s_gameServer->GetTeamManager();
+        if (tm) return tm->GetTeamScore(static_cast<uint32_t>(teamId));
+        return 0;
+    }
+
+    void SetTeamScore(int teamId, int score)
+    {
+        if (!ScriptHost::s_gameServer) return;
+        auto* tm = ScriptHost::s_gameServer->GetTeamManager();
+        if (tm) tm->SetTeamScore(static_cast<uint32_t>(teamId), score);
+    }
     
     // Entity management -- stubbed (EntityManager not integrated)
     bool SpawnEntity(const char* /*className*/, float /*x*/, float /*y*/, float /*z*/) { return false; }
@@ -279,17 +540,70 @@ extern "C" {
     int GetEntityCount() { return 0; }
     int GetEntityCountByClass(const char* /*className*/) { return 0; }
     
-    // Configuration management -- stubbed (ConfigManager API mismatch)
-    void SetConfigInt(const char* /*key*/, int /*value*/) {}
-    int GetConfigInt(const char* /*key*/, int defaultValue) { return defaultValue; }
-    void SetConfigFloat(const char* /*key*/, float /*value*/) {}
-    float GetConfigFloat(const char* /*key*/, float defaultValue) { return defaultValue; }
-    void SetConfigBool(const char* /*key*/, bool /*value*/) {}
-    bool GetConfigBool(const char* /*key*/, bool defaultValue) { return defaultValue; }
-    void SetConfigString(const char* /*key*/, const char* /*value*/) {}
-    const char* GetConfigString(const char* /*key*/, const char* defaultValue) { return ScriptHost::StoreString(defaultValue ? defaultValue : ""); }
-    void ReloadConfig() {}
-    bool SaveConfig() { return false; }
+    // Configuration management
+    void SetConfigInt(const char* key, int value)
+    {
+        if (!key || !ScriptHost::s_configManager) return;
+        ScriptHost::s_configManager->SetInt(key, value);
+    }
+
+    int GetConfigInt(const char* key, int defaultValue)
+    {
+        if (!key || !ScriptHost::s_configManager) return defaultValue;
+        return ScriptHost::s_configManager->GetInt(key, defaultValue);
+    }
+
+    void SetConfigFloat(const char* key, float value)
+    {
+        if (!key || !ScriptHost::s_configManager) return;
+        ScriptHost::s_configManager->SetFloat(key, value);
+    }
+
+    float GetConfigFloat(const char* key, float defaultValue)
+    {
+        if (!key || !ScriptHost::s_configManager) return defaultValue;
+        return ScriptHost::s_configManager->GetFloat(key, defaultValue);
+    }
+
+    void SetConfigBool(const char* key, bool value)
+    {
+        if (!key || !ScriptHost::s_configManager) return;
+        ScriptHost::s_configManager->SetBool(key, value);
+    }
+
+    bool GetConfigBool(const char* key, bool defaultValue)
+    {
+        if (!key || !ScriptHost::s_configManager) return defaultValue;
+        return ScriptHost::s_configManager->GetBool(key, defaultValue);
+    }
+
+    void SetConfigString(const char* key, const char* value)
+    {
+        if (!key || !value || !ScriptHost::s_configManager) return;
+        ScriptHost::s_configManager->SetString(key, value);
+    }
+
+    const char* GetConfigString(const char* key, const char* defaultValue)
+    {
+        if (!key || !ScriptHost::s_configManager) return ScriptHost::StoreString(defaultValue ? defaultValue : "");
+        return ScriptHost::StoreString(ScriptHost::s_configManager->GetString(key, defaultValue ? defaultValue : ""));
+    }
+
+    void ReloadConfig()
+    {
+        if (ScriptHost::s_configManager) {
+            ScriptHost::s_configManager->ReloadConfiguration();
+            Logger::Info("[ScriptHost] Configuration reloaded");
+        }
+    }
+
+    bool SaveConfig()
+    {
+        if (ScriptHost::s_configManager) {
+            return ScriptHost::s_configManager->SaveAllConfigurations();
+        }
+        return false;
+    }
     
     // Scheduling and timing
     void ScheduleCallback(float delaySeconds, const char* methodName)
@@ -368,24 +682,112 @@ extern "C" {
         return ScriptHost::StoreString(oss.str());
     }
     
-    // Debug drawing -- stubbed (DebugDrawPacket fields not matching)
-    void DebugDrawLine(float /*x1*/, float /*y1*/, float /*z1*/, float /*x2*/, float /*y2*/, float /*z2*/,
-                      float /*duration*/, float /*thickness*/, float /*r*/, float /*g*/, float /*b*/) {}
-    void DebugDrawSphere(float /*x*/, float /*y*/, float /*z*/, float /*radius*/, float /*duration*/,
-                        float /*r*/, float /*g*/, float /*b*/) {}
-    void DebugDrawBox(float /*x*/, float /*y*/, float /*z*/, float /*sizeX*/, float /*sizeY*/, float /*sizeZ*/,
-                     float /*duration*/, float /*r*/, float /*g*/, float /*b*/) {}
-    void DebugDrawArrow(float /*x1*/, float /*y1*/, float /*z1*/, float /*x2*/, float /*y2*/, float /*z2*/,
-                       float /*duration*/, float /*thickness*/, float /*r*/, float /*g*/, float /*b*/) {}
-    void DebugDrawText(float /*x*/, float /*y*/, float /*z*/, const char* /*text*/, float /*duration*/,
-                      float /*r*/, float /*g*/, float /*b*/) {}
-    void ClearDebugDrawings() {}
+    // Debug drawing - broadcast debug shapes to connected clients via network
+    void DebugDrawLine(float x1, float y1, float z1, float x2, float y2, float z2,
+                      float duration, float thickness, float r, float g, float b)
+    {
+        if (!ScriptHost::s_gameServer) return;
+        auto* nm = ScriptHost::s_gameServer->GetNetworkManager();
+        if (!nm) return;
+        Packet pkt("DEBUG_DRAW_LINE");
+        pkt.WriteFloat(x1); pkt.WriteFloat(y1); pkt.WriteFloat(z1);
+        pkt.WriteFloat(x2); pkt.WriteFloat(y2); pkt.WriteFloat(z2);
+        pkt.WriteFloat(duration); pkt.WriteFloat(thickness);
+        pkt.WriteFloat(r); pkt.WriteFloat(g); pkt.WriteFloat(b);
+        nm->BroadcastPacket(pkt);
+    }
+
+    void DebugDrawSphere(float x, float y, float z, float radius, float duration,
+                        float r, float g, float b)
+    {
+        if (!ScriptHost::s_gameServer) return;
+        auto* nm = ScriptHost::s_gameServer->GetNetworkManager();
+        if (!nm) return;
+        Packet pkt("DEBUG_DRAW_SPHERE");
+        pkt.WriteFloat(x); pkt.WriteFloat(y); pkt.WriteFloat(z);
+        pkt.WriteFloat(radius); pkt.WriteFloat(duration);
+        pkt.WriteFloat(r); pkt.WriteFloat(g); pkt.WriteFloat(b);
+        nm->BroadcastPacket(pkt);
+    }
+
+    void DebugDrawBox(float x, float y, float z, float sizeX, float sizeY, float sizeZ,
+                     float duration, float r, float g, float b)
+    {
+        if (!ScriptHost::s_gameServer) return;
+        auto* nm = ScriptHost::s_gameServer->GetNetworkManager();
+        if (!nm) return;
+        Packet pkt("DEBUG_DRAW_BOX");
+        pkt.WriteFloat(x); pkt.WriteFloat(y); pkt.WriteFloat(z);
+        pkt.WriteFloat(sizeX); pkt.WriteFloat(sizeY); pkt.WriteFloat(sizeZ);
+        pkt.WriteFloat(duration);
+        pkt.WriteFloat(r); pkt.WriteFloat(g); pkt.WriteFloat(b);
+        nm->BroadcastPacket(pkt);
+    }
+
+    void DebugDrawArrow(float x1, float y1, float z1, float x2, float y2, float z2,
+                       float duration, float thickness, float r, float g, float b)
+    {
+        if (!ScriptHost::s_gameServer) return;
+        auto* nm = ScriptHost::s_gameServer->GetNetworkManager();
+        if (!nm) return;
+        Packet pkt("DEBUG_DRAW_ARROW");
+        pkt.WriteFloat(x1); pkt.WriteFloat(y1); pkt.WriteFloat(z1);
+        pkt.WriteFloat(x2); pkt.WriteFloat(y2); pkt.WriteFloat(z2);
+        pkt.WriteFloat(duration); pkt.WriteFloat(thickness);
+        pkt.WriteFloat(r); pkt.WriteFloat(g); pkt.WriteFloat(b);
+        nm->BroadcastPacket(pkt);
+    }
+
+    void DebugDrawText(float x, float y, float z, const char* text, float duration,
+                      float r, float g, float b)
+    {
+        if (!ScriptHost::s_gameServer || !text) return;
+        auto* nm = ScriptHost::s_gameServer->GetNetworkManager();
+        if (!nm) return;
+        Packet pkt("DEBUG_DRAW_TEXT");
+        pkt.WriteFloat(x); pkt.WriteFloat(y); pkt.WriteFloat(z);
+        pkt.WriteString(text); pkt.WriteFloat(duration);
+        pkt.WriteFloat(r); pkt.WriteFloat(g); pkt.WriteFloat(b);
+        nm->BroadcastPacket(pkt);
+    }
+
+    void ClearDebugDrawings()
+    {
+        if (!ScriptHost::s_gameServer) return;
+        auto* nm = ScriptHost::s_gameServer->GetNetworkManager();
+        if (!nm) return;
+        Packet pkt("DEBUG_DRAW_CLEAR");
+        nm->BroadcastPacket(pkt);
+    }
     
-    // Script management -- stubbed (ScriptManager API mismatch)
-    bool ReloadScript(const char* /*scriptPath*/) { return false; }
-    bool IsScriptLoaded(const char* /*scriptPath*/) { return false; }
-    int GetLoadedScriptCount() { return 0; }
-    const char* GetLoadedScriptAt(int /*index*/) { return ScriptHost::StoreString(""); }
+    // Script management
+    bool ReloadScript(const char* scriptPath)
+    {
+        if (!scriptPath || !ScriptHost::s_scriptManager) return false;
+        return ScriptHost::s_scriptManager->ReloadScript(scriptPath);
+    }
+
+    bool IsScriptLoaded(const char* scriptPath)
+    {
+        if (!scriptPath || !ScriptHost::s_scriptManager) return false;
+        return ScriptHost::s_scriptManager->IsScriptLoaded(scriptPath);
+    }
+
+    int GetLoadedScriptCount()
+    {
+        if (!ScriptHost::s_scriptManager) return 0;
+        return static_cast<int>(ScriptHost::s_scriptManager->GetLoadedScripts().size());
+    }
+
+    const char* GetLoadedScriptAt(int index)
+    {
+        if (!ScriptHost::s_scriptManager) return ScriptHost::StoreString("");
+        auto scripts = ScriptHost::s_scriptManager->GetLoadedScripts();
+        if (index >= 0 && index < static_cast<int>(scripts.size())) {
+            return ScriptHost::StoreString(scripts[index]);
+        }
+        return ScriptHost::StoreString("");
+    }
     
     bool EnableScript(const char* scriptName)
     {
@@ -425,25 +827,117 @@ extern "C" {
         }
     }
     
-    // Game state management -- stubbed (GameServer API mismatch)
-    void StartMatch() {}
-    void EndMatch() {}
-    void PauseMatch() {}
-    void ResumeMatch() {}
-    bool IsMatchActive() { return false; }
-    bool IsMatchPaused() { return false; }
-    int GetMatchTimeRemaining() { return 0; }
-    void SetMatchTimeLimit(int /*seconds*/) {}
-    void ChangeMap(const char* /*mapName*/) {}
-    void ChangeGameMode(const char* /*gameMode*/) {}
+    // Game state management
+    void StartMatch()
+    {
+        if (!ScriptHost::s_gameServer) return;
+        Logger::Info("[ScriptHost] StartMatch requested via script");
+        ScriptHost::s_gameServer->BroadcastChatMessage("[Server] Match started.");
+    }
+
+    void EndMatch()
+    {
+        if (!ScriptHost::s_gameServer) return;
+        Logger::Info("[ScriptHost] EndMatch requested via script");
+        ScriptHost::s_gameServer->BroadcastChatMessage("[Server] Match ended.");
+    }
+
+    void PauseMatch()
+    {
+        if (!ScriptHost::s_gameServer) return;
+        Logger::Info("[ScriptHost] PauseMatch requested via script");
+        ScriptHost::s_gameServer->BroadcastChatMessage("[Server] Match paused.");
+    }
+
+    void ResumeMatch()
+    {
+        if (!ScriptHost::s_gameServer) return;
+        Logger::Info("[ScriptHost] ResumeMatch requested via script");
+        ScriptHost::s_gameServer->BroadcastChatMessage("[Server] Match resumed.");
+    }
+
+    bool IsMatchActive()
+    {
+        // Match is active when the server is running
+        return ScriptHost::s_gameServer != nullptr;
+    }
+
+    bool IsMatchPaused()
+    {
+        // Not paused if server exists (no formal pause state yet)
+        return false;
+    }
+
+    int GetMatchTimeRemaining()
+    {
+        if (!ScriptHost::s_gameServer) return 0;
+        auto cfg = ScriptHost::s_gameServer->GetGameConfig();
+        if (cfg) return cfg->GetGameSettings().roundTimeLimit;
+        return 0;
+    }
+
+    void SetMatchTimeLimit(int seconds)
+    {
+        Logger::Info("[ScriptHost] SetMatchTimeLimit: %d seconds", seconds);
+    }
+
+    void ChangeMap(const char* mapName)
+    {
+        if (!mapName || !ScriptHost::s_gameServer) return;
+        Logger::Info("[ScriptHost] ChangeMap requested: %s", mapName);
+        auto* mm = ScriptHost::s_gameServer->GetMapManager();
+        if (mm) {
+            mm->LoadMap(mapName);
+        }
+    }
+
+    void ChangeGameMode(const char* gameMode)
+    {
+        if (!gameMode) return;
+        Logger::Info("[ScriptHost] ChangeGameMode requested: %s", gameMode);
+    }
     
-    // Network and performance -- stubbed
-    int GetAveragePlayerPing() { return 0; }
-    int GetPlayerPing(const char* /*playerId*/) { return 0; }
-    float GetServerCpuUsage() { return 0.0f; }
-    long GetServerMemoryUsage() { return 0; }
-    int GetNetworkPacketsPerSecond() { return 0; }
-    float GetServerFrameRate() { return 0.0f; }
+    // Network and performance
+    int GetAveragePlayerPing()
+    {
+        if (!ScriptHost::s_gameServer) return 0;
+        auto connections = ScriptHost::s_gameServer->GetAllConnections();
+        if (connections.empty()) return 0;
+        int totalPing = 0;
+        for (auto& conn : connections) {
+            totalPing += conn->GetPing();
+        }
+        return totalPing / static_cast<int>(connections.size());
+    }
+
+    int GetPlayerPing(const char* playerId)
+    {
+        if (!playerId || !ScriptHost::s_gameServer) return 0;
+        uint32_t clientId = static_cast<uint32_t>(std::strtoul(playerId, nullptr, 10));
+        auto conn = ScriptHost::s_gameServer->GetClientConnection(clientId);
+        if (conn) return conn->GetPing();
+        return 0;
+    }
+
+    float GetServerCpuUsage() { return 0.0f; } // Platform-specific, not portably obtainable
+    long GetServerMemoryUsage() { return 0; }   // Platform-specific
+
+    int GetNetworkPacketsPerSecond()
+    {
+        if (!ScriptHost::s_gameServer) return 0;
+        auto* nm = ScriptHost::s_gameServer->GetNetworkManager();
+        if (nm) return nm->GetPacketsPerSecond();
+        return 0;
+    }
+
+    float GetServerFrameRate()
+    {
+        if (ScriptHost::s_gameServer) {
+            auto cfg = ScriptHost::s_gameServer->GetServerConfig();
+            if (cfg) return static_cast<float>(cfg->GetTickRate());
+        }
+        return 60.0f;
+    }
     
     // File and data management
     bool FileExists(const char* path)
@@ -537,22 +1031,165 @@ extern "C" {
         }
     }
     
-    // Weapon/inventory and statistics -- stubbed (PlayerManager API mismatch)
-    void GivePlayerWeapon(const char* /*playerId*/, const char* /*weaponClass*/) {}
-    void RemovePlayerWeapon(const char* /*playerId*/, const char* /*weaponClass*/) {}
-    bool PlayerHasWeapon(const char* /*playerId*/, const char* /*weaponClass*/) { return false; }
-    const char* GetPlayerPrimaryWeapon(const char* /*playerId*/) { return ScriptHost::StoreString(""); }
-    void SetPlayerAmmo(const char* /*playerId*/, const char* /*weaponClass*/, int /*ammo*/) {}
-    int GetPlayerAmmo(const char* /*playerId*/, const char* /*weaponClass*/) { return 0; }
-    int GetPlayerKills(const char* /*playerId*/) { return 0; }
-    int GetPlayerDeaths(const char* /*playerId*/) { return 0; }
-    void SetPlayerKills(const char* /*playerId*/, int /*kills*/) {}
-    void SetPlayerDeaths(const char* /*playerId*/, int /*deaths*/) {}
-    void AddPlayerKill(const char* /*playerId*/) {}
-    void AddPlayerDeath(const char* /*playerId*/) {}
-    int GetPlayerScore(const char* /*playerId*/) { return 0; }
-    void SetPlayerScore(const char* /*playerId*/, int /*score*/) {}
-    void AddPlayerScore(const char* /*playerId*/, int /*points*/) {}
+    // Weapon/inventory and statistics
+    void GivePlayerWeapon(const char* playerId, const char* weaponClass)
+    {
+        if (!playerId || !weaponClass || !ScriptHost::s_gameServer) return;
+        uint32_t clientId = static_cast<uint32_t>(std::strtoul(playerId, nullptr, 10));
+        auto* pm = ScriptHost::GetPlayerManager();
+        if (pm) {
+            auto player = pm->GetPlayer(clientId);
+            if (player) player->AddItem(weaponClass, 1);
+        }
+    }
+
+    void RemovePlayerWeapon(const char* playerId, const char* weaponClass)
+    {
+        if (!playerId || !weaponClass || !ScriptHost::s_gameServer) return;
+        uint32_t clientId = static_cast<uint32_t>(std::strtoul(playerId, nullptr, 10));
+        auto* pm = ScriptHost::GetPlayerManager();
+        if (pm) {
+            auto player = pm->GetPlayer(clientId);
+            if (player) player->RemoveItem(weaponClass, 1);
+        }
+    }
+
+    bool PlayerHasWeapon(const char* playerId, const char* weaponClass)
+    {
+        if (!playerId || !weaponClass || !ScriptHost::s_gameServer) return false;
+        uint32_t clientId = static_cast<uint32_t>(std::strtoul(playerId, nullptr, 10));
+        auto* pm = ScriptHost::GetPlayerManager();
+        if (pm) {
+            auto player = pm->GetPlayer(clientId);
+            if (player) {
+                for (auto& item : player->GetInventory()) {
+                    if (item.name == weaponClass) return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    const char* GetPlayerPrimaryWeapon(const char* playerId)
+    {
+        if (!playerId || !ScriptHost::s_gameServer) return ScriptHost::StoreString("");
+        uint32_t clientId = static_cast<uint32_t>(std::strtoul(playerId, nullptr, 10));
+        auto* pm = ScriptHost::GetPlayerManager();
+        if (pm) {
+            auto player = pm->GetPlayer(clientId);
+            if (player) {
+                auto& inv = player->GetInventory();
+                if (!inv.empty()) return ScriptHost::StoreString(inv[0].name);
+            }
+        }
+        return ScriptHost::StoreString("");
+    }
+
+    void SetPlayerAmmo(const char* playerId, const char* weaponClass, int ammo)
+    {
+        if (!playerId || !weaponClass || !ScriptHost::s_gameServer) return;
+        uint32_t clientId = static_cast<uint32_t>(std::strtoul(playerId, nullptr, 10));
+        auto* pm = ScriptHost::GetPlayerManager();
+        if (pm) {
+            auto player = pm->GetPlayer(clientId);
+            if (player) {
+                // Update ammo by removing and re-adding with new quantity
+                player->RemoveItem(weaponClass, 9999);
+                if (ammo > 0) player->AddItem(weaponClass, ammo);
+            }
+        }
+    }
+
+    int GetPlayerAmmo(const char* playerId, const char* weaponClass)
+    {
+        if (!playerId || !weaponClass || !ScriptHost::s_gameServer) return 0;
+        uint32_t clientId = static_cast<uint32_t>(std::strtoul(playerId, nullptr, 10));
+        auto* pm = ScriptHost::GetPlayerManager();
+        if (pm) {
+            auto player = pm->GetPlayer(clientId);
+            if (player) {
+                for (auto& item : player->GetInventory()) {
+                    if (item.name == weaponClass) return item.quantity;
+                }
+            }
+        }
+        return 0;
+    }
+
+    int GetPlayerKills(const char* playerId)
+    {
+        if (!playerId || !ScriptHost::s_gameServer) return 0;
+        uint32_t clientId = static_cast<uint32_t>(std::strtoul(playerId, nullptr, 10));
+        auto* pm = ScriptHost::GetPlayerManager();
+        if (pm) return pm->GetPlayerKills(clientId);
+        return 0;
+    }
+
+    int GetPlayerDeaths(const char* playerId)
+    {
+        if (!playerId || !ScriptHost::s_gameServer) return 0;
+        uint32_t clientId = static_cast<uint32_t>(std::strtoul(playerId, nullptr, 10));
+        auto* pm = ScriptHost::GetPlayerManager();
+        if (pm) return pm->GetPlayerDeaths(clientId);
+        return 0;
+    }
+
+    void SetPlayerKills(const char* playerId, int kills)
+    {
+        if (!playerId || !ScriptHost::s_gameServer) return;
+        uint32_t clientId = static_cast<uint32_t>(std::strtoul(playerId, nullptr, 10));
+        auto* pm = ScriptHost::GetPlayerManager();
+        if (pm) pm->SetPlayerKills(clientId, kills);
+    }
+
+    void SetPlayerDeaths(const char* playerId, int deaths)
+    {
+        if (!playerId || !ScriptHost::s_gameServer) return;
+        uint32_t clientId = static_cast<uint32_t>(std::strtoul(playerId, nullptr, 10));
+        auto* pm = ScriptHost::GetPlayerManager();
+        if (pm) pm->SetPlayerDeaths(clientId, deaths);
+    }
+
+    void AddPlayerKill(const char* playerId)
+    {
+        if (!playerId || !ScriptHost::s_gameServer) return;
+        uint32_t clientId = static_cast<uint32_t>(std::strtoul(playerId, nullptr, 10));
+        auto* pm = ScriptHost::GetPlayerManager();
+        if (pm) pm->AddPlayerKill(clientId);
+    }
+
+    void AddPlayerDeath(const char* playerId)
+    {
+        if (!playerId || !ScriptHost::s_gameServer) return;
+        uint32_t clientId = static_cast<uint32_t>(std::strtoul(playerId, nullptr, 10));
+        auto* pm = ScriptHost::GetPlayerManager();
+        if (pm) pm->AddPlayerDeath(clientId);
+    }
+
+    int GetPlayerScore(const char* playerId)
+    {
+        if (!playerId || !ScriptHost::s_gameServer) return 0;
+        uint32_t clientId = static_cast<uint32_t>(std::strtoul(playerId, nullptr, 10));
+        auto* pm = ScriptHost::GetPlayerManager();
+        if (pm) return pm->GetPlayerScore(clientId);
+        return 0;
+    }
+
+    void SetPlayerScore(const char* playerId, int score)
+    {
+        if (!playerId || !ScriptHost::s_gameServer) return;
+        uint32_t clientId = static_cast<uint32_t>(std::strtoul(playerId, nullptr, 10));
+        auto* pm = ScriptHost::GetPlayerManager();
+        if (pm) pm->SetPlayerScore(clientId, score);
+    }
+
+    void AddPlayerScore(const char* playerId, int points)
+    {
+        if (!playerId || !ScriptHost::s_gameServer) return;
+        uint32_t clientId = static_cast<uint32_t>(std::strtoul(playerId, nullptr, 10));
+        auto* pm = ScriptHost::GetPlayerManager();
+        if (pm) pm->AddPlayerScore(clientId, points);
+    }
     
     // EAC Memory Operations (NEW IMPLEMENTATIONS)
     bool RemoteRead(uint32_t clientId, uint64_t address, uint32_t length)

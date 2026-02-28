@@ -168,6 +168,47 @@ void PlayerManager::RemoveStalePlayers()
     }
     for (auto id : toRemove) {
         m_players.erase(id);
+        m_playerStats.erase(id);
         Logger::Info("PlayerManager: Removed stale player %u", id);
     }
+}
+
+// Statistics tracking
+int PlayerManager::GetPlayerKills(uint32_t clientId) const {
+    auto it = m_playerStats.find(clientId);
+    return it != m_playerStats.end() ? it->second.kills : 0;
+}
+
+int PlayerManager::GetPlayerDeaths(uint32_t clientId) const {
+    auto it = m_playerStats.find(clientId);
+    return it != m_playerStats.end() ? it->second.deaths : 0;
+}
+
+int PlayerManager::GetPlayerScore(uint32_t clientId) const {
+    auto it = m_playerStats.find(clientId);
+    return it != m_playerStats.end() ? it->second.score : 0;
+}
+
+void PlayerManager::SetPlayerKills(uint32_t clientId, int kills) {
+    m_playerStats[clientId].kills = kills;
+}
+
+void PlayerManager::SetPlayerDeaths(uint32_t clientId, int deaths) {
+    m_playerStats[clientId].deaths = deaths;
+}
+
+void PlayerManager::SetPlayerScore(uint32_t clientId, int score) {
+    m_playerStats[clientId].score = score;
+}
+
+void PlayerManager::AddPlayerKill(uint32_t clientId) {
+    m_playerStats[clientId].kills++;
+}
+
+void PlayerManager::AddPlayerDeath(uint32_t clientId) {
+    m_playerStats[clientId].deaths++;
+}
+
+void PlayerManager::AddPlayerScore(uint32_t clientId, int points) {
+    m_playerStats[clientId].score += points;
 }

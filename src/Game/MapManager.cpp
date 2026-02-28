@@ -7,6 +7,8 @@
 #include "Math/Vector3.h"
 #include <algorithm>
 #include <filesystem>
+#include <fstream>
+#include <cstring>
 #include <random>
 
 MapManager::MapManager(GameServer* server,
@@ -61,12 +63,82 @@ bool MapManager::LoadMap(const std::string& mapName)
 
 bool MapManager::LoadGeometry(const std::string& path)
 {
-    // TODO: integrate actual geometry loading
+    Logger::Trace("[MapManager::LoadGeometry] Entry: path='%s'", path.c_str());
+
     if (!std::filesystem::exists(path)) {
         Logger::Error("Map geometry file not found: %s", path.c_str());
+        Logger::Trace("[MapManager::LoadGeometry] Exit: return false (file not found)");
         return false;
     }
-    Logger::Debug("Loaded geometry from %s", path.c_str());
+
+    auto fileSize = std::filesystem::file_size(path);
+    if (fileSize == 0) {
+        Logger::Error("Map geometry file is empty: %s", path.c_str());
+        return false;
+    }
+
+    // Open geometry file and try to parse bounds information
+    std::ifstream file(path, std::ios::binary);
+    if (!file.is_open()) {
+        Logger::Error("Failed to open geometry file: %s", path.c_str());
+        return false;
+    }
+
+    // Read the first 4 bytes as a magic number to identify file format
+    char magic[4] = {};
+    file.read(magic, sizeof(magic));
+    if (!file.good()) {
+        // File too small for header - use definition bounds
+        file.close();
+        m_bounds.min = m_currentMap.bounds.min;
+        m_bounds.max = m_currentMap.bounds.max;
+        Logger::Info("Loaded geometry (definition bounds) from %s (%.0f KB)",
+                     path.c_str(), static_cast<float>(fileSize) / 1024.0f);
+        return true;
+    }
+
+    // Check for UE3 package magic (0xC1832A9E) or use definition bounds
+    uint32_t magicVal = 0;
+    std::memcpy(&magicVal, magic, sizeof(uint32_t));
+
+    if (magicVal == 0xC1832A9E) {
+        Logger::Debug("[MapManager::LoadGeometry] Detected UE3 package format");
+
+        // Skip package header fields: version(4) + licensee(4) + headerSize(4)
+        file.seekg(12, std::ios::cur);
+
+        // Attempt to read bounds from the expected offset
+        float minX, minY, minZ, maxX, maxY, maxZ;
+        file.read(reinterpret_cast<char*>(&minX), sizeof(float));
+        file.read(reinterpret_cast<char*>(&minY), sizeof(float));
+        file.read(reinterpret_cast<char*>(&minZ), sizeof(float));
+        file.read(reinterpret_cast<char*>(&maxX), sizeof(float));
+        file.read(reinterpret_cast<char*>(&maxY), sizeof(float));
+        file.read(reinterpret_cast<char*>(&maxZ), sizeof(float));
+
+        if (file.good()) {
+            m_bounds.min = Vector3(minX, minY, minZ);
+            m_bounds.max = Vector3(maxX, maxY, maxZ);
+            Logger::Debug("[MapManager::LoadGeometry] UE3 bounds: min(%.1f,%.1f,%.1f) max(%.1f,%.1f,%.1f)",
+                          minX, minY, minZ, maxX, maxY, maxZ);
+        } else {
+            m_bounds.min = m_currentMap.bounds.min;
+            m_bounds.max = m_currentMap.bounds.max;
+        }
+    } else {
+        // Unknown format - use definition bounds as fallback
+        Logger::Debug("[MapManager::LoadGeometry] Unknown format (magic=0x%08X), using definition bounds", magicVal);
+        m_bounds.min = m_currentMap.bounds.min;
+        m_bounds.max = m_currentMap.bounds.max;
+    }
+
+    file.close();
+
+    Logger::Info("Loaded geometry from %s (%.0f KB, bounds: min(%.1f,%.1f,%.1f) max(%.1f,%.1f,%.1f))",
+                 path.c_str(), static_cast<float>(fileSize) / 1024.0f,
+                 m_bounds.min.x, m_bounds.min.y, m_bounds.min.z,
+                 m_bounds.max.x, m_bounds.max.y, m_bounds.max.z);
+    Logger::Trace("[MapManager::LoadGeometry] Exit: return true");
     return true;
 }
 
