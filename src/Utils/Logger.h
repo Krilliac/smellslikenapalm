@@ -17,6 +17,7 @@ enum class LogLevel {
 class Logger {
 public:
     // Initialize the logger (e.g., open log file). Call once at startup.
+    // If logFilePath is non-empty, logs to both console AND file.
     static void Initialize(const std::string& logFilePath = "");
 
     // Shutdown the logger (e.g., flush and close file). Call at exit.
@@ -25,10 +26,13 @@ public:
     // Set minimum level to output. Messages below this level are ignored.
     static void SetLevel(LogLevel level);
 
+    // Get current minimum log level
+    static LogLevel GetLevel();
+
     // Format and write a message at the given level
     static void Log(LogLevel level, const char* fmt, ...);
 
-    // Level‐specific helpers
+    // Level-specific helpers
     static void Trace(const char* fmt, ...);
     static void Debug(const char* fmt, ...);
     static void Info(const char* fmt, ...);

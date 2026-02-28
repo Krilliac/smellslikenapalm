@@ -19,29 +19,60 @@ namespace ProtocolUtils {
 // Tag splitting / joining
 
 std::pair<std::string,std::string> SplitTag(const std::string& tag) {
+    Logger::Trace("[ProtocolUtils::SplitTag] entry — tag='%s'", tag.c_str());
     auto pos = tag.find(':');
-    if (pos == std::string::npos) return {tag, ""};
-    return { tag.substr(0,pos), tag.substr(pos+1) };
+    if (pos == std::string::npos) {
+        Logger::Debug("[ProtocolUtils::SplitTag] no ':' separator found — returning category='%s', subtype=''", tag.c_str());
+        Logger::Trace("[ProtocolUtils::SplitTag] exit — returning {category='%s', subtype=''}", tag.c_str());
+        return {tag, ""};
+    }
+    std::string category = tag.substr(0,pos);
+    std::string subtype = tag.substr(pos+1);
+    Logger::Debug("[ProtocolUtils::SplitTag] split tag at position %zu — category='%s', subtype='%s'",
+                  pos, category.c_str(), subtype.c_str());
+    Logger::Trace("[ProtocolUtils::SplitTag] exit — returning {category='%s', subtype='%s'}",
+                  category.c_str(), subtype.c_str());
+    return { category, subtype };
 }
 
 std::string JoinTag(const std::string& category, const std::string& subtype) {
-    return subtype.empty() ? category : category + ":" + subtype;
+    Logger::Trace("[ProtocolUtils::JoinTag] entry — category='%s', subtype='%s'",
+                  category.c_str(), subtype.c_str());
+    std::string result = subtype.empty() ? category : category + ":" + subtype;
+    if (subtype.empty()) {
+        Logger::Debug("[ProtocolUtils::JoinTag] subtype is empty — returning category only: '%s'", result.c_str());
+    } else {
+        Logger::Debug("[ProtocolUtils::JoinTag] joined category and subtype — result='%s'", result.c_str());
+    }
+    Logger::Trace("[ProtocolUtils::JoinTag] exit — returning '%s'", result.c_str());
+    return result;
 }
 
 //-------------------------------------------------------------------------------------------------
 // Hex-string encoding / decoding
 
 std::string ToHexString(const std::vector<uint8_t>& data) {
+    Logger::Trace("[ProtocolUtils::ToHexString] entry — data.size()=%zu bytes", data.size());
     std::ostringstream oss;
     oss << std::hex << std::setfill('0');
     for (auto b : data) oss << std::setw(2) << int(b);
-    return oss.str();
+    std::string result = oss.str();
+    Logger::Debug("[ProtocolUtils::ToHexString] converted %zu bytes to hex string of length %zu",
+                  data.size(), result.size());
+    Logger::Trace("[ProtocolUtils::ToHexString] exit — returning hex string of length %zu", result.size());
+    return result;
 }
 
 std::optional<std::vector<uint8_t>> FromHexString(const std::string& hex) {
-    if (hex.size() % 2) return std::nullopt;
+    Logger::Trace("[ProtocolUtils::FromHexString] entry — hex string length=%zu", hex.size());
+    if (hex.size() % 2) {
+        Logger::Warn("[ProtocolUtils::FromHexString] odd-length hex string (%zu chars) — cannot decode", hex.size());
+        Logger::Trace("[ProtocolUtils::FromHexString] exit — returning nullopt (odd length)");
+        return std::nullopt;
+    }
     std::vector<uint8_t> out;
     out.reserve(hex.size()/2);
+    Logger::Debug("[ProtocolUtils::FromHexString] parsing %zu hex chars into %zu bytes", hex.size(), hex.size()/2);
     try {
         for (size_t i = 0; i < hex.size(); i += 2) {
             uint8_t byte = static_cast<uint8_t>(
@@ -50,8 +81,12 @@ std::optional<std::vector<uint8_t>> FromHexString(const std::string& hex) {
             out.push_back(byte);
         }
     } catch (...) {
+        Logger::Error("[ProtocolUtils::FromHexString] failed to parse hex string — invalid hex characters encountered");
+        Logger::Trace("[ProtocolUtils::FromHexString] exit — returning nullopt (parse error)");
         return std::nullopt;
     }
+    Logger::Debug("[ProtocolUtils::FromHexString] successfully decoded %zu bytes from hex string", out.size());
+    Logger::Trace("[ProtocolUtils::FromHexString] exit — returning %zu bytes", out.size());
     return out;
 }
 
@@ -59,23 +94,44 @@ std::optional<std::vector<uint8_t>> FromHexString(const std::string& hex) {
 // XOR checksum
 
 uint8_t ComputeChecksum(const std::vector<uint8_t>& payload) {
+    Logger::Trace("[ProtocolUtils::ComputeChecksum] entry — payload.size()=%zu bytes", payload.size());
     uint8_t chk = 0;
     for (auto b : payload) chk ^= b;
+    Logger::Debug("[ProtocolUtils::ComputeChecksum] computed XOR checksum=0x%02X over %zu bytes",
+                  chk, payload.size());
+    Logger::Trace("[ProtocolUtils::ComputeChecksum] exit — returning checksum=0x%02X", chk);
     return chk;
 }
 
 bool VerifyAndStripChecksum(std::vector<uint8_t>& payload) {
-    if (payload.empty()) return false;
+    Logger::Trace("[ProtocolUtils::VerifyAndStripChecksum] entry — payload.size()=%zu bytes", payload.size());
+    if (payload.empty()) {
+        Logger::Warn("[ProtocolUtils::VerifyAndStripChecksum] empty payload — cannot verify checksum");
+        Logger::Trace("[ProtocolUtils::VerifyAndStripChecksum] exit — returning false (empty payload)");
+        return false;
+    }
     uint8_t expected = payload.back();
+    Logger::Debug("[ProtocolUtils::VerifyAndStripChecksum] expected checksum=0x%02X (last byte of payload)", expected);
     payload.pop_back();
     uint8_t actual = ComputeChecksum(payload);
-    return actual == expected;
+    bool match = (actual == expected);
+    if (match) {
+        Logger::Debug("[ProtocolUtils::VerifyAndStripChecksum] checksum verified: actual=0x%02X matches expected=0x%02X, stripped payload size=%zu",
+                      actual, expected, payload.size());
+        Logger::Info("[ProtocolUtils::VerifyAndStripChecksum] checksum verification passed for %zu-byte payload", payload.size());
+    } else {
+        Logger::Error("[ProtocolUtils::VerifyAndStripChecksum] checksum mismatch: actual=0x%02X != expected=0x%02X for %zu-byte payload",
+                      actual, expected, payload.size());
+    }
+    Logger::Trace("[ProtocolUtils::VerifyAndStripChecksum] exit — returning %s", match ? "true" : "false");
+    return match;
 }
 
 //-------------------------------------------------------------------------------------------------
 // Base64 encode / decode (no newlines)
 
 static std::string b64Encode(const uint8_t* data, size_t len) {
+    Logger::Trace("[ProtocolUtils::b64Encode] entry — data=%p, len=%zu", (const void*)data, len);
     BIO* bmem = BIO_new(BIO_s_mem());
     BIO* b64  = BIO_new(BIO_f_base64());
     b64 = BIO_push(b64, bmem);
@@ -86,10 +142,13 @@ static std::string b64Encode(const uint8_t* data, size_t len) {
     BIO_get_mem_ptr(b64, &bptr);
     std::string ret(bptr->data, bptr->length);
     BIO_free_all(b64);
+    Logger::Debug("[ProtocolUtils::b64Encode] encoded %zu raw bytes to %zu base64 chars", len, ret.size());
+    Logger::Trace("[ProtocolUtils::b64Encode] exit — returning base64 string of length %zu", ret.size());
     return ret;
 }
 
 static std::vector<uint8_t> b64Decode(const std::string& b64str) {
+    Logger::Trace("[ProtocolUtils::b64Decode] entry — b64str length=%zu", b64str.size());
     BIO* bmem = BIO_new_mem_buf(b64str.data(), (int)b64str.size());
     BIO* b64f = BIO_new(BIO_f_base64());
     bmem = BIO_push(b64f, bmem);
@@ -97,22 +156,43 @@ static std::vector<uint8_t> b64Decode(const std::string& b64str) {
     std::vector<uint8_t> out(b64str.size());
     int len = BIO_read(bmem, out.data(), (int)out.size());
     BIO_free_all(bmem);
-    if (len <= 0) return {};
+    if (len <= 0) {
+        Logger::Error("[ProtocolUtils::b64Decode] BIO_read returned %d — decoding failed for %zu-char input", len, b64str.size());
+        Logger::Trace("[ProtocolUtils::b64Decode] exit — returning empty vector (decode failure)");
+        return {};
+    }
     out.resize(len);
+    Logger::Debug("[ProtocolUtils::b64Decode] decoded %zu base64 chars to %d raw bytes", b64str.size(), len);
+    Logger::Trace("[ProtocolUtils::b64Decode] exit — returning %d bytes", len);
     return out;
 }
 
 std::string Base64Encode(const std::vector<uint8_t>& data) {
-    return b64Encode(data.data(), data.size());
+    Logger::Trace("[ProtocolUtils::Base64Encode] entry — data.size()=%zu bytes", data.size());
+    std::string result = b64Encode(data.data(), data.size());
+    Logger::Info("[ProtocolUtils::Base64Encode] encoded %zu bytes to base64 string of length %zu",
+                 data.size(), result.size());
+    Logger::Trace("[ProtocolUtils::Base64Encode] exit — returning base64 string of length %zu", result.size());
+    return result;
 }
 
 std::optional<std::vector<uint8_t>> Base64Decode(const std::string& b64) {
+    Logger::Trace("[ProtocolUtils::Base64Decode] entry — b64 string length=%zu", b64.size());
     auto v = b64Decode(b64);
-    return v.empty() ? std::optional<std::vector<uint8_t>>{} : v;
+    if (v.empty()) {
+        Logger::Warn("[ProtocolUtils::Base64Decode] decode returned empty result for input of length %zu — returning nullopt",
+                     b64.size());
+        Logger::Trace("[ProtocolUtils::Base64Decode] exit — returning nullopt (empty decode result)");
+        return std::optional<std::vector<uint8_t>>{};
+    }
+    Logger::Info("[ProtocolUtils::Base64Decode] decoded base64 string of length %zu to %zu bytes",
+                 b64.size(), v.size());
+    Logger::Trace("[ProtocolUtils::Base64Decode] exit — returning %zu bytes", v.size());
+    return v;
 }
 
 //-------------------------------------------------------------------------------------------------
-// RS2V PacketType ↔ tag mappings
+// RS2V PacketType <-> tag mappings
 
 static const std::vector<std::pair<std::string,PacketType>> kTagTypeMap = {
     { "HEARTBEAT",          PacketType::PT_HEARTBEAT },
@@ -139,27 +219,51 @@ static const std::vector<std::pair<std::string,PacketType>> kTagTypeMap = {
 };
 
 PacketType TagToType(const std::string& tag) {
+    Logger::Trace("[ProtocolUtils::TagToType] entry — tag='%s'", tag.c_str());
     auto parts = SplitTag(tag);
     const std::string& key = parts.second.empty() ? parts.first : parts.second;
+    Logger::Debug("[ProtocolUtils::TagToType] lookup key='%s' (category='%s', subtype='%s')",
+                  key.c_str(), parts.first.c_str(), parts.second.c_str());
     for (const auto& kv : kTagTypeMap) {
-        if (kv.first == key) return kv.second;
+        if (kv.first == key) {
+            Logger::Debug("[ProtocolUtils::TagToType] matched tag '%s' to PacketType=%s (%d)",
+                          tag.c_str(), kv.first.c_str(), static_cast<int>(kv.second));
+            Logger::Trace("[ProtocolUtils::TagToType] exit — returning PacketType %d", static_cast<int>(kv.second));
+            return kv.second;
+        }
     }
     Logger::Warn("ProtocolUtils::TagToType: Unknown tag '%s'", tag.c_str());
+    Logger::Debug("[ProtocolUtils::TagToType] searched %zu entries in kTagTypeMap — no match found for key='%s'",
+                  kTagTypeMap.size(), key.c_str());
+    Logger::Trace("[ProtocolUtils::TagToType] exit — returning PT_INVALID");
     return PacketType::PT_INVALID;
 }
 
 std::string TypeToTag(PacketType type) {
+    Logger::Trace("[ProtocolUtils::TypeToTag] entry — type=%d", static_cast<int>(type));
     for (const auto& kv : kTagTypeMap) {
-        if (kv.second == type) return kv.first;
+        if (kv.second == type) {
+            Logger::Debug("[ProtocolUtils::TypeToTag] matched PacketType=%d to tag='%s'",
+                          static_cast<int>(type), kv.first.c_str());
+            Logger::Trace("[ProtocolUtils::TypeToTag] exit — returning '%s'", kv.first.c_str());
+            return kv.first;
+        }
     }
     // Handle custom/extension range
     auto t = static_cast<uint16_t>(type);
     auto start = static_cast<uint16_t>(PacketType::PT_CUSTOM_START);
     auto max   = static_cast<uint16_t>(PacketType::PT_MAX);
+    Logger::Debug("[ProtocolUtils::TypeToTag] no standard match — checking custom range: type=%u, start=%u, max=%u",
+                  t, start, max);
     if (t >= start && t < max) {
-        return "CUSTOM_" + std::to_string(t - start);
+        std::string customTag = "CUSTOM_" + std::to_string(t - start);
+        Logger::Debug("[ProtocolUtils::TypeToTag] type %u is in custom range — generated tag='%s'",
+                      t, customTag.c_str());
+        Logger::Trace("[ProtocolUtils::TypeToTag] exit — returning custom tag '%s'", customTag.c_str());
+        return customTag;
     }
     Logger::Error("ProtocolUtils::TypeToTag: Unrecognized PacketType %u", t);
+    Logger::Trace("[ProtocolUtils::TypeToTag] exit — returning empty string (unrecognized type)");
     return "";
 }
 
