@@ -1,0 +1,48 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: rs2v-server
+  namespace: rs2v
+  labels:
+    app: rs2v-server
+spec:
+  type: NodePort
+  selector:
+    app: rs2v-server
+  ports:
+    - name: game
+      protocol: UDP
+      port: 7777
+      targetPort: 7777
+      nodePort: 30777
+    - name: query
+      protocol: UDP
+      port: 27015
+      targetPort: 27015
+      nodePort: 30015
+    - name: eac
+      protocol: TCP
+      port: 7957
+      targetPort: 7957
+    - name: metrics
+      protocol: TCP
+      port: 9090
+      targetPort: 9090
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rs2v-metrics
+  namespace: rs2v
+  labels:
+    app: rs2v-server
+    monitoring: prometheus
+spec:
+  type: ClusterIP
+  selector:
+    app: rs2v-server
+  ports:
+    - name: metrics
+      protocol: TCP
+      port: 9090
+      targetPort: 9090

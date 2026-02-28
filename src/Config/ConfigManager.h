@@ -6,6 +6,9 @@
 #include <map>
 #include <vector>
 #include <memory>
+#include <thread>
+#include <atomic>
+#include <mutex>
 
 // Interface for receiving config change notifications
 class IConfigurationListener {
@@ -69,6 +72,16 @@ public:
     void AddConfigurationListener(std::shared_ptr<IConfigurationListener> listener);
     void RemoveConfigurationListener(std::shared_ptr<IConfigurationListener> listener);
 
+    // Live configuration reloading
+    bool StartFileWatcher();
+    void StopFileWatcher();
+    bool IsFileWatcherRunning() const;
+
+    // Configuration backup and rollback
+    bool BackupConfiguration(const std::string& backupPath = "");
+    bool RollbackConfiguration(const std::string& backupPath = "");
+    std::vector<std::string> GetAvailableBackups() const;
+
 private:
 
     // Validation and application steps
@@ -90,9 +103,21 @@ private:
     std::string GetConfigComment(const std::string& section, const std::string& key);
     std::string GetCurrentTimestamp();
 
+    // File watcher thread function
+    void FileWatcherThread();
+
     // Member variables
     std::string m_primaryConfigFile;
     std::map<std::string, std::string> m_configValues;
     bool m_autoSave = false;
     std::vector<std::weak_ptr<IConfigurationListener>> m_listeners;
+
+    // File watcher state
+    std::thread m_fileWatcherThread;
+    std::atomic<bool> m_fileWatcherRunning{false};
+    std::mutex m_configMutex;
+
+    // Backup tracking
+    std::string m_backupDirectory;
+    std::string m_backupPrefix;
 };

@@ -3,6 +3,7 @@
 #include "Game/AdminManager.h"
 #include "Network/ClientConnection.h"
 #include "Utils/Logger.h"
+#include "../../telemetry/TelemetryManager.h"
 #include <algorithm>
 
 AntiCheatManager::AntiCheatManager(GameServer* server, std::shared_ptr<SecurityConfig> cfg)
@@ -85,6 +86,7 @@ void AntiCheatManager::InspectPacket(uint32_t clientId, const Packet& pkt, bool 
     if (!allowed) {
         int& v = m_violations[clientId];
         v++;
+        TELEMETRY_INCREMENT_SECURITY_VIOLATION();
         Logger::Warn("AntiCheat: client %u sent disallowed packet '%s' (violation %d)",
                      clientId, tag.c_str(), v);
         Logger::Debug("[AntiCheatManager::InspectPacket] Client %u violation count incremented to %d (maxViolations=%d)",
@@ -108,6 +110,7 @@ void AntiCheatManager::BanIfNeeded(uint32_t clientId) {
         Logger::Error("AntiCheat: client %u exceeded max violations, banning", clientId);
         Logger::Debug("[AntiCheatManager::BanIfNeeded] Client %u violations=%d >= maxViolations=%d, proceeding with ban",
                       clientId, m_violations[clientId], m_maxViolations);
+        TELEMETRY_INCREMENT_BAN();
         auto conn = m_server->GetClientConnection(clientId);
         if (conn) {
             Logger::Debug("[AntiCheatManager::BanIfNeeded] Client %u connection found, retrieving SteamID for ban", clientId);

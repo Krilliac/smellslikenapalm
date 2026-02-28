@@ -7,6 +7,7 @@
 #include "Network/Packet.h"
 #include "Network/BandwidthManager.h"
 #include "Protocol/ReverseEngineering/ProtocolDecoder.h"
+#include "../../telemetry/TelemetryManager.h"
 #include <chrono>
 
 ConnectionManager::ConnectionManager(GameServer* server)
@@ -37,7 +38,7 @@ bool ConnectionManager::Initialize(uint16_t listenPort) {
     Logger::Debug("[ConnectionManager::Initialize] UDP socket bound successfully on port %u", listenPort);
 
     auto cfgMgr = m_server->GetConfigManager();
-    Logger::Debug("[ConnectionManager::Initialize] ConfigManager=%p", (void*)cfgMgr);
+    Logger::Debug("[ConnectionManager::Initialize] ConfigManager=%p", (void*)cfgMgr.get());
     m_bandwidthLimit = cfgMgr ? (uint32_t)cfgMgr->GetInt("Network.bandwidth_limit", 65536) : 65536;
     Logger::Debug("[ConnectionManager::Initialize] Bandwidth limit set to %u bytes/sec", m_bandwidthLimit);
     m_bwManager = std::make_unique<BandwidthManager>(m_bandwidthLimit);
@@ -102,6 +103,7 @@ void ConnectionManager::PumpNetwork() {
         if (m_bwManager && !m_bwManager->CanReceivePacket(addr, (uint32_t)len)) {
             Logger::Warn("[ConnectionManager::PumpNetwork] Bandwidth limit exceeded for %s:%u, dropping %d byte packet",
                          srcIp.c_str(), srcPort, len);
+            TELEMETRY_INCREMENT_PACKETS_DROPPED();
             continue;
         }
 
@@ -278,6 +280,9 @@ uint32_t ConnectionManager::CreateOrGetClient(const std::string& ip, uint16_t po
     Logger::Info("ConnectionManager: New client %u from %s:%u", clientId, ip.c_str(), port);
     Logger::Debug("[ConnectionManager::CreateOrGetClient] Total clients now: %zu", m_clients.size());
 
+    // Update telemetry connection metrics
+    TELEMETRY_UPDATE_PLAYER_COUNTS(m_clients.size(), m_clients.size());
+
     // Notify protocol decoder of new client connection
     GetProtocolDecoder().OnClientConnected(clientId, ip);
     Logger::Debug("[ConnectionManager::CreateOrGetClient] Protocol decoder notified of new client %u", clientId);
@@ -306,6 +311,9 @@ void ConnectionManager::RemoveStaleConnections() {
             GetProtocolDecoder().OnClientDisconnected(conn->GetClientId());
             conn->MarkDisconnected();
             toRemove.push_back(kv.first);
+
+            // Track disconnection in telemetry
+            TELEMETRY_UPDATE_PLAYER_COUNTS(m_clients.size() - toRemove.size(), m_clients.size() - toRemove.size());
         }
     }
     Logger::Debug("[ConnectionManager::RemoveStaleConnections] Removing %zu stale connections", toRemove.size());

@@ -7,6 +7,7 @@
 #include "Config/ConfigManager.h"
 #include "Utils/Logger.h"
 #include "Utils/PacketAnalysis.h"
+#include "../../telemetry/TelemetryManager.h"
 
 NetworkManager::NetworkManager(GameServer* server)
     : m_server(server)
@@ -40,7 +41,7 @@ bool NetworkManager::Initialize(uint16_t listenPort) {
 
     // Bandwidth limit from config
     auto cfgMgr = m_server->GetConfigManager();
-    Logger::Debug("[NetworkManager::Initialize] ConfigManager=%p", (void*)cfgMgr);
+    Logger::Debug("[NetworkManager::Initialize] ConfigManager=%p", (void*)cfgMgr.get());
     m_bandwidthLimit = cfgMgr ? (uint32_t)cfgMgr->GetInt("Network.bandwidth_limit", 65536) : 65536;
     Logger::Debug("[NetworkManager::Initialize] Bandwidth limit set to %u bytes/sec", m_bandwidthLimit);
     m_bwManager = std::make_unique<BandwidthManager>(m_bandwidthLimit);
@@ -203,6 +204,9 @@ void NetworkManager::OnPacketReceived(uint32_t clientId, const Packet& pkt, cons
     // Dump for analysis
     Logger::Debug("[NetworkManager::OnPacketReceived] Dumping packet for analysis: tag='%s'", pkt.GetTag().c_str());
     DumpPacketForAnalysis(pkt.RawData(), "NetworkManager_OnReceive");
+
+    // Track packet processing in telemetry
+    TELEMETRY_INCREMENT_PACKETS_PROCESSED();
 
     // Enqueue into GameServer's receive queue
     Logger::Debug("[NetworkManager::OnPacketReceived] Enqueueing packet for client %u into GameServer queue", clientId);

@@ -1,0 +1,106 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rs2v-server
+  namespace: rs2v
+  labels:
+    app: rs2v-server
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: rs2v-server
+  template:
+    metadata:
+      labels:
+        app: rs2v-server
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+        prometheus.io/path: "/metrics"
+    spec:
+      containers:
+        - name: rs2v-server
+          image: rs2v-server:latest
+          ports:
+            - containerPort: 7777
+              protocol: UDP
+              name: game
+            - containerPort: 27015
+              protocol: UDP
+              name: query
+            - containerPort: 7957
+              protocol: TCP
+              name: eac
+            - containerPort: 9090
+              protocol: TCP
+              name: metrics
+          env:
+            - name: RS2V_CONFIG_FILE
+              value: /opt/rs2v/config/server.ini
+            - name: RS2V_LOG_DIR
+              value: /opt/rs2v/logs
+            - name: RS2V_TELEMETRY_DIR
+              value: /opt/rs2v/telemetry/output
+          volumeMounts:
+            - name: config
+              mountPath: /opt/rs2v/config
+              readOnly: true
+            - name: logs
+              mountPath: /opt/rs2v/logs
+            - name: telemetry
+              mountPath: /opt/rs2v/telemetry/output
+          resources:
+            requests:
+              cpu: "1000m"
+              memory: "1Gi"
+            limits:
+              cpu: "4000m"
+              memory: "4Gi"
+          livenessProbe:
+            tcpSocket:
+              port: 9090
+            initialDelaySeconds: 15
+            periodSeconds: 30
+            timeoutSeconds: 5
+          readinessProbe:
+            httpGet:
+              path: /metrics
+              port: 9090
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 3
+      volumes:
+        - name: config
+          configMap:
+            name: rs2v-config
+        - name: logs
+          persistentVolumeClaim:
+            claimName: rs2v-logs-pvc
+        - name: telemetry
+          persistentVolumeClaim:
+            claimName: rs2v-telemetry-pvc
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: rs2v-logs-pvc
+  namespace: rs2v
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: rs2v-telemetry-pvc
+  namespace: rs2v
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 5Gi

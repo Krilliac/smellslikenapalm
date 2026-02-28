@@ -1,0 +1,166 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "panels": [
+    {
+      "title": "Server Overview",
+      "type": "row",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 }
+    },
+    {
+      "title": "Active Players",
+      "type": "stat",
+      "datasource": "Prometheus",
+      "targets": [
+        { "expr": "rs2v_server_authenticated_players", "legendFormat": "Players" }
+      ],
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 1 },
+      "fieldConfig": {
+        "defaults": { "thresholds": { "steps": [
+          { "color": "green", "value": null },
+          { "color": "yellow", "value": 48 },
+          { "color": "red", "value": 60 }
+        ]}}
+      }
+    },
+    {
+      "title": "Active Connections",
+      "type": "stat",
+      "datasource": "Prometheus",
+      "targets": [
+        { "expr": "rs2v_server_active_connections", "legendFormat": "Connections" }
+      ],
+      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 1 }
+    },
+    {
+      "title": "CPU Usage",
+      "type": "gauge",
+      "datasource": "Prometheus",
+      "targets": [
+        { "expr": "rs2v_server_cpu_usage_percent", "legendFormat": "CPU %" }
+      ],
+      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 1 },
+      "fieldConfig": {
+        "defaults": {
+          "min": 0, "max": 100, "unit": "percent",
+          "thresholds": { "steps": [
+            { "color": "green", "value": null },
+            { "color": "yellow", "value": 70 },
+            { "color": "red", "value": 90 }
+          ]}
+        }
+      }
+    },
+    {
+      "title": "Memory Usage",
+      "type": "gauge",
+      "datasource": "Prometheus",
+      "targets": [
+        { "expr": "rs2v_server_memory_usage_percent", "legendFormat": "Memory %" }
+      ],
+      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 1 },
+      "fieldConfig": {
+        "defaults": {
+          "min": 0, "max": 100, "unit": "percent",
+          "thresholds": { "steps": [
+            { "color": "green", "value": null },
+            { "color": "yellow", "value": 75 },
+            { "color": "red", "value": 90 }
+          ]}
+        }
+      }
+    },
+    {
+      "title": "Performance",
+      "type": "row",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 5 }
+    },
+    {
+      "title": "Frame Time (ms)",
+      "type": "timeseries",
+      "datasource": "Prometheus",
+      "targets": [
+        { "expr": "rs2v_server_frame_time_milliseconds", "legendFormat": "Frame Time" },
+        { "expr": "rs2v_server_physics_time_milliseconds", "legendFormat": "Physics Time" },
+        { "expr": "rs2v_server_network_time_milliseconds", "legendFormat": "Network Time" },
+        { "expr": "rs2v_server_game_logic_time_milliseconds", "legendFormat": "Game Logic Time" }
+      ],
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 6 },
+      "fieldConfig": { "defaults": { "unit": "ms" } }
+    },
+    {
+      "title": "Network Throughput",
+      "type": "timeseries",
+      "datasource": "Prometheus",
+      "targets": [
+        { "expr": "rate(rs2v_server_network_bytes_sent_total[5m])", "legendFormat": "Sent (B/s)" },
+        { "expr": "rate(rs2v_server_network_bytes_received_total[5m])", "legendFormat": "Received (B/s)" }
+      ],
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 6 },
+      "fieldConfig": { "defaults": { "unit": "Bps" } }
+    },
+    {
+      "title": "Gameplay",
+      "type": "row",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 14 }
+    },
+    {
+      "title": "Kills & Deaths",
+      "type": "timeseries",
+      "datasource": "Prometheus",
+      "targets": [
+        { "expr": "rate(rs2v_server_kills_total[5m])", "legendFormat": "Kills/s" },
+        { "expr": "rate(rs2v_server_deaths_total[5m])", "legendFormat": "Deaths/s" }
+      ],
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 15 }
+    },
+    {
+      "title": "Objectives Captured",
+      "type": "timeseries",
+      "datasource": "Prometheus",
+      "targets": [
+        { "expr": "rate(rs2v_server_objectives_captured_total[5m])", "legendFormat": "Captures/s" }
+      ],
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 15 }
+    },
+    {
+      "title": "Security",
+      "type": "row",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 23 }
+    },
+    {
+      "title": "Security Events",
+      "type": "timeseries",
+      "datasource": "Prometheus",
+      "targets": [
+        { "expr": "rate(rs2v_server_security_violations_total[5m])", "legendFormat": "Violations/s" },
+        { "expr": "rate(rs2v_server_speed_hack_detections_total[5m])", "legendFormat": "Speed Hacks/s" },
+        { "expr": "rate(rs2v_server_malformed_packets_total[5m])", "legendFormat": "Malformed Pkts/s" }
+      ],
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 24 }
+    },
+    {
+      "title": "Packet Loss Rate",
+      "type": "timeseries",
+      "datasource": "Prometheus",
+      "targets": [
+        { "expr": "rs2v_server_packet_loss_percent", "legendFormat": "Packet Loss %" },
+        { "expr": "rs2v_server_average_latency_milliseconds", "legendFormat": "Avg Latency (ms)" }
+      ],
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 24 }
+    }
+  ],
+  "schemaVersion": 39,
+  "tags": ["rs2v", "game-server"],
+  "templating": { "list": [] },
+  "time": { "from": "now-1h", "to": "now" },
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "RS2V Server Dashboard",
+  "uid": "rs2v-server-overview",
+  "version": 1
+}

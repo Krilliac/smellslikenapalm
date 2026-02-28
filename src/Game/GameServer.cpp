@@ -8,6 +8,7 @@
 #include "Game/GameMode.h"
 #include "Config/ConfigManager.h"
 #include "Config/GameConfig.h"
+#include "../../telemetry/TelemetryManager.h"
 #include "Config/NetworkConfig.h"
 #include "Config/ServerConfig.h"
 #include "Config/SecurityConfig.h"
@@ -304,9 +305,18 @@ void GameServer::Run() {
         return;
     }
 
-    // Poll network and process received packets
-    if (m_networkManager) {
-        m_networkManager->PollNetwork();
+    // Start frame timing
+    auto frameStart = std::chrono::high_resolution_clock::now();
+
+    // Poll network and process received packets (with timing)
+    {
+        auto netStart = std::chrono::high_resolution_clock::now();
+        if (m_networkManager) {
+            m_networkManager->PollNetwork();
+        }
+        auto netEnd = std::chrono::high_resolution_clock::now();
+        double netMs = std::chrono::duration<double, std::milli>(netEnd - netStart).count();
+        Telemetry::TelemetryManager::Instance().GetCustomMetrics().UpdateFrameTiming(0, 0, netMs, 0);
     }
 
     // Process queued packets
@@ -347,22 +357,40 @@ void GameServer::Run() {
 
     float dt = m_tickDeltaSeconds;
 
-    // Tick core subsystems
-    if (m_gameMode) m_gameMode->Update();
-    if (m_playerManager) m_playerManager->Update();
+    // Tick core subsystems with game logic timing
+    {
+        auto gameStart = std::chrono::high_resolution_clock::now();
 
-    // Tick RS2V game systems
-    if (m_ticketSystem) m_ticketSystem->Update(dt);
-    if (m_objectiveSystem) m_objectiveSystem->Update(dt);
-    if (m_commanderAbilities) m_commanderAbilities->Update(dt);
-    if (m_spawnSystem) m_spawnSystem->Update(dt);
-    if (m_damageSystem) m_damageSystem->Update(dt);
-    if (m_helicopterPhysics) m_helicopterPhysics->Update(dt);
+        if (m_gameMode) m_gameMode->Update();
+        if (m_playerManager) m_playerManager->Update();
 
-    // Tick active game mode
-    if (m_territoryMode) m_territoryMode->Update(dt);
-    if (m_supremacyMode) m_supremacyMode->Update(dt);
-    if (m_skirmishMode) m_skirmishMode->Update(dt);
+        // Tick RS2V game systems
+        if (m_ticketSystem) m_ticketSystem->Update(dt);
+        if (m_objectiveSystem) m_objectiveSystem->Update(dt);
+        if (m_commanderAbilities) m_commanderAbilities->Update(dt);
+        if (m_spawnSystem) m_spawnSystem->Update(dt);
+        if (m_damageSystem) m_damageSystem->Update(dt);
+
+        auto gameEnd = std::chrono::high_resolution_clock::now();
+        double gameMs = std::chrono::duration<double, std::milli>(gameEnd - gameStart).count();
+
+        // Physics timing (helicopter physics is the main physics update)
+        auto physStart = std::chrono::high_resolution_clock::now();
+        if (m_helicopterPhysics) m_helicopterPhysics->Update(dt);
+        auto physEnd = std::chrono::high_resolution_clock::now();
+        double physMs = std::chrono::duration<double, std::milli>(physEnd - physStart).count();
+
+        // Tick active game mode
+        if (m_territoryMode) m_territoryMode->Update(dt);
+        if (m_supremacyMode) m_supremacyMode->Update(dt);
+        if (m_skirmishMode) m_skirmishMode->Update(dt);
+
+        // Update performance metrics with timing data
+        auto frameEnd = std::chrono::high_resolution_clock::now();
+        double frameMs = std::chrono::duration<double, std::milli>(frameEnd - frameStart).count();
+        Telemetry::TelemetryManager::Instance().GetCustomMetrics().UpdateFrameTiming(
+            frameMs, physMs, 0, gameMs);
+    }
 
     if (m_networkManager) m_networkManager->Flush();
     Logger::Trace("[GameServer::Run] Exit");

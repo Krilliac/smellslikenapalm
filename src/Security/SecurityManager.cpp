@@ -1,5 +1,6 @@
 #include "Security/SecurityManager.h"
 #include "Utils/Logger.h"
+#include "../../telemetry/TelemetryManager.h"
 #include <chrono>
 
 SecurityManager::SecurityManager(std::shared_ptr<SecurityConfig> config)
@@ -89,6 +90,7 @@ void SecurityManager::OnClientConnect(std::shared_ptr<ClientConnection> conn) {
         Logger::Warn("SecurityManager: connection from banned SteamID %s", steamId.c_str());
         Logger::Info("[SecurityManager::OnClientConnect] Rejecting connection from banned SteamID '%s' (client %u)",
                      steamId.c_str(), id);
+        TELEMETRY_INCREMENT_SECURITY_VIOLATION();
         DisconnectClient(id, "Banned");
         Logger::Trace("[SecurityManager::OnClientConnect] Exit (banned client disconnected)");
         return;
@@ -142,6 +144,7 @@ bool SecurityManager::ValidatePacket(uint32_t clientId, const std::vector<uint8_
         Logger::Warn("SecurityManager: packet from blocked %s:%u dropped", addr.ip.c_str(), addr.port);
         Logger::Info("[SecurityManager::ValidatePacket] Packet from blocked address %s:%u (client %u) was dropped (%zu bytes)",
                      addr.ip.c_str(), addr.port, clientId, rawData.size());
+        TELEMETRY_INCREMENT_SECURITY_VIOLATION();
         Logger::Trace("[SecurityManager::ValidatePacket] Exit, returning false (blocked)");
         return false;
     }
@@ -226,6 +229,7 @@ void SecurityManager::HandleEACReport(const EnhancedEACReport& report) {
                      report.clientId, int(report.result), report.details.c_str());
         Logger::Info("[SecurityManager::HandleEACReport] Taking enforcement action against client %u for cheat detection",
                      report.clientId);
+        TELEMETRY_INCREMENT_SECURITY_VIOLATION();
         // Ban or block on cheat detection
         auto it = m_connections.find(report.clientId);
         if (it != m_connections.end()) {

@@ -26,6 +26,10 @@
 // Security / EAC emulator
 #include "Security/EACServerEmulator.h"
 
+// Telemetry system
+#include "../telemetry/TelemetryManager.h"
+#include "../telemetry/MetricsReporter.h"
+
 // Global server and subsystems for signal handling
 static std::unique_ptr<GameServer>         g_server;
 static std::unique_ptr<EACServerEmulator>  g_eacServer;
@@ -44,6 +48,11 @@ void SignalHandler(int signal)
     } else {
         Logger::Warn("[main::SignalHandler] g_gameClock is null, cannot stop game clock from signal handler");
     }
+
+    // Graceful telemetry shutdown
+    Logger::Debug("[main::SignalHandler] Initiating telemetry shutdown from signal handler");
+    Telemetry::TelemetryManager::Instance().Shutdown();
+
     Logger::Info("[main::SignalHandler] Signal handler completed for signal %d", signal);
 }
 
@@ -222,6 +231,91 @@ int main(int argc, char* argv[])
         Logger::Info("[main] EAC emulator started successfully on port %u", eacPort);
     }
 
+    // Initialize telemetry system
+    Logger::Info("[main] Initializing telemetry system...");
+    {
+        Telemetry::TelemetryConfig telemetryCfg;
+        auto cfgMgr = g_server->GetConfigManager();
+        telemetryCfg.enabled = cfgMgr ? cfgMgr->GetBool("Telemetry.enabled", true) : true;
+        telemetryCfg.enableFileReporter = cfgMgr ? cfgMgr->GetBool("Telemetry.file_reporter", true) : true;
+        telemetryCfg.enablePrometheusReporter = cfgMgr ? cfgMgr->GetBool("Telemetry.prometheus_reporter", false) : false;
+        telemetryCfg.prometheusPort = cfgMgr ? cfgMgr->GetInt("Telemetry.prometheus_port", 9090) : 9090;
+        telemetryCfg.metricsDirectory = cfgMgr ? cfgMgr->GetString("Telemetry.metrics_directory", "telemetry/output") : "telemetry/output";
+        int samplingMs = cfgMgr ? cfgMgr->GetInt("Telemetry.sampling_interval_ms", 1000) : 1000;
+        telemetryCfg.samplingInterval = std::chrono::milliseconds(samplingMs);
+
+        auto& telemetry = Telemetry::TelemetryManager::Instance();
+        if (telemetry.Initialize(telemetryCfg)) {
+            // Add file reporter
+            if (telemetryCfg.enableFileReporter) {
+                auto fileReporter = Telemetry::ReporterFactory::CreateFileReporter("rs2v_metrics");
+                if (fileReporter->Initialize(telemetryCfg.metricsDirectory)) {
+                    telemetry.AddReporter(std::move(fileReporter));
+                    Logger::Info("[main] File metrics reporter enabled in '%s'", telemetryCfg.metricsDirectory.c_str());
+                }
+            }
+
+            // Add CSV reporter
+            {
+                auto csvReporter = Telemetry::ReporterFactory::CreateCSVReporter("rs2v_metrics.csv");
+                if (csvReporter->Initialize(telemetryCfg.metricsDirectory)) {
+                    telemetry.AddReporter(std::move(csvReporter));
+                    Logger::Info("[main] CSV metrics reporter enabled");
+                }
+            }
+
+            // Add in-memory reporter
+            {
+                auto memReporter = Telemetry::ReporterFactory::CreateMemoryReporter(3600);
+                if (memReporter->Initialize(telemetryCfg.metricsDirectory)) {
+                    telemetry.AddReporter(std::move(memReporter));
+                    Logger::Info("[main] In-memory metrics reporter enabled");
+                }
+            }
+
+            // Add Prometheus reporter if configured
+            if (telemetryCfg.enablePrometheusReporter) {
+                auto promReporter = Telemetry::ReporterFactory::CreatePrometheusReporter(
+                    telemetryCfg.prometheusPort, "rs2v_server");
+                if (promReporter->Initialize(telemetryCfg.metricsDirectory)) {
+                    telemetry.AddReporter(std::move(promReporter));
+                    Logger::Info("[main] Prometheus metrics reporter enabled on port %d", telemetryCfg.prometheusPort);
+                }
+            }
+
+            // Add alert reporter with default thresholds
+            {
+                Telemetry::AlertReporterConfig alertCfg;
+                Telemetry::AlertReporterConfig::AlertRule cpuRule;
+                cpuRule.name = "high_cpu";
+                cpuRule.metricPath = "cpuUsagePercent";
+                cpuRule.op = Telemetry::AlertReporterConfig::AlertRule::GREATER_THAN;
+                cpuRule.threshold = 90.0;
+                cpuRule.cooldownPeriod = std::chrono::seconds(300);
+                alertCfg.rules.push_back(cpuRule);
+
+                Telemetry::AlertReporterConfig::AlertRule connRule;
+                connRule.name = "max_connections";
+                connRule.metricPath = "activeConnections";
+                connRule.op = Telemetry::AlertReporterConfig::AlertRule::GREATER_THAN;
+                connRule.threshold = 200.0;
+                connRule.cooldownPeriod = std::chrono::seconds(60);
+                alertCfg.rules.push_back(connRule);
+
+                auto alertReporter = std::make_unique<Telemetry::AlertMetricsReporter>(alertCfg);
+                if (alertReporter->Initialize(telemetryCfg.metricsDirectory)) {
+                    telemetry.AddReporter(std::move(alertReporter));
+                    Logger::Info("[main] Alert metrics reporter enabled with %zu rules", alertCfg.rules.size());
+                }
+            }
+
+            telemetry.StartSampling();
+            Logger::Info("[main] Telemetry system initialized and sampling started (interval: %dms)", samplingMs);
+        } else {
+            Logger::Warn("[main] Telemetry system initialization failed, continuing without telemetry");
+        }
+    }
+
     Logger::Info("[main] Server initialization complete");
     int serverPort = serverCfg ? serverCfg->GetPort() : 7777;
     Logger::Info("[main] Listening on game port: %d", serverPort);
@@ -257,6 +351,20 @@ int main(int argc, char* argv[])
     gameClock.RunLoop();
 
     Logger::Info("[main] Main game loop exited, beginning shutdown sequence...");
+
+    // Shutdown telemetry system first to capture final metrics
+    Logger::Debug("[main] Shutting down telemetry system...");
+    {
+        auto& telemetry = Telemetry::TelemetryManager::Instance();
+        if (telemetry.IsRunning()) {
+            telemetry.ForceSample(); // Capture final snapshot
+            telemetry.Shutdown();
+            Logger::Info("[main] Telemetry system shut down (total samples: %llu)",
+                        (unsigned long long)telemetry.GetTotalSamplesTaken());
+        } else {
+            Logger::Debug("[main] Telemetry was not running");
+        }
+    }
 
     // Shutdown sequence
     Logger::Debug("[main] Shutting down EAC emulator...");
