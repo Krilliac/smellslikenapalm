@@ -1,0 +1,12 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: 'rs2v-server'
+    static_configs:
+      - targets: ['rs2v-server:9090']
+        labels:
+          instance: 'rs2v-primary'
+    metrics_path: '/metrics'
+    scrape_interval: 5s

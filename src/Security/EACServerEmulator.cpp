@@ -3,6 +3,7 @@
 #include "Security/EACServerEmulator.h"
 #include "Security/EACPackets.h"
 #include "Utils/Logger.h"
+#include "../../telemetry/TelemetryManager.h"
 #include <cstring>
 #include <chrono>
 #include <algorithm>
@@ -274,6 +275,9 @@ void EACServerEmulator::HandleHandshake(const ClientSession& sess, uint64_t clie
 
     Logger::Info("[EACServerEmulator::HandleHandshake] Handshake result for client %u: %s",
                  sess.clientId, accept ? "ACCEPTED" : "REJECTED");
+    if (!accept) {
+        TELEMETRY_INCREMENT_SECURITY_VIOLATION();
+    }
     SendHandshakeResponse(sess, accept);
     Logger::Trace("[EACServerEmulator::HandleHandshake] Exit");
 }
@@ -576,7 +580,7 @@ uint64_t EACServerEmulator::GenerateNonce() {
 uint32_t EACServerEmulator::GenerateClientId() {
     Logger::Trace("[EACServerEmulator::GenerateClientId] Entry");
     uint32_t id = m_nextClientId++;
-    Logger::Debug("[EACServerEmulator::GenerateClientId] Generated clientId=%u, next will be %u", id, m_nextClientId.load());
+    Logger::Debug("[EACServerEmulator::GenerateClientId] Generated clientId=%u, next will be %u", id, m_nextClientId);
     Logger::Trace("[EACServerEmulator::GenerateClientId] Exit, returning %u", id);
     return id;
 }

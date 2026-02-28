@@ -13,6 +13,8 @@
 #include <set>
 #include <map>
 #include <vector>
+#include <thread>
+#include <regex>
 
 ConfigManager::ConfigManager() {
     Logger::Trace("[ConfigManager::ConfigManager] Entry - default constructor called");
@@ -21,7 +23,8 @@ ConfigManager::ConfigManager() {
 }
 
 ConfigManager::~ConfigManager() {
-    Logger::Trace("[ConfigManager::~ConfigManager] Entry - destructor called, saving all configurations before teardown");
+    Logger::Trace("[ConfigManager::~ConfigManager] Entry - destructor called, stopping file watcher and saving all configurations before teardown");
+    StopFileWatcher();
     SaveAllConfigurations();
     Logger::Trace("[ConfigManager::~ConfigManager] Exit");
 }
@@ -565,4 +568,252 @@ bool ConfigManager::SaveAllConfigurations() {
     Logger::Debug("[ConfigManager::SaveAllConfigurations] No primary config file set, nothing to save");
     Logger::Trace("[ConfigManager::SaveAllConfigurations] Exit - returning true (nothing to save)");
     return true;
+}
+
+// ---------------------------------------------------------------------------
+// Live configuration reloading - File Watcher
+// ---------------------------------------------------------------------------
+
+bool ConfigManager::StartFileWatcher() {
+    Logger::Trace("[ConfigManager::StartFileWatcher] Entry");
+
+    if (m_fileWatcherRunning.load()) {
+        Logger::Warn("[ConfigManager::StartFileWatcher] File watcher is already running");
+        Logger::Trace("[ConfigManager::StartFileWatcher] Exit - returning false, already running");
+        return false;
+    }
+
+    if (m_primaryConfigFile.empty()) {
+        Logger::Error("[ConfigManager::StartFileWatcher] Cannot start file watcher: no primary config file set");
+        Logger::Trace("[ConfigManager::StartFileWatcher] Exit - returning false, no config file");
+        return false;
+    }
+
+    if (!std::filesystem::exists(m_primaryConfigFile)) {
+        Logger::Error("[ConfigManager::StartFileWatcher] Cannot start file watcher: config file does not exist: '%s'", m_primaryConfigFile.c_str());
+        Logger::Trace("[ConfigManager::StartFileWatcher] Exit - returning false, file missing");
+        return false;
+    }
+
+    m_fileWatcherRunning.store(true);
+    Logger::Info("[ConfigManager::StartFileWatcher] Starting file watcher for: '%s'", m_primaryConfigFile.c_str());
+
+    m_fileWatcherThread = std::thread(&ConfigManager::FileWatcherThread, this);
+
+    Logger::Info("[ConfigManager::StartFileWatcher] File watcher started successfully");
+    Logger::Trace("[ConfigManager::StartFileWatcher] Exit - returning true");
+    return true;
+}
+
+void ConfigManager::StopFileWatcher() {
+    Logger::Trace("[ConfigManager::StopFileWatcher] Entry");
+
+    if (!m_fileWatcherRunning.load()) {
+        Logger::Debug("[ConfigManager::StopFileWatcher] File watcher is not running, nothing to stop");
+        Logger::Trace("[ConfigManager::StopFileWatcher] Exit - watcher was not running");
+        return;
+    }
+
+    Logger::Info("[ConfigManager::StopFileWatcher] Stopping file watcher...");
+    m_fileWatcherRunning.store(false);
+
+    if (m_fileWatcherThread.joinable()) {
+        Logger::Debug("[ConfigManager::StopFileWatcher] Joining file watcher thread");
+        m_fileWatcherThread.join();
+        Logger::Debug("[ConfigManager::StopFileWatcher] File watcher thread joined successfully");
+    }
+
+    Logger::Info("[ConfigManager::StopFileWatcher] File watcher stopped");
+    Logger::Trace("[ConfigManager::StopFileWatcher] Exit");
+}
+
+bool ConfigManager::IsFileWatcherRunning() const {
+    Logger::Trace("[ConfigManager::IsFileWatcherRunning] Entry");
+    bool running = m_fileWatcherRunning.load();
+    Logger::Trace("[ConfigManager::IsFileWatcherRunning] Exit - returning %s", running ? "true" : "false");
+    return running;
+}
+
+void ConfigManager::FileWatcherThread() {
+    Logger::Trace("[ConfigManager::FileWatcherThread] Entry - watcher thread started");
+    Logger::Info("[ConfigManager::FileWatcherThread] File watcher thread running for: '%s'", m_primaryConfigFile.c_str());
+
+    std::filesystem::file_time_type lastWriteTime;
+    try {
+        lastWriteTime = std::filesystem::last_write_time(m_primaryConfigFile);
+        Logger::Debug("[ConfigManager::FileWatcherThread] Initial last-write-time captured for '%s'", m_primaryConfigFile.c_str());
+    } catch (const std::exception& e) {
+        Logger::Error("[ConfigManager::FileWatcherThread] Failed to get initial last-write-time: %s", e.what());
+        m_fileWatcherRunning.store(false);
+        Logger::Trace("[ConfigManager::FileWatcherThread] Exit - aborting due to initial timestamp error");
+        return;
+    }
+
+    while (m_fileWatcherRunning.load()) {
+        std::this_thread::sleep_for(std::chrono::seconds(2));
+
+        if (!m_fileWatcherRunning.load()) {
+            Logger::Debug("[ConfigManager::FileWatcherThread] Stop requested during sleep, breaking out of loop");
+            break;
+        }
+
+        try {
+            if (!std::filesystem::exists(m_primaryConfigFile)) {
+                Logger::Warn("[ConfigManager::FileWatcherThread] Config file no longer exists: '%s'", m_primaryConfigFile.c_str());
+                continue;
+            }
+
+            auto currentWriteTime = std::filesystem::last_write_time(m_primaryConfigFile);
+            if (currentWriteTime != lastWriteTime) {
+                Logger::Info("[ConfigManager::FileWatcherThread] Config file change detected: '%s'", m_primaryConfigFile.c_str());
+                lastWriteTime = currentWriteTime;
+
+                std::lock_guard<std::mutex> lock(m_configMutex);
+                Logger::Debug("[ConfigManager::FileWatcherThread] Acquired config mutex, reloading configuration");
+                if (ReloadConfiguration()) {
+                    Logger::Info("[ConfigManager::FileWatcherThread] Configuration reloaded successfully after file change");
+                } else {
+                    Logger::Error("[ConfigManager::FileWatcherThread] Configuration reload failed after file change");
+                }
+            }
+        } catch (const std::exception& e) {
+            Logger::Error("[ConfigManager::FileWatcherThread] Error checking file modification time: %s", e.what());
+        }
+    }
+
+    Logger::Info("[ConfigManager::FileWatcherThread] File watcher thread exiting");
+    Logger::Trace("[ConfigManager::FileWatcherThread] Exit");
+}
+
+// ---------------------------------------------------------------------------
+// Configuration backup and rollback
+// ---------------------------------------------------------------------------
+
+bool ConfigManager::BackupConfiguration(const std::string& backupPath) {
+    Logger::Trace("[ConfigManager::BackupConfiguration] Entry - backupPath='%s'", backupPath.c_str());
+
+    if (m_primaryConfigFile.empty()) {
+        Logger::Error("[ConfigManager::BackupConfiguration] Cannot backup: no primary config file set");
+        Logger::Trace("[ConfigManager::BackupConfiguration] Exit - returning false, no config file");
+        return false;
+    }
+
+    if (!std::filesystem::exists(m_primaryConfigFile)) {
+        Logger::Error("[ConfigManager::BackupConfiguration] Cannot backup: config file does not exist: '%s'", m_primaryConfigFile.c_str());
+        Logger::Trace("[ConfigManager::BackupConfiguration] Exit - returning false, file missing");
+        return false;
+    }
+
+    std::string targetPath = backupPath;
+    if (targetPath.empty()) {
+        // Generate timestamped backup path
+        auto now = std::chrono::system_clock::now();
+        auto t   = std::chrono::system_clock::to_time_t(now);
+        std::ostringstream ss;
+        ss << std::put_time(std::localtime(&t), "%Y%m%d_%H%M%S");
+        targetPath = m_primaryConfigFile + ".backup." + ss.str();
+        Logger::Debug("[ConfigManager::BackupConfiguration] Generated backup path: '%s'", targetPath.c_str());
+    }
+
+    try {
+        std::filesystem::copy_file(m_primaryConfigFile, targetPath,
+                                   std::filesystem::copy_options::overwrite_existing);
+        Logger::Info("[ConfigManager::BackupConfiguration] Configuration backed up: '%s' -> '%s'", m_primaryConfigFile.c_str(), targetPath.c_str());
+        Logger::Trace("[ConfigManager::BackupConfiguration] Exit - returning true");
+        return true;
+    } catch (const std::exception& e) {
+        Logger::Error("[ConfigManager::BackupConfiguration] Failed to create backup: %s", e.what());
+        Logger::Trace("[ConfigManager::BackupConfiguration] Exit - returning false due to copy error");
+        return false;
+    }
+}
+
+bool ConfigManager::RollbackConfiguration(const std::string& backupPath) {
+    Logger::Trace("[ConfigManager::RollbackConfiguration] Entry - backupPath='%s'", backupPath.c_str());
+
+    if (backupPath.empty()) {
+        Logger::Error("[ConfigManager::RollbackConfiguration] Cannot rollback: no backup path specified");
+        Logger::Trace("[ConfigManager::RollbackConfiguration] Exit - returning false, empty path");
+        return false;
+    }
+
+    if (!std::filesystem::exists(backupPath)) {
+        Logger::Error("[ConfigManager::RollbackConfiguration] Cannot rollback: backup file does not exist: '%s'", backupPath.c_str());
+        Logger::Trace("[ConfigManager::RollbackConfiguration] Exit - returning false, backup missing");
+        return false;
+    }
+
+    if (m_primaryConfigFile.empty()) {
+        Logger::Error("[ConfigManager::RollbackConfiguration] Cannot rollback: no primary config file set");
+        Logger::Trace("[ConfigManager::RollbackConfiguration] Exit - returning false, no config file");
+        return false;
+    }
+
+    try {
+        Logger::Info("[ConfigManager::RollbackConfiguration] Restoring configuration from backup: '%s'", backupPath.c_str());
+        std::filesystem::copy_file(backupPath, m_primaryConfigFile,
+                                   std::filesystem::copy_options::overwrite_existing);
+        Logger::Debug("[ConfigManager::RollbackConfiguration] Backup file copied to '%s', reloading configuration", m_primaryConfigFile.c_str());
+    } catch (const std::exception& e) {
+        Logger::Error("[ConfigManager::RollbackConfiguration] Failed to restore backup file: %s", e.what());
+        Logger::Trace("[ConfigManager::RollbackConfiguration] Exit - returning false due to copy error");
+        return false;
+    }
+
+    if (!ReloadConfiguration()) {
+        Logger::Error("[ConfigManager::RollbackConfiguration] Failed to reload configuration after rollback");
+        Logger::Trace("[ConfigManager::RollbackConfiguration] Exit - returning false due to reload failure");
+        return false;
+    }
+
+    Logger::Info("[ConfigManager::RollbackConfiguration] Configuration rolled back successfully from: '%s'", backupPath.c_str());
+    Logger::Trace("[ConfigManager::RollbackConfiguration] Exit - returning true");
+    return true;
+}
+
+std::vector<std::string> ConfigManager::GetAvailableBackups() const {
+    Logger::Trace("[ConfigManager::GetAvailableBackups] Entry");
+    std::vector<std::string> backups;
+
+    if (m_primaryConfigFile.empty()) {
+        Logger::Warn("[ConfigManager::GetAvailableBackups] No primary config file set, cannot scan for backups");
+        Logger::Trace("[ConfigManager::GetAvailableBackups] Exit - returning empty list");
+        return backups;
+    }
+
+    std::filesystem::path configPath(m_primaryConfigFile);
+    std::filesystem::path configDir = configPath.parent_path();
+    std::string configFilename = configPath.filename().string();
+
+    if (configDir.empty()) {
+        configDir = ".";
+    }
+
+    Logger::Debug("[ConfigManager::GetAvailableBackups] Scanning directory '%s' for backups of '%s'",
+                  configDir.string().c_str(), configFilename.c_str());
+
+    std::string backupPattern = configFilename + ".backup.";
+
+    try {
+        for (const auto& entry : std::filesystem::directory_iterator(configDir)) {
+            if (!entry.is_regular_file()) {
+                continue;
+            }
+            std::string filename = entry.path().filename().string();
+            if (filename.rfind(backupPattern, 0) == 0) {
+                std::string fullPath = entry.path().string();
+                backups.push_back(fullPath);
+                Logger::Debug("[ConfigManager::GetAvailableBackups] Found backup: '%s'", fullPath.c_str());
+            }
+        }
+    } catch (const std::exception& e) {
+        Logger::Error("[ConfigManager::GetAvailableBackups] Error scanning for backups: %s", e.what());
+    }
+
+    // Sort backups alphabetically (timestamps in filenames ensure chronological order)
+    std::sort(backups.begin(), backups.end());
+
+    Logger::Info("[ConfigManager::GetAvailableBackups] Found %zu backup file(s)", backups.size());
+    Logger::Trace("[ConfigManager::GetAvailableBackups] Exit - returning %zu backups", backups.size());
+    return backups;
 }

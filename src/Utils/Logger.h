@@ -3,6 +3,7 @@
 #include <string>
 #include <cstdarg>
 #include <memory>
+#include <vector>
 
 // Logging levels
 enum class LogLevel {
@@ -39,6 +40,19 @@ public:
     static void Warn(const char* fmt, ...);
     static void Error(const char* fmt, ...);
     static void Fatal(const char* fmt, ...);
+
+    // Structured logging - outputs in JSON format
+    static void SetStructuredLogging(bool enabled);
+    static bool IsStructuredLogging();
+
+    // Log rotation
+    static void SetMaxFileSize(size_t maxBytes);
+    static void SetMaxLogFiles(size_t maxFiles);
+    static void RotateIfNeeded();
+
+    // Remote log shipping
+    static void SetRemoteEndpoint(const std::string& endpoint);
+    static void EnableRemoteShipping(bool enabled);
 
 private:
     struct Impl;

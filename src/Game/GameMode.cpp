@@ -6,6 +6,7 @@
 #include "Game/PlayerManager.h"
 #include "Game/MapManager.h"
 #include "Game/TeamManager.h"
+#include "../../telemetry/TelemetryManager.h"
 #include <algorithm>
 #include <cstring>
 
@@ -54,6 +55,7 @@ void GameMode::Update()
         AdvancePhase();
     }
     m_tickCount++;
+    TELEMETRY_UPDATE_TICK(m_tickCount);
     // Periodic tasks
     if (m_tickCount % 60 == 0) {
         Logger::Debug("[GameMode::Update] Tick %lu: Running periodic respawn check", (unsigned long)m_tickCount);
@@ -153,6 +155,9 @@ void GameMode::HandleObjectiveCapture(uint32_t playerId, uint32_t objectiveId)
             "Player " + std::to_string(playerId) +
             " captured objective " + std::to_string(objectiveId)
         );
+
+        // Track objective capture in telemetry
+        Telemetry::TelemetryManager::Instance().GetCustomMetrics().IncrementObjectiveCapture();
 
         // Award points
         tm->AddTeamScore(team, 100);

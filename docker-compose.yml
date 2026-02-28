@@ -1,0 +1,79 @@
+# RS2V Server - Docker Compose deployment
+version: "3.8"
+
+services:
+  rs2v-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: rs2v-server
+    restart: unless-stopped
+    ports:
+      - "7777:7777/udp"    # Game port
+      - "27015:27015/udp"  # Steam query port
+      - "7957:7957/tcp"    # EAC emulator port
+      - "9090:9090/tcp"    # Prometheus metrics endpoint
+    volumes:
+      - ./config:/opt/rs2v/config:ro
+      - rs2v-logs:/opt/rs2v/logs
+      - rs2v-telemetry:/opt/rs2v/telemetry/output
+      - rs2v-analysis:/opt/rs2v/protocol_analysis
+    environment:
+      - RS2V_CONFIG_FILE=/opt/rs2v/config/server.ini
+      - RS2V_LOG_DIR=/opt/rs2v/logs
+      - RS2V_TELEMETRY_DIR=/opt/rs2v/telemetry/output
+    deploy:
+      resources:
+        limits:
+          cpus: "4.0"
+          memory: 4G
+        reservations:
+          cpus: "1.0"
+          memory: 1G
+    networks:
+      - rs2v-net
+
+  # Prometheus metrics collector (optional)
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: rs2v-prometheus
+    restart: unless-stopped
+    ports:
+      - "9091:9090"
+    volumes:
+      - ./deploy/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    depends_on:
+      - rs2v-server
+    networks:
+      - rs2v-net
+
+  # Grafana dashboards (optional)
+  grafana:
+    image: grafana/grafana:latest
+    container_name: rs2v-grafana
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./deploy/grafana/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./deploy/grafana/datasources:/etc/grafana/provisioning/datasources:ro
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    depends_on:
+      - prometheus
+    networks:
+      - rs2v-net
+
+volumes:
+  rs2v-logs:
+  rs2v-telemetry:
+  rs2v-analysis:
+  prometheus-data:
+  grafana-data:
+
+networks:
+  rs2v-net:
+    driver: bridge

@@ -6,7 +6,7 @@
 RPCHandler::RPCHandler() {
     Logger::Trace("[RPCHandler::RPCHandler] entry — constructing default RPCHandler");
     Logger::Debug("[RPCHandler::RPCHandler] initialized with empty RPC map, requestTag='%s', responseTag='%s'",
-                  m_requestTag.c_str(), m_responseTag.c_str());
+                  m_requestTag, m_responseTag);
     Logger::Trace("[RPCHandler::RPCHandler] exit — construction complete");
 }
 
@@ -81,7 +81,7 @@ void RPCHandler::Handle(uint32_t clientId,
     }
     else {
         Logger::Debug("[RPCHandler::Handle] packet tag '%s' does not match requestTag='%s' or responseTag='%s' — not an RPC packet, ignoring",
-                      tag.c_str(), m_requestTag.c_str(), m_responseTag.c_str());
+                      tag.c_str(), m_requestTag, m_responseTag);
         // Not an RPC packet
     }
     Logger::Trace("[RPCHandler::Handle] exit — finished handling packet tag='%s' from clientId=%u",

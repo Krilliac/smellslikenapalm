@@ -1,6 +1,7 @@
 // src/Input/MovementValidator.cpp
 #include "Input/MovementValidator.h"
 #include "Utils/Logger.h"
+#include "../../telemetry/TelemetryManager.h"
 #include <algorithm>
 
 MovementValidator::MovementValidator(const Config& cfg)
@@ -70,6 +71,7 @@ bool MovementValidator::ValidateMovement(uint32_t clientId,
     if (speed > m_cfg.maxSpeed) {
         Logger::Warn("MovementValidator: client %u speed %.2f > max %.2f", clientId, speed, m_cfg.maxSpeed);
         Logger::Debug("[MovementValidator::ValidateMovement] Client %u: SPEED CHECK FAILED - speed %.4f exceeds max %.4f", clientId, speed, m_cfg.maxSpeed);
+        TELEMETRY_INCREMENT_SPEED_HACK();
         Logger::Trace("[MovementValidator::ValidateMovement] Exit - returning false (speed exceeded)");
         return false;
     }
@@ -81,6 +83,7 @@ bool MovementValidator::ValidateMovement(uint32_t clientId,
     if (accel > m_cfg.maxAccel) {
         Logger::Warn("MovementValidator: client %u accel %.2f > max %.2f", clientId, accel, m_cfg.maxAccel);
         Logger::Debug("[MovementValidator::ValidateMovement] Client %u: ACCELERATION CHECK FAILED - accel %.4f exceeds max %.4f", clientId, accel, m_cfg.maxAccel);
+        TELEMETRY_INCREMENT_SPEED_HACK();
         Logger::Trace("[MovementValidator::ValidateMovement] Exit - returning false (acceleration exceeded)");
         return false;
     }
@@ -92,6 +95,7 @@ bool MovementValidator::ValidateMovement(uint32_t clientId,
     if (turnRate > m_cfg.maxTurnRateDeg) {
         Logger::Warn("MovementValidator: client %u turnRate %.2f°/s > max %.2f°/s", clientId, turnRate, m_cfg.maxTurnRateDeg);
         Logger::Debug("[MovementValidator::ValidateMovement] Client %u: TURN RATE CHECK FAILED - turnRate %.4f exceeds max %.4f", clientId, turnRate, m_cfg.maxTurnRateDeg);
+        TELEMETRY_INCREMENT_SPEED_HACK();
         Logger::Trace("[MovementValidator::ValidateMovement] Exit - returning false (turn rate exceeded)");
         return false;
     }
@@ -103,6 +107,7 @@ bool MovementValidator::ValidateMovement(uint32_t clientId,
     if (dist > m_cfg.maxTeleportDistance && speed < 0.01f) {
         Logger::Warn("MovementValidator: client %u teleport distance %.2f > max %.2f", clientId, dist, m_cfg.maxTeleportDistance);
         Logger::Debug("[MovementValidator::ValidateMovement] Client %u: TELEPORT CHECK FAILED - dist=%.4f > maxTeleportDistance=%.4f while speed=%.4f < 0.01", clientId, dist, m_cfg.maxTeleportDistance, speed);
+        TELEMETRY_INCREMENT_SPEED_HACK();
         Logger::Trace("[MovementValidator::ValidateMovement] Exit - returning false (teleport detected)");
         return false;
     }
