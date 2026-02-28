@@ -353,16 +353,27 @@ ctest -R "Telemetry.*" --verbose  # Telemetry tests
 
 ### Available Documentation
 
+> **Start here:** [Documentation Home](docs/Home.md) — Central index for all project documentation.
+
 | Document | Description | Status |
 |----------|-------------|--------|
-| **[TODO.md](TODO.md)** | Development roadmap and task tracking | ✅ Complete |
-| **[ARCHITECTURE.md](docs/ARCHITECTURE.md)** | Detailed system architecture | ✅ Complete |
-| **[API.md](docs/API.md)** | Complete API reference | ✅ Complete |
-| **[SECURITY.md](docs/SECURITY.md)** | Security architecture and best practices | ✅ Complete |
-| **[TELEMETRY.md](docs/TELEMETRY.md)** | Telemetry system guide | ✅ Complete |
-| **[SCRIPTING.md](docs/SCRIPTING.md)** | Plugin development guide | ✅ Complete |
-| **[DEPLOYMENT.md](docs/DEPLOYMENT.md)** | Production deployment guide | ✅ Complete |
-| **[TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md)** | Common issues and solutions | ✅ Complete |
+| **[Documentation Home](docs/Home.md)** | Central wiki index and navigation hub | ✅ Complete |
+| **[Configuration Reference](docs/CONFIGURATION.md)** | Complete reference for every config file and setting | ✅ Complete |
+| **[Admin Commands](docs/ADMIN_COMMANDS.md)** | All 18 admin/RCON commands with examples | ✅ Complete |
+| **[Game Modes Guide](docs/GAME_MODES.md)** | All 5 game modes with mechanics and strategy | ✅ Complete |
+| **[Maps Guide](docs/MAPS.md)** | All 8 maps, rotation, custom maps, Workshop | ✅ Complete |
+| **[FAQ](docs/FAQ.md)** | Frequently asked questions | ✅ Complete |
+| **[API Reference](docs/API.md)** | Complete API reference | ✅ Complete |
+| **[Architecture](docs/ARCHITECTURE.md)** | Detailed system architecture | ✅ Complete |
+| **[Security](docs/SECURITY.md)** | Security architecture and best practices | ✅ Complete |
+| **[Telemetry](docs/TELEMETRY.md)** | Telemetry system guide | ✅ Complete |
+| **[Scripting](docs/SCRIPTING.md)** | Plugin development guide | ✅ Complete |
+| **[Deployment](docs/DEPLOYMENT.md)** | Production deployment guide | ✅ Complete |
+| **[Development](docs/DEVELOPMENT.md)** | Build, debug, test, contribute | ✅ Complete |
+| **[Troubleshooting](docs/TROUBLESHOOTING.md)** | Common issues and solutions | ✅ Complete |
+| **[Contributing](CONTRIBUTING.md)** | Contribution guidelines | ✅ Complete |
+| **[Changelog](CHANGELOG.md)** | Version history and release notes | ✅ Complete |
+| **[TODO](TODO.md)** | Development roadmap and task tracking | ✅ Complete |
 
 ### Online Resources
 
