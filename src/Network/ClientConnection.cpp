@@ -315,3 +315,11 @@ void ClientConnection::ResetWindowIfNeeded() {
     }
     Logger::Trace("[ClientConnection::ResetWindowIfNeeded] Exit");
 }
+
+int ClientConnection::GetPing() const {
+    return m_pingMs;
+}
+
+void ClientConnection::UpdatePing(int pingMs) {
+    m_pingMs = pingMs;
+}

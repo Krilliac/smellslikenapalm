@@ -38,8 +38,14 @@ public:
 
     // Team scoring
     void AddTeamScore(uint32_t teamId, uint32_t points);
+    void SetTeamScore(uint32_t teamId, int score);
     uint32_t GetTeamScore(uint32_t teamId) const;
     void ResetScores();
+
+    // Team info
+    std::string GetTeamName(uint32_t teamId) const;
+    void SetTeamMaxSize(uint32_t teamId, int maxSize);
+    int GetTeamSize(uint32_t teamId) const;
 
     // Objectives
     bool CaptureObjective(uint32_t teamId, uint32_t objectiveId);
@@ -53,6 +59,7 @@ private:
     GameServer* m_server;
     std::map<uint32_t, TeamInfo> m_teams;
     std::map<uint32_t, uint32_t> m_playerTeamMap; // playerId -> teamId
+    std::map<uint32_t, int> m_teamMaxSizes;       // teamId -> max player count
 
     void EnsureTeamExists(uint32_t teamId, const std::string& name = "");
 };

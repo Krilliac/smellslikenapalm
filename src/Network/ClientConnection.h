@@ -55,6 +55,10 @@ public:
     void                SendSessionState(uint32_t aliveCount);
     void                SendInventoryUpdate(const std::vector<struct InventoryItem>& items);
 
+    // Ping measurement
+    int                 GetPing() const;
+    void                UpdatePing(int pingMs);
+
     // Rate limiting / QoS
     bool                CanSend(uint32_t byteCount);
     void                OnBytesSent(uint32_t byteCount);
@@ -74,6 +78,8 @@ private:
 
     Packet                      m_lastPacket;
     std::vector<uint8_t>        m_lastRaw;
+
+    int                         m_pingMs = 0;
 
     // Bandwidth tracking
     uint32_t                    m_sentBytesThisWindow = 0;

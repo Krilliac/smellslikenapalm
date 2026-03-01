@@ -160,3 +160,26 @@ void TeamManager::AutoBalanceTeams()
                      playerId, maxTeam, minTeam);
     }
 }
+
+void TeamManager::SetTeamScore(uint32_t teamId, int score) {
+    EnsureTeamExists(teamId);
+    m_teams[teamId].score = static_cast<uint32_t>(score);
+    Logger::Debug("TeamManager: Team %u score set to %d", teamId, score);
+}
+
+std::string TeamManager::GetTeamName(uint32_t teamId) const {
+    auto it = m_teams.find(teamId);
+    if (it != m_teams.end()) return it->second.name;
+    return "Team " + std::to_string(teamId);
+}
+
+void TeamManager::SetTeamMaxSize(uint32_t teamId, int maxSize) {
+    m_teamMaxSizes[teamId] = maxSize;
+    Logger::Debug("TeamManager: Team %u max size set to %d", teamId, maxSize);
+}
+
+int TeamManager::GetTeamSize(uint32_t teamId) const {
+    auto it = m_teams.find(teamId);
+    if (it != m_teams.end()) return static_cast<int>(it->second.playerIds.size());
+    return 0;
+}

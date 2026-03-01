@@ -32,6 +32,7 @@ class CommanderAbilities;
 class SpawnSystem;
 class WeaponDatabase;
 class DamageSystem;
+class ProjectileManager;
 class HelicopterPhysics;
 class TerritoryMode;
 class SupremacyMode;
@@ -79,6 +80,7 @@ public:
     SpawnSystem*                    GetSpawnSystem()        const;
     WeaponDatabase*                 GetWeaponDatabase()     const;
     DamageSystem*                   GetDamageSystem()       const;
+    ProjectileManager*              GetProjectileManager()  const;
     HelicopterPhysics*              GetHelicopterPhysics()  const;
     TerritoryMode*                  GetTerritoryMode()      const;
     SupremacyMode*                  GetSupremacyMode()      const;
@@ -132,6 +134,7 @@ private:
     std::unique_ptr<SpawnSystem>        m_spawnSystem;
     std::unique_ptr<WeaponDatabase>     m_weaponDatabase;
     std::unique_ptr<DamageSystem>       m_damageSystem;
+    std::unique_ptr<ProjectileManager>  m_projectileManager;
     std::unique_ptr<HelicopterPhysics>  m_helicopterPhysics;
     std::unique_ptr<TerritoryMode>      m_territoryMode;
     std::unique_ptr<SupremacyMode>      m_supremacyMode;

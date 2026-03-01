@@ -25,7 +25,15 @@ ChatManager::~ChatManager()
 void ChatManager::Initialize()
 {
     Logger::Trace("[ChatManager::Initialize] Entry");
-    Logger::Info("ChatManager: Ready to handle chat messages");
+
+    // Initialize default profanity word list for slur filtering
+    m_profanityList = {
+        "nigger", "nigga", "faggot", "kike", "spic", "chink",
+        "wetback", "coon", "gook", "tranny"
+    };
+
+    Logger::Info("ChatManager: Ready (profanity filter: %zu words, rate limit: %d/%ds)",
+                 m_profanityList.size(), RATE_LIMIT_MAX_MESSAGES, RATE_LIMIT_WINDOW_SECONDS);
     Logger::Trace("[ChatManager::Initialize] Exit");
 }
 
@@ -46,9 +54,16 @@ void ChatManager::HandlePlayerChat(uint32_t clientId, const std::string& message
         return;
     }
 
+    if (!IsMessageAllowed(clientId, message)) {
+        Logger::Debug("[ChatManager::HandlePlayerChat] Message rejected by filter for client %u", clientId);
+        Logger::Trace("[ChatManager::HandlePlayerChat] Exit (filtered)");
+        return;
+    }
+
+    std::string cleanMessage = CensorMessage(message);
     std::string playerName = std::to_string(conn->GetClientId());
     Logger::Debug("[ChatManager::HandlePlayerChat] Player '%s' (client %u) sending public chat", playerName.c_str(), clientId);
-    std::string formatted = FormatChatMessage(playerName, message);
+    std::string formatted = FormatChatMessage(playerName, cleanMessage);
     Logger::Debug("[ChatManager::HandlePlayerChat] Formatted message: '%s'", formatted.c_str());
     BroadcastChat(formatted);
     Logger::Trace("[ChatManager::HandlePlayerChat] Exit");
@@ -64,10 +79,17 @@ void ChatManager::HandleTeamChat(uint32_t clientId, const std::string& message)
         return;
     }
 
+    if (!IsMessageAllowed(clientId, message)) {
+        Logger::Debug("[ChatManager::HandleTeamChat] Message rejected by filter for client %u", clientId);
+        Logger::Trace("[ChatManager::HandleTeamChat] Exit (filtered)");
+        return;
+    }
+
+    std::string cleanMessage = CensorMessage(message);
     uint32_t teamId = conn->GetClientId() % 2;
     std::string playerName = std::to_string(conn->GetClientId());
     Logger::Debug("[ChatManager::HandleTeamChat] Player '%s' (client %u) sending team chat to team %u", playerName.c_str(), clientId, teamId);
-    std::string formatted = FormatTeamMessage(playerName, message);
+    std::string formatted = FormatTeamMessage(playerName, cleanMessage);
     Logger::Debug("[ChatManager::HandleTeamChat] Formatted message: '%s'", formatted.c_str());
     BroadcastTeam(teamId, formatted);
     Logger::Trace("[ChatManager::HandleTeamChat] Exit");
@@ -125,24 +147,85 @@ std::string ChatManager::FormatTeamMessage(const std::string& playerName, const 
     return result;
 }
 
-bool ChatManager::IsMessageAllowed(const std::string& message) const
+bool ChatManager::IsMessageAllowed(uint32_t clientId, const std::string& message)
 {
-    Logger::Trace("[ChatManager::IsMessageAllowed] Entry: message.size=%zu", message.size());
-    // Basic spam/filter check; reject empty or too long
+    Logger::Trace("[ChatManager::IsMessageAllowed] Entry: clientId=%u, message.size=%zu", clientId, message.size());
+
+    // Reject empty messages
     if (message.empty()) {
         Logger::Debug("[ChatManager::IsMessageAllowed] Message rejected: empty");
-        Logger::Trace("[ChatManager::IsMessageAllowed] Exit: return false (empty)");
         return false;
     }
+
+    // Reject messages that are too long
     if (message.size() > 256) {
         Logger::Debug("[ChatManager::IsMessageAllowed] Message rejected: too long (%zu > 256)", message.size());
-        Logger::Trace("[ChatManager::IsMessageAllowed] Exit: return false (too long)");
         return false;
     }
-    // TODO: Add profanity filtering, rate limiting
-    Logger::Debug("[ChatManager::IsMessageAllowed] Message allowed (size=%zu)", message.size());
-    Logger::Trace("[ChatManager::IsMessageAllowed] Exit: return true");
+
+    // Rate limiting: check if the client has sent too many messages in the time window
+    auto now = std::chrono::steady_clock::now();
+    auto& entry = m_rateLimits[clientId];
+
+    // Remove timestamps outside the window
+    auto windowStart = now - std::chrono::seconds(RATE_LIMIT_WINDOW_SECONDS);
+    entry.timestamps.erase(
+        std::remove_if(entry.timestamps.begin(), entry.timestamps.end(),
+                        [&windowStart](const auto& ts) { return ts < windowStart; }),
+        entry.timestamps.end());
+
+    if (static_cast<int>(entry.timestamps.size()) >= RATE_LIMIT_MAX_MESSAGES) {
+        Logger::Debug("[ChatManager::IsMessageAllowed] Message rejected: rate limited (client %u, %zu msgs in %ds)",
+                      clientId, entry.timestamps.size(), RATE_LIMIT_WINDOW_SECONDS);
+        return false;
+    }
+
+    // Record this message timestamp
+    entry.timestamps.push_back(now);
+
+    // Profanity check (message is still allowed but will be censored at send time)
+    if (ContainsProfanity(message)) {
+        Logger::Debug("[ChatManager::IsMessageAllowed] Message contains profanity, will be censored (client %u)", clientId);
+        // Still allowed, but will be censored in the format step
+    }
+
+    Logger::Debug("[ChatManager::IsMessageAllowed] Message allowed (client=%u, size=%zu, rate=%zu/%d)",
+                  clientId, message.size(), entry.timestamps.size(), RATE_LIMIT_MAX_MESSAGES);
     return true;
+}
+
+bool ChatManager::ContainsProfanity(const std::string& message) const
+{
+    // Convert message to lowercase for case-insensitive matching
+    std::string lower = message;
+    std::transform(lower.begin(), lower.end(), lower.begin(),
+                   [](unsigned char c) { return std::tolower(c); });
+
+    for (const auto& word : m_profanityList) {
+        if (lower.find(word) != std::string::npos) {
+            return true;
+        }
+    }
+    return false;
+}
+
+std::string ChatManager::CensorMessage(const std::string& message) const
+{
+    std::string result = message;
+    std::string lower = message;
+    std::transform(lower.begin(), lower.end(), lower.begin(),
+                   [](unsigned char c) { return std::tolower(c); });
+
+    for (const auto& word : m_profanityList) {
+        size_t pos = 0;
+        while ((pos = lower.find(word, pos)) != std::string::npos) {
+            std::string replacement(word.size(), '*');
+            result.replace(pos, word.size(), replacement);
+            lower.replace(pos, word.size(), replacement);
+            pos += word.size();
+        }
+    }
+    return result;
 }
 
 void ChatManager::ProcessChatCommand(uint32_t clientId, const std::string& message)

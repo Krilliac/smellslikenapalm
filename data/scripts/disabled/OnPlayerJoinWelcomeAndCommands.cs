@@ -1,38 +1,63 @@
+// OnPlayerJoinWelcomeAndCommands.cs — Welcomes players and provides basic chat commands.
+// Demonstrates: event handlers, per-player chat, chat command parsing.
+
 using System;
-using System.Runtime.InteropServices;
 
-public static class Native
-{
-    [DllImport("RS2VNativePlugin", CallingConvention = CallingConvention.Cdecl)]
-    public static extern void SendChatToPlayer(string playerId, string message);
-
-    [DllImport("RS2VNativePlugin", CallingConvention = CallingConvention.Cdecl)]
-    public static extern void BroadcastChat(string message);
-}
-
-public class WelcomeAndCommands
+public class OnPlayerJoinWelcomeAndCommands
 {
     public static void Initialize()
     {
-        ScriptHost.RegisterEventHandler("OnPlayerJoin", nameof(OnPlayerJoin));
-        ScriptHost.RegisterEventHandler("OnChatMessage", nameof(OnChatMessage));
-        ScriptHelpers.LogInfo("[C#] WelcomeAndCommands initialized");
+        ScriptHelpers.OnEvent("OnPlayerJoin", nameof(OnPlayerJoin));
+        ScriptHelpers.OnEvent("OnChatMessage", nameof(OnChatMessage));
+        ScriptHelpers.Log("[WelcomeAndCommands] Initialized");
+    }
+
+    public static void Cleanup()
+    {
+        ScriptHelpers.OffEvent("OnPlayerJoin", nameof(OnPlayerJoin));
+        ScriptHelpers.OffEvent("OnChatMessage", nameof(OnChatMessage));
     }
 
     public static void OnPlayerJoin(string playerId)
     {
-        Native.SendChatToPlayer(playerId, "Welcome to the server! Type !time to get the server time.");
+        string name = ScriptHelpers.PlayerName(playerId);
+        string serverName = ScriptHelpers.ServerNameStr();
+        ScriptHelpers.ChatTo(playerId,
+            $"Welcome to {serverName}, {name}! Type !help for available commands.");
     }
 
     public static void OnChatMessage(string playerId, string message)
     {
-        // Handle !time command
-        ScriptHelpers.OnChatCommand(playerId, message, "time", HandleTimeCommand);
+        ScriptHelpers.OnChatCommand(playerId, message, "time", HandleTime);
+        ScriptHelpers.OnChatCommand(playerId, message, "help", HandleHelp);
+        ScriptHelpers.OnChatCommand(playerId, message, "stats", HandleStats);
+        ScriptHelpers.OnChatCommand(playerId, message, "ping", HandlePing);
     }
 
-    private static void HandleTimeCommand(string[] args, string playerId)
+    private static void HandleTime(string[] args, string playerId)
     {
-        string time = DateTime.UtcNow.ToString("HH:mm:ss") + " UTC";
-        Native.SendChatToPlayer(playerId, $"Server time is {time}");
+        ScriptHelpers.ChatTo(playerId,
+            $"Server time: {DateTime.UtcNow:HH:mm:ss} UTC | Uptime: {ScriptHelpers.FmtSpan(TimeSpan.FromSeconds(ScriptHelpers.Uptime()))}");
+    }
+
+    private static void HandleHelp(string[] args, string playerId)
+    {
+        ScriptHelpers.ChatTo(playerId, "Commands: !time, !help, !stats, !ping");
+    }
+
+    private static void HandleStats(string[] args, string playerId)
+    {
+        int kills = ScriptHelpers.Kills(playerId);
+        int deaths = ScriptHelpers.Deaths(playerId);
+        int score = ScriptHelpers.Score(playerId);
+        float kd = deaths > 0 ? (float)kills / deaths : kills;
+        ScriptHelpers.ChatTo(playerId, $"K:{kills} D:{deaths} K/D:{kd:0.00} Score:{score}");
+    }
+
+    private static void HandlePing(string[] args, string playerId)
+    {
+        int ping = ScriptHelpers.PlayerPing(playerId);
+        int avg = ScriptHelpers.AvgPing();
+        ScriptHelpers.ChatTo(playerId, $"Your ping: {ping}ms (server avg: {avg}ms)");
     }
 }

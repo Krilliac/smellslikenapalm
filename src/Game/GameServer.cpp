@@ -23,6 +23,7 @@
 #include "Game/SpawnSystem.h"
 #include "Game/WeaponDatabase.h"
 #include "Game/DamageSystem.h"
+#include "Game/ProjectileManager.h"
 #include "Game/HelicopterPhysics.h"
 #include "Game/TerritoryMode.h"
 #include "Game/SupremacyMode.h"
@@ -227,6 +228,9 @@ bool GameServer::Initialize() {
     m_damageSystem = std::make_unique<DamageSystem>(this);
     m_damageSystem->Initialize();
     m_damageSystem->SetFriendlyFireEnabled(m_gameConfig->IsFriendlyFire());
+
+    m_projectileManager = std::make_unique<ProjectileManager>(this);
+    m_projectileManager->Initialize();
     m_damageSystem->SetOnKill([this](const KillEvent& kill) {
         if (m_ticketSystem && !kill.isTeamKill) {
             auto* tm = GetTeamManager();
@@ -370,6 +374,7 @@ void GameServer::Run() {
         if (m_commanderAbilities) m_commanderAbilities->Update(dt);
         if (m_spawnSystem) m_spawnSystem->Update(dt);
         if (m_damageSystem) m_damageSystem->Update(dt);
+        if (m_projectileManager) m_projectileManager->Update(dt);
 
         auto gameEnd = std::chrono::high_resolution_clock::now();
         double gameMs = std::chrono::duration<double, std::milli>(gameEnd - gameStart).count();
@@ -414,6 +419,7 @@ void GameServer::Shutdown() {
     m_supremacyMode.reset();
     m_territoryMode.reset();
     m_helicopterPhysics.reset();
+    m_projectileManager.reset();
     m_damageSystem.reset();
     m_spawnSystem.reset();
     m_commanderAbilities.reset();
@@ -501,6 +507,7 @@ CommanderAbilities* GameServer::GetCommanderAbilities() const { return m_command
 SpawnSystem*        GameServer::GetSpawnSystem()        const { return m_spawnSystem.get();        }
 WeaponDatabase*     GameServer::GetWeaponDatabase()     const { return m_weaponDatabase.get();     }
 DamageSystem*       GameServer::GetDamageSystem()       const { return m_damageSystem.get();       }
+ProjectileManager*  GameServer::GetProjectileManager()  const { return m_projectileManager.get();  }
 HelicopterPhysics*  GameServer::GetHelicopterPhysics()  const { return m_helicopterPhysics.get();  }
 TerritoryMode*      GameServer::GetTerritoryMode()      const { return m_territoryMode.get();      }
 SupremacyMode*      GameServer::GetSupremacyMode()      const { return m_supremacyMode.get();      }

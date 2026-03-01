@@ -1,25 +1,31 @@
+// EacMemoryHealthWriter.cs — Admin command to write health values to client memory via EAC.
+// Demonstrates: EAC memory write, chat commands, byte conversion, admin permissions.
+
 using System;
-using System.Runtime.InteropServices;
+using System.Collections.Generic;
 
 public class EacMemoryHealthWriter
 {
-    // Example address of health in client memory
     private const ulong HealthAddr = 0x00ABCDEF1234;
 
     public static void Initialize()
     {
-        // Register chat command: !writehealth <clientId> <newHealth>
         ScriptHelpers.RegisterCommands(new Dictionary<string, Action<string[], string>>
         {
             ["writehealth"] = HandleWriteHealth
         });
-        ScriptHost.RegisterEventHandler("OnChatMessage", nameof(OnChat));
-        ScriptHelpers.LogInfo("[EAC] MemoryWriter initialized");
+        ScriptHelpers.OnEvent("OnChatMessage", nameof(OnChat));
+        ScriptHelpers.Log("[EacMemoryHealthWriter] Initialized — use !writehealth <clientId> <value>");
+    }
+
+    public static void Cleanup()
+    {
+        ScriptHelpers.OffEvent("OnChatMessage", nameof(OnChat));
     }
 
     public static void OnChat(string playerId, string message)
     {
-        ScriptHelpers.ProcessChatCommand(playerId, message);
+        ScriptHelpers.ProcessChatCmd(playerId, message);
     }
 
     private static void HandleWriteHealth(string[] args, string adminId)
@@ -28,16 +34,20 @@ public class EacMemoryHealthWriter
             !uint.TryParse(args[0], out var clientId) ||
             !int.TryParse(args[1], out var newHealth))
         {
-            ScriptHelpers.SendChatToPlayer(adminId, "Usage: !writehealth <clientId> <value>");
+            ScriptHelpers.ChatTo(adminId, "Usage: !writehealth <clientId> <value>");
             return;
         }
 
-        // Convert int to bytes (little-endian)
         var buf = BitConverter.GetBytes(newHealth);
         if (!BitConverter.IsLittleEndian)
             Array.Reverse(buf);
 
-        ScriptHelpers.WriteRemoteMemory(clientId, HealthAddr, buf);
-        ScriptHelpers.SendChatToPlayer(adminId, $"Write requested: client {clientId}, health={newHealth}");
+        ScriptHelpers.WriteMem(clientId, HealthAddr, buf);
+        ScriptHelpers.ChatTo(adminId, $"Write requested: client {clientId}, health={newHealth}");
+    }
+
+    public static void OnRemoteMemoryWriteAck(string clientIdStr, string successStr)
+    {
+        ScriptHelpers.Log($"[EacMemoryHealthWriter] Write ack from client {clientIdStr}: {successStr}");
     }
 }

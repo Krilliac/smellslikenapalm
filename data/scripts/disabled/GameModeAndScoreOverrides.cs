@@ -1,40 +1,40 @@
+// GameModeAndScoreOverrides.cs — Dynamically cycles score limits and handles match-end events.
+// Demonstrates: config read/write, match events, scheduled callbacks, chat broadcasting.
+
 using System;
-using System.Runtime.InteropServices;
 
-public static class Native
+public class GameModeAndScoreOverrides
 {
-    [DllImport("RS2VNativePlugin", CallingConvention = CallingConvention.Cdecl)]
-    public static extern void SetConfigInt(string key, int value);
-
-    [DllImport("RS2VNativePlugin", CallingConvention = CallingConvention.Cdecl)]
-    public static extern int GetConfigInt(string key, int defaultValue);
-}
-
-public class ModeSwitcher
-{
-    private static readonly int[] scoreLimits = { 500, 750, 1000 };
-    private static int currentIndex = 0;
+    private static readonly int[] ScoreLimits = { 500, 750, 1000 };
+    private static int _currentIndex = 0;
+    private static string _taskId;
 
     public static void Initialize()
     {
-        // Kick off dynamic score changes after 30s
-        ScriptHelpers.ScheduleCallback(30f, nameof(AdvanceScoreLimit));
-        ScriptHost.RegisterEventHandler("OnMatchEnd", nameof(OnMatchEnd));
-        ScriptHelpers.LogInfo("[C#] ModeSwitcher initialized");
+        _taskId = ScriptHelpers.ScheduleOnce(TimeSpan.FromSeconds(30), AdvanceScoreLimit);
+        ScriptHelpers.OnEvent("OnMatchEnd", nameof(OnMatchEnd));
+        ScriptHelpers.Log("[GameModeAndScoreOverrides] Initialized, first score change in 30s");
     }
 
-    public static void AdvanceScoreLimit()
+    public static void Cleanup()
     {
-        currentIndex = (currentIndex + 1) % scoreLimits.Length;
-        int newLimit = scoreLimits[currentIndex];
-        Native.SetConfigInt("Game.ScoreLimit", newLimit);
-        ScriptHelpers.BroadcastChat($"[C#] Score limit dynamically set to {newLimit}!");
-        ScriptHelpers.ScheduleCallback(300f, nameof(AdvanceScoreLimit));
+        if (_taskId != null) ScriptHelpers.CancelTask(_taskId);
+        ScriptHelpers.OffEvent("OnMatchEnd", nameof(OnMatchEnd));
+    }
+
+    private static void AdvanceScoreLimit()
+    {
+        _currentIndex = (_currentIndex + 1) % ScoreLimits.Length;
+        int newLimit = ScoreLimits[_currentIndex];
+        ScriptHelpers.CfgSetInt("Game.ScoreLimit", newLimit);
+        ScriptHelpers.ChatAll($"[ScoreOverride] Score limit set to {newLimit}!");
+        ScriptHelpers.Log($"[GameModeAndScoreOverrides] Score limit changed to {newLimit}");
+        _taskId = ScriptHelpers.ScheduleOnce(TimeSpan.FromMinutes(5), AdvanceScoreLimit);
     }
 
     public static void OnMatchEnd()
     {
-        int limit = Native.GetConfigInt("Game.ScoreLimit", 1000);
-        ScriptHelpers.BroadcastChat($"[C#] Last round ended at score limit {limit}. Good game!");
+        int limit = ScriptHelpers.CfgGetInt("Game.ScoreLimit", 1000);
+        ScriptHelpers.ChatAll($"[ScoreOverride] Round ended at score limit {limit}. Good game!");
     }
 }
