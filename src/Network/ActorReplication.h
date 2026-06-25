@@ -17,9 +17,12 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
+#include <string>
 
 #include "Network/BitReader.h"
 #include "Network/BitWriter.h"
+#include "Network/PacketCodec.h"
 
 namespace ActorRepl {
 
@@ -59,5 +62,32 @@ struct NewActorHeader {
 
 void WriteNewActorHeader(BitWriter& w, const NewActorHeader& hdr);
 NewActorHeader ReadNewActorHeader(BitReader& r);
+
+// ---- Replicated-property serialization ---------------------------------------
+// Each replicated property on the wire is `SerializeInt(handle, maxHandle)` then
+// the type-specific value (spec §3.1). `handle` is the property's index in the
+// class's replicated VAR DECLARATION order; `maxHandle` is the class's replicated
+// field count (ClassNetCache) - a per-class value the caller supplies from the
+// class tables in docs/RS2V_ActorReplication_7258.md. Properties are written in
+// ascending handle order; the bunch's BunchDataBits length delimits the block (no
+// terminator handle). The value encodings are standard UE3 net formats:
+//   bool=1 bit, byte=8 bits, int=int32, float=float32, FString=length-prefixed,
+//   object ref=NetGUID (WriteNetGUID).
+void WritePropBool  (BitWriter& w, uint32_t handle, uint32_t maxHandle, bool v);
+void WritePropByte  (BitWriter& w, uint32_t handle, uint32_t maxHandle, uint8_t v);
+void WritePropInt   (BitWriter& w, uint32_t handle, uint32_t maxHandle, int32_t v);
+void WritePropFloat (BitWriter& w, uint32_t handle, uint32_t maxHandle, float v);
+void WritePropString(BitWriter& w, uint32_t handle, uint32_t maxHandle, const std::string& v);
+void WritePropObject(BitWriter& w, uint32_t handle, uint32_t maxHandle, const NetGUIDRef& v);
+
+// Build an OPENING actor-channel bunch (bOpen=1, bReliable=1, ChType=2) on
+// `chIndex` with ChSequence `chSeq`: payload = SerializeNewActor(hdr) followed by
+// whatever `writeProps` writes (the bNetInitial property block). The returned
+// Bunch's payloadBits is exact (not byte-padded), ready for
+// PacketAssembler::BuildRawBunchPacket + Encode at the server MaxPacket.
+PacketCodec::Bunch MakeOpeningActorBunch(
+    uint32_t chIndex, uint32_t chSeq,
+    const NewActorHeader& hdr,
+    const std::function<void(BitWriter&)>& writeProps);
 
 } // namespace ActorRepl

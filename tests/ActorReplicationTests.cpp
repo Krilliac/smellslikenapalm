@@ -85,6 +85,74 @@ TEST(ActorReplication, CapturePlayerControllerOpenIsExport) {
     (void)cls;
 }
 
+// A mixed replicated-property block (one of each type) round-trips: each property
+// is SerializeInt(handle, maxHandle) + typed value, read back in order.
+TEST(ActorReplication, PropertyBlockRoundTrips) {
+    const uint32_t maxHandle = 64;
+    BitWriter w;
+    ActorRepl::WritePropBool  (w, 5,  maxHandle, true);
+    ActorRepl::WritePropByte  (w, 7,  maxHandle, 0xAB);
+    ActorRepl::WritePropInt   (w, 10, maxHandle, -12345);
+    ActorRepl::WritePropFloat (w, 12, maxHandle, 3.5f);
+    ActorRepl::WritePropString(w, 20, maxHandle, "Krill");
+    ActorRepl::WritePropObject(w, 30, maxHandle, NetGUIDRef{/*isStatic=*/true, 600u});
+
+    const std::vector<uint8_t> bytes = w.GetBytes();
+    const size_t nbits = w.NumBits();
+    BitReader r(bytes.data(), bytes.size(), nbits);
+
+    EXPECT_EQ(r.SerializeInt(maxHandle), 5u);    EXPECT_TRUE(r.ReadBit());
+    EXPECT_EQ(r.SerializeInt(maxHandle), 7u);    EXPECT_EQ(r.ReadByte(), 0xABu);
+    EXPECT_EQ(r.SerializeInt(maxHandle), 10u);   EXPECT_EQ(r.ReadInt32(), -12345);
+    EXPECT_EQ(r.SerializeInt(maxHandle), 12u);   EXPECT_FLOAT_EQ(r.ReadFloat(), 3.5f);
+    EXPECT_EQ(r.SerializeInt(maxHandle), 20u);   EXPECT_EQ(r.ReadString(), "Krill");
+    EXPECT_EQ(r.SerializeInt(maxHandle), 30u);
+    NetGUIDRef g = ActorRepl::ReadNetGUID(r);
+    EXPECT_TRUE(g.isStatic);
+    EXPECT_EQ(g.index, 600u);
+
+    EXPECT_FALSE(r.IsOverflowed());
+    EXPECT_EQ(r.BitPos(), nbits) << "block consumed exactly (length-delimited)";
+}
+
+// An opening actor bunch (SerializeNewActor header + property block) decodes back:
+// models a ch2 PlayerController open with the Actor-base role flags that make it
+// the owning client's (RemoteRole=AutonomousProxy, bNetOwner).
+TEST(ActorReplication, OpeningActorBunchDecodes) {
+    const uint32_t maxHandle = 80;
+    NewActorHeader hdr;
+    hdr.actorGuid = NetGUIDRef{/*isStatic=*/false, 0x4242u}; // exported new actor
+    hdr.classGuid = NetGUIDRef{/*isStatic=*/true, 90u};      // PlayerController class ref
+
+    PacketCodec::Bunch b = ActorRepl::MakeOpeningActorBunch(
+        /*chIndex=*/2, /*chSeq=*/1, hdr,
+        [&](BitWriter& w) {
+            ActorRepl::WritePropByte(w, 6, maxHandle, 2);  // RemoteRole=AutonomousProxy
+            ActorRepl::WritePropByte(w, 7, maxHandle, 3);  // Role=Authority
+            ActorRepl::WritePropBool(w, 8, maxHandle, true); // bNetOwner
+        });
+
+    EXPECT_FALSE(b.bControl);
+    EXPECT_TRUE(b.bOpen);
+    EXPECT_TRUE(b.bReliable);
+    EXPECT_EQ(b.chIndex, 2u);
+    EXPECT_EQ(b.chType, 2u);
+    EXPECT_EQ(b.chSequence, 1u);
+
+    BitReader r(b.payload.data(), b.payload.size(), b.payloadBits);
+    NewActorHeader out = ActorRepl::ReadNewActorHeader(r);
+    EXPECT_FALSE(out.actorGuid.isStatic);
+    EXPECT_EQ(out.actorGuid.index, 0x4242u);
+    EXPECT_TRUE(out.classGuid.isStatic);
+    EXPECT_EQ(out.classGuid.index, 90u);
+
+    EXPECT_EQ(r.SerializeInt(maxHandle), 6u);  EXPECT_EQ(r.ReadByte(), 2u);
+    EXPECT_EQ(r.SerializeInt(maxHandle), 7u);  EXPECT_EQ(r.ReadByte(), 3u);
+    EXPECT_EQ(r.SerializeInt(maxHandle), 8u);  EXPECT_TRUE(r.ReadBit());
+    EXPECT_FALSE(r.IsOverflowed());
+    EXPECT_EQ(r.BitPos(), static_cast<size_t>(b.payloadBits));
+}
+
 int main(int argc, char** argv) {
     ::testing::InitGoogleTest(&argc, argv);
     return RUN_ALL_TESTS();
