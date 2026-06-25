@@ -33,8 +33,7 @@ std::vector<uint8_t> BuildHello(const HelloMessage& msg) {
 std::vector<uint8_t> BuildChallenge(const ChallengeMessage& msg) {
     BitWriter w;
     w.WriteByte(NMTByte(NMT::Challenge));
-    w.WriteInt32(msg.serverFlags);   // spec §4: leading int32
-    w.WriteString(msg.challenge);
+    w.WriteUInt32(msg.nonce);   // 32-bit cookie (one 40-bit bunch on the wire)
     return w.GetBytes();
 }
 
@@ -146,8 +145,7 @@ bool ParseChallenge(const uint8_t* data, size_t len, ChallengeMessage& out, bool
     if (!CheckType(r, expectType, NMT::Challenge)) {
         return false;
     }
-    out.serverFlags = r.ReadInt32();   // spec §4: leading int32
-    out.challenge = r.ReadString();
+    out.nonce = r.ReadUInt32();   // 32-bit cookie
     return !r.IsOverflowed();
 }
 
@@ -220,9 +218,13 @@ bool ConsumeMessage(BitReader& r, NMT& outType) {
     // functions above (and ControlChannel.h spec §4). Values are discarded - we
     // only need to advance the reader to the end of this message.
     switch (type) {
-        case NMT::Hello:        // BYTE bLittleEndian, INT, INT, QWORD, FStr, FStr
-            r.ReadByte(); r.ReadInt32(); r.ReadInt32(); r.ReadUInt64();
-            r.ReadString(); r.ReadString();
+        case NMT::Hello:        // RS2 on-wire: NMT + a single BYTE.
+            // NOTE: the disassembly suggested {bLE,INT,INT,QWORD,FStr,FStr}, but
+            // the LIVE client's Hello bunch is only 16 bits (NMT + 1 byte). The
+            // version/SteamId fields arrive in a later message, not here. Reading
+            // the full layout here made the reassembler wait forever for bytes the
+            // client never sends, deadlocking the handshake.
+            r.ReadByte();
             break;
         case NMT::Welcome:      // FStr, FStr, QWORD
             r.ReadString(); r.ReadString(); r.ReadUInt64();
@@ -230,8 +232,8 @@ bool ConsumeMessage(BitReader& r, NMT& outType) {
         case NMT::Upgrade:      // INT, INT
             r.ReadInt32(); r.ReadInt32();
             break;
-        case NMT::Challenge:    // INT, FStr
-            r.ReadInt32(); r.ReadString();
+        case NMT::Challenge:    // DWORD cookie
+            r.ReadUInt32();
             break;
         case NMT::Netspeed:     // INT
             r.ReadInt32();

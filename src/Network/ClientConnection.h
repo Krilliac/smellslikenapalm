@@ -7,6 +7,7 @@
 #include <chrono>
 #include <cstdint>
 #include <memory>
+#include <atomic>
 #include "Network/UDPSocket.h"
 #include "Network/Packet.h"
 
@@ -40,6 +41,14 @@ public:
     // Connection state
     void                MarkDisconnected();
     bool                IsDisconnected() const;
+
+    // UE3 handshake gating. A real client speaks the UE3 control-channel protocol
+    // and CANNOT parse the emulator's internal Packet format. Until the handshake
+    // completes (NMT_Join -> Joined), no game-layer Packets may be sent to it -
+    // doing so corrupts the client's UE3 packet/sequence state. SendPacket is
+    // suppressed while this is false; SendRaw (UE3 control bytes) is always allowed.
+    void                SetHandshakeComplete(bool complete) { m_handshakeComplete = complete; }
+    bool                IsHandshakeComplete() const { return m_handshakeComplete; }
     void                UpdateLastHeartbeat();
     std::chrono::steady_clock::time_point GetLastHeartbeat() const;
 
@@ -75,6 +84,7 @@ private:
     ConnectionManager*          m_manager;
 
     bool                        m_disconnected = false;
+    std::atomic<bool>           m_handshakeComplete{false};
     std::chrono::steady_clock::time_point m_lastHeartbeat;
 
     std::string                 m_playerName;

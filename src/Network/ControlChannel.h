@@ -54,8 +54,10 @@ struct HelloMessage {
 // Spec §4: the body is `int32, FString` (a leading int32 precedes the nonce),
 // NOT a bare FString as previously assumed.
 struct ChallengeMessage {
-    int32_t     serverFlags = 0;  // leading int32 (purpose [?]; spec §4 medium-confidence)
-    std::string challenge;        // server nonce FString
+    // RS2 on-wire NMT_Challenge body is a single 32-bit cookie (the live Challenge
+    // bunch is 40 bits: NMT + DWORD). The earlier {int32, FString} layout was wrong
+    // (it bloated the Challenge across 4 bunches and the client ignored it).
+    uint32_t nonce = 0;
 };
 
 // NMT_Netspeed (C->S): { INT Netspeed } [UE3]

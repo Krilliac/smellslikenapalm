@@ -395,6 +395,12 @@ void ConnectionManager::FireClientLoggedIn(const ClientLoggedInEvent& ev) {
 
 void ConnectionManager::FireClientJoined(const ClientJoinedEvent& ev) {
     Logger::Info("[ConnectionManager::FireClientJoined] client %u joined", ev.clientId);
+    // The UE3 handshake is complete: from here the game layer may send to this
+    // client (until now SendPacket was suppressed to keep the handshake's wire
+    // stream clean).
+    if (auto conn = GetConnection(ev.clientId)) {
+        conn->SetHandshakeComplete(true);
+    }
     if (m_clientJoinedCb) {
         m_clientJoinedCb(ev);
     } else {
@@ -487,11 +493,14 @@ void ConnectionManager::ParseIncomingControl(uint32_t clientId, const std::vecto
 
     ControlState& cs = GetControlState(clientId);
 
-    // Acknowledge this received packet. UE3 clients retransmit un-acked reliable
-    // bunches indefinitely, so without this the handshake never advances. The ack
-    // rides on the next outbound packet (e.g. the handshake response), or a
-    // standalone ack packet below if we emit nothing.
-    cs.outbound.QueueAck(pkt.packetId);
+    // Acknowledge this received packet ONLY if it carried bunch data. Acking a
+    // pure-ack packet would make the peer ack our ack, and us ack that, forever
+    // (an infinite ack ping-pong with no data - observed against the live client).
+    // UE3 only acks packets that delivered bunches. The ack rides on the next
+    // outbound packet (e.g. the handshake response), or a standalone ack below.
+    if (!pkt.bunches.empty()) {
+        cs.outbound.QueueAck(pkt.packetId);
+    }
 
     // (pkt.acks confirm OUR reliable bunches arrived; with the handshake's
     // request/response pacing there is no retransmit window to advance yet, so

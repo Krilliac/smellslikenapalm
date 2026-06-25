@@ -60,6 +60,15 @@ std::string ClientConnection::GetSteamID() const {
 bool ClientConnection::SendPacket(const Packet& pkt) {
     Logger::Trace("[ClientConnection::SendPacket] Entry: clientId=%u, tag='%s', payloadSize=%u",
                   m_clientId, pkt.GetTag().c_str(), pkt.GetPayloadSize());
+    // Gate: never send the emulator's internal Packet format to a client that has
+    // not finished the UE3 control-channel handshake. A real RS2 client mis-parses
+    // these as UE3 packets and corrupts its sequence/ack state, stalling the
+    // handshake. (SendRaw, used for UE3 control bytes, is intentionally not gated.)
+    if (!m_handshakeComplete) {
+        Logger::Debug("[ClientConnection::SendPacket] Suppressing game packet tag='%s' to client %u: UE3 handshake not complete",
+                      pkt.GetTag().c_str(), m_clientId);
+        return false;
+    }
     auto data = pkt.Serialize();
     Logger::Debug("[ClientConnection::SendPacket] Serialized packet: tag='%s', serialized size=%zu bytes",
                   pkt.GetTag().c_str(), data.size());

@@ -26,14 +26,12 @@ namespace {
 // Generate a short random server nonce for the Challenge. Not cryptographic -
 // real challenge/response validation is intentionally out of scope (Steam auth
 // is stubbed); this only needs to be a non-empty, per-connection string.
-std::string MakeServerNonce(uint32_t clientId) {
-    static const char kHex[] = "0123456789ABCDEF";
+uint32_t MakeServerNonce(uint32_t clientId) {
+    // RS2's NMT_Challenge body is a single 32-bit cookie (the on-wire Challenge is
+    // a 40-bit bunch: NMT + DWORD). Return a 32-bit nonce.
     std::mt19937 rng(static_cast<uint32_t>(
         std::random_device{}() ^ (clientId * 2654435761u)));
-    std::string s;
-    s.reserve(16);
-    for (int i = 0; i < 16; ++i) s.push_back(kHex[rng() & 0xF]);
-    return s;
+    return rng();
 }
 } // namespace
 
@@ -122,41 +120,33 @@ void HandshakeState::OnHello(const uint8_t* data, size_t len) {
         return;
     }
 
+    // RS2's on-wire NMT_Hello is minimal (NMT + a single BYTE); the version /
+    // SteamId / session fields the codec once assumed are NOT in this message
+    // (they arrive later, e.g. in Login). So we do NOT require a full body parse
+    // and do NOT gate on version here - the presence of NMT_Hello is enough to
+    // issue the Challenge, which is what the real server does. Capture any
+    // identity we CAN parse (best-effort); never reject a short Hello.
     ControlChannel::HelloMessage hello;
-    if (!ControlChannel::ParseHello(data, len, hello)) {
-        Logger::Warn("[HandshakeState] client %u: malformed Hello, ignoring", m_clientId);
-        return;
+    if (ControlChannel::ParseHello(data, len, hello)) {
+        m_steamId = hello.steamId;
+        m_leechSessionId = hello.leechSessionId;
+        Logger::Info("[HandshakeState] client %u: Hello { LE=%u MinVer=%d Ver=%d SteamId=%llu session='%s' }",
+                     m_clientId, (unsigned)hello.bIsLittleEndian, hello.minVersion, hello.version,
+                     (unsigned long long)hello.steamId, hello.leechSessionId.c_str());
+    } else {
+        Logger::Info("[HandshakeState] client %u: minimal Hello (%zu bytes), proceeding to Challenge",
+                     m_clientId, len);
     }
 
-    Logger::Info("[HandshakeState] client %u: Hello { LE=%u MinVer=%d Ver=%d SteamId=%llu session='%s' }",
-                 m_clientId, (unsigned)hello.bIsLittleEndian, hello.minVersion, hello.version,
-                 (unsigned long long)hello.steamId, hello.leechSessionId.c_str());
-
-    // Version gate: reject clients older than our minimum net version. We also
-    // send an Upgrade carrying our minimum so a compliant client can react.
-    if (hello.version < kMinNetVersion) {
-        Logger::Warn("[HandshakeState] client %u: version %d < kMinNetVersion %d, upgrading/rejecting",
-                     m_clientId, hello.version, kMinNetVersion);
-        ControlChannel::UpgradeMessage upg;
-        upg.remoteMinVer = kMinNetVersion;
-        Emit(ControlChannel::BuildUpgrade(upg));
-        Reject(NetFailureKeys::SteamClientRequired, "client version too old");
-        return;
-    }
-
-    // Accept identity BLINDLY (stub). No Steam ticket validation here.
-    m_steamId = hello.steamId;
-    m_leechSessionId = hello.leechSessionId;
-
-    // Send Challenge (server nonce string).
+    // Send Challenge (server nonce: a single 32-bit cookie).
     m_challenge = MakeServerNonce(m_clientId);
     ControlChannel::ChallengeMessage chal;
-    chal.challenge = m_challenge;
+    chal.nonce = m_challenge;
     Emit(ControlChannel::BuildChallenge(chal));
 
     m_phase = HandshakePhase::ChallengeSent;
-    Logger::Info("[HandshakeState] client %u: Hello accepted -> Challenge sent (nonce='%s'), state=%s",
-                 m_clientId, m_challenge.c_str(), HandshakePhaseName(m_phase));
+    Logger::Info("[HandshakeState] client %u: Hello accepted -> Challenge sent (nonce=0x%08X), state=%s",
+                 m_clientId, m_challenge, HandshakePhaseName(m_phase));
 }
 
 void HandshakeState::OnNetspeed(const uint8_t* data, size_t len) {

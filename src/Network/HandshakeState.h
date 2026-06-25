@@ -114,8 +114,8 @@ public:
     const std::string& LeechSessionId() const { return m_leechSessionId; }
     int32_t Netspeed() const { return m_netspeed; }
 
-    // The server nonce sent in the Challenge (useful for the test).
-    const std::string& Challenge() const { return m_challenge; }
+    // The server nonce (32-bit cookie) sent in the Challenge (useful for tests).
+    uint32_t Challenge() const { return m_challenge; }
 
     // The parsed login options (valid once WelcomeSent has been reached).
     const URLOptions& LoginOptions() const { return m_loginOptions; }
@@ -149,6 +149,6 @@ private:
     std::string       m_leechSessionId;
     int32_t           m_netspeed = kNetspeedInternet;
 
-    std::string       m_challenge;     // server nonce we sent
+    uint32_t          m_challenge = 0; // server nonce (32-bit cookie) we sent
     URLOptions        m_loginOptions;  // parsed from the Login URL
 };
