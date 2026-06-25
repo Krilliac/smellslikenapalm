@@ -28,6 +28,10 @@
 #include "Game/TerritoryMode.h"
 #include "Game/SupremacyMode.h"
 #include "Game/SkirmishMode.h"
+#include "Game/ConnectionLoginBridge.h"
+#include "Protocol/ProtocolHandler.h"
+#include "Protocol/ReplicationManager.h"
+#include "Network/ClientConnection.h"
 #include "Utils/PathUtils.h"
 #include "Utils/HandlerLibraryManager.h"
 #include "Protocol/ReverseEngineering/ProtocolDecoder.h"
@@ -256,6 +260,57 @@ bool GameServer::Initialize() {
 
     Logger::Info("RS2V game systems initialized");
 
+    // ------------------------------------------------------------------
+    // Security + replication + the connection->player login bridge.
+    //
+    // This is the wiring that turns a connected client into a spawned player:
+    // SecurityManager runs the PreLogin ban gate, ReplicationManager carries the
+    // GRI/PRI, and ConnectionLoginBridge mirrors the UE3 Login/PostLogin flow
+    // onto the control-channel ClientLoggedIn / ClientJoined events.
+    // ------------------------------------------------------------------
+    Logger::Debug("[GameServer::Initialize] Creating ProtocolHandler + ReplicationManager");
+    m_protocolHandler    = std::make_unique<ProtocolHandler>();
+    m_replicationManager = std::make_unique<ReplicationManager>(*m_protocolHandler);
+
+    Logger::Debug("[GameServer::Initialize] Creating ConnectionLoginBridge and subscribing handshake callbacks");
+    {
+        // The bridge constructs and owns the SecurityManager itself (from
+        // m_securityConfig). This keeps the Security headers out of this TU,
+        // avoiding the duplicate ClientAddress definition shared between
+        // Security/NetworkBlocker.h and Network/BandwidthManager.h.
+        ConnectionLoginBridge::Dependencies deps;
+        deps.playerManager      = m_playerManager.get();
+        deps.teamManager        = m_teamManager.get();
+        deps.spawnSystem        = m_spawnSystem.get();
+        deps.securityConfig     = m_securityConfig;
+        deps.replicationManager = m_replicationManager.get();
+        deps.serverConfig       = m_serverConfig;
+        deps.resolveConnection  = [this](uint32_t clientId) {
+            return GetClientConnection(clientId);
+        };
+        deps.dropConnection     = [this](uint32_t clientId, const std::string& reason) {
+            Logger::Info("[GameServer] Dropping client %u after failed PreLogin: %s", clientId, reason.c_str());
+            if (auto conn = GetClientConnection(clientId)) {
+                conn->MarkDisconnected();
+            }
+        };
+        m_loginBridge = std::make_unique<ConnectionLoginBridge>(std::move(deps));
+    }
+
+    // Subscribe GameServer to the two control-channel handshake events. This is
+    // the GameServer subscription point that routes Network -> Game.
+    if (m_networkManager) {
+        m_networkManager->SetClientLoggedInCallback(
+            [this](const ClientLoggedInEvent& ev) {
+                if (m_loginBridge) m_loginBridge->OnClientLoggedIn(ev);
+            });
+        m_networkManager->SetClientJoinedCallback(
+            [this](const ClientJoinedEvent& ev) {
+                if (m_loginBridge) m_loginBridge->OnClientJoined(ev);
+            });
+        Logger::Info("[GameServer::Initialize] Subscribed to ClientLoggedIn/ClientJoined handshake callbacks");
+    }
+
     // Start first map and game mode
     std::string mapName = m_gameConfig->GetGameSettings().mapName;
     Logger::Debug("[GameServer::Initialize] Attempting to load initial map: '%s'", mapName.c_str());
@@ -367,6 +422,7 @@ void GameServer::Run() {
 
         if (m_gameMode) m_gameMode->Update();
         if (m_playerManager) m_playerManager->Update();
+        if (m_replicationManager) m_replicationManager->Tick(dt);
 
         // Tick RS2V game systems
         if (m_ticketSystem) m_ticketSystem->Update(dt);
@@ -412,6 +468,13 @@ void GameServer::Shutdown() {
 
     m_running = false;
     StopAutoRegen();
+
+    // Shutdown login bridge / replication first (they reference the game
+    // subsystems below). The bridge owns and shuts down its SecurityManager.
+    Logger::Debug("[GameServer::Shutdown] Destroying login bridge and replication");
+    m_loginBridge.reset();
+    m_replicationManager.reset();
+    m_protocolHandler.reset();
 
     // Shutdown RS2V systems
     Logger::Debug("[GameServer::Shutdown] Destroying RS2V game systems");
