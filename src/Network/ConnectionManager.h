@@ -113,6 +113,17 @@ private:
     // Frame + encode an outbound control packet and push it to the client.
     void SendEncodedPacket(uint32_t clientId, const PacketCodec::Packet& pkt);
 
+    // Post-Join WORLD REPLICATION bootstrap. Once a client reaches Joined the
+    // retail client sits on the loading screen until the server replicates the
+    // world - first the PackageMap export (the map's package/NetGUID list), then
+    // the bootstrap actor channels. We replay the official server's recorded
+    // post-Welcome control-channel messages (reversed from the handshake capture;
+    // see docs/RS2V_PostJoin_Replication_7258.md): a sequence of complete reliable
+    // control bunches (NMT 0x07 PackageMap chunks, ...), loaded from
+    // data/replication_bootstrap.bin (a stream of [uint32 LE len][payload] records)
+    // and sent in order via SendRawToClient. No-op (logged) if the file is absent.
+    void SendReplicationBootstrap(uint32_t clientId);
+
     // ------------------------------------------------------------------------
     //  CONTROL-CHANNEL INBOUND PATH.
     //

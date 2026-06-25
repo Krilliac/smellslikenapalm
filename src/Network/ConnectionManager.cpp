@@ -11,6 +11,8 @@
 #include "Network/ControlChannel.h"
 #include "../../telemetry/TelemetryManager.h"
 #include <chrono>
+#include <fstream>
+#include <mutex>
 
 ConnectionManager::ConnectionManager(GameServer* server)
     : m_server(server)
@@ -403,6 +405,12 @@ void ConnectionManager::FireClientJoined(const ClientJoinedEvent& ev) {
     if (auto conn = GetConnection(ev.clientId)) {
         conn->SetHandshakeComplete(true);
     }
+
+    // Kick off world replication: send the PackageMap export (+ bootstrap actors)
+    // so the client can leave the loading screen. This must go out BEFORE the game
+    // layer reacts, so the client has the package map before any actor references.
+    SendReplicationBootstrap(ev.clientId);
+
     if (m_clientJoinedCb) {
         m_clientJoinedCb(ev);
     } else {
@@ -493,6 +501,64 @@ void ConnectionManager::SendEncodedPacket(uint32_t clientId, const PacketCodec::
         : PacketCodec::kHandshakeMaxPacketBytes;
     const std::vector<uint8_t> wire = PacketCodec::Encode(pkt, maxPacketBytes);
     conn->SendRaw(wire.data(), wire.size());
+}
+
+namespace {
+// Load the replication-bootstrap record stream once and cache it. Format:
+// repeated [uint32 LE length][length payload bytes]. Each record is one complete
+// control-channel message payload (e.g. an NMT 0x07 PackageMap chunk) to send as
+// one reliable control bunch. Returns an empty vector if the file is absent/empty
+// (replication simply doesn't run - the handshake itself is unaffected).
+const std::vector<std::vector<uint8_t>>& GetReplicationBootstrapRecords() {
+    static std::once_flag once;
+    static std::vector<std::vector<uint8_t>> records;
+    std::call_once(once, [] {
+        const char* kPath = "data/replication_bootstrap.bin";
+        std::ifstream f(kPath, std::ios::binary);
+        if (!f) {
+            Logger::Info("[ReplicationBootstrap] '%s' not present - post-Join replication disabled",
+                         kPath);
+            return;
+        }
+        std::vector<uint8_t> all((std::istreambuf_iterator<char>(f)),
+                                 std::istreambuf_iterator<char>());
+        size_t off = 0;
+        while (off + 4 <= all.size()) {
+            const uint32_t len = static_cast<uint32_t>(all[off]) |
+                                 (static_cast<uint32_t>(all[off + 1]) << 8) |
+                                 (static_cast<uint32_t>(all[off + 2]) << 16) |
+                                 (static_cast<uint32_t>(all[off + 3]) << 24);
+            off += 4;
+            if (len == 0 || off + len > all.size()) {
+                Logger::Warn("[ReplicationBootstrap] truncated/invalid record at offset %zu (len=%u) - stopping",
+                             off - 4, len);
+                break;
+            }
+            records.emplace_back(all.begin() + off, all.begin() + off + len);
+            off += len;
+        }
+        Logger::Info("[ReplicationBootstrap] loaded %zu records (%zu bytes) from '%s'",
+                     records.size(), all.size(), kPath);
+    });
+    return records;
+}
+} // namespace
+
+void ConnectionManager::SendReplicationBootstrap(uint32_t clientId) {
+    const std::vector<std::vector<uint8_t>>& records = GetReplicationBootstrapRecords();
+    if (records.empty()) {
+        return;
+    }
+    Logger::Info("[ConnectionManager::SendReplicationBootstrap] client %u: sending %zu replication bootstrap messages",
+                 clientId, records.size());
+    size_t sent = 0;
+    for (const std::vector<uint8_t>& msg : records) {
+        if (SendRawToClient(clientId, msg)) {
+            ++sent;
+        }
+    }
+    Logger::Info("[ConnectionManager::SendReplicationBootstrap] client %u: sent %zu/%zu messages",
+                 clientId, sent, records.size());
 }
 
 bool ConnectionManager::ParseIncomingControl(uint32_t clientId, const std::vector<uint8_t>& datagram) {
