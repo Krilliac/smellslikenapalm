@@ -15,7 +15,7 @@
 #include <vector>
 #include <random>
 #include <chrono>
-#include "Network/ReplicationManager.h"
+#include "Protocol/ReplicationManager.h"
 #include "Network/ReplicationSnapshot.h"
 #include "Math/Vector3.h"
 #include "Utils/Logger.h"

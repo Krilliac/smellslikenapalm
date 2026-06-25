@@ -20,7 +20,7 @@
 #include "Game/VehicleManager.h"
 #include "Physics/PhysicsEngine.h"
 #include "Math/Vector3.h"
-#include "Network/ReplicationManager.h"
+#include "Protocol/ReplicationManager.h"
 #include "Utils/Logger.h"
 
 using ::testing::_;

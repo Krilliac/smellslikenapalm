@@ -67,41 +67,51 @@ if(ENABLE_TELEMETRY)
     add_compile_definitions(RS2V_TELEMETRY_ENABLED)
 endif()
 
-# Main server executable
-add_executable(rs2v_server
-    src/main.cpp
-    ${CORE_SOURCES}
-)
+# Core library — all sources the server uses MINUS src/main.cpp.
+# Built once as a STATIC library so both rs2v_server and the test suite can
+# link against it without recompiling every translation unit.
+add_library(rs2v_core STATIC ${CORE_SOURCES})
 
-target_link_libraries(rs2v_server PRIVATE Threads::Threads)
+# src/ is on the include path (set globally above via include_directories),
+# but expose it transitively so test targets that link rs2v_core inherit it.
+target_include_directories(rs2v_core PUBLIC ${CMAKE_SOURCE_DIR}/src)
+if(ENABLE_TELEMETRY)
+    target_include_directories(rs2v_core PUBLIC ${CMAKE_SOURCE_DIR}/telemetry)
+endif()
 
-# Platform-specific link libraries
+target_link_libraries(rs2v_core PUBLIC Threads::Threads)
+
+# Platform-specific link libraries (PUBLIC so consumers inherit them)
 if(WIN32)
-    target_link_libraries(rs2v_server PRIVATE ws2_32 iphlpapi pdh psapi)
+    target_link_libraries(rs2v_core PUBLIC ws2_32 iphlpapi pdh psapi)
 else()
-    target_link_libraries(rs2v_server PRIVATE dl)
+    target_link_libraries(rs2v_core PUBLIC dl)
 endif()
 
 # OpenSSL (optional — ProtocolUtils uses it for Base64)
 if(OpenSSL_FOUND)
-    target_link_libraries(rs2v_server PRIVATE OpenSSL::SSL OpenSSL::Crypto)
-    target_compile_definitions(rs2v_server PRIVATE RS2V_HAS_OPENSSL)
+    target_link_libraries(rs2v_core PUBLIC OpenSSL::SSL OpenSSL::Crypto)
+    target_compile_definitions(rs2v_core PUBLIC RS2V_HAS_OPENSSL)
 else()
     message(STATUS "OpenSSL not found — Base64 will use built-in implementation")
 endif()
 
 # zlib (optional — CompressionHandler uses it)
 if(ZLIB_FOUND)
-    target_link_libraries(rs2v_server PRIVATE ZLIB::ZLIB)
-    target_compile_definitions(rs2v_server PRIVATE RS2V_HAS_ZLIB)
+    target_link_libraries(rs2v_core PUBLIC ZLIB::ZLIB)
+    target_compile_definitions(rs2v_core PUBLIC RS2V_HAS_ZLIB)
 else()
     message(STATUS "zlib not found — compression will use built-in stub")
 endif()
 
 # Filesystem support (GCC < 9 needs explicit linkage)
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS 9.0)
-    target_link_libraries(rs2v_server PRIVATE stdc++fs)
+    target_link_libraries(rs2v_core PUBLIC stdc++fs)
 endif()
+
+# Main server executable — just main.cpp + the core library
+add_executable(rs2v_server src/main.cpp)
+target_link_libraries(rs2v_server PRIVATE rs2v_core)
 
 # Install target
 install(TARGETS rs2v_server RUNTIME DESTINATION bin)
@@ -117,3 +127,9 @@ message(STATUS "  Compression:   ${ENABLE_COMPRESSION}")
 message(STATUS "  OpenSSL:       ${OpenSSL_FOUND}")
 message(STATUS "  zlib:          ${ZLIB_FOUND}")
 message(STATUS "")
+
+# Test suite (opt-in via -DBUILD_TESTS=ON)
+if(BUILD_TESTS)
+    enable_testing()
+    add_subdirectory(tests)
+endif()

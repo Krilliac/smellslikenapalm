@@ -20,7 +20,7 @@
 #include "Utils/FileUtils.h"
 #include "Utils/PathUtils.h"
 #include "Utils/Logger.h"
-#include "Utils/TimeUtils.h"
+#include "Time/TimeUtils.h"
 #include "Math/Vector3.h"
 
 using ::testing::_;

@@ -18,7 +18,7 @@
 #include "Protocol/PacketTypes.h"
 #include "Utils/PacketAnalysis.h"
 #include "Utils/HandlerLibraryManager.h"
-#include "Utils/PacketSerializer.h"
+#include "Network/PacketSerializer.h"
 #include "Utils/Logger.h"
 
 using ::testing::_;
