@@ -49,24 +49,80 @@ std::vector<uint8_t> Packet::Serialize() const {
 Packet Packet::FromBuffer(const std::vector<uint8_t>& buffer, PacketMetadata& meta) {
     Logger::Trace("[Packet::FromBuffer] Entry: buffer size=%zu", buffer.size());
     Packet pkt;
-    size_t offset=0;
-    uint32_t tagLen=0;
-    std::memcpy(&tagLen, &buffer[offset],4); offset+=4;
+
+    // Roadmap T0 hardening: fully validate every length/offset against the actual
+    // buffer size BEFORE reading. The legacy format is
+    //   [4B tagLen][tagLen bytes][4B payloadLen][payloadLen bytes]
+    // and previously the leading bytes were trusted blindly, allowing a malformed
+    // or real-client datagram to drive an out-of-bounds read. Now any
+    // inconsistency yields an empty parse-failure packet instead of OOB access.
+    //
+    // We always populate metadata so callers can timestamp even a rejected
+    // datagram. A rejected packet has an empty tag and empty payload.
+
+    // Always fill the timestamp first so even failures carry one.
+    meta.timestamp = (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+
+    auto rejectEmpty = [&](const char* why) -> Packet {
+        Logger::Warn("[Packet::FromBuffer] Rejecting malformed buffer (size=%zu): %s",
+                     buffer.size(), why);
+        Packet empty;
+        empty.m_readOffset = 0;
+        meta.rawTag.clear();
+        return empty;
+    };
+
+    const size_t bufSize = buffer.size();
+
+    // Need at least the 4-byte tag-length header.
+    if (bufSize < 4) {
+        return rejectEmpty("buffer smaller than 4-byte tag-length header");
+    }
+
+    size_t offset = 0;
+    uint32_t tagLen = 0;
+    std::memcpy(&tagLen, &buffer[offset], 4);
+    offset += 4;
     Logger::Debug("[Packet::FromBuffer] Read tagLen=%u", tagLen);
-    pkt.m_tag.assign((char*)&buffer[offset], tagLen); offset+=tagLen;
+
+    // tagLen must fit within the remaining buffer AND leave room for the
+    // subsequent 4-byte payload-length header. Guard against overflow in the
+    // additions by checking against the remaining byte count instead of adding.
+    const size_t afterTagHeader = offset; // == 4
+    if (tagLen > bufSize - afterTagHeader) {
+        return rejectEmpty("tag length exceeds buffer");
+    }
+    offset += tagLen;
+
+    // Read tag bytes (validated to be in range).
+    if (tagLen > 0) {
+        pkt.m_tag.assign(reinterpret_cast<const char*>(&buffer[afterTagHeader]), tagLen);
+    }
     Logger::Debug("[Packet::FromBuffer] Read tag='%s'", pkt.m_tag.c_str());
-    uint32_t payloadLen=0;
-    std::memcpy(&payloadLen, &buffer[offset],4); offset+=4;
+
+    // Need 4 bytes for the payload-length header.
+    if (offset > bufSize || bufSize - offset < 4) {
+        return rejectEmpty("missing payload-length header");
+    }
+    uint32_t payloadLen = 0;
+    std::memcpy(&payloadLen, &buffer[offset], 4);
+    offset += 4;
     Logger::Debug("[Packet::FromBuffer] Read payloadLen=%u", payloadLen);
+
+    // payloadLen must fit exactly within the remaining buffer.
+    if (payloadLen > bufSize - offset) {
+        return rejectEmpty("payload length exceeds buffer");
+    }
+
     if (payloadLen) {
-        pkt.m_payload.assign(buffer.begin()+offset, buffer.begin()+offset+payloadLen);
+        pkt.m_payload.assign(buffer.begin() + offset,
+                             buffer.begin() + offset + payloadLen);
         Logger::Debug("[Packet::FromBuffer] Copied %u payload bytes", payloadLen);
     } else {
         Logger::Debug("[Packet::FromBuffer] No payload in packet");
     }
-    // fill metadata
-    meta.timestamp = (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::system_clock::now().time_since_epoch()).count();
+
     meta.rawTag = pkt.m_tag;
     pkt.m_readOffset = 0;
     Logger::Debug("[Packet::FromBuffer] Metadata filled: timestamp=%llu, rawTag='%s'",
