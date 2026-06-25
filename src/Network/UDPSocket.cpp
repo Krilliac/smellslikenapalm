@@ -182,7 +182,11 @@ int UDPSocket::ReceiveFrom(std::string& outIp, uint16_t& outPort,
                        bufferLen, 0,
                        (sockaddr*)&src, &addrLen);
     if (len > 0) {
-        outIp = inet_ntoa(src.sin_addr);
+        // inet_ntoa returns a non-reentrant static buffer; ReceiveFrom runs on the
+        // network thread, so use inet_ntop into a local buffer instead.
+        char ipbuf[INET_ADDRSTRLEN] = {0};
+        inet_ntop(AF_INET, &src.sin_addr, ipbuf, sizeof(ipbuf));
+        outIp = ipbuf;
         outPort = ntohs(src.sin_port);
         Logger::Debug("[UDPSocket::ReceiveFrom] Received %d bytes from %s:%u", len, outIp.c_str(), outPort);
     } else {

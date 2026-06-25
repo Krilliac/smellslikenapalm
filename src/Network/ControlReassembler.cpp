@@ -34,7 +34,20 @@ void ControlReassembler::OnBunch(const Bunch& bunch) {
     if (bunch.chSequence < m_nextSeq) {
         return;
     }
-    m_pending[bunch.chSequence] = bunch; // dedup: same seq overwrites identical data
+    // Bound out-of-order buffering: a garbled/malicious client could send bunches
+    // with arbitrary far-future ChSequence (0..1023). Reject sequences too far
+    // ahead of what we expect, and cap the pending map, so reassembly can never
+    // grow without bound while waiting for a gap that will never arrive.
+    constexpr uint32_t kMaxSeqAhead = 64;
+    constexpr size_t kMaxPending = 128;
+    if (bunch.chSequence > m_nextSeq + kMaxSeqAhead) {
+        return;
+    }
+    if (m_pending.size() >= kMaxPending && m_pending.find(bunch.chSequence) == m_pending.end()) {
+        return;
+    }
+    // dedup: keep the first copy of a given sequence (ignore later differing copies)
+    m_pending.emplace(bunch.chSequence, bunch);
     Drain();
 }
 

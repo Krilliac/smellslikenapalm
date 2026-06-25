@@ -131,8 +131,12 @@ bool TryDecodeExact(const uint8_t* data, size_t numBytes, Packet& out) {
 Packet Decode(const uint8_t* data, size_t numBytes) {
     // Try the full datagram first; if it does not parse to an exact terminator
     // (datagram carries trailing bytes after the packet's own terminator byte),
-    // drop trailing bytes and retry. The longest clean prefix is the packet.
-    for (size_t n = numBytes; n > 0; --n) {
+    // drop trailing bytes and retry. The spec only ever sees a 1-byte trailer, so
+    // cap the retry at a small constant instead of walking every length (the old
+    // n..1 loop was O(n^2) per datagram and pathological for large non-UE3 frames).
+    constexpr size_t kMaxTrailerRetry = 3;
+    const size_t lo = (numBytes > kMaxTrailerRetry) ? (numBytes - kMaxTrailerRetry) : 0;
+    for (size_t n = numBytes; n > lo; --n) {
         Packet pkt;
         if (TryDecodeExact(data, n, pkt)) {
             return pkt;
