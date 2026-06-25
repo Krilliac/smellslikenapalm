@@ -18,14 +18,17 @@ NetGUIDRef ReadNetGUID(BitReader& r) {
 }
 
 void WriteNewActorHeader(BitWriter& w, const NewActorHeader& hdr) {
-    WriteNetGUID(w, hdr.actorGuid);
+    // Wire order is [class NetGUID][actor NetGUID] - the CLASS ref comes FIRST (the
+    // recurring constant per class family in the capture, e.g. 5aa50200 shared by 65
+    // PRIs). Confirmed by RE of the real session (doc §6.0).
     WriteNetGUID(w, hdr.classGuid);
+    WriteNetGUID(w, hdr.actorGuid);
 }
 
 NewActorHeader ReadNewActorHeader(BitReader& r) {
     NewActorHeader hdr;
-    hdr.actorGuid = ReadNetGUID(r);
     hdr.classGuid = ReadNetGUID(r);
+    hdr.actorGuid = ReadNetGUID(r);
     return hdr;
 }
 

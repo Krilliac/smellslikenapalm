@@ -52,9 +52,10 @@ NetGUIDRef ReadNetGUID(BitReader& r);
 
 // ---- SerializeNewActor opening-bunch header ---------------------------------
 // The first bytes of an opening actor bunch (bOpen=1, ChType=2):
-//   [actor NetGUID][class NetGUID]   (then the bNetInitial property block)
-// The actor NetGUID is normally an export (a new actor); the class NetGUID refs a
-// class object in the PackageMap we exported (so all same-class actors share it).
+//   [class NetGUID][actor NetGUID]   (then the bNetInitial property block)
+// The CLASS NetGUID comes FIRST (it is the recurring constant per class family in
+// the capture - e.g. 5aa50200 shared by 65 PRIs; doc §6.0). The actor NetGUID is
+// the per-instance reference.
 struct NewActorHeader {
     NetGUIDRef actorGuid;  // usually export (isStatic=false)
     NetGUIDRef classGuid;  // ref into the PackageMap (the actor's class)

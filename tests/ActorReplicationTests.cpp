@@ -77,12 +77,13 @@ TEST(ActorReplication, CapturePlayerControllerOpenIsExport) {
         0x60, 0xc1, 0x01, 0x00, 0x1b, 0xcc, 0xea, 0x3f, 0x49, 0x04, 0x60, 0xe0};
 
     BitReader r(openPrefix);
-    NetGUIDRef actor = ActorRepl::ReadNetGUID(r);
-    EXPECT_FALSE(actor.isStatic) << "a freshly-spawned actor's NetGUID must be the export path";
-    // The class ref follows; it must also decode without running out of bits.
+    // Wire order is [class NetGUID][actor NetGUID]; both are on the export path here
+    // (flag bit 0). The first (class) ref must decode as export.
     NetGUIDRef cls = ActorRepl::ReadNetGUID(r);
+    EXPECT_FALSE(cls.isStatic) << "the class NetGUID at the open header must decode (export path)";
+    NetGUIDRef actor = ActorRepl::ReadNetGUID(r);
     EXPECT_FALSE(r.IsOverflowed());
-    (void)cls;
+    (void)actor;
 }
 
 // A mixed replicated-property block (one of each type) round-trips: each property
