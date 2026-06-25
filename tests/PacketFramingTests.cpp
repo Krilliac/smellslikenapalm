@@ -29,7 +29,13 @@ using PacketCodec::Encode;
 // carries a 9-byte UE3 packet plus one extra byte). Decode strips those, so the
 // round-trip target is the captured frame truncated to `packetBytes`.
 static void ExpectRoundTrip(const std::vector<uint8_t>& frame, size_t packetBytes) {
-    PacketCodec::Packet pkt = Decode(frame.data(), frame.size());
+    // Decode the actual UE3 PACKET (packetBytes), not the whole captured datagram:
+    // a datagram may carry a trailing byte after the packet's terminator byte, and
+    // the terminator is the high set bit of the packet's LAST byte. Handing Decode
+    // the full datagram would move the terminator into the trailer and mis-read the
+    // gap as a spurious trailing ack. (On the live wire the datagram IS the packet;
+    // these fixtures just include a capture trailer.)
+    PacketCodec::Packet pkt = Decode(frame.data(), packetBytes);
     ASSERT_TRUE(pkt.ok);
     const std::vector<uint8_t> reencoded = Encode(pkt);
     const std::vector<uint8_t> expected(frame.begin(), frame.begin() + packetBytes);
@@ -43,7 +49,9 @@ TEST(PacketFraming, DecodesHelloOpeningBunch) {
     const std::vector<uint8_t> hello = {
         0x00, 0x80, 0x05, 0x20, 0x80, 0x40, 0x00, 0x1d, 0x01, 0x01};
 
-    PacketCodec::Packet pkt = Decode(hello.data(), hello.size());
+    // Decode the 9-byte UE3 packet (the opening reliable bunch ends at bit 64,
+    // terminator in byte 8); the captured datagram's 10th byte is a trailer.
+    PacketCodec::Packet pkt = Decode(hello.data(), 9);
 
     ASSERT_TRUE(pkt.ok);
     EXPECT_EQ(pkt.packetId, 0u);
@@ -84,7 +92,9 @@ TEST(PacketFraming, ChallengeFrame157) {
     const std::vector<uint8_t> challenge = {
         0x00, 0x00, 0x01, 0x08, 0x20, 0x28, 0x80, 0x47, 0xb7, 0xe5, 0x64, 0x6c};
 
-    PacketCodec::Packet pkt = Decode(challenge.data(), challenge.size());
+    // Decode the 11-byte UE3 packet (bunch ends at bit 86, terminator in byte 10);
+    // the captured datagram's 12th byte (0x6c) is a trailer.
+    PacketCodec::Packet pkt = Decode(challenge.data(), 11);
     ASSERT_TRUE(pkt.ok);
     EXPECT_EQ(pkt.packetId, 0u);
     ASSERT_EQ(pkt.bunches.size(), 1u);
