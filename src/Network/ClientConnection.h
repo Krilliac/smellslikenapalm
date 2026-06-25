@@ -49,6 +49,15 @@ public:
     // suppressed while this is false; SendRaw (UE3 control bytes) is always allowed.
     void                SetHandshakeComplete(bool complete) { m_handshakeComplete = complete; }
     bool                IsHandshakeComplete() const { return m_handshakeComplete; }
+
+    // Marks this connection as a UE3-protocol client (set as soon as it decodes a
+    // valid UE3 control packet). A UE3 client must NEVER receive the emulator's
+    // legacy Packet format - not even after Join - or it mis-parses the bytes and
+    // can disconnect. All comms to a UE3 client go through the UE3 framing path
+    // (SendRaw / control + replication bunches); SendPacket is suppressed entirely.
+    // (Once world replication is implemented it will emit UE3 bunches, not Packets.)
+    void                SetUE3Client(bool isUE3) { m_isUE3Client = isUE3; }
+    bool                IsUE3Client() const { return m_isUE3Client; }
     void                UpdateLastHeartbeat();
     std::chrono::steady_clock::time_point GetLastHeartbeat() const;
 
@@ -85,6 +94,7 @@ private:
 
     bool                        m_disconnected = false;
     std::atomic<bool>           m_handshakeComplete{false};
+    std::atomic<bool>           m_isUE3Client{false};
     std::chrono::steady_clock::time_point m_lastHeartbeat;
 
     std::string                 m_playerName;

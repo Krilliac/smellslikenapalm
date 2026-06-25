@@ -60,12 +60,15 @@ std::string ClientConnection::GetSteamID() const {
 bool ClientConnection::SendPacket(const Packet& pkt) {
     Logger::Trace("[ClientConnection::SendPacket] Entry: clientId=%u, tag='%s', payloadSize=%u",
                   m_clientId, pkt.GetTag().c_str(), pkt.GetPayloadSize());
-    // Gate: never send the emulator's internal Packet format to a client that has
-    // not finished the UE3 control-channel handshake. A real RS2 client mis-parses
-    // these as UE3 packets and corrupts its sequence/ack state, stalling the
-    // handshake. (SendRaw, used for UE3 control bytes, is intentionally not gated.)
-    if (!m_handshakeComplete) {
-        Logger::Debug("[ClientConnection::SendPacket] Suppressing game packet tag='%s' to client %u: UE3 handshake not complete",
+    // Gate: NEVER send the emulator's internal Packet format to a UE3-protocol
+    // client - not during the handshake and not after Join. A real RS2 client
+    // mis-parses these as UE3 packets and corrupts its sequence/ack state (it can
+    // disconnect). UE3 clients receive only UE3-framed bytes via SendRaw (control
+    // bunches now; world-replication bunches once implemented). The legacy Packet
+    // path is reserved for non-UE3 peers (in-process tests/tools). (SendRaw is
+    // intentionally not gated.)
+    if (m_isUE3Client) {
+        Logger::Debug("[ClientConnection::SendPacket] Suppressing legacy game packet tag='%s' to UE3 client %u",
                       pkt.GetTag().c_str(), m_clientId);
         return false;
     }

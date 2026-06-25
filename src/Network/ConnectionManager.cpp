@@ -519,6 +519,12 @@ bool ConnectionManager::ParseIncomingControl(uint32_t clientId, const std::vecto
         return false;
     }
 
+    // This peer speaks UE3: mark it so the legacy emulator-Packet send path is
+    // suppressed for it (a UE3 client mis-parses that format - see SendPacket).
+    if (auto conn = GetConnection(clientId)) {
+        conn->SetUE3Client(true);
+    }
+
     ControlState& cs = GetControlState(clientId);
 
     // Acknowledge this received packet ONLY if it carried bunch data. Acking a
