@@ -51,6 +51,22 @@ void GameServer::Cmd_RegenHandlers(const std::vector<std::string>& /*args*/) {
 #ifdef _WIN32
     if (codeGenExe.find(".exe") == std::string::npos) codeGenExe += ".exe";
 #endif
+
+    // GUARD (latent-defect fix): never shell out to a tool that isn't there.
+    // The PacketHandlerCodeGen executable is a build-time tool and is not
+    // guaranteed to be deployed next to the server. If it's missing, log a
+    // clear warning and no-op instead of invoking std::system() on a bogus
+    // command line (which previously fired every hour from a detached thread).
+    if (!std::filesystem::exists(codeGenExe)) {
+        Logger::Warn("[GameServer::Cmd_RegenHandlers] Code generator not found at '%s'. "
+                     "Skipping handler regeneration. Generated handlers are compiled "
+                     "statically at build time; runtime regeneration is optional and "
+                     "only available when PacketHandlerCodeGen is deployed.",
+                     codeGenExe.c_str());
+        Logger::Trace("[GameServer::Cmd_RegenHandlers] Exit (code generator missing)");
+        return;
+    }
+
     std::string handlersDir = PathUtils::ResolveFromExecutable("src/Generated/Handlers");
     std::string cmd = codeGenExe + " " + handlersDir;
 
@@ -103,6 +119,9 @@ void GameServer::StopAutoRegen() {
 
 void GameServer::DynamicReloadGeneratedHandlers() {
     Logger::Trace("[GameServer::DynamicReloadGeneratedHandlers] Entry");
+
+    auto& mgr = HandlerLibraryManager::Instance();
+
     if (m_handlerLibraryPath.empty()) {
         Logger::Debug("[GameServer::DynamicReloadGeneratedHandlers] Library path empty, resolving platform-specific path");
 #ifdef _WIN32
@@ -113,22 +132,40 @@ void GameServer::DynamicReloadGeneratedHandlers() {
         m_handlerLibraryPath = PathUtils::ResolveFromExecutable("libGeneratedHandlers.so");
 #endif
         Logger::Debug("[GameServer::DynamicReloadGeneratedHandlers] Resolved library path: %s", m_handlerLibraryPath.c_str());
+
+        // GUARD (latent-defect fix): the dynamic hot-reload library is OFF by
+        // default and is not shipped. If it isn't present, do NOT try to load
+        // it — fall back to the statically-compiled handlers (the normal path).
         if (!std::filesystem::exists(m_handlerLibraryPath)) {
-            Logger::Warn("Handler library not found: %s", m_handlerLibraryPath.c_str());
-            Logger::Trace("[GameServer::DynamicReloadGeneratedHandlers] Exit (library not found)");
+            if (mgr.HasStaticHandlers()) {
+                Logger::Info("Using statically-compiled generated handlers (no dynamic library present at '%s').",
+                             m_handlerLibraryPath.c_str());
+            } else {
+                Logger::Warn("No generated handlers available: dynamic library '%s' not found and "
+                             "no static handler registry was compiled in. Packet handling will rely "
+                             "on built-in handlers only.", m_handlerLibraryPath.c_str());
+            }
+            Logger::Trace("[GameServer::DynamicReloadGeneratedHandlers] Exit (no dynamic library; using static fallback)");
             return;
         }
-        if (!HandlerLibraryManager::Instance().Initialize(m_handlerLibraryPath)) {
-            Logger::Error("[GameServer::DynamicReloadGeneratedHandlers] Failed to initialize handler library manager");
+
+        // A dynamic library IS present — opt into the hot-reload path.
+        if (!mgr.Initialize(m_handlerLibraryPath)) {
+            Logger::Error("[GameServer::DynamicReloadGeneratedHandlers] Failed to initialize handler library manager; "
+                          "continuing with static handlers if available");
             Logger::Trace("[GameServer::DynamicReloadGeneratedHandlers] Exit (init failed)");
             return;
         }
         Logger::Debug("[GameServer::DynamicReloadGeneratedHandlers] Handler library manager initialized");
     }
-    if (HandlerLibraryManager::Instance().ForceReload()) {
+
+    // Only force a reload when a dynamic library has actually been initialized.
+    // ForceReload() itself no-ops + warns otherwise, so this is doubly safe.
+    if (mgr.ForceReload()) {
         Logger::Info("Generated handlers reloaded successfully.");
     } else {
-        Logger::Error("[GameServer::DynamicReloadGeneratedHandlers] Failed to reload generated handlers.");
+        Logger::Warn("[GameServer::DynamicReloadGeneratedHandlers] Dynamic reload unavailable; "
+                     "using statically-compiled handlers.");
     }
     Logger::Trace("[GameServer::DynamicReloadGeneratedHandlers] Exit");
 }
@@ -346,9 +383,30 @@ bool GameServer::Initialize() {
         });
     }
 
-    // Start periodic handler regeneration (every 1 hour by default)
-    Logger::Debug("[GameServer::Initialize] Starting periodic handler regeneration (3600s interval)");
-    StartAutoRegen(3600);
+    // Periodic handler regeneration is OFF by default. Generated packet
+    // handlers are compiled statically into the server at build time, so no
+    // runtime regeneration is needed for normal operation. The auto-regen
+    // thread only makes sense for developers who deploy the PacketHandlerCodeGen
+    // tool alongside the server and want live regeneration; it is opt-in via
+    // config and StartAutoRegen() itself guards against a missing tool.
+    bool autoRegenEnabled = false;
+    int  autoRegenInterval = 3600;
+    if (m_configManager) {
+        autoRegenEnabled  = m_configManager->GetBool("Handlers.auto_regen", false);
+        autoRegenInterval = m_configManager->GetInt("Handlers.auto_regen_interval", 3600);
+    }
+    if (autoRegenEnabled) {
+        Logger::Info("[GameServer::Initialize] Handler auto-regeneration ENABLED via config (interval=%ds)", autoRegenInterval);
+        StartAutoRegen(autoRegenInterval);
+    } else {
+        Logger::Debug("[GameServer::Initialize] Handler auto-regeneration disabled (default). "
+                      "Using statically-compiled generated handlers.");
+    }
+
+    // Resolve generated handlers for runtime use. Prefers the dynamic library
+    // when present, otherwise falls back to the statically-compiled registry.
+    // Fully guarded — never crashes when neither is available.
+    DynamicReloadGeneratedHandlers();
 
     m_running = true;
     Logger::Info("GameServer initialized successfully");

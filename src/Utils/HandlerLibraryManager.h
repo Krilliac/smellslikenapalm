@@ -43,12 +43,19 @@ namespace GeneratedHandlers {
         // Check if library needs reloading and do it if necessary
         bool CheckAndReload();
         
-        // Get a handler function by name
+        // Get a handler function by name. When no dynamic library is loaded
+        // (the default, recommended configuration) this resolves the handler
+        // from the statically-compiled generated registry instead.
         HandlerFunction GetHandler(const std::string& handlerName);
-        
-        // Manually trigger a reload
+
+        // Manually trigger a reload of the dynamic library (no-op + warning
+        // when no dynamic library has been initialized).
         bool ForceReload();
-        
+
+        // True when the statically-generated handler registry is available
+        // (i.e. the codegen output was compiled into the binary).
+        bool HasStaticHandlers() const;
+
     private:
         HandlerLibraryManager() = default;
         ~HandlerLibraryManager() = default;

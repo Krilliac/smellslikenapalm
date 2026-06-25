@@ -3,6 +3,8 @@
 #include <fstream>
 #include <sstream>
 #include <filesystem>
+#include <vector>
+#include <string>
 #include "Protocol/PacketTypes.h"
 #include "Protocol/ProtocolUtils.h"
 #include "Utils/Logger.h"
@@ -31,6 +33,10 @@ int main(int argc, char** argv) {
 
     int generatedCount = 0;
     int skippedCount = 0;
+
+    // Collected tags for which a handler was generated (used to emit the
+    // static registry below).
+    std::vector<std::string> generatedTags;
 
     // Map PacketType enum to tag strings via ProtocolUtils
     for (int i = startType; i < maxType; ++i) {
@@ -73,12 +79,76 @@ int main(int argc, char** argv) {
         c << "// Auto-generated. Do not edit.\n"
              "#include \"" << header.filename().string() << "\"\n\n"
              "void Handle_" << tag << "(const PacketAnalysisResult& res) {\n"
+             "    (void)res; // suppress unused-parameter warning until logic is added\n"
              "    // TODO: add handling logic for " << tag << "\n"
              "}\n";
         c.close();
         Logger::Trace("[CodeGen::main] Implementation file written successfully: '%s'", impl.string().c_str());
 
+        generatedTags.push_back(tag);
         generatedCount++;
+    }
+
+    // ------------------------------------------------------------------
+    // Emit a static registry that maps "Handle_<TAG>" -> &Handle_<TAG>.
+    // This is what lets the generated handlers be linked STATICALLY into
+    // rs2v_core (no runtime .dll/.so required). HandlerLibraryManager
+    // consults this registry as a fallback when no dynamic library is
+    // loaded. The registry is regenerated alongside the stubs so the two
+    // can never drift out of sync.
+    // ------------------------------------------------------------------
+    {
+        fs::path regHeader = outDir / "GeneratedHandlerRegistry.h";
+        fs::path regImpl   = outDir / "GeneratedHandlerRegistry.cpp";
+        Logger::Info("[CodeGen::main] Writing static handler registry: '%s' / '%s'",
+                     regHeader.string().c_str(), regImpl.string().c_str());
+
+        std::ofstream rh(regHeader);
+        if (rh.is_open()) {
+            rh << "// Auto-generated. Do not edit.\n"
+                  "#pragma once\n"
+                  "#include <unordered_map>\n"
+                  "#include <string>\n"
+                  "#include \"Utils/PacketAnalysis.h\"\n\n"
+                  "namespace GeneratedHandlers {\n"
+                  "    using HandlerFunction = void(*)(const PacketAnalysisResult&);\n"
+                  "    // Returns the table of statically-compiled generated handlers,\n"
+                  "    // keyed by symbol name (e.g. \"Handle_HEARTBEAT\").\n"
+                  "    const std::unordered_map<std::string, HandlerFunction>& GetStaticHandlerRegistry();\n"
+                  "}\n";
+            rh.close();
+        } else {
+            Logger::Error("[CodeGen::main] Failed to open registry header for writing: '%s'", regHeader.string().c_str());
+        }
+
+        std::ofstream rc(regImpl);
+        if (rc.is_open()) {
+            rc << "// Auto-generated. Do not edit.\n"
+                  "#include \"GeneratedHandlerRegistry.h\"\n";
+            // Pull in the handler IMPLEMENTATIONS (not just declarations) so the
+            // registry is a single self-contained translation unit. This means
+            // the build only has to compile GeneratedHandlerRegistry.cpp to get
+            // every Handle_<TAG> definition + the registry map — no need to
+            // separately enumerate/compile each stub .cpp, which avoids a
+            // first-build ordering problem in CMake.
+            for (const auto& tag : generatedTags) {
+                rc << "#include \"Handler_" << tag << ".cpp\"\n";
+            }
+            rc << "\nnamespace GeneratedHandlers {\n"
+                  "const std::unordered_map<std::string, HandlerFunction>& GetStaticHandlerRegistry() {\n"
+                  "    static const std::unordered_map<std::string, HandlerFunction> registry = {\n";
+            for (const auto& tag : generatedTags) {
+                rc << "        { \"Handle_" << tag << "\", &Handle_" << tag << " },\n";
+            }
+            rc << "    };\n"
+                  "    return registry;\n"
+                  "}\n"
+                  "}\n";
+            rc.close();
+            Logger::Info("[CodeGen::main] Static registry written with %zu entries", generatedTags.size());
+        } else {
+            Logger::Error("[CodeGen::main] Failed to open registry impl for writing: '%s'", regImpl.string().c_str());
+        }
     }
 
     Logger::Info("[CodeGen::main] Code generation complete: generated=%d handler stubs, skipped=%d, output_dir='%s'",

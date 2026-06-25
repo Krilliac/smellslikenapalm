@@ -6,7 +6,30 @@
 #include <filesystem>
 #include <ctime>
 
+// When the packet-handler code generator has run at build time and its output
+// was compiled into this binary, RS2V_HAS_STATIC_HANDLERS is defined and the
+// generated registry header is available. This is the preferred (default) way
+// the server resolves generated handlers — no runtime .dll/.so is needed.
+#ifdef RS2V_HAS_STATIC_HANDLERS
+#include "GeneratedHandlerRegistry.h"
+#endif
+
 namespace GeneratedHandlers {
+
+// Resolve a handler from the statically-compiled registry, if present.
+// Returns nullptr when static handlers are unavailable or the name is unknown.
+static HandlerFunction LookupStaticHandler(const std::string& handlerName) {
+#ifdef RS2V_HAS_STATIC_HANDLERS
+    const auto& registry = GetStaticHandlerRegistry();
+    auto it = registry.find(handlerName);
+    if (it != registry.end()) {
+        return it->second;
+    }
+#else
+    (void)handlerName;
+#endif
+    return nullptr;
+}
 
 HandlerLibrary::~HandlerLibrary() {
     Logger::Trace("[HandlerLibrary::~HandlerLibrary] Entry: destructor called, libraryPath='%s'", libraryPath.c_str());
@@ -268,20 +291,38 @@ HandlerFunction HandlerLibraryManager::GetHandler(const std::string& handlerName
     std::lock_guard<std::mutex> lock(m_mutex);
     Logger::Debug("[HandlerLibraryManager::GetHandler] Mutex acquired, m_initialized=%s", m_initialized ? "true" : "false");
 
-    if (!m_initialized || !m_library) {
-        Logger::Warn("[HandlerLibraryManager::GetHandler] Not initialized or library is null, cannot get handler '%s'", handlerName.c_str());
-        Logger::Trace("[HandlerLibraryManager::GetHandler] Exit: returning nullptr (not initialized)");
-        return nullptr;
+    // Prefer a dynamically-loaded handler when a library is active (hot-reload
+    // path). This lets a freshly-built library override the static defaults.
+    if (m_initialized && m_library) {
+        HandlerFunction fn = m_library->GetHandler(handlerName);
+        if (fn) {
+            Logger::Debug("[HandlerLibraryManager::GetHandler] Handler '%s' resolved from dynamic library", handlerName.c_str());
+            Logger::Trace("[HandlerLibraryManager::GetHandler] Exit: returning dynamic function pointer");
+            return fn;
+        }
+        Logger::Debug("[HandlerLibraryManager::GetHandler] Handler '%s' not found in dynamic library, trying static registry", handlerName.c_str());
     }
 
-    HandlerFunction fn = m_library->GetHandler(handlerName);
-    if (fn) {
-        Logger::Debug("[HandlerLibraryManager::GetHandler] Handler '%s' resolved successfully", handlerName.c_str());
-    } else {
-        Logger::Debug("[HandlerLibraryManager::GetHandler] Handler '%s' not found in library", handlerName.c_str());
+    // Fall back to the statically-compiled generated registry. This is the
+    // default resolution path when no dynamic library is loaded.
+    HandlerFunction staticFn = LookupStaticHandler(handlerName);
+    if (staticFn) {
+        Logger::Debug("[HandlerLibraryManager::GetHandler] Handler '%s' resolved from static registry", handlerName.c_str());
+        Logger::Trace("[HandlerLibraryManager::GetHandler] Exit: returning static function pointer");
+        return staticFn;
     }
-    Logger::Trace("[HandlerLibraryManager::GetHandler] Exit: returning %s", fn ? "valid function pointer" : "nullptr");
-    return fn;
+
+    Logger::Debug("[HandlerLibraryManager::GetHandler] Handler '%s' not found (dynamic or static)", handlerName.c_str());
+    Logger::Trace("[HandlerLibraryManager::GetHandler] Exit: returning nullptr");
+    return nullptr;
+}
+
+bool HandlerLibraryManager::HasStaticHandlers() const {
+#ifdef RS2V_HAS_STATIC_HANDLERS
+    return !GetStaticHandlerRegistry().empty();
+#else
+    return false;
+#endif
 }
 
 bool HandlerLibraryManager::ForceReload() {

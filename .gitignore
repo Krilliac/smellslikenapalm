@@ -92,3 +92,5 @@ Security: do not ignore config files if needed, but ignore secrets
 # CMake test/out build dirs
 build-tests/
 out/
+build-authtests/
+Testing/

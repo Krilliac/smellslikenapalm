@@ -49,8 +49,14 @@ file(GLOB_RECURSE CORE_SOURCES
     src/Utils/*.cpp
 )
 
-# Exclude CodeGen.cpp (standalone code generation tool with its own main)
+# Exclude CodeGen.cpp (standalone code generation tool with its own main —
+# built separately below as the PacketHandlerCodeGen target).
 list(FILTER CORE_SOURCES EXCLUDE REGEX "CodeGen\\.cpp$")
+
+# Also exclude anything under the generated handler output dir if it happens to
+# live in-tree; the canonical generated sources are produced in the build tree
+# and added to rs2v_core explicitly further down.
+list(FILTER CORE_SOURCES EXCLUDE REGEX "Generated/Handlers/")
 
 # Scripting sources (optional)
 if(ENABLE_SCRIPTING)
@@ -67,10 +73,79 @@ if(ENABLE_TELEMETRY)
     add_compile_definitions(RS2V_TELEMETRY_ENABLED)
 endif()
 
+# ---------------------------------------------------------------------------
+# Packet-handler code generation pipeline
+# ---------------------------------------------------------------------------
+# PacketHandlerCodeGen is a standalone build-time tool (its own main()) that
+# emits one Handle_<TAG> stub per packet type plus a static registry. We build
+# it from a minimal set of sources so it does NOT depend on rs2v_core (which
+# would be circular, since rs2v_core consumes the generated output).
+add_executable(PacketHandlerCodeGen
+    src/Generated/CodeGen.cpp
+    src/Protocol/ProtocolUtils.cpp
+    src/Protocol/PacketTypes.cpp
+    src/Utils/Logger.cpp
+)
+target_include_directories(PacketHandlerCodeGen PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(PacketHandlerCodeGen PRIVATE Threads::Threads)
+if(OpenSSL_FOUND)
+    target_link_libraries(PacketHandlerCodeGen PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+    target_compile_definitions(PacketHandlerCodeGen PRIVATE RS2V_HAS_OPENSSL)
+endif()
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS 9.0)
+    target_link_libraries(PacketHandlerCodeGen PRIVATE stdc++fs)
+endif()
+# Statically link the GCC/MinGW runtime into the code generator. It runs as a
+# build step under a bare cmd.exe environment that does NOT have the MinGW bin
+# dir on PATH, so a dynamically-linked exe fails at launch with a missing-DLL
+# error (STATUS_ENTRYPOINT_NOT_FOUND / 0xc0000139). Static linking makes the
+# tool self-contained and runnable from any environment.
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    target_link_options(PacketHandlerCodeGen PRIVATE -static -static-libgcc -static-libstdc++)
+endif()
+
+# Where the generated handler sources land (build tree, never committed).
+set(GENERATED_HANDLERS_DIR ${CMAKE_BINARY_DIR}/generated/Handlers)
+
+# The generator emits per-tag Handler_<TAG>.{h,cpp} plus a self-contained
+# GeneratedHandlerRegistry.cpp that #includes every Handler_<TAG>.cpp impl and
+# builds the name->function table. Because the registry TU is self-contained,
+# rs2v_core only needs to compile that ONE generated source — this sidesteps the
+# first-build ordering problem of globbing generated stub files at configure time.
+set(GENERATED_REGISTRY_CPP ${GENERATED_HANDLERS_DIR}/GeneratedHandlerRegistry.cpp)
+
+# Run the generator at build time. It (re)writes all Handler_*.{h,cpp} and the
+# GeneratedHandlerRegistry.{h,cpp} into GENERATED_HANDLERS_DIR.
+add_custom_command(
+    OUTPUT ${GENERATED_REGISTRY_CPP}
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${GENERATED_HANDLERS_DIR}
+    COMMAND PacketHandlerCodeGen ${GENERATED_HANDLERS_DIR}
+    DEPENDS PacketHandlerCodeGen
+    COMMENT "Generating packet handler stubs + static registry into ${GENERATED_HANDLERS_DIR}"
+    VERBATIM
+)
+
+# A custom target so generation participates in the default build dependency graph.
+add_custom_target(generate_packet_handlers
+    DEPENDS ${GENERATED_REGISTRY_CPP}
+)
+
+set(GENERATED_HANDLER_SOURCES ${GENERATED_REGISTRY_CPP})
+set_source_files_properties(${GENERATED_HANDLER_SOURCES} PROPERTIES GENERATED TRUE)
+
 # Core library — all sources the server uses MINUS src/main.cpp.
 # Built once as a STATIC library so both rs2v_server and the test suite can
 # link against it without recompiling every translation unit.
-add_library(rs2v_core STATIC ${CORE_SOURCES})
+# The statically-generated packet handlers are compiled in here.
+add_library(rs2v_core STATIC ${CORE_SOURCES} ${GENERATED_HANDLER_SOURCES})
+
+# rs2v_core must wait for the generator to emit the registry/stubs.
+add_dependencies(rs2v_core generate_packet_handlers)
+
+# Let HandlerLibraryManager (and anything else in core) find the generated
+# registry header, and tell it the static registry exists.
+target_include_directories(rs2v_core PUBLIC ${GENERATED_HANDLERS_DIR})
+target_compile_definitions(rs2v_core PUBLIC RS2V_HAS_STATIC_HANDLERS)
 
 # src/ is on the include path (set globally above via include_directories),
 # but expose it transitively so test targets that link rs2v_core inherit it.
