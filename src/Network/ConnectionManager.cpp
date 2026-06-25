@@ -422,10 +422,23 @@ bool ConnectionManager::SendRawToClient(uint32_t clientId, const std::vector<uin
     // result: <BYTE NMT><fields>). Frame it into UE3 packets - reliable control
     // bunch(es) with a rolling PacketId/ChSequence, fragmented to MaxPacket, with
     // any pending acks drained onto the first packet - then encode and send each.
+    // The BunchDataBits SerializeInt bound is phase-dependent on the wire and MUST
+    // match what the client decodes with, or the client mis-reads the bunch (it
+    // still acks at the packet level, masking the bug). During the StatelessConnect
+    // handshake MaxPacket is 8 (bound 64); once the NMT phase begins it is 2048
+    // (bound 16384) and large messages (Welcome, PackageMap export) go out as one
+    // big bunch rather than 63-bit fragments. Pick both from the handshake state.
+    const bool established = GetOrCreateHandshake(clientId).IsControlHandshakeComplete();
+    const uint32_t maxPacketBytes = established
+        ? PacketCodec::kNmtMaxPacketBytes
+        : PacketCodec::kHandshakeMaxPacketBytes;
+    const uint32_t maxBunchDataBits = maxPacketBytes * 8u - 1u;
+
     ControlState& cs = GetControlState(clientId);
     bool ok = true;
-    for (const PacketCodec::Packet& pkt : cs.outbound.BuildControlMessagePackets(bytes)) {
-        const std::vector<uint8_t> wire = PacketCodec::Encode(pkt);
+    for (const PacketCodec::Packet& pkt :
+         cs.outbound.BuildControlMessagePackets(bytes, maxBunchDataBits)) {
+        const std::vector<uint8_t> wire = PacketCodec::Encode(pkt, maxPacketBytes);
         if (!conn->SendRaw(wire.data(), wire.size())) {
             ok = false;
         }
@@ -472,7 +485,13 @@ void ConnectionManager::SendEncodedPacket(uint32_t clientId, const PacketCodec::
     if (!conn) {
         return;
     }
-    const std::vector<uint8_t> wire = PacketCodec::Encode(pkt);
+    // Ack-only packets carry no bunches, so the BunchDataBits bound is moot here,
+    // but keep the phase-appropriate MaxPacket for consistency with SendRawToClient.
+    const bool established = GetOrCreateHandshake(clientId).IsControlHandshakeComplete();
+    const uint32_t maxPacketBytes = established
+        ? PacketCodec::kNmtMaxPacketBytes
+        : PacketCodec::kHandshakeMaxPacketBytes;
+    const std::vector<uint8_t> wire = PacketCodec::Encode(pkt, maxPacketBytes);
     conn->SendRaw(wire.data(), wire.size());
 }
 

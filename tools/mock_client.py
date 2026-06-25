@@ -13,7 +13,7 @@ Modes:
 
 The bit codec mirrors src/Network/{BitReader,BitWriter,PacketCodec}: LSB-first
 bits, UE3 variable-length ReadInt(Max), terminator = high bit of the packet's
-last byte, BunchDataBits = ReadInt(64) during the handshake.
+last byte, BunchDataBits = ReadInt(16384) (MaxPacket=2048 for the live connection).
 
 Usage:
   python tools/mock_client.py replay [--host 127.0.0.1] [--port 7777]
@@ -122,7 +122,11 @@ def decode_packet(data):
         ci = r.rint(1023)
         sq = r.rint(1024) if bR else 0
         ct = r.rint(8) if (bR or bO) else 0
-        bd = r.rint(64)
+        # BunchDataBits = SerializeInt(MaxPacket*8). MaxPacket is 2048 for the live
+        # connection (RE'd from VNGame.exe [conn+0x10c]) => bound 16384, a 14-bit
+        # field, from the very first packet. (The old rint(64) was wrong and caused
+        # large bunches - e.g. the PackageMap export - to mis-decode as "partial".)
+        bd = r.rint(16384)
         ps = r.p
         # payload bits
         pay = BitWriter()

@@ -13,10 +13,6 @@ namespace PacketCodec {
 
 namespace {
 
-// A control bunch carries at most kBunchDataBitsMax-1 data bits (spec §3:
-// BunchDataBits = ReadInt(64) => max 63 during the MaxPacket=8 handshake).
-constexpr uint32_t kMaxFragmentBits = kBunchDataBitsMax - 1; // 63
-
 // Pack `bitCount` bits starting at bit offset `startBit` of `bytes` (LSB-first,
 // 8 bits/byte) into a fresh LSB-first buffer via BitWriter. Returns the packed
 // bytes with the trailing partial byte zero-padded — the exact layout a Bunch
@@ -54,10 +50,12 @@ void PacketAssembler::DrainAcksInto(Packet& pkt) {
 }
 
 std::vector<Packet> PacketAssembler::BuildControlMessagePackets(
-    const std::vector<uint8_t>& messagePayload) {
+    const std::vector<uint8_t>& messagePayload,
+    uint32_t maxBunchDataBits) {
     std::vector<Packet> packets;
 
     const size_t totalBits = messagePayload.size() * 8u;
+    const uint32_t maxFragmentBits = maxBunchDataBits > 0 ? maxBunchDataBits : 1u;
 
     // Compute fragment boundaries. An empty payload still yields exactly one
     // (zero-bit) bunch so the channel-open and any acks still go out.
@@ -65,9 +63,9 @@ std::vector<Packet> PacketAssembler::BuildControlMessagePackets(
     bool first = true;
     do {
         const uint32_t fragBits = static_cast<uint32_t>(
-            (totalBits - bitOffset) < kMaxFragmentBits
+            (totalBits - bitOffset) < maxFragmentBits
                 ? (totalBits - bitOffset)
-                : kMaxFragmentBits);
+                : maxFragmentBits);
 
         Bunch b;
         // The very first control bunch on this channel opens it.

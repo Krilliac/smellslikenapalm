@@ -52,8 +52,18 @@ public:
     //
     // An empty payload still produces exactly one packet carrying a single
     // zero-bit bunch (so the channel-open / ack still goes out).
+    //
+    // `maxBunchDataBits` is the largest payload bit count one bunch may carry,
+    // i.e. MaxPacket*8 - 1 for the phase. It defaults to the small handshake
+    // value (63, from MaxPacket=8); once the connection is established the caller
+    // passes the NMT value (kNmtMaxPacketBytes*8 - 1 = 16383) so a large message
+    // - e.g. NMT_Welcome or the PackageMap export - goes out as ONE big bunch,
+    // exactly as the retail server frames it, instead of hundreds of 63-bit
+    // fragments. The BunchDataBits SerializeInt bound used when ENCODING must
+    // match (see PacketCodec::Encode's maxPacketBytes) or the peer mis-reads it.
     std::vector<Packet> BuildControlMessagePackets(
-        const std::vector<uint8_t>& messagePayload);
+        const std::vector<uint8_t>& messagePayload,
+        uint32_t maxBunchDataBits = kBunchDataBitsMax - 1);
 
     // Flush any pending acks in a bunch-less packet (PacketId + acks only). Useful
     // when we must acknowledge received packets without sending data. Always
