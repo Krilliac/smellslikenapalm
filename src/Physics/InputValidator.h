@@ -1,4 +1,4 @@
-// src/Input/InputValidator.h
+// src/Physics/InputValidator.h
 #pragma once
 
 #include <string>
@@ -31,11 +31,11 @@ private:
     static const std::regex kCommandPattern;    // command name
     static const std::regex kAlnumPattern;      // alphanumeric + underscores
 
-    // Bounds
-    static constexpr float kWorldMinX = -10000.0f;
-    static constexpr float kWorldMaxX =  10000.0f;
-    static constexpr float kWorldMinY = -10000.0f;
-    static constexpr float kWorldMaxY =  10000.0f;
-    static constexpr float kWorldMinZ = -1000.0f;
-    static constexpr float kWorldMaxZ =  1000.0f;
+    // Bounds (use the wider/safer world bounds; matches large RS2V maps)
+    static constexpr float kWorldMinX = -100000.0f;
+    static constexpr float kWorldMaxX =  100000.0f;
+    static constexpr float kWorldMinY = -100000.0f;
+    static constexpr float kWorldMaxY =  100000.0f;
+    static constexpr float kWorldMinZ = -100000.0f;
+    static constexpr float kWorldMaxZ =  100000.0f;
 };

@@ -2,7 +2,7 @@
 #include "Protocol/MessageDecoder.h"
 #include "Utils/Logger.h"
 #include "Math/Vector3.h"
-#include "Input/InputValidator.h"
+#include "Physics/InputValidator.h"
 
 bool MessageDecoder::Decode(const Packet& pkt, std::string& outTag, std::vector<uint8_t>& outPayload) {
     Logger::Trace("[MessageDecoder::Decode] entry — packet tag='%s'", pkt.GetTag().c_str());

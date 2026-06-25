@@ -1,6 +1,7 @@
 .gitignore for RS2V Server
 Build artifacts
 build/
+build-mingw/
 bin/
 obj/
 *.o
@@ -48,6 +49,7 @@ Logs and runtime files
 *.log
 *.pid
 *.pid.lock
+.remember/logs/
 
 Configuration backups
 *.swp
