@@ -99,3 +99,7 @@ out/
 build-authtests/
 Testing/
 .claude/
+
+# Python
+__pycache__/
+*.pyc

@@ -436,9 +436,12 @@ bool ConnectionManager::SendRawToClient(uint32_t clientId, const std::vector<uin
     // handshake MaxPacket is 8 (bound 64); once the NMT phase begins it is 2048
     // (bound 16384) and large messages (Welcome, PackageMap export) go out as one
     // big bunch rather than 63-bit fragments. Pick both from the handshake state.
+    // We are the SERVER: encode S2C bunches with the server's MaxPacket (~1500),
+    // which is what the retail client expects from a server (asymmetric vs the
+    // client's 2048 that we DECODE inbound with - see PacketCodec.h).
     const bool established = GetOrCreateHandshake(clientId).IsControlHandshakeComplete();
     const uint32_t maxPacketBytes = established
-        ? PacketCodec::kNmtMaxPacketBytes
+        ? PacketCodec::kServerSendMaxPacketBytes
         : PacketCodec::kHandshakeMaxPacketBytes;
     const uint32_t maxBunchDataBits = maxPacketBytes * 8u - 1u;
 
@@ -494,10 +497,10 @@ void ConnectionManager::SendEncodedPacket(uint32_t clientId, const PacketCodec::
         return;
     }
     // Ack-only packets carry no bunches, so the BunchDataBits bound is moot here,
-    // but keep the phase-appropriate MaxPacket for consistency with SendRawToClient.
+    // but keep the phase-appropriate server-send MaxPacket for consistency.
     const bool established = GetOrCreateHandshake(clientId).IsControlHandshakeComplete();
     const uint32_t maxPacketBytes = established
-        ? PacketCodec::kNmtMaxPacketBytes
+        ? PacketCodec::kServerSendMaxPacketBytes
         : PacketCodec::kHandshakeMaxPacketBytes;
     const std::vector<uint8_t> wire = PacketCodec::Encode(pkt, maxPacketBytes);
     conn->SendRaw(wire.data(), wire.size());

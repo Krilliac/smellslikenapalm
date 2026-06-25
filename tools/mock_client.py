@@ -355,13 +355,16 @@ def react(host, port):
     step("HandshakeStart 0x1d", bytes([0x00, 0x1d]), 8, bytes([0x00, 0x1e]), 64, want_open=True)
     # 2. HandshakeResponse (0x00 0x1f) -> HandshakeComplete (0x00 0x20). Bound 64.
     step("HandshakeResponse 0x1f", bytes([0x00, 0x1f]), 8, bytes([0x00, 0x20]), 64)
-    # 3. NMT phase: Steam login (0x10) -> Welcome (0x01 ...). Bound 16384.
-    step("SteamLogin 0x10", bytes([0x10, 0x00, 0x00, 0x00]), 2048, bytes([0x01]), 16384)
+    # 3. NMT phase: Steam login (0x10) -> Welcome (0x01 ...). We DECODE the server's
+    #    S2C bunches at the server-send bound 1500*8=12000 (asymmetric: the client
+    #    sends C2S at 2048, the server sends S2C at ~1500). See PacketCodec.h.
+    SERVER_BD = 1500 * 8
+    step("SteamLogin 0x10", bytes([0x10, 0x00, 0x00, 0x00]), 2048, bytes([0x01]), SERVER_BD)
     # 4. Join (0x09) -> server reaches Joined; post-Join the server should send the
     #    world-replication bootstrap (PackageMap export = NMT 0x07 bunches). If the
     #    server has no bootstrap data loaded, this is just an ack (no 0x07) - which
     #    is still a PASS for the handshake, with a note.
-    got = step("Join 0x09", bytes([0x09]), 2048, None, 16384)
+    got = step("Join 0x09", bytes([0x09]), 2048, None, SERVER_BD)
     pkgmap_bunches = sum(1 for d in got for b2 in d.get("bunches", [])
                          if b2["chIndex"] == 0 and b2["nmt"] == 0x07)
     if pkgmap_bunches:

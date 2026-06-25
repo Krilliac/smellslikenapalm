@@ -44,7 +44,19 @@ constexpr uint32_t kHandshakeMaxPacketBytes = 8;     // StatelessConnect phase
 // right-shifts the whole NMT-phase payload by one bit per bunch, mis-reading every
 // NMT byte (Hello 0x00 -> 0x20, Login 0x10 -> 0x08, etc). (Binary static default
 // is 512; the live connection's MaxPacket is negotiated up to 2048 by the NMT phase.)
-constexpr uint32_t kNmtMaxPacketBytes       = 2048;  // established / NMT phase
+constexpr uint32_t kNmtMaxPacketBytes       = 2048;  // established / NMT phase (CLIENT->server decode)
+
+// MaxPacket is per-connection and ASYMMETRIC on this build: the CLIENT encodes its
+// C2S bunches with MaxPacket 2048 (bound 16384 - kNmtMaxPacketBytes, validated
+// byte-exact against the login version fields), but the dedicated SERVER encodes
+// its S2C bunches with a smaller MaxPacket ~1500 (Ethernet MTU; bound ~12000) -
+// reversed from the official server's PackageMap export (frames f167-f185), whose
+// 20 bunches only decode with consumesAll when the bound is in (10088, 13928].
+// So we DECODE inbound at kNmtMaxPacketBytes but ENCODE our outbound (we are the
+// server) at this value, matching what the retail client expects from a server.
+// Any value in (1261, 1741] bytes frames the PackageMap chunks identically; 1500
+// is the principled MTU choice. See docs/RS2V_PostJoin_Replication_7258.md.
+constexpr uint32_t kServerSendMaxPacketBytes = 1500;  // established / NMT phase (server->CLIENT encode)
 constexpr uint32_t kBunchDataBitsMax = kHandshakeMaxPacketBytes * 8; // 64 (handshake default)
 
 // One decoded bunch. `payload` holds the bunch data bits packed LSB-first (the
