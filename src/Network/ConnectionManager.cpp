@@ -132,6 +132,16 @@ void ConnectionManager::HandleIncomingPacket(const std::vector<uint8_t>& data, c
     }
     Logger::Debug("[ConnectionManager::HandleIncomingPacket] clientId=%u for %s:%u", clientId, addr.ip.c_str(), addr.port);
 
+    // HANDSHAKE WIRE TRACE: dump small inbound datagrams (the handshake/control
+    // packets are tiny) so we can see exactly what the real client sends. Skipped
+    // for large datagrams to avoid spamming gameplay traffic.
+    if (data.size() <= 80) {
+        std::string hex; hex.reserve(data.size() * 2);
+        static const char* H = "0123456789abcdef";
+        for (uint8_t b : data) { hex += H[b >> 4]; hex += H[b & 0xF]; }
+        Logger::Info("[WIRE<-] client %u %zuB: %s", clientId, data.size(), hex.c_str());
+    }
+
     auto conn = m_clients[addr];
     conn->UpdateLastHeartbeat();
     Logger::Debug("[ConnectionManager::HandleIncomingPacket] Updated heartbeat for client %u", clientId);
@@ -445,13 +455,13 @@ bool ConnectionManager::SendRawToClient(uint32_t clientId, const std::vector<uin
     // handshake MaxPacket is 8 (bound 64); once the NMT phase begins it is 2048
     // (bound 16384) and large messages (Welcome, PackageMap export) go out as one
     // big bunch rather than 63-bit fragments. Pick both from the handshake state.
-    // We are the SERVER: encode S2C bunches with the server's MaxPacket (~1500),
-    // which is what the retail client expects from a server (asymmetric vs the
-    // client's 2048 that we DECODE inbound with - see PacketCodec.h).
-    const bool established = GetOrCreateHandshake(clientId).IsControlHandshakeComplete();
-    const uint32_t maxPacketBytes = established
-        ? PacketCodec::kServerSendMaxPacketBytes
-        : PacketCodec::kHandshakeMaxPacketBytes;
+    // We are the SERVER: encode S2C bunches with the server's MaxPacket (~1500,
+    // bound ~12000) from the FIRST packet (including the HandshakeChallenge) - the
+    // client decodes server bunches at that bound from the start. (Asymmetric vs the
+    // client's 2048 that we DECODE inbound with - see PacketCodec.h. There is NO
+    // small-bound handshake phase; the old bound-64 encode made our challenge
+    // unparseable to the real client, stalling it on the loading screen.)
+    const uint32_t maxPacketBytes = PacketCodec::kServerSendMaxPacketBytes;
     const uint32_t maxBunchDataBits = maxPacketBytes * 8u - 1u;
 
     ControlState& cs = GetControlState(clientId);
@@ -459,6 +469,12 @@ bool ConnectionManager::SendRawToClient(uint32_t clientId, const std::vector<uin
     for (const PacketCodec::Packet& pkt :
          cs.outbound.BuildControlMessagePackets(bytes, maxBunchDataBits)) {
         const std::vector<uint8_t> wire = PacketCodec::Encode(pkt, maxPacketBytes);
+        if (wire.size() <= 80) {  // HANDSHAKE WIRE TRACE (small control sends)
+            std::string hex; hex.reserve(wire.size() * 2);
+            static const char* H = "0123456789abcdef";
+            for (uint8_t b : wire) { hex += H[b >> 4]; hex += H[b & 0xF]; }
+            Logger::Info("[WIRE->] client %u %zuB: %s", clientId, wire.size(), hex.c_str());
+        }
         if (!conn->SendRaw(wire.data(), wire.size())) {
             ok = false;
         }
@@ -506,12 +522,9 @@ void ConnectionManager::SendEncodedPacket(uint32_t clientId, const PacketCodec::
         return;
     }
     // Ack-only packets carry no bunches, so the BunchDataBits bound is moot here,
-    // but keep the phase-appropriate server-send MaxPacket for consistency.
-    const bool established = GetOrCreateHandshake(clientId).IsControlHandshakeComplete();
-    const uint32_t maxPacketBytes = established
-        ? PacketCodec::kServerSendMaxPacketBytes
-        : PacketCodec::kHandshakeMaxPacketBytes;
-    const std::vector<uint8_t> wire = PacketCodec::Encode(pkt, maxPacketBytes);
+    // but keep the server-send MaxPacket for consistency (always, no phase).
+    const std::vector<uint8_t> wire =
+        PacketCodec::Encode(pkt, PacketCodec::kServerSendMaxPacketBytes);
     conn->SendRaw(wire.data(), wire.size());
 }
 
@@ -679,10 +692,12 @@ bool ConnectionManager::ParseIncomingControl(uint32_t clientId, const std::vecto
     // sets the BunchDataBits SerializeInt bound) is phase-dependent: 8 during the
     // StatelessConnect handshake, ~512 once the NMT phase begins. Pick it from the
     // connection's handshake state. See docs/RS2V_ControlChannel_WireSpec_7258.md.
-    const uint32_t maxPacketBytes =
-        GetOrCreateHandshake(clientId).IsControlHandshakeComplete()
-            ? PacketCodec::kNmtMaxPacketBytes
-            : PacketCodec::kHandshakeMaxPacketBytes;
+    // The client (C2S) frames BunchDataBits at its MaxPacket = 2048 (bound 16384)
+    // from the VERY FIRST packet - including the StatelessConnect handshake bunches.
+    // There is NO small-bound "handshake phase": decoding the handshake bunches at
+    // the old bound 64 misaligned them (the NMT byte landed in the 2nd byte), so the
+    // client's HandshakeStart/Response were mis-keyed. Always decode at the NMT bound.
+    const uint32_t maxPacketBytes = PacketCodec::kNmtMaxPacketBytes;
     PacketCodec::Packet pkt =
         PacketCodec::Decode(datagram.data(), datagram.size(), maxPacketBytes);
     if (!pkt.ok) {

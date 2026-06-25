@@ -84,18 +84,22 @@ std::vector<uint8_t> BuildJoin(const JoinMessage& /*msg*/) {
 }
 
 std::vector<uint8_t> BuildHandshakeChallenge(uint32_t nonce) {
+    // The handshake NMT byte (0x1e) is the FIRST payload byte - there is NO 0x00
+    // family prefix (reversed from the official server's f157: payload = [1e dd 96
+    // 93 b1] = NMT 0x1e + 4 cookie bytes). The client validates/echoes the cookie,
+    // so we send a full 32-bit nonce as the 4 bytes.
     BitWriter w;
-    w.WriteByte(Handshake::kFamilyByte);   // 0x00
     w.WriteByte(Handshake::kChallenge);    // 0x1e
     w.WriteByte(static_cast<uint8_t>(nonce & 0xFF));
     w.WriteByte(static_cast<uint8_t>((nonce >> 8) & 0xFF));
     w.WriteByte(static_cast<uint8_t>((nonce >> 16) & 0xFF));
+    w.WriteByte(static_cast<uint8_t>((nonce >> 24) & 0xFF));
     return w.GetBytes();
 }
 
 std::vector<uint8_t> BuildHandshakeComplete() {
+    // NMT 0x20, no family prefix (official f159 payload = [20]).
     BitWriter w;
-    w.WriteByte(Handshake::kFamilyByte);   // 0x00
     w.WriteByte(Handshake::kComplete);     // 0x20
     return w.GetBytes();
 }

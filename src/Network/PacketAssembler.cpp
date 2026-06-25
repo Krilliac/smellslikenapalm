@@ -68,15 +68,15 @@ std::vector<Packet> PacketAssembler::BuildControlMessagePackets(
                 : maxFragmentBits);
 
         Bunch b;
-        // The very first control bunch on this channel opens it.
-        if (first && !m_channelOpened) {
-            b.bControl = true;
-            b.bOpen = true;
-            m_channelOpened = true;
-        } else {
-            b.bControl = false;
-            b.bOpen = false;
-        }
+        // The control channel (ChIndex 0) is opened by the CLIENT (its first bunch,
+        // the HandshakeStart, is bOpen=1). The SERVER never opens it - it only sends
+        // on the already-open channel, so every server ch0 bunch is bControl=0,
+        // bOpen=0 (verified against the official server: ALL its ch0 bunches decode
+        // O0). Marking our first send as bOpen=1 shifted the bunch header and the
+        // real client rejected our HandshakeChallenge (stuck on the loading screen).
+        b.bControl = false;
+        b.bOpen = false;
+        m_channelOpened = true; // tracked for IsChannelOpened(); we never emit bOpen
         b.bClose = false;
         b.bReliable = true;
         b.chIndex = kControlChannelIndex; // 0

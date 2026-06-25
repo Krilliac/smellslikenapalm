@@ -132,14 +132,15 @@ void HandshakeState::HandleControlMessage(const uint8_t* data, size_t len) {
 }
 
 void HandshakeState::HandleHandshakeMessage(const uint8_t* data, size_t len) {
-    // Payload = [0x00 family][subtype][data]. Switch on the subtype byte (the 2nd
-    // byte). We blind-accept: any nonce on the challenge, no validation of the
-    // client's response. See ControlChannel::Handshake.
-    if (len < 2) {
-        Logger::Debug("[HandshakeState] client %u: short handshake msg (%zu bytes), ignoring", m_clientId, len);
+    // Payload = [NMT byte][data...]. The handshake NMT (0x1d/0x1f) is the FIRST
+    // byte - there is NO 0x00 family prefix (reversed from the capture: client
+    // HandshakeStart payload = [1d 01], Response = [1f ...]). We blind-accept: any
+    // nonce on the challenge, no validation of the client's response.
+    if (len < 1) {
+        Logger::Debug("[HandshakeState] client %u: empty handshake msg, ignoring", m_clientId);
         return;
     }
-    const uint8_t subtype = data[1];
+    const uint8_t subtype = data[0];
     switch (subtype) {
         case ControlChannel::Handshake::kStart: {  // 0x1d  C->S HandshakeStart
             m_handshakeNonce = MakeServerNonce(m_clientId);
@@ -258,15 +259,15 @@ void HandshakeState::CompleteLogin() {
         m_phase != HandshakePhase::AwaitingLogin) {
         return; // already past login (e.g. a retransmitted Steam login)
     }
-    // Send Welcome with placeholder map/gameclass (Stream B will make these real).
-    ControlChannel::WelcomeMessage welcome;
-    welcome.levelName = "VNTE-CuChi";                          // placeholder Map
-    welcome.gameName  = "ROGame.ROGameInfoTerritories";        // placeholder GameClass
-    welcome.flags = 0;                                         // spec §4 trailing QWORD
-    Emit(ControlChannel::BuildWelcome(welcome));
-
+    // NOTE: we do NOT send NMT_Welcome(0x01) here. The official server does not send
+    // a Welcome after the Steam login - it sends NMT 0x11 then NMT_Challenge(0x03)
+    // then the PackageMap (capture S2C f162/f165/f167+). Sending our fake 0x01
+    // Welcome made the retail client close the control channel. Those post-login
+    // control messages are now part of the replication bootstrap (sent from
+    // ConnectionManager::FireClientLoggedIn, triggered by the ClientLoggedIn event
+    // below). See data/replication_bootstrap.bin + gen_replication_bootstrap.py.
     m_phase = HandshakePhase::WelcomeSent;
-    Logger::Info("[HandshakeState] client %u: login complete -> Welcome sent, state=%s",
+    Logger::Info("[HandshakeState] client %u: login complete -> (bootstrap will send 0x11/0x03/PackageMap), state=%s",
                  m_clientId, HandshakePhaseName(m_phase));
 
     // Fire the Game-facing ClientLoggedIn event (no direct Game/ dependency).
