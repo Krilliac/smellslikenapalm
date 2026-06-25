@@ -6,22 +6,7 @@
 #include <mutex>
 #include <chrono>
 #include <unordered_map>
-
-struct ClientAddress {
-    std::string ip;
-    uint16_t    port;
-    bool operator==(ClientAddress const& o) const {
-        return ip == o.ip && port == o.port;
-    }
-};
-
-namespace std {
-template<> struct hash<ClientAddress> {
-    size_t operator()(ClientAddress const& a) const noexcept {
-        return hash<string>()(a.ip) ^ (hash<uint16_t>()(a.port) << 1);
-    }
-};
-}
+#include "Network/ClientAddress.h"
 
 class NetworkBlocker {
 public:

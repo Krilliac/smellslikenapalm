@@ -7,11 +7,7 @@
 #include <cstdint>
 #include <functional>
 #include "Network/Packet.h"
-
-struct ClientAddress {
-    std::string ip;
-    uint16_t    port;
-};
+#include "Network/ClientAddress.h"
 
 class NetworkInterface {
 public:
