@@ -47,6 +47,15 @@ Packet:
     # (An empty packet = PacketId + terminator only => the 2-byte "XX40" keepalive/ack packets.)
 ```
 
+**Terminator (corrected from capture/disasm):** UE3 sends exactly ONE packet per
+datagram and the readable bit count is recovered as the **high set bit of the
+packet's LAST byte** (`PacketBits = NumBytes*8 - 8 + HighBit(lastByte)`), not the
+highest set bit across the whole buffer. The sender's flush guarantees a non-zero
+final byte. Captured datagrams sometimes carry a constant trailing byte AFTER the
+packet's terminator byte (e.g. the 10-byte retransmitted Hello datagram carries a
+9-byte packet); the decoder treats the longest leading prefix that parses exactly
+to its last-byte terminator (overflow-free) as the packet and ignores any trailer.
+
 `PacketId` is reconstructed from the 14-bit wire value as a rolling sequence
 (`(wire - last - 0x2000) & 0x3fff` delta math against the last received id).
 Reader/demux: `UNetConnection::ReceivedPacket` @ `0x1404a4e60`; PreSend (writer) @ `0x14049e4a0`.
