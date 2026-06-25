@@ -100,8 +100,13 @@ def terminator_bit(data):
 # ----------------------------------------------------------------------------
 # Packet decode (PacketId, acks, bunches)
 # ----------------------------------------------------------------------------
-def decode_packet(data):
-    """Return dict {pid, acks:[], bunches:[{flags, chIndex, chSeq, chType, bits, nmt, payloadHex}], ok}."""
+def decode_packet(data, bd_max=16384):
+    """Return dict {pid, acks:[], bunches:[{flags, chIndex, chSeq, chType, bits, nmt, payloadHex}], ok}.
+
+    bd_max is the BunchDataBits SerializeInt bound = MaxPacket*8 for the phase:
+    64 during the StatelessConnect handshake, 16384 (MaxPacket=2048) in the NMT
+    phase. Pass the phase-appropriate value or the bunch payload misaligns.
+    """
     t = terminator_bit(data)
     if t < 0:
         return {"ok": False, "reason": "no terminator (all-zero)"}
@@ -110,7 +115,7 @@ def decode_packet(data):
     acks = []
     bunches = []
     guard = 0
-    while r.p < t and not r.error and guard < 64:
+    while r.p < t and not r.error and guard < 256:
         guard += 1
         if r.bit():  # IsAck
             acks.append(r.rint(MAX_PACKETID))
@@ -122,11 +127,7 @@ def decode_packet(data):
         ci = r.rint(1023)
         sq = r.rint(1024) if bR else 0
         ct = r.rint(8) if (bR or bO) else 0
-        # BunchDataBits = SerializeInt(MaxPacket*8). MaxPacket is 2048 for the live
-        # connection (RE'd from VNGame.exe [conn+0x10c]) => bound 16384, a 14-bit
-        # field, from the very first packet. (The old rint(64) was wrong and caused
-        # large bunches - e.g. the PackageMap export - to mis-decode as "partial".)
-        bd = r.rint(16384)
+        bd = r.rint(bd_max)
         ps = r.p
         # payload bits
         pay = BitWriter()
@@ -266,14 +267,113 @@ def drive(host, port):
     sock.close()
     return 0
 
+# ----------------------------------------------------------------------------
+# Packet encode (mirror of src/Network/PacketCodec::Encode) - for the reactive
+# client. A bunch dict: {bControl,bOpen,bClose,bReliable,chIndex,chType,chSeq,
+# payload(bytes)}.
+# ----------------------------------------------------------------------------
+def encode_packet(pid, bunches, max_packet_bytes, acks=None):
+    w = BitWriter()
+    w.wint(pid, MAX_PACKETID)
+    for a in (acks or []):
+        w.bit(1)           # IsAck
+        w.wint(a, MAX_PACKETID)
+    bd_max = max_packet_bytes * 8
+    for b in bunches:
+        w.bit(0)           # not an ack
+        bC = b.get("bControl", 0)
+        w.bit(bC)
+        if bC:
+            w.bit(b.get("bOpen", 0))
+            w.bit(b.get("bClose", 0))
+        bR = b.get("bReliable", 1)
+        w.bit(bR)
+        w.wint(b["chIndex"], 1023)
+        if bR:
+            w.wint(b["chSeq"], 1024)
+        if bR or b.get("bOpen", 0):
+            w.wint(b["chType"], 8)
+        payload = b["payload"]
+        bits = len(payload) * 8
+        w.wint(bits, bd_max)
+        for byte in payload:
+            for i in range(8):
+                w.bit((byte >> i) & 1)
+    w.bit(1)               # terminator (high set bit of the last byte)
+    return w.to_bytes()
+
+# ----------------------------------------------------------------------------
+# Reactive mode: act as a real UE3 client - drive the StatelessConnect handshake
+# and the NMT login LIVE against our server, decoding/validating each response
+# phase-aware (bound 64 during the handshake, 16384 once in the NMT phase). This
+# is the ONLY harness that validates our SEND path (replay only tests receive).
+# ----------------------------------------------------------------------------
+def react(host, port):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.settimeout(1.5)
+    seq = 1
+    pid = 0
+    ok = True
+
+    def step(name, payload, max_pkt, expect_prefix, bd_decode, want_open=False):
+        # expect_prefix: bytes the server's response bunch payload must START with
+        # (e.g. b"\x00\x1e" for HandshakeChallenge, b"\x01" for Welcome), or None.
+        nonlocal seq, pid, ok
+        b = {"bControl": 1 if want_open else 0, "bOpen": 1 if want_open else 0,
+             "bClose": 0, "bReliable": 1, "chIndex": 0, "chType": 1,
+             "chSeq": seq, "payload": payload}
+        dg = encode_packet(pid, [b], max_pkt)
+        sock.sendto(dg, (host, port))
+        print(f"  -> {name}: sent pid={pid} seq={seq} payload={payload.hex()} ({max_pkt}B)")
+        seq += 1
+        pid += 1
+        got = []
+        payloads = []
+        try:
+            while True:
+                resp, _ = sock.recvfrom(4096)
+                dec = decode_packet(resp, bd_max=bd_decode)
+                got.append(dec)
+                for b2 in dec.get("bunches", []):
+                    if b2["payloadHex"]:
+                        payloads.append(b2["payloadHex"])
+                print(f"     <- {fmt_packet(dec)}")
+        except socket.timeout:
+            pass
+        if expect_prefix is not None:
+            pref = expect_prefix.hex()
+            if any(ph.startswith(pref) for ph in payloads):
+                print(f"     OK: server response payload starts with {pref}")
+            else:
+                print(f"     FAIL: expected payload prefix {pref}, got payloads {payloads}")
+                ok = False
+        return got
+
+    print(f"react: live handshake against {host}:{port}\n")
+    # 1. StatelessConnect: HandshakeStart (0x00 0x1d) -> HandshakeChallenge
+    #    (0x00 0x1e + 3 nonce bytes). Bound 64.
+    step("HandshakeStart 0x1d", bytes([0x00, 0x1d]), 8, bytes([0x00, 0x1e]), 64, want_open=True)
+    # 2. HandshakeResponse (0x00 0x1f) -> HandshakeComplete (0x00 0x20). Bound 64.
+    step("HandshakeResponse 0x1f", bytes([0x00, 0x1f]), 8, bytes([0x00, 0x20]), 64)
+    # 3. NMT phase: Steam login (0x10) -> Welcome (0x01 ...). Bound 16384.
+    step("SteamLogin 0x10", bytes([0x10, 0x00, 0x00, 0x00]), 2048, bytes([0x01]), 16384)
+    # 4. Join (0x09) -> server reaches Joined (replication, if any, follows).
+    step("Join 0x09", bytes([0x09]), 2048, None, 16384)
+
+    sock.close()
+    print("\n=== react: " + ("PASS - handshake sends are well-formed" if ok else "FAIL - see above") + " ===")
+    return 0 if ok else 1
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["replay", "drive"])
+    ap.add_argument("mode", choices=["replay", "drive", "react"])
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=7777)
     args = ap.parse_args()
     if args.mode == "replay":
         return replay(args.host, args.port)
+    if args.mode == "react":
+        return react(args.host, args.port)
     return drive(args.host, args.port)
 
 if __name__ == "__main__":
