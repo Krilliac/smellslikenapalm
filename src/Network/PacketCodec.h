@@ -58,4 +58,9 @@ struct Packet {
 // out of bounds; sets Packet::ok = false on any malformed/truncated input.
 Packet Decode(const uint8_t* data, size_t numBytes);
 
+// Encode a packet (PacketId, then acks, then bunches, then the terminator '1'
+// bit + zero pad to a byte boundary) into raw wire bytes. The inverse of Decode:
+// decoding a frame and re-encoding the result must reproduce the original bytes.
+std::vector<uint8_t> Encode(const Packet& pkt);
+
 } // namespace PacketCodec
