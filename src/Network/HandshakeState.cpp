@@ -88,8 +88,10 @@ void HandshakeState::HandleControlMessage(const uint8_t* data, size_t len) {
         return;
     }
 
-    Logger::Debug("[HandshakeState] client %u: control message type=0x%02X in state %s",
-                  m_clientId, (unsigned)NMTByte(type), HandshakePhaseName(m_phase));
+    Logger::Debug("[HandshakeState] client %u: NMT msg type=0x%02X len=%zu first=[%02x %02x %02x] state %s",
+                  m_clientId, (unsigned)NMTByte(type), len,
+                  len>0?data[0]:0, len>1?data[1]:0, len>2?data[2]:0,
+                  HandshakePhaseName(m_phase));
 
     switch (type) {
         case NMT::Hello:
