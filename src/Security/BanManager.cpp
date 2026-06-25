@@ -36,12 +36,29 @@ bool BanManager::LoadBans() {
     size_t lineNumber = 0;
     while (std::getline(file, line)) {
         ++lineNumber;
-        if (line.empty()) {
-            Logger::Trace("[BanManager::LoadBans] Skipping empty line %zu", lineNumber);
+        // Skip blank lines and '#' comment lines (the shipped ban_list.txt has a
+        // comment banner). Also skip lines with no '|' field separator - they are
+        // not serialized ban entries and must not be parsed as such.
+        const size_t firstNonWs = line.find_first_not_of(" \t\r\n");
+        if (firstNonWs == std::string::npos) {
+            Logger::Trace("[BanManager::LoadBans] Skipping blank line %zu", lineNumber);
+            continue;
+        }
+        if (line[firstNonWs] == '#') {
+            Logger::Trace("[BanManager::LoadBans] Skipping comment line %zu", lineNumber);
+            continue;
+        }
+        if (line.find('|') == std::string::npos) {
+            Logger::Warn("[BanManager::LoadBans] Skipping malformed (no '|') line %zu: '%s'",
+                         lineNumber, line.c_str());
             continue;
         }
         Logger::Trace("[BanManager::LoadBans] Parsing line %zu: '%s'", lineNumber, line.c_str());
         BanEntry entry = DeserializeEntry(line);
+        if (entry.steamId.empty()) {
+            Logger::Warn("[BanManager::LoadBans] Skipping line %zu: empty SteamID", lineNumber);
+            continue;
+        }
         m_bans[entry.steamId] = entry;
         Logger::Debug("[BanManager::LoadBans] Loaded ban entry for SteamID '%s', type=%s, reason='%s'",
                       entry.steamId.c_str(),
@@ -269,7 +286,16 @@ BanEntry BanManager::DeserializeEntry(const std::string& line) const {
                   entry.type == BanType::Permanent ? "Permanent" : "Temporary");
     if (entry.type == BanType::Temporary) {
         std::getline(iss, token, '|');
-        auto secs = std::stoll(token);
+        long long secs = 0;
+        try {
+            secs = std::stoll(token);
+        } catch (const std::exception& e) {
+            // Malformed expiry field: don't crash the server loading bans - treat
+            // as an already-expired temporary ban and warn.
+            Logger::Warn("[BanManager::DeserializeEntry] Bad expiry token '%s' (%s); treating as expired",
+                         token.c_str(), e.what());
+            secs = 0;
+        }
         entry.expiresAt = std::chrono::steady_clock::time_point(std::chrono::seconds(secs));
         Logger::Debug("[BanManager::DeserializeEntry] Parsed temporary ban expiry: %lld seconds since epoch", secs);
     } else {
