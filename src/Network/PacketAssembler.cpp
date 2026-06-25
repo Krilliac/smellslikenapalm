@@ -103,6 +103,15 @@ std::vector<Packet> PacketAssembler::BuildControlMessagePackets(
     return packets;
 }
 
+Packet PacketAssembler::BuildRawBunchPacket(const Bunch& bunch) {
+    Packet pkt;
+    pkt.packetId = AllocatePacketId();
+    pkt.ok = true;
+    pkt.bunches.push_back(bunch);
+    DrainAcksInto(pkt);
+    return pkt;
+}
+
 Packet PacketAssembler::BuildAckOnlyPacket() {
     Packet pkt;
     pkt.packetId = AllocatePacketId();

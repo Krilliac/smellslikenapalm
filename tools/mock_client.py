@@ -370,7 +370,13 @@ def react(host, port):
     #    world-replication bootstrap (PackageMap export = NMT 0x07 bunches). If the
     #    server has no bootstrap data loaded, this is just an ack (no 0x07) - which
     #    is still a PASS for the handshake, with a note.
-    step("Join 0x09", bytes([0x09]), 2048, None, SERVER_BD)
+    join_got = step("Join 0x09", bytes([0x09]), 2048, None, SERVER_BD)
+    actor_chans = sorted({b2["chIndex"] for d in join_got for b2 in d.get("bunches", [])
+                          if b2["chIndex"] >= 2 and b2["bOpen"]})
+    if actor_chans:
+        print(f"     REPLICATION: server opened bootstrap actor channels {actor_chans} after Join")
+    else:
+        print("     (no actor channels opened after Join - actor bootstrap not loaded)")
 
     sock.close()
     print("\n=== react: " + ("PASS - handshake sends are well-formed" if ok else "FAIL - see above") + " ===")

@@ -70,6 +70,14 @@ public:
     // produces a packet (with an incremented PacketId) even if no acks are queued.
     Packet BuildAckOnlyPacket();
 
+    // Wrap ONE fully-specified bunch in its own packet (next PacketId, queued acks
+    // drained onto it). Unlike BuildControlMessagePackets this does NOT touch the
+    // control-channel sequence or fragment - the caller owns every bunch field
+    // (chIndex, chType, bOpen/bClose/bReliable, chSequence, payload). Used to open
+    // bootstrap ACTOR channels (ChIndex>=2, ChType 2, bOpen) whose per-channel
+    // sequence is independent of the control channel.
+    Packet BuildRawBunchPacket(const Bunch& bunch);
+
     // ---- state accessors (for tests / integration) ----
     uint32_t NextPacketId() const { return m_nextPacketId; }
     uint32_t NextControlChSequence() const { return m_nextControlChSequence; }

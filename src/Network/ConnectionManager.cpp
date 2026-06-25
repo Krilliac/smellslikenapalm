@@ -413,10 +413,13 @@ void ConnectionManager::FireClientJoined(const ClientJoinedEvent& ev) {
     if (auto conn = GetConnection(ev.clientId)) {
         conn->SetHandshakeComplete(true);
     }
-    // (The PackageMap export is sent earlier, on ClientLoggedIn / right after
-    // Welcome - see FireClientLoggedIn. The bootstrap ACTOR channels belong here,
-    // after the client confirms it Joined; TODO once the actor-channel send path
-    // exists - they are ChType 2 bOpen bunches on ChIndex 2-8, not ch0 control.)
+    // The PackageMap export went out earlier (on ClientLoggedIn / right after
+    // Welcome). Now that the client has Joined, open the bootstrap ACTOR channels
+    // (ROGameReplicationInfo, TeamInfo, the local PlayerController, PRIs) so it can
+    // build the world and spawn. Best-effort verbatim replay of the official f231
+    // burst - see SendActorBootstrap.
+    SendActorBootstrap(ev.clientId);
+
     if (m_clientJoinedCb) {
         m_clientJoinedCb(ev);
     } else {
@@ -552,6 +555,100 @@ const std::vector<std::vector<uint8_t>>& GetReplicationBootstrapRecords() {
     return records;
 }
 } // namespace
+
+namespace {
+// One bootstrap actor bunch descriptor parsed from data/actor_bootstrap.bin.
+struct ActorBunchRecord {
+    uint16_t chIndex = 0;
+    uint8_t  chType = 0;
+    bool     bOpen = false, bClose = false, bReliable = false, bControl = false;
+    uint16_t chSequence = 0;
+    uint32_t bunchDataBits = 0;       // EXACT bit count (payload is ceil/8 bytes)
+    std::vector<uint8_t> payload;
+};
+
+const std::vector<ActorBunchRecord>& GetActorBootstrapRecords() {
+    static std::once_flag once;
+    static std::vector<ActorBunchRecord> records;
+    std::call_once(once, [] {
+        const char* kPath = "data/actor_bootstrap.bin";
+        std::ifstream f(kPath, std::ios::binary);
+        if (!f) {
+            Logger::Info("[ActorBootstrap] '%s' not present - bootstrap actor channels disabled", kPath);
+            return;
+        }
+        std::vector<uint8_t> all((std::istreambuf_iterator<char>(f)),
+                                 std::istreambuf_iterator<char>());
+        size_t off = 0;
+        // record: u16 chIndex | u8 chType | u8 flags | u16 chSeq | u32 len | payload
+        while (off + 10 <= all.size()) {
+            ActorBunchRecord r;
+            r.chIndex = static_cast<uint16_t>(all[off] | (all[off + 1] << 8));
+            r.chType = all[off + 2];
+            const uint8_t flags = all[off + 3];
+            r.bOpen = flags & 0x1; r.bClose = flags & 0x2;
+            r.bReliable = flags & 0x4; r.bControl = flags & 0x8;
+            r.chSequence = static_cast<uint16_t>(all[off + 4] | (all[off + 5] << 8));
+            r.bunchDataBits = static_cast<uint32_t>(all[off + 6]) |
+                              (static_cast<uint32_t>(all[off + 7]) << 8) |
+                              (static_cast<uint32_t>(all[off + 8]) << 16) |
+                              (static_cast<uint32_t>(all[off + 9]) << 24);
+            const size_t len = (r.bunchDataBits + 7) / 8;  // payload bytes
+            off += 10;
+            if (off + len > all.size()) {
+                Logger::Warn("[ActorBootstrap] truncated record (bits=%u) - stopping", r.bunchDataBits);
+                break;
+            }
+            r.payload.assign(all.begin() + off, all.begin() + off + len);
+            off += len;
+            records.push_back(std::move(r));
+        }
+        Logger::Info("[ActorBootstrap] loaded %zu actor bunch descriptors from '%s'",
+                     records.size(), kPath);
+    });
+    return records;
+}
+} // namespace
+
+void ConnectionManager::SendActorBootstrap(uint32_t clientId) {
+    const std::vector<ActorBunchRecord>& records = GetActorBootstrapRecords();
+    if (records.empty()) {
+        return;
+    }
+    auto conn = GetConnection(clientId);
+    if (!conn) {
+        return;
+    }
+    ControlState& cs = GetControlState(clientId);
+    Logger::Info("[ConnectionManager::SendActorBootstrap] client %u: opening %zu bootstrap actor channels",
+                 clientId, records.size());
+    for (const ActorBunchRecord& r : records) {
+        if (r.chIndex == 0) {
+            // A ch0 control bunch in the burst: ride the normal control path so our
+            // own rolling control ChSequence stays contiguous (the recorded seq is
+            // the official server's, not ours).
+            SendRawToClient(clientId, r.payload);
+            continue;
+        }
+        // An actor channel (ChIndex>=2): emit the recorded bunch verbatim - it opens
+        // the channel (bOpen, its own per-channel ChSequence). Encode at the server
+        // MaxPacket (matches how we frame all S2C bunches).
+        PacketCodec::Bunch b;
+        b.bControl = r.bControl;
+        b.bOpen = r.bOpen;
+        b.bClose = r.bClose;
+        b.bReliable = r.bReliable;
+        b.chIndex = r.chIndex;
+        b.chType = r.chType;
+        b.chSequence = r.chSequence;
+        b.payload = r.payload;
+        b.payloadBits = r.bunchDataBits;  // exact bit count (not byte-padded)
+        const PacketCodec::Packet pkt = cs.outbound.BuildRawBunchPacket(b);
+        const std::vector<uint8_t> wire =
+            PacketCodec::Encode(pkt, PacketCodec::kServerSendMaxPacketBytes);
+        conn->SendRaw(wire.data(), wire.size());
+    }
+}
 
 void ConnectionManager::SendReplicationBootstrap(uint32_t clientId) {
     const std::vector<std::vector<uint8_t>>& records = GetReplicationBootstrapRecords();

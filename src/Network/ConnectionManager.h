@@ -124,6 +124,18 @@ private:
     // and sent in order via SendRawToClient. No-op (logged) if the file is absent.
     void SendReplicationBootstrap(uint32_t clientId);
 
+    // Open the bootstrap ACTOR channels after the client confirms Join. Replays the
+    // official server's f231 burst (ROGameReplicationInfo on ch2, TeamInfo, the
+    // local ROPlayerController on ch6, PlayerReplicationInfos) from
+    // data/actor_bootstrap.bin - a stream of full bunch descriptors
+    // [u16 chIndex][u8 chType][u8 flags][u16 chSequence][u32 len][payload]. ch0
+    // records ride the normal control path; ChIndex>=2 records open their own
+    // channel via PacketAssembler::BuildRawBunchPacket. No-op (logged) if absent.
+    // NOTE: actor payloads are session-specific (NetGUIDs, the recorded player's
+    // state) - this is a best-effort replay; correct per-session actor replication
+    // is a later step.
+    void SendActorBootstrap(uint32_t clientId);
+
     // ------------------------------------------------------------------------
     //  CONTROL-CHANNEL INBOUND PATH.
     //
