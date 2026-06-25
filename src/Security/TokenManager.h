@@ -1,0 +1,55 @@
+// src/Security/TokenManager.h
+//
+// Issues and validates per-user session / CSRF tokens. A token is an opaque,
+// cryptographically-random string bound to the user it was issued for. Tokens
+// optionally expire after a configurable lifetime.
+//
+// Semantics (matches the security test spec):
+//   * GenerateToken(user)            -> fresh random token bound to `user`.
+//   * ValidateToken(user, token)     -> true iff `token` was issued for `user`
+//                                       and has not expired. A token issued for
+//                                       one user never validates for another.
+
+#pragma once
+
+#include <string>
+#include <chrono>
+#include <mutex>
+#include <unordered_map>
+
+class TokenManager {
+public:
+    // Default token lifetime (0 == never expires).
+    explicit TokenManager(std::chrono::seconds tokenLifetime = std::chrono::seconds(0));
+    ~TokenManager();
+
+    // Generate a fresh token for `user`. Each call returns a distinct token;
+    // previously issued tokens for the same user remain valid until they expire
+    // or are revoked.
+    std::string GenerateToken(const std::string& user);
+
+    // Validate that `token` was issued for `user` and is still live.
+    bool ValidateToken(const std::string& user, const std::string& token);
+
+    // Explicitly revoke a single token (no-op if unknown).
+    void RevokeToken(const std::string& token);
+
+    // Revoke every token belonging to `user`.
+    void RevokeUser(const std::string& user);
+
+    // Number of currently-tracked (issued, not yet purged) tokens.
+    size_t ActiveTokenCount() const;
+
+private:
+    struct Entry {
+        std::string user;
+        std::chrono::steady_clock::time_point expiry; // only meaningful if m_lifetime > 0
+        bool hasExpiry;
+    };
+
+    bool IsExpired(const Entry& e) const;
+
+    std::chrono::seconds m_lifetime;
+    mutable std::mutex m_mutex;
+    std::unordered_map<std::string, Entry> m_tokens; // token -> entry
+};

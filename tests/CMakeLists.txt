@@ -47,6 +47,7 @@ endfunction()
 rs2v_add_test(Vector3Tests)      # reconciled: global Vector3, LengthSquared/DistanceSquared, member Lerp, inline clamp
 rs2v_add_test(ThreadPoolTests)   # reconciled: future-based waits (no WaitAll/GetThisThreadIndex)
 rs2v_add_test(INIParserTests)    # reconciled: self-contained TestINIParser; dead mocks + INISection clash removed
+rs2v_add_test(AuthenticationTests) # implemented: Security/{EACProxy,AuthManager,PasswordHasher,TokenManager}
 
 # Scripting is OFF by default (deprecated .NET COM hosting). The scripting test
 # is gated on ENABLE_SCRIPTING, but it ALSO references Scripting/ScriptEngine.h
@@ -60,7 +61,6 @@ endif()
 #
 # (A) Reference headers that do NOT exist in src/ (cannot compile; do not
 #     fabricate src headers):
-#   AuthenticationTests   -> Security/EACProxy.h
 #   EACTests              -> Security/EACProxy.h
 #   IntegrationTests      -> Security/EACProxy.h
 #   SecurityTests         -> Security/AuthManager.h, Utils/PasswordHasher.h,
