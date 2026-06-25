@@ -68,10 +68,9 @@ struct WireServer {
 
     void Deliver(const std::vector<std::vector<uint8_t>>& datagrams) {
         for (const std::vector<uint8_t>& dg : datagrams) {
-            const uint32_t maxPacketBytes =
-                handshake->IsControlHandshakeComplete()
-                    ? PacketCodec::kNmtMaxPacketBytes
-                    : PacketCodec::kHandshakeMaxPacketBytes;
+            // Mirror ConnectionManager::ParseIncomingControl: the client (C2S) frames
+            // at MaxPacket 2048 from the first packet - there is no small-bound phase.
+            const uint32_t maxPacketBytes = PacketCodec::kNmtMaxPacketBytes;
             PacketCodec::Packet pkt = PacketCodec::Decode(dg.data(), dg.size(), maxPacketBytes);
             ASSERT_TRUE(pkt.ok) << "server failed to decode a client datagram";
             for (const PacketCodec::Bunch& b : pkt.bunches) {
@@ -93,19 +92,18 @@ ControlChannel::HelloMessage MakeRealHello() {
 }
 
 // Drive the pre-NMT StatelessConnect handshake (client 0x1d -> server 0x1e ->
-// client 0x1f -> server 0x20). Handshake messages are raw [0x00 family][subtype]
-// payloads sent at the tiny handshake MaxPacket. Leaves the server in the NMT
-// phase (AwaitingHello) and clears the captured emissions/datagrams.
+// client 0x1f -> server 0x20). The handshake NMT byte (0x1d/0x1f) is the WHOLE
+// message payload - there is no 0x00 family prefix - and it is framed at the
+// normal MaxPacket (no small-bound phase). Leaves the server in the NMT phase
+// (AwaitingHello) and clears the captured emissions/datagrams.
 void CompleteStatelessHandshake(WireClient& client, WireServer& server) {
-    client.Send(std::vector<uint8_t>{ControlChannel::Handshake::kFamilyByte,
-                                     ControlChannel::Handshake::kStart},
-                PacketCodec::kHandshakeMaxPacketBytes);
+    client.Send(std::vector<uint8_t>{ControlChannel::Handshake::kStart},   // 0x1d
+                PacketCodec::kNmtMaxPacketBytes);
     server.Deliver(client.sent);
     client.Clear();
 
-    client.Send(std::vector<uint8_t>{ControlChannel::Handshake::kFamilyByte,
-                                     ControlChannel::Handshake::kResponse},
-                PacketCodec::kHandshakeMaxPacketBytes);
+    client.Send(std::vector<uint8_t>{ControlChannel::Handshake::kResponse}, // 0x1f
+                PacketCodec::kNmtMaxPacketBytes);
     server.Deliver(client.sent);
     client.Clear();
 

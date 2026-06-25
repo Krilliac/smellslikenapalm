@@ -11,7 +11,9 @@
 //   * a control bunch carries <= kBunchDataBitsMax-1 (63) data bits;
 //   * reliable control bunches use ChIndex 0, ChType 1, consecutive ChSequence
 //     starting at 1;
-//   * the very first control bunch opens the channel (bControl & bOpen);
+//   * the SERVER never opens the control channel - the CLIENT opens ch0 (its
+//     HandshakeStart is bOpen=1); every server ch0 bunch is bControl=0, bOpen=0
+//     (verified against the official server; opening it stalled the real client);
 //   * the server must ack received PacketIds.
 
 #include <gtest/gtest.h>
@@ -68,8 +70,9 @@ std::vector<Bunch> AllBunches(const std::vector<Packet>& packets) {
 
 } // namespace
 
-// A short payload (2 bytes) -> exactly 1 packet, 1 bunch, channel-opening.
-TEST(PacketAssembler, ShortPayloadSingleOpeningBunch) {
+// A short payload (2 bytes) -> exactly 1 packet, 1 bunch on the (already-open,
+// client-opened) control channel: bControl=0, bOpen=0.
+TEST(PacketAssembler, ShortPayloadSingleBunch) {
     PacketAssembler asm_;
     const std::vector<uint8_t> payload = {NMTByte(NMT::Hello), 0x01}; // 16 bits
 
@@ -80,8 +83,8 @@ TEST(PacketAssembler, ShortPayloadSingleOpeningBunch) {
     ASSERT_EQ(packets[0].bunches.size(), 1u);
 
     const Bunch& b = packets[0].bunches[0];
-    EXPECT_TRUE(b.bControl);
-    EXPECT_TRUE(b.bOpen);
+    EXPECT_FALSE(b.bControl);  // server never opens ch0
+    EXPECT_FALSE(b.bOpen);
     EXPECT_FALSE(b.bClose);
     EXPECT_TRUE(b.bReliable);
     EXPECT_EQ(b.chIndex, 0u);
@@ -95,7 +98,7 @@ TEST(PacketAssembler, ShortPayloadSingleOpeningBunch) {
 
 // A payload whose bit count exceeds 63 -> multiple bunches, consecutive
 // ChSequence, each <=63 bits, reassembling to the original payload bit-for-bit.
-// Only the FIRST bunch opens the channel.
+// No bunch opens the channel (the server never opens ch0).
 TEST(PacketAssembler, LongPayloadFragmentsAcrossBunches) {
     PacketAssembler asm_;
     // 16 bytes = 128 bits > 63 => needs >=3 bunches (63 + 63 + 2).
@@ -109,10 +112,8 @@ TEST(PacketAssembler, LongPayloadFragmentsAcrossBunches) {
     std::vector<Bunch> bunches = AllBunches(packets);
     ASSERT_GE(bunches.size(), 2u);
 
-    // First bunch opens the channel; the rest do not.
-    EXPECT_TRUE(bunches.front().bControl);
-    EXPECT_TRUE(bunches.front().bOpen);
-    for (size_t i = 1; i < bunches.size(); ++i) {
+    // No bunch opens the channel (server never opens ch0).
+    for (size_t i = 0; i < bunches.size(); ++i) {
         EXPECT_FALSE(bunches[i].bControl) << "bunch " << i;
         EXPECT_FALSE(bunches[i].bOpen) << "bunch " << i;
     }
@@ -138,11 +139,11 @@ TEST(PacketAssembler, LongPayloadFragmentsAcrossBunches) {
     EXPECT_EQ(GatherPayloadBits(bunches), BytesToBits(payload));
 }
 
-// A second BuildControlMessagePackets call: its first bunch does NOT re-open the
-// channel and ChSequence continues incrementing.
-TEST(PacketAssembler, SecondMessageDoesNotReopenChannel) {
+// Consecutive BuildControlMessagePackets calls: neither opens the channel and
+// ChSequence continues incrementing across messages.
+TEST(PacketAssembler, ChSequenceContinuesAcrossMessages) {
     PacketAssembler asm_;
-    const std::vector<uint8_t> first = {NMTByte(NMT::Challenge), 0x02}; // opens
+    const std::vector<uint8_t> first = {NMTByte(NMT::Challenge), 0x02};
     const std::vector<uint8_t> second = {NMTByte(NMT::Welcome), 0x03};
 
     std::vector<Packet> p1 = asm_.BuildControlMessagePackets(first);
@@ -150,8 +151,8 @@ TEST(PacketAssembler, SecondMessageDoesNotReopenChannel) {
 
     ASSERT_FALSE(p1.empty());
     ASSERT_FALSE(p1[0].bunches.empty());
-    EXPECT_TRUE(p1[0].bunches[0].bControl);
-    EXPECT_TRUE(p1[0].bunches[0].bOpen);
+    EXPECT_FALSE(p1[0].bunches[0].bControl);  // server never opens ch0
+    EXPECT_FALSE(p1[0].bunches[0].bOpen);
     EXPECT_EQ(p1[0].bunches[0].chSequence, 1u);
 
     ASSERT_FALSE(p2.empty());
