@@ -11,6 +11,9 @@
 #include "Network/UDPSocket.h"
 #include "Network/BandwidthManager.h"
 #include "Network/HandshakeState.h"
+#include "Network/PacketCodec.h"
+#include "Network/PacketAssembler.h"
+#include "Network/ControlReassembler.h"
 
 class GameServer;
 
@@ -80,6 +83,16 @@ private:
 
     // Per-connection control-channel handshake state machines, keyed by clientId.
     std::unordered_map<uint32_t, std::unique_ptr<HandshakeState>> m_handshakes;
+
+    // Per-connection UE3 control-channel framing state, keyed by clientId:
+    //   * outbound    - assigns PacketId/ChSequence, fragments + acks (send side).
+    //   * reassembler - orders/dedups inbound reliable control bunches and peels
+    //                   complete messages into the handshake (receive side).
+    struct ControlState {
+        PacketCodec::PacketAssembler outbound;
+        std::unique_ptr<PacketCodec::ControlReassembler> reassembler;
+    };
+    std::unordered_map<uint32_t, ControlState> m_controlState;
     uint32_t m_nextClientId{1};
     size_t m_maxClients{256};
     uint32_t m_bandwidthLimit{65536};
@@ -93,17 +106,21 @@ private:
     // Get-or-create the handshake state machine for a client.
     HandshakeState& GetOrCreateHandshake(uint32_t clientId);
 
+    // Get-or-create the per-connection control-channel framing state (lazily wires
+    // the reassembler's message callback to the client's handshake).
+    ControlState& GetControlState(uint32_t clientId);
+
+    // Frame + encode an outbound control packet and push it to the client.
+    void SendEncodedPacket(uint32_t clientId, const PacketCodec::Packet& pkt);
+
     // ------------------------------------------------------------------------
-    //  PROVISIONAL CONTROL-CHANNEL FRAMING SEAM.
+    //  CONTROL-CHANNEL INBOUND PATH.
     //
-    //  Routes a raw inbound UDP datagram into the control-channel handshake. The
-    //  outer UE3 packet/bunch FRAMING (PacketId, ack bitfield, bunch header bits)
-    //  is NOT yet pinned - it awaits the Stream R2 packet capture (see the TODO
-    //  in ControlChannel.h §3/§9). Until then we treat the datagram payload
-    //  (from a provisional offset) AS the control-message payload and dispatch it
-    //  through ControlChannel parse. When the capture lands, the ONLY change
-    //  needed is to compute kProvisionalBunchHeaderOffset / split multiple
-    //  bunches here - the state machine downstream is framing-agnostic.
+    //  Decodes a raw inbound UDP datagram as a UE3 packet (PacketCodec::Decode),
+    //  acknowledges it, feeds its control-channel bunches to the per-connection
+    //  reassembler (which orders/dedups them and peels complete messages into the
+    //  handshake), and flushes a standalone ack if no response carried it. Wire
+    //  format: docs/RS2V_ControlChannel_WireSpec_7258.md.
     // ------------------------------------------------------------------------
     void ParseIncomingControl(uint32_t clientId, const std::vector<uint8_t>& datagram);
 };

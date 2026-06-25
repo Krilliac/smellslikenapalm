@@ -13,6 +13,9 @@ BitReader::BitReader(const uint8_t* data, size_t numBytes)
 BitReader::BitReader(const std::vector<uint8_t>& data)
     : m_data(data.empty() ? nullptr : data.data()), m_numBits(data.size() * 8) {}
 
+BitReader::BitReader(const uint8_t* data, size_t numBytes, size_t validBits)
+    : m_data(data), m_numBits(validBits <= numBytes * 8 ? validBits : numBytes * 8) {}
+
 bool BitReader::EnsureBits(size_t count) {
     if (m_overflow) {
         return false;

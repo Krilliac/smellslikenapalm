@@ -209,4 +209,54 @@ bool ParseJoin(const uint8_t* data, size_t len, JoinMessage& /*out*/, bool expec
     return !r.IsOverflowed(); // empty body
 }
 
+bool ConsumeMessage(BitReader& r, NMT& outType) {
+    const uint8_t typeByte = r.ReadByte();
+    if (r.IsOverflowed()) {
+        return false;
+    }
+    const NMT type = static_cast<NMT>(typeByte);
+
+    // Advance past the body for this NMT. Field reads MUST mirror the Parse*
+    // functions above (and ControlChannel.h spec §4). Values are discarded - we
+    // only need to advance the reader to the end of this message.
+    switch (type) {
+        case NMT::Hello:        // BYTE bLittleEndian, INT, INT, QWORD, FStr, FStr
+            r.ReadByte(); r.ReadInt32(); r.ReadInt32(); r.ReadUInt64();
+            r.ReadString(); r.ReadString();
+            break;
+        case NMT::Welcome:      // FStr, FStr, QWORD
+            r.ReadString(); r.ReadString(); r.ReadUInt64();
+            break;
+        case NMT::Upgrade:      // INT, INT
+            r.ReadInt32(); r.ReadInt32();
+            break;
+        case NMT::Challenge:    // INT, FStr
+            r.ReadInt32(); r.ReadString();
+            break;
+        case NMT::Netspeed:     // INT
+            r.ReadInt32();
+            break;
+        case NMT::Login:        // FStr, FStr, QWORD
+            r.ReadString(); r.ReadString(); r.ReadUInt64();
+            break;
+        case NMT::Failure:      // FStr
+            r.ReadString();
+            break;
+        case NMT::Join:         // empty
+            break;
+        case NMT::SteamLogin:   // INT, INT, QWORD  (spec §4 handler 0x10)
+            r.ReadInt32(); r.ReadInt32(); r.ReadUInt64();
+            break;
+        default:
+            // Unknown / not-yet-modeled body length: cannot delimit safely.
+            return false;
+    }
+
+    if (r.IsOverflowed()) {
+        return false; // incomplete: more bunches needed
+    }
+    outType = type;
+    return true;
+}
+
 } // namespace ControlChannel

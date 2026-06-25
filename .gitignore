@@ -94,3 +94,4 @@ build-tests/
 out/
 build-authtests/
 Testing/
+.claude/

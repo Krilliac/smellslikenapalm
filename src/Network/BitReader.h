@@ -21,6 +21,14 @@ public:
     BitReader(const uint8_t* data, size_t numBytes);
     explicit BitReader(const std::vector<uint8_t>& data);
 
+    // Construct with an EXPLICIT valid bit count (validBits <= numBytes*8). Reads
+    // past validBits set the overflow flag even though the backing buffer has more
+    // (zero-pad) bytes. Used to parse a bit-packed buffer whose meaningful length
+    // is not a whole number of bytes (e.g. a reassembled control-channel stream),
+    // so an incomplete trailing message is detected as overflow rather than read
+    // into pad bits.
+    BitReader(const uint8_t* data, size_t numBytes, size_t validBits);
+
     // ---- primitive bit IO ----
     bool ReadBit();                                   // returns false on overflow
     uint64_t ReadBits(int count);                     // low `count` bits, LSB-first

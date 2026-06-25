@@ -410,7 +410,19 @@ bool ConnectionManager::SendRawToClient(uint32_t clientId, const std::vector<uin
                       clientId, bytes.size());
         return false;
     }
-    return conn->SendRaw(bytes.data(), bytes.size());
+    // `bytes` is a control-channel MESSAGE payload (a ControlChannel::Build*
+    // result: <BYTE NMT><fields>). Frame it into UE3 packets - reliable control
+    // bunch(es) with a rolling PacketId/ChSequence, fragmented to MaxPacket, with
+    // any pending acks drained onto the first packet - then encode and send each.
+    ControlState& cs = GetControlState(clientId);
+    bool ok = true;
+    for (const PacketCodec::Packet& pkt : cs.outbound.BuildControlMessagePackets(bytes)) {
+        const std::vector<uint8_t> wire = PacketCodec::Encode(pkt);
+        if (!conn->SendRaw(wire.data(), wire.size())) {
+            ok = false;
+        }
+    }
+    return ok;
 }
 
 HandshakeState& ConnectionManager::GetOrCreateHandshake(uint32_t clientId) {
@@ -433,6 +445,29 @@ HandshakeState& ConnectionManager::GetOrCreateHandshake(uint32_t clientId) {
     return *raw;
 }
 
+ConnectionManager::ControlState& ConnectionManager::GetControlState(uint32_t clientId) {
+    ControlState& cs = m_controlState[clientId];
+    if (!cs.reassembler) {
+        // Reassembled control messages are dispatched straight into the client's
+        // handshake state machine. Capturing `this` + clientId is safe: both maps
+        // outlive no later than this ConnectionManager.
+        cs.reassembler = std::make_unique<PacketCodec::ControlReassembler>(
+            [this, clientId](const std::vector<uint8_t>& payload) {
+                this->GetOrCreateHandshake(clientId).HandleControlMessage(payload);
+            });
+    }
+    return cs;
+}
+
+void ConnectionManager::SendEncodedPacket(uint32_t clientId, const PacketCodec::Packet& pkt) {
+    auto conn = GetConnection(clientId);
+    if (!conn) {
+        return;
+    }
+    const std::vector<uint8_t> wire = PacketCodec::Encode(pkt);
+    conn->SendRaw(wire.data(), wire.size());
+}
+
 void ConnectionManager::ParseIncomingControl(uint32_t clientId, const std::vector<uint8_t>& datagram) {
     Logger::Trace("[ConnectionManager::ParseIncomingControl] Entry: client=%u, %zu bytes",
                   clientId, datagram.size());
@@ -441,32 +476,41 @@ void ConnectionManager::ParseIncomingControl(uint32_t clientId, const std::vecto
         return;
     }
 
-    // ===================================================================
-    //  PROVISIONAL FRAMING (TODO: correct after Stream R2 packet capture).
-    //
-    //  The real UE3 wire wraps each control message in a bunch inside an
-    //  FBitWriter packet: <PacketId><ack bits><bunch header bits><payload>.
-    //  Those header bits are version-sensitive and NOT yet pinned (see
-    //  ControlChannel.h §3/§9). Until the capture lands we treat the datagram
-    //  payload starting at kProvisionalBunchHeaderOffset as the raw control
-    //  message payload (`<BYTE NMT><fields>`) and dispatch it directly.
-    //
-    //  POST-CAPTURE: change ONLY this function - compute the real header size,
-    //  optionally split multiple bunches, and call HandleControlMessage() once
-    //  per decoded bunch payload. The state machine downstream is unchanged.
-    // ===================================================================
-    constexpr size_t kProvisionalBunchHeaderOffset = 0; // <-- correct post-capture
-
-    if (datagram.size() <= kProvisionalBunchHeaderOffset) {
-        Logger::Debug("[ConnectionManager::ParseIncomingControl] datagram smaller than provisional header offset, ignoring");
+    // Decode the UE3 packet framing (PacketId, acks, bunches) per
+    // docs/RS2V_ControlChannel_WireSpec_7258.md.
+    PacketCodec::Packet pkt = PacketCodec::Decode(datagram.data(), datagram.size());
+    if (!pkt.ok) {
+        Logger::Debug("[ConnectionManager::ParseIncomingControl] client %u: %zu bytes are not a decodable UE3 packet, ignoring",
+                      clientId, datagram.size());
         return;
     }
 
-    const uint8_t* payload = datagram.data() + kProvisionalBunchHeaderOffset;
-    size_t payloadLen = datagram.size() - kProvisionalBunchHeaderOffset;
+    ControlState& cs = GetControlState(clientId);
 
-    HandshakeState& hs = GetOrCreateHandshake(clientId);
-    hs.HandleControlMessage(payload, payloadLen);
+    // Acknowledge this received packet. UE3 clients retransmit un-acked reliable
+    // bunches indefinitely, so without this the handshake never advances. The ack
+    // rides on the next outbound packet (e.g. the handshake response), or a
+    // standalone ack packet below if we emit nothing.
+    cs.outbound.QueueAck(pkt.packetId);
+
+    // (pkt.acks confirm OUR reliable bunches arrived; with the handshake's
+    // request/response pacing there is no retransmit window to advance yet, so
+    // they are currently informational.)
+
+    // Feed control-channel bunches to the reassembler. Complete messages are
+    // dispatched to the handshake, which may emit responses via SendRawToClient
+    // (draining the queued ack onto the response packet).
+    for (const PacketCodec::Bunch& b : pkt.bunches) {
+        cs.reassembler->OnBunch(b);
+    }
+
+    // If nothing we sent carried the ack, emit a standalone ack so the client
+    // advances its reliable window (e.g. while a multi-bunch Hello is still
+    // being received).
+    if (cs.outbound.PendingAckCount() > 0) {
+        SendEncodedPacket(clientId, cs.outbound.BuildAckOnlyPacket());
+    }
+
     Logger::Trace("[ConnectionManager::ParseIncomingControl] Exit: client=%u now in state %s",
-                  clientId, HandshakePhaseName(hs.Phase()));
+                  clientId, HandshakePhaseName(GetOrCreateHandshake(clientId).Phase()));
 }

@@ -26,6 +26,8 @@
 
 #include "Network/NetMessages.h"
 
+class BitReader;
+
 namespace ControlChannel {
 
 // ===========================================================================
@@ -135,6 +137,18 @@ bool ParseJoin(const uint8_t* data, size_t len, JoinMessage& out, bool expectTyp
 // Peek the leading message-type byte of a payload without fully parsing.
 // Returns false if the buffer is empty.
 bool PeekType(const uint8_t* data, size_t len, NMT& outType);
+
+// Consume the first complete control message from `r` (its leading type BYTE
+// plus the body fields for that NMT), advancing `r` past it. Returns true and
+// sets `outType` on success; returns false (with `r` overflowed, position
+// unspecified) if `r` does not yet hold a complete message OR the NMT is not a
+// recognized control message whose body length we can determine.
+//
+// This is the message DELIMITER used by the inbound reassembler to peel complete
+// messages off the continuous control-channel bit stream (UE3 has no per-message
+// length marker - the size is implicit in the NMT's fields). Its per-NMT field
+// reads MUST stay in lockstep with the Parse* functions above.
+bool ConsumeMessage(BitReader& r, NMT& outType);
 
 // ---------------------------------------------------------------------------
 //  TODO (spec §3, §9): UE3 packet/bunch framing.
