@@ -139,7 +139,7 @@ void ConnectionManager::HandleIncomingPacket(const std::vector<uint8_t>& data, c
         std::string hex; hex.reserve(data.size() * 2);
         static const char* H = "0123456789abcdef";
         for (uint8_t b : data) { hex += H[b >> 4]; hex += H[b & 0xF]; }
-        Logger::Info("[WIRE<-] client %u %zuB: %s", clientId, data.size(), hex.c_str());
+        Logger::Debug("[WIRE<-] client %u %zuB: %s", clientId, data.size(), hex.c_str());
     }
 
     auto conn = m_clients[addr];
@@ -473,7 +473,7 @@ bool ConnectionManager::SendRawToClient(uint32_t clientId, const std::vector<uin
             std::string hex; hex.reserve(wire.size() * 2);
             static const char* H = "0123456789abcdef";
             for (uint8_t b : wire) { hex += H[b >> 4]; hex += H[b & 0xF]; }
-            Logger::Info("[WIRE->] client %u %zuB: %s", clientId, wire.size(), hex.c_str());
+            Logger::Debug("[WIRE->] client %u %zuB: %s", clientId, wire.size(), hex.c_str());
         }
         if (!conn->SendRaw(wire.data(), wire.size())) {
             ok = false;
