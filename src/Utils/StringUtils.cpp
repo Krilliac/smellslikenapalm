@@ -1,4 +1,5 @@
 #include "Utils/StringUtils.h"
+#include <algorithm>
 #include "Utils/Logger.h"
 
 namespace StringUtils {

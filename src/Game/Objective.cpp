@@ -1,6 +1,7 @@
 // src/Game/Objective.cpp – Implementation for Objective
 
 #include "Game/Objective.h"
+#include <algorithm>
 #include "Utils/Logger.h"
 
 Objective::Objective(uint32_t id, ObjectiveType type, const Vector3& pos, float radius)
