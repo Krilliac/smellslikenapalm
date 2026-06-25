@@ -389,6 +389,14 @@ void ConnectionManager::FireClientLoggedIn(const ClientLoggedInEvent& ev) {
     if (auto conn = GetConnection(ev.clientId)) {
         if (!ev.options.PlayerName().empty()) conn->SetPlayerName(ev.options.PlayerName());
     }
+
+    // World-replication bootstrap goes out HERE - immediately after NMT_Welcome -
+    // exactly as the official server does (capture: Welcome f162 -> PackageMap
+    // f167-f185, BEFORE the client's "packages verified" reply at f227). Sending it
+    // on Join instead would deadlock a real client: it won't send Join/ready until
+    // it has reconciled the PackageMap. See docs/RS2V_PostJoin_Replication_7258.md.
+    SendReplicationBootstrap(ev.clientId);
+
     if (m_clientLoggedInCb) {
         m_clientLoggedInCb(ev);
     } else {
@@ -405,12 +413,10 @@ void ConnectionManager::FireClientJoined(const ClientJoinedEvent& ev) {
     if (auto conn = GetConnection(ev.clientId)) {
         conn->SetHandshakeComplete(true);
     }
-
-    // Kick off world replication: send the PackageMap export (+ bootstrap actors)
-    // so the client can leave the loading screen. This must go out BEFORE the game
-    // layer reacts, so the client has the package map before any actor references.
-    SendReplicationBootstrap(ev.clientId);
-
+    // (The PackageMap export is sent earlier, on ClientLoggedIn / right after
+    // Welcome - see FireClientLoggedIn. The bootstrap ACTOR channels belong here,
+    // after the client confirms it Joined; TODO once the actor-channel send path
+    // exists - they are ChType 2 bOpen bunches on ChIndex 2-8, not ch0 control.)
     if (m_clientJoinedCb) {
         m_clientJoinedCb(ev);
     } else {

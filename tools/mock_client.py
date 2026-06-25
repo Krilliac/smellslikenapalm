@@ -359,18 +359,18 @@ def react(host, port):
     #    S2C bunches at the server-send bound 1500*8=12000 (asymmetric: the client
     #    sends C2S at 2048, the server sends S2C at ~1500). See PacketCodec.h.
     SERVER_BD = 1500 * 8
-    step("SteamLogin 0x10", bytes([0x10, 0x00, 0x00, 0x00]), 2048, bytes([0x01]), SERVER_BD)
+    login_got = step("SteamLogin 0x10", bytes([0x10, 0x00, 0x00, 0x00]), 2048, bytes([0x01]), SERVER_BD)
+    pkgmap = sum(1 for d in login_got for b2 in d.get("bunches", [])
+                 if b2["chIndex"] == 0 and b2["nmt"] == 0x07)
+    if pkgmap:
+        print(f"     REPLICATION: server sent {pkgmap} PackageMap (NMT 0x07) bunch(es) right after Welcome")
+    else:
+        print("     (no PackageMap after Welcome - replication bootstrap not loaded)")
     # 4. Join (0x09) -> server reaches Joined; post-Join the server should send the
     #    world-replication bootstrap (PackageMap export = NMT 0x07 bunches). If the
     #    server has no bootstrap data loaded, this is just an ack (no 0x07) - which
     #    is still a PASS for the handshake, with a note.
-    got = step("Join 0x09", bytes([0x09]), 2048, None, SERVER_BD)
-    pkgmap_bunches = sum(1 for d in got for b2 in d.get("bunches", [])
-                         if b2["chIndex"] == 0 and b2["nmt"] == 0x07)
-    if pkgmap_bunches:
-        print(f"     REPLICATION: server sent {pkgmap_bunches} PackageMap (NMT 0x07) bunch(es) after Join")
-    else:
-        print("     (no PackageMap bunches after Join - replication bootstrap not loaded)")
+    step("Join 0x09", bytes([0x09]), 2048, None, SERVER_BD)
 
     sock.close()
     print("\n=== react: " + ("PASS - handshake sends are well-formed" if ok else "FAIL - see above") + " ===")
