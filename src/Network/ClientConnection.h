@@ -29,6 +29,10 @@ public:
 
     // Packet I/O
     bool                SendPacket(const Packet& pkt);
+
+    // Send raw bytes (no Packet tag/serialize wrapper). Used for UE3
+    // control-channel message payloads produced by ControlChannel::Build*.
+    bool                SendRaw(const uint8_t* data, size_t len);
     bool                ReceiveRaw(std::vector<uint8_t>& outData, PacketMetadata& meta);
     Packet              LastPacket() const;
     std::vector<uint8_t> LastRawPacket() const;

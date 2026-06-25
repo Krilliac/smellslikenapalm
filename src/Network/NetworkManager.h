@@ -6,6 +6,7 @@
 #include <vector>
 #include "Network/BandwidthManager.h"
 #include "Network/Packet.h"
+#include "Network/HandshakeState.h"  // ClientLoggedIn/Joined event + callback types
 
 class GameServer;
 class ConnectionManager;
@@ -36,6 +37,12 @@ public:
 
     uint32_t GetBandwidthLimit() const;
     int GetPacketsPerSecond() const;
+
+    // ---- Game-facing handshake observer subscription (Stream B hooks here) --
+    // These forward to ConnectionManager so the Game layer can react to the
+    // control-channel handshake without depending on Network internals.
+    void SetClientLoggedInCallback(ClientLoggedInCallback cb);
+    void SetClientJoinedCallback(ClientJoinedCallback cb);
 
 private:
     GameServer*                                m_server;

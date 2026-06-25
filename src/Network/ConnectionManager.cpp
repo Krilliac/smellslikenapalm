@@ -7,6 +7,8 @@
 #include "Network/Packet.h"
 #include "Network/BandwidthManager.h"
 #include "Protocol/ReverseEngineering/ProtocolDecoder.h"
+#include "Network/HandshakeState.h"
+#include "Network/ControlChannel.h"
 #include "../../telemetry/TelemetryManager.h"
 #include <chrono>
 
@@ -141,6 +143,12 @@ void ConnectionManager::HandleIncomingPacket(const std::vector<uint8_t>& data, c
                   pkt.GetTag().c_str(), clientId, pkt.GetPayloadSize());
     conn->UpdateLastHeartbeat();
     Logger::Debug("[ConnectionManager::HandleIncomingPacket] Updated heartbeat for client %u", clientId);
+
+    // ---- NEW: drive the control-channel handshake state machine ----
+    // Route the raw datagram into the provisional control-channel framing seam.
+    // This is the path for NEW connections (handshake). It runs ALONGSIDE the
+    // legacy packet-callback path below so existing callers are not broken.
+    ParseIncomingControl(clientId, data);
 
     // Feed parsed packet to protocol decoder for structure analysis
     GetProtocolDecoder().OnPacketReceived(clientId, pkt.RawData(), pkt.GetTag());
@@ -309,6 +317,7 @@ void ConnectionManager::RemoveStaleConnections() {
             Logger::Debug("[ConnectionManager::RemoveStaleConnections] Client %u exceeded timeout (%lld > %d), marking for removal",
                           conn->GetClientId(), (long long)elapsed, timeoutSecs);
             GetProtocolDecoder().OnClientDisconnected(conn->GetClientId());
+            m_handshakes.erase(conn->GetClientId());
             conn->MarkDisconnected();
             toRemove.push_back(kv.first);
 
@@ -353,4 +362,111 @@ void ConnectionManager::SetMaxClients(size_t maxClients) {
 size_t ConnectionManager::GetMaxClients() const {
     Logger::Trace("[ConnectionManager::GetMaxClients] Entry/Exit: returning %zu", m_maxClients);
     return m_maxClients;
+}
+
+// ===========================================================================
+//  Game-facing handshake observer interface
+// ===========================================================================
+
+void ConnectionManager::SetClientLoggedInCallback(ClientLoggedInCallback cb) {
+    Logger::Debug("[ConnectionManager::SetClientLoggedInCallback] %s", cb ? "set" : "cleared");
+    m_clientLoggedInCb = std::move(cb);
+}
+
+void ConnectionManager::SetClientJoinedCallback(ClientJoinedCallback cb) {
+    Logger::Debug("[ConnectionManager::SetClientJoinedCallback] %s", cb ? "set" : "cleared");
+    m_clientJoinedCb = std::move(cb);
+}
+
+void ConnectionManager::FireClientLoggedIn(const ClientLoggedInEvent& ev) {
+    Logger::Info("[ConnectionManager::FireClientLoggedIn] client %u logged in (steamId=%llu, name='%s')",
+                 ev.clientId, (unsigned long long)ev.steamId, ev.options.PlayerName().c_str());
+    // Mirror the parsed player name onto the connection for convenience.
+    if (auto conn = GetConnection(ev.clientId)) {
+        if (!ev.options.PlayerName().empty()) conn->SetPlayerName(ev.options.PlayerName());
+    }
+    if (m_clientLoggedInCb) {
+        m_clientLoggedInCb(ev);
+    } else {
+        Logger::Debug("[ConnectionManager::FireClientLoggedIn] no Game subscriber for ClientLoggedIn (client %u)",
+                      ev.clientId);
+    }
+}
+
+void ConnectionManager::FireClientJoined(const ClientJoinedEvent& ev) {
+    Logger::Info("[ConnectionManager::FireClientJoined] client %u joined", ev.clientId);
+    if (m_clientJoinedCb) {
+        m_clientJoinedCb(ev);
+    } else {
+        Logger::Debug("[ConnectionManager::FireClientJoined] no Game subscriber for ClientJoined (client %u)",
+                      ev.clientId);
+    }
+}
+
+bool ConnectionManager::SendRawToClient(uint32_t clientId, const std::vector<uint8_t>& bytes) {
+    auto conn = GetConnection(clientId);
+    if (!conn) {
+        Logger::Error("[ConnectionManager::SendRawToClient] No connection for client %u (%zu bytes dropped)",
+                      clientId, bytes.size());
+        return false;
+    }
+    return conn->SendRaw(bytes.data(), bytes.size());
+}
+
+HandshakeState& ConnectionManager::GetOrCreateHandshake(uint32_t clientId) {
+    auto it = m_handshakes.find(clientId);
+    if (it != m_handshakes.end()) return *it->second;
+
+    // The handshake's raw-send callback funnels outbound control bytes back to
+    // this connection. Capturing `this` + clientId is safe: the handshake is
+    // owned by m_handshakes and erased no later than this ConnectionManager.
+    auto hs = std::make_unique<HandshakeState>(
+        clientId,
+        [this, clientId](const std::vector<uint8_t>& payload) {
+            this->SendRawToClient(clientId, payload);
+        },
+        [this](const ClientLoggedInEvent& ev) { this->FireClientLoggedIn(ev); },
+        [this](const ClientJoinedEvent& ev)   { this->FireClientJoined(ev); });
+    auto* raw = hs.get();
+    m_handshakes[clientId] = std::move(hs);
+    Logger::Debug("[ConnectionManager::GetOrCreateHandshake] Created handshake for client %u", clientId);
+    return *raw;
+}
+
+void ConnectionManager::ParseIncomingControl(uint32_t clientId, const std::vector<uint8_t>& datagram) {
+    Logger::Trace("[ConnectionManager::ParseIncomingControl] Entry: client=%u, %zu bytes",
+                  clientId, datagram.size());
+    if (datagram.empty()) {
+        Logger::Trace("[ConnectionManager::ParseIncomingControl] empty datagram, ignoring");
+        return;
+    }
+
+    // ===================================================================
+    //  PROVISIONAL FRAMING (TODO: correct after Stream R2 packet capture).
+    //
+    //  The real UE3 wire wraps each control message in a bunch inside an
+    //  FBitWriter packet: <PacketId><ack bits><bunch header bits><payload>.
+    //  Those header bits are version-sensitive and NOT yet pinned (see
+    //  ControlChannel.h §3/§9). Until the capture lands we treat the datagram
+    //  payload starting at kProvisionalBunchHeaderOffset as the raw control
+    //  message payload (`<BYTE NMT><fields>`) and dispatch it directly.
+    //
+    //  POST-CAPTURE: change ONLY this function - compute the real header size,
+    //  optionally split multiple bunches, and call HandleControlMessage() once
+    //  per decoded bunch payload. The state machine downstream is unchanged.
+    // ===================================================================
+    constexpr size_t kProvisionalBunchHeaderOffset = 0; // <-- correct post-capture
+
+    if (datagram.size() <= kProvisionalBunchHeaderOffset) {
+        Logger::Debug("[ConnectionManager::ParseIncomingControl] datagram smaller than provisional header offset, ignoring");
+        return;
+    }
+
+    const uint8_t* payload = datagram.data() + kProvisionalBunchHeaderOffset;
+    size_t payloadLen = datagram.size() - kProvisionalBunchHeaderOffset;
+
+    HandshakeState& hs = GetOrCreateHandshake(clientId);
+    hs.HandleControlMessage(payload, payloadLen);
+    Logger::Trace("[ConnectionManager::ParseIncomingControl] Exit: client=%u now in state %s",
+                  clientId, HandshakePhaseName(hs.Phase()));
 }

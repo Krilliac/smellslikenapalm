@@ -10,6 +10,7 @@
 #include "Network/ClientConnection.h"
 #include "Network/UDPSocket.h"
 #include "Network/BandwidthManager.h"
+#include "Network/HandshakeState.h"
 
 class GameServer;
 
@@ -26,6 +27,19 @@ public:
 
     // Set callback for received packets (used by NetworkManager)
     void SetPacketCallback(PacketCallback cb);
+
+    // ---- Game-facing handshake observer interface --------------------------
+    // The Game layer (Stream B) subscribes to these to react to control-channel
+    // handshake progress WITHOUT the Network layer depending on Game/. The
+    // handshake state machine calls FireClientLoggedIn / FireClientJoined.
+    void SetClientLoggedInCallback(ClientLoggedInCallback cb);
+    void SetClientJoinedCallback(ClientJoinedCallback cb);
+    void FireClientLoggedIn(const ClientLoggedInEvent& ev);
+    void FireClientJoined(const ClientJoinedEvent& ev);
+
+    // Send raw control-channel bytes (a ControlChannel::Build* payload) to a
+    // client without the Packet tag/serialize wrapper. Used by HandshakeState.
+    bool SendRawToClient(uint32_t clientId, const std::vector<uint8_t>& bytes);
 
     // Main loop: receive raw data and dispatch to handlers
     void PumpNetwork();
@@ -57,8 +71,15 @@ private:
     std::shared_ptr<UDPSocket> m_socket;
     PacketCallback m_packetCallback;
 
+    // Game-facing handshake observers (set by Stream B; null = not subscribed).
+    ClientLoggedInCallback m_clientLoggedInCb;
+    ClientJoinedCallback   m_clientJoinedCb;
+
     // Client lookup by address
     std::unordered_map<ClientAddress, std::shared_ptr<ClientConnection>> m_clients;
+
+    // Per-connection control-channel handshake state machines, keyed by clientId.
+    std::unordered_map<uint32_t, std::unique_ptr<HandshakeState>> m_handshakes;
     uint32_t m_nextClientId{1};
     size_t m_maxClients{256};
     uint32_t m_bandwidthLimit{65536};
@@ -68,4 +89,21 @@ private:
 
     // Helpers
     void HandleIncomingPacket(const std::vector<uint8_t>& data, const ClientAddress& addr);
+
+    // Get-or-create the handshake state machine for a client.
+    HandshakeState& GetOrCreateHandshake(uint32_t clientId);
+
+    // ------------------------------------------------------------------------
+    //  PROVISIONAL CONTROL-CHANNEL FRAMING SEAM.
+    //
+    //  Routes a raw inbound UDP datagram into the control-channel handshake. The
+    //  outer UE3 packet/bunch FRAMING (PacketId, ack bitfield, bunch header bits)
+    //  is NOT yet pinned - it awaits the Stream R2 packet capture (see the TODO
+    //  in ControlChannel.h §3/§9). Until then we treat the datagram payload
+    //  (from a provisional offset) AS the control-message payload and dispatch it
+    //  through ControlChannel parse. When the capture lands, the ONLY change
+    //  needed is to compute kProvisionalBunchHeaderOffset / split multiple
+    //  bunches here - the state machine downstream is framing-agnostic.
+    // ------------------------------------------------------------------------
+    void ParseIncomingControl(uint32_t clientId, const std::vector<uint8_t>& datagram);
 };

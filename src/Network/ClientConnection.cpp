@@ -87,6 +87,31 @@ bool ClientConnection::SendPacket(const Packet& pkt) {
     return ok;
 }
 
+bool ClientConnection::SendRaw(const uint8_t* data, size_t len) {
+    Logger::Trace("[ClientConnection::SendRaw] Entry: clientId=%u, len=%zu", m_clientId, len);
+    if (!m_socket || !data || len == 0) {
+        Logger::Warn("[ClientConnection::SendRaw] Client %u: invalid socket/data, dropping %zu bytes",
+                     m_clientId, len);
+        return false;
+    }
+    if (!CanSend((uint32_t)len)) {
+        Logger::Warn("[ClientConnection::SendRaw] Bandwidth limit exceeded for client %u, dropping %zu raw bytes",
+                     m_clientId, len);
+        return false;
+    }
+    bool ok = m_socket->SendTo(m_ip, m_port, data, len);
+    if (ok) {
+        OnBytesSent((uint32_t)len);
+        Logger::Debug("[ClientConnection::SendRaw] Sent %zu raw bytes to client %u (%s:%u)",
+                      len, m_clientId, m_ip.c_str(), m_port);
+    } else {
+        Logger::Error("[ClientConnection::SendRaw] Failed to send %zu raw bytes to client %u (%s:%u)",
+                      len, m_clientId, m_ip.c_str(), m_port);
+    }
+    Logger::Trace("[ClientConnection::SendRaw] Exit: returning %s", ok ? "true" : "false");
+    return ok;
+}
+
 bool ClientConnection::ReceiveRaw(std::vector<uint8_t>& outData, PacketMetadata& meta) {
     Logger::Trace("[ClientConnection::ReceiveRaw] Entry: clientId=%u", m_clientId);
     outData.resize(1500);

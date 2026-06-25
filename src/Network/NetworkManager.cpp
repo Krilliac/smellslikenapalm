@@ -202,6 +202,18 @@ int NetworkManager::GetPacketsPerSecond() const {
     return m_packetsThisTick;
 }
 
+void NetworkManager::SetClientLoggedInCallback(ClientLoggedInCallback cb) {
+    Logger::Debug("[NetworkManager::SetClientLoggedInCallback] forwarding to ConnectionManager");
+    if (m_connMgr) m_connMgr->SetClientLoggedInCallback(std::move(cb));
+    else Logger::Warn("[NetworkManager::SetClientLoggedInCallback] ConnectionManager null, callback dropped");
+}
+
+void NetworkManager::SetClientJoinedCallback(ClientJoinedCallback cb) {
+    Logger::Debug("[NetworkManager::SetClientJoinedCallback] forwarding to ConnectionManager");
+    if (m_connMgr) m_connMgr->SetClientJoinedCallback(std::move(cb));
+    else Logger::Warn("[NetworkManager::SetClientJoinedCallback] ConnectionManager null, callback dropped");
+}
+
 void NetworkManager::OnPacketReceived(uint32_t clientId, const Packet& pkt, const PacketMetadata& meta) {
     m_packetsThisTick++;
     Logger::Trace("[NetworkManager::OnPacketReceived] Entry: clientId=%u, tag='%s', payloadSize=%u",
