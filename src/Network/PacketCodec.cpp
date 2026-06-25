@@ -51,38 +51,46 @@ void CopyBits(BitReader& in, BitWriter& out, uint32_t count) {
     }
 }
 
-// Parse a single packet out of the first `numBytes` bytes of `data`, where the
-// terminator is taken as the high bit of byte (numBytes-1). Returns true and
-// fills `out` only if the parse lands EXACTLY on the terminator with no
-// overflow (i.e. these bytes are a complete, well-formed UE3 packet).
-bool TryDecodeExact(const uint8_t* data, size_t numBytes, Packet& out) {
+} // namespace
+
+Packet Decode(const uint8_t* data, size_t numBytes) {
+    // UE3 receive semantics (UNetConnection::ReceivedPacket): the readable bit
+    // count is the high set bit of the LAST byte (the terminator '1' bit); data
+    // lives strictly below it. We set the BitReader's valid bits to that
+    // terminator so reads cannot run past it, then parse entries until end-of-
+    // stream (AtEnd), exactly like the engine's loop.
+    //
+    // IMPORTANT: the final entry's SerializeInt naturally tries to read one bit
+    // past the terminator (e.g. a trailing AckPacketId = ReadInt(16384), which
+    // keeps consuming bits until value+mask >= max). That terminal overflow is
+    // BENIGN - the engine tolerates it via AtEnd(). So we do NOT reject on it; we
+    // only refuse a datagram whose PacketId itself can't be read. (This also makes
+    // a datagram-level trailing byte parse as a harmless trailing ack rather than
+    // requiring a length-walk.)
+    Packet pkt;
     if (numBytes == 0) {
-        return false;
+        return pkt; // ok == false
     }
     const int hb = HighBit(data[numBytes - 1]);
     if (hb < 0) {
-        return false; // last byte all-zero: not a clean packet boundary
+        return pkt; // last byte all-zero: not a clean UE3 packet boundary
     }
     const size_t terminatorBit = numBytes * 8 - 8 + static_cast<size_t>(hb);
 
-    BitReader r(data, numBytes);
-    Packet pkt;
+    BitReader r(data, numBytes, terminatorBit);
     pkt.packetId = r.ReadInt(static_cast<uint32_t>(kMaxPacketId));
     if (r.IsOverflowed()) {
-        return false;
+        return pkt; // can't even read the PacketId -> not a UE3 packet
     }
 
-    while (r.BitPos() < terminatorBit) {
+    while (r.BitPos() < terminatorBit && !r.IsOverflowed()) {
         const bool isAck = r.ReadBit();
         if (r.IsOverflowed()) {
-            return false;
+            break; // reached the terminator
         }
         if (isAck) {
-            const uint32_t ack = r.ReadInt(static_cast<uint32_t>(kMaxPacketId));
-            if (r.IsOverflowed()) {
-                return false;
-            }
-            pkt.acks.push_back(ack);
+            // A trailing ack may terminal-overflow (benign); keep its value.
+            pkt.acks.push_back(r.ReadInt(static_cast<uint32_t>(kMaxPacketId)));
             continue;
         }
 
@@ -103,46 +111,21 @@ bool TryDecodeExact(const uint8_t* data, size_t numBytes, Packet& out) {
         }
         const uint32_t bunchDataBits = r.ReadInt(kBunchDataBitsMax);
         if (r.IsOverflowed()) {
-            return false;
+            break; // truncated bunch header at the terminator - drop the partial
         }
 
         BitWriter payloadWriter;
         CopyBits(r, payloadWriter, bunchDataBits);
         if (r.IsOverflowed()) {
-            return false;
+            break; // truncated payload - drop the partial bunch
         }
         b.payload = payloadWriter.GetBytes();
         b.payloadBits = bunchDataBits;
         pkt.bunches.push_back(std::move(b));
     }
 
-    // Must land exactly on the terminator (no partial entry straddling it).
-    if (r.BitPos() != terminatorBit || r.IsOverflowed()) {
-        return false;
-    }
-
-    pkt.ok = true;
-    out = std::move(pkt);
-    return true;
-}
-
-} // namespace
-
-Packet Decode(const uint8_t* data, size_t numBytes) {
-    // Try the full datagram first; if it does not parse to an exact terminator
-    // (datagram carries trailing bytes after the packet's own terminator byte),
-    // drop trailing bytes and retry. The spec only ever sees a 1-byte trailer, so
-    // cap the retry at a small constant instead of walking every length (the old
-    // n..1 loop was O(n^2) per datagram and pathological for large non-UE3 frames).
-    constexpr size_t kMaxTrailerRetry = 3;
-    const size_t lo = (numBytes > kMaxTrailerRetry) ? (numBytes - kMaxTrailerRetry) : 0;
-    for (size_t n = numBytes; n > lo; --n) {
-        Packet pkt;
-        if (TryDecodeExact(data, n, pkt)) {
-            return pkt;
-        }
-    }
-    return Packet{}; // ok == false: empty / all-zero / unparseable
+    pkt.ok = true; // valid PacketId + best-effort entries (UE3-lenient)
+    return pkt;
 }
 
 std::vector<uint8_t> Encode(const Packet& pkt) {
