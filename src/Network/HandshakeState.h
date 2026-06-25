@@ -109,6 +109,12 @@ public:
     bool IsRejected() const { return m_phase == HandshakePhase::Rejected; }
     bool IsJoined() const { return m_phase == HandshakePhase::Joined; }
 
+    // True once the StatelessConnect handshake (0x1d/0x1e/0x1f/0x20) is done and
+    // the NMT phase has begun. The packet framing's MaxPacket grows from 8 to the
+    // established value at this point, so the decoder uses this to pick the right
+    // BunchDataBits bound.
+    bool IsControlHandshakeComplete() const { return m_controlHandshakeComplete; }
+
     // The (stubbed, accepted-blindly) identity captured from Hello.
     uint64_t SteamId() const { return m_steamId; }
     const std::string& LeechSessionId() const { return m_leechSessionId; }
@@ -133,6 +139,10 @@ private:
     void OnHello(const uint8_t* data, size_t len);
     void OnNetspeed(const uint8_t* data, size_t len);
     void OnLogin(const uint8_t* data, size_t len);
+    // Shared login completion: send Welcome, fire ClientLoggedIn, -> WelcomeSent.
+    // Called by OnLogin (NMT_Login 0x05) and the Steam login path (0x10/0x12),
+    // whichever the client actually uses (the EOS build uses Steam login).
+    void CompleteLogin();
     void OnJoin(const uint8_t* data, size_t len);
     void HandleSteamAuthStub(NMT type);
 

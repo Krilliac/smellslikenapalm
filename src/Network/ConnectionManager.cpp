@@ -484,9 +484,16 @@ bool ConnectionManager::ParseIncomingControl(uint32_t clientId, const std::vecto
         return false;
     }
 
-    // Decode the UE3 packet framing (PacketId, acks, bunches) per
-    // docs/RS2V_ControlChannel_WireSpec_7258.md.
-    PacketCodec::Packet pkt = PacketCodec::Decode(datagram.data(), datagram.size());
+    // Decode the UE3 packet framing (PacketId, acks, bunches). MaxPacket (which
+    // sets the BunchDataBits SerializeInt bound) is phase-dependent: 8 during the
+    // StatelessConnect handshake, ~512 once the NMT phase begins. Pick it from the
+    // connection's handshake state. See docs/RS2V_ControlChannel_WireSpec_7258.md.
+    const uint32_t maxPacketBytes =
+        GetOrCreateHandshake(clientId).IsControlHandshakeComplete()
+            ? PacketCodec::kNmtMaxPacketBytes
+            : PacketCodec::kHandshakeMaxPacketBytes;
+    PacketCodec::Packet pkt =
+        PacketCodec::Decode(datagram.data(), datagram.size(), maxPacketBytes);
     if (!pkt.ok) {
         Logger::Debug("[ConnectionManager::ParseIncomingControl] client %u: %zu bytes are not a decodable UE3 packet, ignoring",
                       clientId, datagram.size());

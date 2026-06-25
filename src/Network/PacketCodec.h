@@ -29,8 +29,19 @@ constexpr uint32_t kControlChannelType = 1; // ChType for the control channel [U
 // BunchDataBits = ReadInt(MaxPacket*8). MaxPacket is 8 during the control
 // handshake => bound 64 (so a control bunch carries <=63 data bits and large
 // messages fragment across many reliable bunches). See spec §3.
-constexpr uint32_t kHandshakeMaxPacketBytes = 8;
-constexpr uint32_t kBunchDataBitsMax = kHandshakeMaxPacketBytes * 8; // 64
+// MaxPacket is phase-dependent on the wire: 8 during the StatelessConnect
+// handshake (tiny bunches), but it GROWS once the connection is established and
+// the NMT phase begins (the real client's Hello bunch is 504 data bits, Login is
+// 6256). BunchDataBits = SerializeInt(MaxPacket*8), so the SerializeInt WIDTH -
+// and thus where the payload starts - changes with MaxPacket. The caller passes
+// the right value per connection phase (see PacketCodec::Decode/Encode).
+constexpr uint32_t kHandshakeMaxPacketBytes = 8;     // StatelessConnect phase
+// 1024 is the empirically-clean value: the NMT-phase Login bunch carries 6256
+// BunchDataBits, which only decodes if MaxPacket*8 > 6256 (=> >=783); the whole
+// 803-byte Login datagram parses byte-exactly at 1024. (Binary static default is
+// 512, but the live connection's MaxPacket is negotiated up by the NMT phase.)
+constexpr uint32_t kNmtMaxPacketBytes       = 1024;  // established / NMT phase
+constexpr uint32_t kBunchDataBitsMax = kHandshakeMaxPacketBytes * 8; // 64 (handshake default)
 
 // One decoded bunch. `payload` holds the bunch data bits packed LSB-first (the
 // same layout BitReader/BitWriter use); `payloadBits` is the exact bit count.
@@ -54,13 +65,18 @@ struct Packet {
     bool ok = false;                // false if the datagram was malformed/overflowed
 };
 
-// Decode a raw UDP datagram (one UE3 packet) into its structure. Never reads
-// out of bounds; sets Packet::ok = false on any malformed/truncated input.
-Packet Decode(const uint8_t* data, size_t numBytes);
+// Decode a raw UDP datagram (one UE3 packet) into its structure. `maxPacketBytes`
+// is the connection's MaxPacket for the current phase (kHandshakeMaxPacketBytes
+// during StatelessConnect, kNmtMaxPacketBytes once established) - it sets the
+// SerializeInt bound for BunchDataBits. Never reads out of bounds; sets
+// Packet::ok = false on any malformed/truncated input.
+Packet Decode(const uint8_t* data, size_t numBytes,
+              uint32_t maxPacketBytes = kHandshakeMaxPacketBytes);
 
 // Encode a packet (PacketId, then acks, then bunches, then the terminator '1'
-// bit + zero pad to a byte boundary) into raw wire bytes. The inverse of Decode:
-// decoding a frame and re-encoding the result must reproduce the original bytes.
-std::vector<uint8_t> Encode(const Packet& pkt);
+// bit + zero pad to a byte boundary) into raw wire bytes. `maxPacketBytes` must
+// match the phase the peer will decode with. The inverse of Decode.
+std::vector<uint8_t> Encode(const Packet& pkt,
+                            uint32_t maxPacketBytes = kHandshakeMaxPacketBytes);
 
 } // namespace PacketCodec

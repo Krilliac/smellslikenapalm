@@ -53,7 +53,8 @@ void CopyBits(BitReader& in, BitWriter& out, uint32_t count) {
 
 } // namespace
 
-Packet Decode(const uint8_t* data, size_t numBytes) {
+Packet Decode(const uint8_t* data, size_t numBytes, uint32_t maxPacketBytes) {
+    const uint32_t bunchDataBitsMax = maxPacketBytes * 8;
     // UE3 receive semantics (UNetConnection::ReceivedPacket): the readable bit
     // count is the high set bit of the LAST byte (the terminator '1' bit); data
     // lives strictly below it. We set the BitReader's valid bits to that
@@ -109,7 +110,7 @@ Packet Decode(const uint8_t* data, size_t numBytes) {
         if (b.bReliable || b.bOpen) {
             b.chType = r.ReadInt(kChTypeMax);
         }
-        const uint32_t bunchDataBits = r.ReadInt(kBunchDataBitsMax);
+        const uint32_t bunchDataBits = r.ReadInt(bunchDataBitsMax);
         if (r.IsOverflowed()) {
             break; // truncated bunch header at the terminator - drop the partial
         }
@@ -128,7 +129,8 @@ Packet Decode(const uint8_t* data, size_t numBytes) {
     return pkt;
 }
 
-std::vector<uint8_t> Encode(const Packet& pkt) {
+std::vector<uint8_t> Encode(const Packet& pkt, uint32_t maxPacketBytes) {
+    const uint32_t bunchDataBitsMax = maxPacketBytes * 8;
     BitWriter w;
 
     w.WriteInt(pkt.packetId, static_cast<uint32_t>(kMaxPacketId));
@@ -153,7 +155,7 @@ std::vector<uint8_t> Encode(const Packet& pkt) {
         if (b.bReliable || b.bOpen) {
             w.WriteInt(b.chType, kChTypeMax);
         }
-        w.WriteInt(b.payloadBits, kBunchDataBitsMax);
+        w.WriteInt(b.payloadBits, bunchDataBitsMax);
 
         // Write the payloadBits payload bits LSB-first from the packed payload.
         BitReader payloadReader(b.payload);

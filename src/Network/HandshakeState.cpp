@@ -231,6 +231,14 @@ void HandshakeState::OnLogin(const uint8_t* data, size_t len) {
                  m_clientId, login.url.c_str(), m_loginOptions.Map().c_str(),
                  m_loginOptions.PlayerName().c_str(), m_loginOptions.Team());
 
+    CompleteLogin();
+}
+
+void HandshakeState::CompleteLogin() {
+    if (m_phase != HandshakePhase::ChallengeSent &&
+        m_phase != HandshakePhase::AwaitingLogin) {
+        return; // already past login (e.g. a retransmitted Steam login)
+    }
     // Send Welcome with placeholder map/gameclass (Stream B will make these real).
     ControlChannel::WelcomeMessage welcome;
     welcome.levelName = "VNTE-CuChi";                          // placeholder Map
@@ -239,7 +247,7 @@ void HandshakeState::OnLogin(const uint8_t* data, size_t len) {
     Emit(ControlChannel::BuildWelcome(welcome));
 
     m_phase = HandshakePhase::WelcomeSent;
-    Logger::Info("[HandshakeState] client %u: Login accepted -> Welcome sent, state=%s",
+    Logger::Info("[HandshakeState] client %u: login complete -> Welcome sent, state=%s",
                  m_clientId, HandshakePhaseName(m_phase));
 
     // Fire the Game-facing ClientLoggedIn event (no direct Game/ dependency).
@@ -270,8 +278,16 @@ void HandshakeState::OnJoin(const uint8_t* /*data*/, size_t /*len*/) {
 }
 
 void HandshakeState::HandleSteamAuthStub(NMT type) {
-    // Steam auth (NMT_SteamAuth / NMT_SteamLogin): accept blindly. No ticket
-    // validation is performed - this is a deliberate stub for Stream A.
-    Logger::Info("[HandshakeState] client %u: Steam auth message type=0x%02X accepted blindly (STUB, no validation)",
+    // Steam auth (NMT_SteamAuth 0x12 / NMT_SteamLogin 0x10): accept blindly, no
+    // ticket validation. In the RS2 EOS build this Steam-family message - not the
+    // classic NMT_Login (0x05) - carries the client's login (the ~795B EOS auth
+    // ticket). So when it arrives after the Challenge it IS the login: complete it
+    // (send Welcome, fire ClientLoggedIn) exactly like OnLogin. The client
+    // retransmits it; only the first (in ChallengeSent) advances.
+    Logger::Info("[HandshakeState] client %u: Steam auth/login type=0x%02X accepted blindly (STUB)",
                  m_clientId, (unsigned)NMTByte(type));
+    if (m_phase == HandshakePhase::ChallengeSent || m_phase == HandshakePhase::AwaitingLogin) {
+        Logger::Info("[HandshakeState] client %u: treating Steam login as login completion -> Welcome", m_clientId);
+        CompleteLogin();
+    }
 }
