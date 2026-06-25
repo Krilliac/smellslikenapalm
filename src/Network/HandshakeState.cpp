@@ -201,7 +201,7 @@ void HandshakeState::OnLogin(const uint8_t* data, size_t len) {
     ControlChannel::WelcomeMessage welcome;
     welcome.levelName = "VNTE-CuChi";                          // placeholder Map
     welcome.gameName  = "ROGame.ROGameInfoTerritories";        // placeholder GameClass
-    welcome.redirectUrl = "";
+    welcome.flags = 0;                                         // spec §4 trailing QWORD
     Emit(ControlChannel::BuildWelcome(welcome));
 
     m_phase = HandshakePhase::WelcomeSent;

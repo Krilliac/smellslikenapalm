@@ -48,9 +48,12 @@ struct HelloMessage {
     std::string token;
 };
 
-// NMT_Challenge (S->C): { FSTR ServerNonce } [UE3]
+// NMT_Challenge (S->C): { INT ServerFlags, FSTR ServerNonce }
+// Spec §4: the body is `int32, FString` (a leading int32 precedes the nonce),
+// NOT a bare FString as previously assumed.
 struct ChallengeMessage {
-    std::string challenge;
+    int32_t     serverFlags = 0;  // leading int32 (purpose [?]; spec §4 medium-confidence)
+    std::string challenge;        // server nonce FString
 };
 
 // NMT_Netspeed (C->S): { INT Netspeed } [UE3]
@@ -58,17 +61,23 @@ struct NetspeedMessage {
     int32_t netspeed = kNetspeedInternet;
 };
 
-// NMT_Login (C->S): { FSTR ClientResponse, FSTR URL } [UE3]
+// NMT_Login (C->S): { FSTR ClientResponse, FSTR URL, QWORD SteamId }
+// Spec §4: the body is `FString, FString, QWORD` (a trailing QWORD follows the
+// URL), NOT just two FStrings.
 struct LoginMessage {
     std::string response; // computed from the Challenge nonce
     std::string url;      // FURL option string (see URLOptions.h)
+    uint64_t    steamId = 0; // trailing QWORD (spec §4)
 };
 
-// NMT_Welcome (S->C): { FSTR LevelName, FSTR GameName, FSTR Redirect } [UE3]
+// NMT_Welcome (S->C): { FSTR LevelName, FSTR GameName, QWORD }
+// Spec §4: the body is `FString, FString, QWORD` (a trailing QWORD), NOT three
+// FStrings. The third field is the previously-assumed "Redirect" slot, but the
+// binary serializes a QWORD there.
 struct WelcomeMessage {
     std::string levelName;
     std::string gameName;
-    std::string redirectUrl; // RS2 may omit; [UE3]
+    uint64_t    flags = 0;   // trailing QWORD (spec §4 medium-confidence)
 };
 
 // NMT_Failure (S->C): { FSTR ErrorKey } [UE3]
@@ -76,9 +85,11 @@ struct FailureMessage {
     std::string errorKey;
 };
 
-// NMT_Upgrade (S->C): { INT RemoteMinVer } [UE3]
+// NMT_Upgrade (S->C): { INT RemoteMinVer, INT RemoteVer }
+// Spec §4: the body is `int32, int32` (two ints), NOT a single int.
 struct UpgradeMessage {
     int32_t remoteMinVer = kMinNetVersion;
+    int32_t remoteVer = kEngineVersion;  // second int32 (spec §4)
 };
 
 // NMT_Join (C->S): empty body [UE3]

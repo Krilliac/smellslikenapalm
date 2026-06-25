@@ -49,6 +49,7 @@ rs2v_add_test(ThreadPoolTests)   # reconciled: future-based waits (no WaitAll/Ge
 rs2v_add_test(INIParserTests)    # reconciled: self-contained TestINIParser; dead mocks + INISection clash removed
 rs2v_add_test(AuthenticationTests) # implemented: Security/{EACProxy,AuthManager,PasswordHasher,TokenManager}
 rs2v_add_test(PacketFramingTests)  # UE3 packet/bunch framing codec; fixtures = real handshake capture
+rs2v_add_test(ControlChannelTests) # UE3 control-channel message-body codec; round-trips per spec §4
 
 # Scripting is OFF by default (deprecated .NET COM hosting). The scripting test
 # is gated on ENABLE_SCRIPTING, but it ALSO references Scripting/ScriptEngine.h

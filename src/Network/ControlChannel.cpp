@@ -33,6 +33,7 @@ std::vector<uint8_t> BuildHello(const HelloMessage& msg) {
 std::vector<uint8_t> BuildChallenge(const ChallengeMessage& msg) {
     BitWriter w;
     w.WriteByte(NMTByte(NMT::Challenge));
+    w.WriteInt32(msg.serverFlags);   // spec §4: leading int32
     w.WriteString(msg.challenge);
     return w.GetBytes();
 }
@@ -49,6 +50,7 @@ std::vector<uint8_t> BuildLogin(const LoginMessage& msg) {
     w.WriteByte(NMTByte(NMT::Login));
     w.WriteString(msg.response);
     w.WriteString(msg.url);
+    w.WriteUInt64(msg.steamId);       // spec §4: trailing QWORD
     return w.GetBytes();
 }
 
@@ -57,7 +59,7 @@ std::vector<uint8_t> BuildWelcome(const WelcomeMessage& msg) {
     w.WriteByte(NMTByte(NMT::Welcome));
     w.WriteString(msg.levelName);
     w.WriteString(msg.gameName);
-    w.WriteString(msg.redirectUrl);
+    w.WriteUInt64(msg.flags);         // spec §4: trailing QWORD (not a 3rd FString)
     return w.GetBytes();
 }
 
@@ -72,6 +74,7 @@ std::vector<uint8_t> BuildUpgrade(const UpgradeMessage& msg) {
     BitWriter w;
     w.WriteByte(NMTByte(NMT::Upgrade));
     w.WriteInt32(msg.remoteMinVer);
+    w.WriteInt32(msg.remoteVer);      // spec §4: second int32
     return w.GetBytes();
 }
 
@@ -143,6 +146,7 @@ bool ParseChallenge(const uint8_t* data, size_t len, ChallengeMessage& out, bool
     if (!CheckType(r, expectType, NMT::Challenge)) {
         return false;
     }
+    out.serverFlags = r.ReadInt32();   // spec §4: leading int32
     out.challenge = r.ReadString();
     return !r.IsOverflowed();
 }
@@ -163,6 +167,7 @@ bool ParseLogin(const uint8_t* data, size_t len, LoginMessage& out, bool expectT
     }
     out.response = r.ReadString();
     out.url = r.ReadString();
+    out.steamId = r.ReadUInt64();      // spec §4: trailing QWORD
     return !r.IsOverflowed();
 }
 
@@ -173,9 +178,7 @@ bool ParseWelcome(const uint8_t* data, size_t len, WelcomeMessage& out, bool exp
     }
     out.levelName = r.ReadString();
     out.gameName = r.ReadString();
-    out.redirectUrl = r.ReadString();
-    // RS2 may omit the redirect field; tolerate a clean end-of-buffer there by
-    // only failing if an overflow occurred BEFORE the optional last field.
+    out.flags = r.ReadUInt64();        // spec §4: trailing QWORD (not a 3rd FString)
     return !r.IsOverflowed();
 }
 
@@ -194,6 +197,7 @@ bool ParseUpgrade(const uint8_t* data, size_t len, UpgradeMessage& out, bool exp
         return false;
     }
     out.remoteMinVer = r.ReadInt32();
+    out.remoteVer = r.ReadInt32();     // spec §4: second int32
     return !r.IsOverflowed();
 }
 
