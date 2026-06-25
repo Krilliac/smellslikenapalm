@@ -122,5 +122,7 @@ private:
     //  handshake), and flushes a standalone ack if no response carried it. Wire
     //  format: docs/RS2V_ControlChannel_WireSpec_7258.md.
     // ------------------------------------------------------------------------
-    void ParseIncomingControl(uint32_t clientId, const std::vector<uint8_t>& datagram);
+    // Returns true if `datagram` was a well-formed UE3 packet and was handled
+    // here (so the caller must NOT also run it through the legacy Packet path).
+    bool ParseIncomingControl(uint32_t clientId, const std::vector<uint8_t>& datagram);
 };

@@ -130,25 +130,27 @@ void ConnectionManager::HandleIncomingPacket(const std::vector<uint8_t>& data, c
     }
     Logger::Debug("[ConnectionManager::HandleIncomingPacket] clientId=%u for %s:%u", clientId, addr.ip.c_str(), addr.port);
 
-    // Feed raw UDP data to protocol decoder for UE3 bunch analysis
-    GetProtocolDecoder().OnRawUDPReceived(clientId, data.data(), data.size());
-    Logger::Debug("[ConnectionManager::HandleIncomingPacket] Fed %zu raw bytes to protocol decoder for client %u",
-                  data.size(), clientId);
-
     auto conn = m_clients[addr];
+    conn->UpdateLastHeartbeat();
+    Logger::Debug("[ConnectionManager::HandleIncomingPacket] Updated heartbeat for client %u", clientId);
+
+    // ---- UE3 control-channel path (EXCLUSIVE) ----
+    // A well-formed UE3 packet is handled ONLY here. Running it through the legacy
+    // Packet pipeline below would mis-parse the UE3 bytes as a tagged Packet
+    // (Packet::FromBuffer) and enqueue garbage into the game queue (observed as a
+    // flood of "Rejecting malformed buffer" warns + bogus callback dispatches).
+    GetProtocolDecoder().OnRawUDPReceived(clientId, data.data(), data.size());
+    if (ParseIncomingControl(clientId, data)) {
+        Logger::Trace("[ConnectionManager::HandleIncomingPacket] client %u: handled as UE3 control packet", clientId);
+        return;
+    }
+
+    // ---- legacy / non-UE3 path (internal Packet format: in-process tests, tools) ----
     PacketMetadata meta;
     meta.clientId = clientId;
     Packet pkt = Packet::FromBuffer(data, meta);
     Logger::Debug("[ConnectionManager::HandleIncomingPacket] Parsed packet: tag='%s', clientId=%u, payloadSize=%u",
                   pkt.GetTag().c_str(), clientId, pkt.GetPayloadSize());
-    conn->UpdateLastHeartbeat();
-    Logger::Debug("[ConnectionManager::HandleIncomingPacket] Updated heartbeat for client %u", clientId);
-
-    // ---- NEW: drive the control-channel handshake state machine ----
-    // Route the raw datagram into the provisional control-channel framing seam.
-    // This is the path for NEW connections (handshake). It runs ALONGSIDE the
-    // legacy packet-callback path below so existing callers are not broken.
-    ParseIncomingControl(clientId, data);
 
     // Feed parsed packet to protocol decoder for structure analysis
     GetProtocolDecoder().OnPacketReceived(clientId, pkt.RawData(), pkt.GetTag());
@@ -474,12 +476,12 @@ void ConnectionManager::SendEncodedPacket(uint32_t clientId, const PacketCodec::
     conn->SendRaw(wire.data(), wire.size());
 }
 
-void ConnectionManager::ParseIncomingControl(uint32_t clientId, const std::vector<uint8_t>& datagram) {
+bool ConnectionManager::ParseIncomingControl(uint32_t clientId, const std::vector<uint8_t>& datagram) {
     Logger::Trace("[ConnectionManager::ParseIncomingControl] Entry: client=%u, %zu bytes",
                   clientId, datagram.size());
     if (datagram.empty()) {
         Logger::Trace("[ConnectionManager::ParseIncomingControl] empty datagram, ignoring");
-        return;
+        return false;
     }
 
     // Decode the UE3 packet framing (PacketId, acks, bunches) per
@@ -488,7 +490,7 @@ void ConnectionManager::ParseIncomingControl(uint32_t clientId, const std::vecto
     if (!pkt.ok) {
         Logger::Debug("[ConnectionManager::ParseIncomingControl] client %u: %zu bytes are not a decodable UE3 packet, ignoring",
                       clientId, datagram.size());
-        return;
+        return false;
     }
 
     ControlState& cs = GetControlState(clientId);
@@ -522,4 +524,5 @@ void ConnectionManager::ParseIncomingControl(uint32_t clientId, const std::vecto
 
     Logger::Trace("[ConnectionManager::ParseIncomingControl] Exit: client=%u now in state %s",
                   clientId, HandshakePhaseName(GetOrCreateHandshake(clientId).Phase()));
+    return true;
 }
