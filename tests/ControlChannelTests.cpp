@@ -98,20 +98,23 @@ TEST(ControlChannelUpgrade, RoundTrip) {
 }
 
 // ---------------------------------------------------------------------------
-// Challenge (0x03, S->C): int32, FString   (NOT just an FString)
+// Challenge (0x03, S->C): a single 32-bit nonce/cookie. (The RS2 on-wire
+// NMT_Challenge body is one DWORD - a 40-bit bunch NMT + DWORD - NOT the
+// {int32, FString} layout earlier assumed, which bloated it across 4 bunches
+// and the client ignored.)
 // ---------------------------------------------------------------------------
 TEST(ControlChannelChallenge, RoundTrip) {
     ChallengeMessage in;
-    in.serverFlags = 0x0000BEEF;
-    in.challenge = "0123456789ABCDEF";
+    in.nonce = 0xDEADBEEFu;
 
     std::vector<uint8_t> bytes = BuildChallenge(in);
     ExpectLeadingNMT(bytes, NMT::Challenge);
+    // NMT byte + a single DWORD = exactly 5 bytes on the wire.
+    EXPECT_EQ(bytes.size(), 5u);
 
     ChallengeMessage out;
     ASSERT_TRUE(ParseChallenge(bytes.data(), bytes.size(), out));
-    EXPECT_EQ(out.serverFlags, in.serverFlags);
-    EXPECT_EQ(out.challenge, in.challenge);
+    EXPECT_EQ(out.nonce, in.nonce);
 }
 
 // ---------------------------------------------------------------------------
@@ -195,16 +198,14 @@ TEST(ControlChannelExpectType, WrongTypeByteRejected) {
 // the BODY (skipping the leading byte) must succeed.
 TEST(ControlChannelExpectType, SkipTypeByteParsesBody) {
     ChallengeMessage in;
-    in.serverFlags = 0x1234;
-    in.challenge = "nonce";
+    in.nonce = 0x12345678u;
     std::vector<uint8_t> bytes = BuildChallenge(in);
     ASSERT_GE(bytes.size(), 1u);
 
     // Hand the parser the body WITHOUT the leading type byte.
     ChallengeMessage out;
     ASSERT_TRUE(ParseChallenge(bytes.data() + 1, bytes.size() - 1, out, /*expectType=*/false));
-    EXPECT_EQ(out.serverFlags, in.serverFlags);
-    EXPECT_EQ(out.challenge, in.challenge);
+    EXPECT_EQ(out.nonce, in.nonce);
 }
 
 // ---------------------------------------------------------------------------

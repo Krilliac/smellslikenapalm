@@ -1,26 +1,26 @@
 // tests/HandshakeIntegrationTests.cpp
 //
 // End-to-end integration test of the control-channel handshake over the REAL UE3
-// wire codec, with no sockets. It wires the same pieces ConnectionManager does:
+// wire codec, with no sockets. It mirrors exactly what ConnectionManager does on
+// the receive path:
 //
-//   client: ControlChannel::Build* -> PacketAssembler (fragment + sequence)
-//           -> PacketCodec::Encode -> wire datagrams
-//   server: PacketCodec::Decode -> ack -> ControlReassembler (order/dedup/peel)
-//           -> HandshakeState::HandleControlMessage
-//   server responses: HandshakeState emits message payloads -> server
-//           PacketAssembler -> PacketCodec::Encode -> wire datagrams (decoded
-//           back on the client side to verify the response).
+//   client: ControlChannel::Build* -> ONE reliable control bunch per message
+//           -> PacketCodec::Encode (phase-appropriate MaxPacket) -> wire datagram
+//   server: PacketCodec::Decode (MaxPacket gated on IsControlHandshakeComplete)
+//           -> ack -> ControlReassembler (order/dedup) -> HandshakeState
+//   server responses: captured directly from HandshakeState's rawSend callback
+//           (the raw message payloads the state machine emits).
 //
-// This exercises the whole stack against realistic, multi-bunch messages -
-// crucially the real Hello body (versions, SteamId, FString session/token) parsed
-// by OnHello - so it de-risks a live retail-client connect.
+// The real RS2 client sends each control message as a SINGLE reliable bunch (at
+// the established-phase MaxPacket of 2048 a single bunch holds up to 16384 data
+// bits), and the MaxPacket grows from the tiny StatelessConnect-handshake value
+// to the NMT value once the handshake completes - so this test does the same.
 
 #include <gtest/gtest.h>
 
 #include "Network/HandshakeState.h"
 #include "Network/ControlChannel.h"
 #include "Network/PacketCodec.h"
-#include "Network/PacketAssembler.h"
 #include "Network/ControlReassembler.h"
 #include "Network/NetMessages.h"
 
@@ -29,34 +29,57 @@
 
 namespace {
 
-// A simulated peer endpoint: an outbound PacketAssembler whose produced packets
-// are encoded and captured as wire datagrams.
-struct Endpoint {
-    PacketCodec::PacketAssembler out;
-    std::vector<std::vector<uint8_t>> sent; // encoded datagrams this peer "sent"
+// A faithful client: each control message is sent as ONE reliable control-channel
+// (chIndex 0) bunch with a consecutive ChSequence, encoded into its own datagram
+// at the caller-supplied MaxPacket (small during the StatelessConnect handshake,
+// 2048 once in the NMT phase) - exactly as the real client frames them.
+struct WireClient {
+    uint32_t seq = 1;
+    uint32_t packetId = 0;
+    std::vector<std::vector<uint8_t>> sent;
 
-    void Send(const std::vector<uint8_t>& messagePayload) {
-        for (const PacketCodec::Packet& pkt : out.BuildControlMessagePackets(messagePayload)) {
-            sent.push_back(PacketCodec::Encode(pkt));
+    void Send(const std::vector<uint8_t>& payload, uint32_t maxPacketBytes) {
+        PacketCodec::Bunch b;
+        b.bControl   = (seq == 1);   // first control bunch opens the channel
+        b.bOpen      = (seq == 1);
+        b.bReliable  = true;
+        b.chIndex    = static_cast<uint32_t>(kControlChannelIndex);
+        b.chType     = PacketCodec::kControlChannelType;
+        b.chSequence = seq++;
+        b.payload    = payload;
+        b.payloadBits = static_cast<uint32_t>(payload.size() * 8);
+
+        PacketCodec::Packet pkt;
+        pkt.packetId = packetId++;
+        pkt.bunches.push_back(b);
+        pkt.ok = true;
+        sent.push_back(PacketCodec::Encode(pkt, maxPacketBytes));
+    }
+
+    void Clear() { sent.clear(); }
+};
+
+// The server side: HandshakeState fed via a ControlReassembler, decoding inbound
+// datagrams with the same phase-based MaxPacket selection as ConnectionManager.
+struct WireServer {
+    std::vector<std::vector<uint8_t>> emitted;  // raw message payloads the state machine sent
+    HandshakeState* handshake = nullptr;
+    PacketCodec::ControlReassembler* reasm = nullptr;
+
+    void Deliver(const std::vector<std::vector<uint8_t>>& datagrams) {
+        for (const std::vector<uint8_t>& dg : datagrams) {
+            const uint32_t maxPacketBytes =
+                handshake->IsControlHandshakeComplete()
+                    ? PacketCodec::kNmtMaxPacketBytes
+                    : PacketCodec::kHandshakeMaxPacketBytes;
+            PacketCodec::Packet pkt = PacketCodec::Decode(dg.data(), dg.size(), maxPacketBytes);
+            ASSERT_TRUE(pkt.ok) << "server failed to decode a client datagram";
+            for (const PacketCodec::Bunch& b : pkt.bunches) {
+                reasm->OnBunch(b);
+            }
         }
     }
 };
-
-// Decode every datagram and reassemble its control messages via `reasm`.
-void Deliver(const std::vector<std::vector<uint8_t>>& datagrams,
-             PacketCodec::PacketAssembler* ackTo,
-             PacketCodec::ControlReassembler& reasm) {
-    for (const std::vector<uint8_t>& dg : datagrams) {
-        PacketCodec::Packet pkt = PacketCodec::Decode(dg.data(), dg.size());
-        ASSERT_TRUE(pkt.ok) << "server/client failed to decode a peer datagram";
-        if (ackTo) {
-            ackTo->QueueAck(pkt.packetId);
-        }
-        for (const PacketCodec::Bunch& b : pkt.bunches) {
-            reasm.OnBunch(b);
-        }
-    }
-}
 
 ControlChannel::HelloMessage MakeRealHello() {
     ControlChannel::HelloMessage h;
@@ -69,101 +92,114 @@ ControlChannel::HelloMessage MakeRealHello() {
     return h;
 }
 
+// Drive the pre-NMT StatelessConnect handshake (client 0x1d -> server 0x1e ->
+// client 0x1f -> server 0x20). Handshake messages are raw [0x00 family][subtype]
+// payloads sent at the tiny handshake MaxPacket. Leaves the server in the NMT
+// phase (AwaitingHello) and clears the captured emissions/datagrams.
+void CompleteStatelessHandshake(WireClient& client, WireServer& server) {
+    client.Send(std::vector<uint8_t>{ControlChannel::Handshake::kFamilyByte,
+                                     ControlChannel::Handshake::kStart},
+                PacketCodec::kHandshakeMaxPacketBytes);
+    server.Deliver(client.sent);
+    client.Clear();
+
+    client.Send(std::vector<uint8_t>{ControlChannel::Handshake::kFamilyByte,
+                                     ControlChannel::Handshake::kResponse},
+                PacketCodec::kHandshakeMaxPacketBytes);
+    server.Deliver(client.sent);
+    client.Clear();
+
+    server.emitted.clear();  // discard the 0x1e / 0x20 handshake responses
+}
+
 } // namespace
 
-// A realistic, multi-bunch Hello reassembles server-side, OnHello parses its body,
-// the handshake advances to ChallengeSent, and the framed Challenge response
-// decodes back on the client as NMT_Challenge with the recorded nonce.
+// After the StatelessConnect handshake, a single-bunch Hello reassembles
+// server-side, OnHello runs, the handshake advances to ChallengeSent, and the
+// server emits an NMT_Challenge carrying the recorded nonce.
 TEST(HandshakeIntegration, RealHelloAdvancesToChallenge) {
-    Endpoint server;
-    std::vector<std::vector<uint8_t>> serverResponses;
-
+    WireServer server;
     HandshakeState handshake(
         /*clientId*/ 1u,
-        /*rawSend*/ [&](const std::vector<uint8_t>& payload) {
-            for (const PacketCodec::Packet& pkt : server.out.BuildControlMessagePackets(payload)) {
-                serverResponses.push_back(PacketCodec::Encode(pkt));
-            }
-        });
-
-    PacketCodec::ControlReassembler serverReasm(
+        /*rawSend*/ [&](const std::vector<uint8_t>& payload) { server.emitted.push_back(payload); });
+    PacketCodec::ControlReassembler reasm(
         [&](const std::vector<uint8_t>& msg) { handshake.HandleControlMessage(msg); });
+    server.handshake = &handshake;
+    server.reasm = &reasm;
 
-    // Client sends a (multi-bunch) Hello.
-    Endpoint client;
-    client.Send(ControlChannel::BuildHello(MakeRealHello()));
-    Deliver(client.sent, &server.out, serverReasm);
+    WireClient client;
+    CompleteStatelessHandshake(client, server);
+    ASSERT_TRUE(handshake.IsControlHandshakeComplete());
+    ASSERT_EQ(handshake.Phase(), HandshakePhase::AwaitingHello);
 
-    // Server advanced and recorded a nonce.
+    client.Send(ControlChannel::BuildHello(MakeRealHello()), PacketCodec::kNmtMaxPacketBytes);
+    server.Deliver(client.sent);
+
+    // Server advanced and recorded a (non-zero) nonce.
     EXPECT_EQ(handshake.Phase(), HandshakePhase::ChallengeSent);
-    EXPECT_FALSE(handshake.Challenge().empty());
-    ASSERT_FALSE(serverResponses.empty());
+    EXPECT_NE(handshake.Challenge(), 0u);
 
-    // The server's framed response decodes/reassembles back to a Challenge.
-    std::vector<std::vector<uint8_t>> clientMsgs;
-    PacketCodec::ControlReassembler clientReasm(
-        [&](const std::vector<uint8_t>& m) { clientMsgs.push_back(m); });
-    Deliver(serverResponses, /*ackTo*/ nullptr, clientReasm);
-
-    ASSERT_FALSE(clientMsgs.empty());
+    // The server emitted a Challenge carrying that nonce.
+    ASSERT_FALSE(server.emitted.empty());
+    const std::vector<uint8_t>& resp = server.emitted.back();
     NMT type{};
-    ASSERT_TRUE(ControlChannel::PeekType(clientMsgs[0].data(), clientMsgs[0].size(), type));
+    ASSERT_TRUE(ControlChannel::PeekType(resp.data(), resp.size(), type));
     EXPECT_EQ(type, NMT::Challenge);
 
     ControlChannel::ChallengeMessage chal;
-    ASSERT_TRUE(ControlChannel::ParseChallenge(clientMsgs[0].data(), clientMsgs[0].size(), chal));
-    EXPECT_EQ(chal.challenge, handshake.Challenge());
+    ASSERT_TRUE(ControlChannel::ParseChallenge(resp.data(), resp.size(), chal));
+    EXPECT_EQ(chal.nonce, handshake.Challenge());
 }
 
-// Drive the full happy-path sequence Hello -> Netspeed -> Login -> Join and verify
-// the server-side state machine reaches Joined and fires the Game-facing events.
+// Drive the full NMT happy path (Hello -> Netspeed -> Login -> Join) after the
+// StatelessConnect handshake, and verify the server reaches Joined and fires the
+// Game-facing events with the identity captured from Hello.
 TEST(HandshakeIntegration, FullHandshakeReachesJoined) {
-    Endpoint server;
+    WireServer server;
     bool loggedIn = false;
     bool joined = false;
     uint64_t loggedInSteamId = 0;
 
     HandshakeState handshake(
         /*clientId*/ 7u,
-        /*rawSend*/ [&](const std::vector<uint8_t>& payload) {
-            for (const PacketCodec::Packet& pkt : server.out.BuildControlMessagePackets(payload)) {
-                server.sent.push_back(PacketCodec::Encode(pkt));
-            }
-        },
+        /*rawSend*/ [&](const std::vector<uint8_t>& payload) { server.emitted.push_back(payload); },
         /*onLoggedIn*/ [&](const ClientLoggedInEvent& ev) { loggedIn = true; loggedInSteamId = ev.steamId; },
         /*onJoined*/   [&](const ClientJoinedEvent&) { joined = true; });
-
-    PacketCodec::ControlReassembler serverReasm(
+    PacketCodec::ControlReassembler reasm(
         [&](const std::vector<uint8_t>& msg) { handshake.HandleControlMessage(msg); });
+    server.handshake = &handshake;
+    server.reasm = &reasm;
 
-    // One client endpoint => one continuous reliable ChSequence stream across all
-    // four messages, exactly as a real client sends them.
-    Endpoint client;
+    // One client => one continuous reliable ChSequence stream across the
+    // StatelessConnect handshake AND all four NMT messages.
+    WireClient client;
+    CompleteStatelessHandshake(client, server);
+    ASSERT_TRUE(handshake.IsControlHandshakeComplete());
 
-    client.Send(ControlChannel::BuildHello(MakeRealHello()));
-    Deliver(client.sent, &server.out, serverReasm);
-    client.sent.clear();
+    client.Send(ControlChannel::BuildHello(MakeRealHello()), PacketCodec::kNmtMaxPacketBytes);
+    server.Deliver(client.sent);
+    client.Clear();
     ASSERT_EQ(handshake.Phase(), HandshakePhase::ChallengeSent);
 
     ControlChannel::NetspeedMessage ns; ns.netspeed = kNetspeedInternet;
-    client.Send(ControlChannel::BuildNetspeed(ns));
-    Deliver(client.sent, &server.out, serverReasm);
-    client.sent.clear();
+    client.Send(ControlChannel::BuildNetspeed(ns), PacketCodec::kNmtMaxPacketBytes);
+    server.Deliver(client.sent);
+    client.Clear();
     EXPECT_EQ(handshake.Netspeed(), kNetspeedInternet);
 
     ControlChannel::LoginMessage login;
     login.response = "challenge-response";
     login.url = "VNTE-CuChi?Name=Recon?Team=0";
     login.steamId = 0x0110000112345678ull;
-    client.Send(ControlChannel::BuildLogin(login));
-    Deliver(client.sent, &server.out, serverReasm);
-    client.sent.clear();
+    client.Send(ControlChannel::BuildLogin(login), PacketCodec::kNmtMaxPacketBytes);
+    server.Deliver(client.sent);
+    client.Clear();
     ASSERT_EQ(handshake.Phase(), HandshakePhase::WelcomeSent);
     EXPECT_TRUE(loggedIn);
     EXPECT_EQ(loggedInSteamId, 0x0110000112345678ull);
 
-    client.Send(ControlChannel::BuildJoin(ControlChannel::JoinMessage{}));
-    Deliver(client.sent, &server.out, serverReasm);
+    client.Send(ControlChannel::BuildJoin(ControlChannel::JoinMessage{}), PacketCodec::kNmtMaxPacketBytes);
+    server.Deliver(client.sent);
 
     EXPECT_EQ(handshake.Phase(), HandshakePhase::Joined);
     EXPECT_TRUE(handshake.IsJoined());
