@@ -213,13 +213,13 @@ PacketAnalysisResult PacketAnalyzer::AnalyzePacket(
         }
         pat.lastSeen = now;
         pat.clientIds.push_back(clientId);
-        Logger::Trace("[PacketAnalyzer::AnalyzePacket] Pattern key='%s', frequency=%zu", key.c_str(), pat.frequency);
+        Logger::Trace("[PacketAnalyzer::AnalyzePacket] Pattern key='%s', frequency=%u", key.c_str(), pat.frequency);
         if (pat.frequency > 100 &&
             std::chrono::duration_cast<std::chrono::seconds>(now - pat.firstSeen).count() < 10) {
             pat.suspicious = true;
             result.warnings.push_back("Suspicious traffic pattern detected");
             Logger::Warn("PacketAnalyzer: %s - suspicious pattern", context.c_str());
-            Logger::Debug("[PacketAnalyzer::AnalyzePacket] Pattern '%s' flagged as suspicious: frequency=%zu in <10 seconds", key.c_str(), pat.frequency);
+            Logger::Debug("[PacketAnalyzer::AnalyzePacket] Pattern '%s' flagged as suspicious: frequency=%u in <10 seconds", key.c_str(), pat.frequency);
         }
     } else {
         Logger::Debug("[PacketAnalyzer::AnalyzePacket] Pattern detection skipped (enabled=%s, flag set=%s)",
@@ -423,7 +423,7 @@ namespace PacketAnalysisUtils {
         // Resolve tag to enum
         auto tagStr = packet.GetTag();
         PacketType type = ProtocolUtils::TagToType(tagStr);
-        Logger::Debug("[PacketAnalysisUtils::DecodePacketStructure] Decoding packet with tag='%s', payloadSize=%zu",
+        Logger::Debug("[PacketAnalysisUtils::DecodePacketStructure] Decoding packet with tag='%s', payloadSize=%u",
                       tagStr.c_str(), packet.GetPayloadSize());
 
         oss << "Tag: " << tagStr << "\n";

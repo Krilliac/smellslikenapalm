@@ -8,8 +8,13 @@
 // printf-style format-string checking under GCC/Clang. These are static member
 // functions (no implicit 'this'), so the format string is argument 1 and the
 // variadic arguments begin at argument 2 — i.e. RS2V_PRINTF_FORMAT(1, 2).
+// Use the gnu_printf archetype: on MinGW the plain "printf" archetype maps to
+// ms_printf, which rejects C99 length modifiers (%zu, %llu, %lld) and produces
+// hundreds of false positives. gnu_printf validates against the C99/glibc specs
+// the code actually uses, on both Linux GCC and MinGW, while still catching real
+// format/argument mismatches.
 #if defined(__GNUC__)
-  #define RS2V_PRINTF_FORMAT(fmtIdx, argIdx) __attribute__((format(printf, fmtIdx, argIdx)))
+  #define RS2V_PRINTF_FORMAT(fmtIdx, argIdx) __attribute__((format(gnu_printf, fmtIdx, argIdx)))
 #else
   #define RS2V_PRINTF_FORMAT(fmtIdx, argIdx)
 #endif

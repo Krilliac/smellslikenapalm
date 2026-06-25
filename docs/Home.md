@@ -2,9 +2,9 @@
 
 Welcome to the **RS2V Custom Server** documentation. This page serves as the central index for all project documentation, organized by topic and audience.
 
-RS2V Custom Server is a highly modular, extensible dedicated server implementation for Rising Storm 2: Vietnam, built in C++17 with enterprise-grade architecture, comprehensive telemetry, and advanced security features.
+RS2V Custom Server is a modular, extensible dedicated-server **emulator** for Rising Storm 2: Vietnam (an Unreal Engine 3 game, `EngineVersion 7258`), built in C++17. It is organized around a production-style architecture with telemetry, security, and networking subsystems.
 
-> **Note:** This project is under active development. The public API, file layout, and naming conventions are not yet frozen and may change without notice. See [TODO.md](../TODO.md) for the current roadmap.
+> **Status:** This project is under active development. The main server target builds on MSVC and MinGW, but the UE3 control-channel handshake is still being implemented and **a stock client cannot fully connect yet**. C# scripting is currently **disabled** (it does not build), and telemetry/security are partially stubbed. The public API, file layout, and naming conventions are not yet frozen and may change without notice. See the README's *Current Status* section and [TODO.md](../TODO.md) for the current roadmap.
 
 ---
 
@@ -54,7 +54,7 @@ These documents cover building from source, the internal architecture, the API s
 | [Development Guide](DEVELOPMENT.md) | **Build from source** instructions, local development workflow, CMake options, coding standards, debugging techniques, test execution, and CI/CD pipeline overview. |
 | [Architecture Overview](ARCHITECTURE.md) | **System design** document covering the modular architecture, subsystem interactions, data flow patterns, threading model, memory management, networking internals, physics engine, replication system, and security architecture. |
 | [API Reference](API.md) | **Complete API reference** for all public classes and interfaces: `ConfigManager`, `ServerConfig`, `NetworkManager`, `Packet`, `ReplicationManager`, `TelemetryManager`, `ScriptHost`, `SecurityManager`, `PhysicsEngine`, `GameServer`, `PlayerManager`, `TeamManager`, and the testing utilities. |
-| [Scripting Guide](SCRIPTING.md) | **Plugin development** guide for C# scripting (Roslyn-based hot-reload, sandbox security, event hooks) and native C++ plugin development (handler libraries, dynamic loading, API bindings). |
+| [Scripting Guide](SCRIPTING.md) | **Plugin development** guide for C# scripting (hot-reload, sandbox security, event hooks) and native C++ plugin development (handler libraries, dynamic loading, API bindings). **Note:** the C# scripting host is currently disabled (does not build) — this documents the intended design. |
 | [Contributing Guidelines](../CONTRIBUTING.md) | **How to contribute** including fork/branch workflow, coding standards, commit message conventions, testing requirements, pull request process, and issue reporting guidelines. |
 
 ---
@@ -97,7 +97,7 @@ cmake --build . --parallel
 | Option | Default | Description |
 |---|---|---|
 | `ENABLE_TELEMETRY` | `ON` | Build with the telemetry subsystem (Prometheus metrics, file reporters, alerting) |
-| `ENABLE_SCRIPTING` | `ON` | Build with C# scripting support (requires .NET SDK) |
+| `ENABLE_SCRIPTING` | `OFF` | Build with C# scripting support. **Currently does not build** — the host uses a deprecated .NET COM hosting API and is disabled pending a rework. |
 | `ENABLE_COMPRESSION` | `ON` | Build with packet compression (uses zlib if available, otherwise built-in stub) |
 | `BUILD_TESTS` | `OFF` | Build the Google Test suite |
 
@@ -145,13 +145,12 @@ smellslikenapalm/
 │   ├── Game/                   # Game logic (modes, maps, players, teams)
 │   ├── Network/                # Networking stack (UDP, TCP, protocol)
 │   ├── Physics/                # Physics engine (rigid bodies, collision)
-│   ├── Protocol/               # UE3-compatible protocol implementation
-│   ├── Scripting/              # C# scripting host (Roslyn)
-│   ├── Security/               # Anti-cheat, auth, input validation
+│   ├── Protocol/               # UE3 control-channel / replication protocol (handshake WIP)
+│   ├── Scripting/              # C# scripting host (.NET COM hosting — currently disabled)
+│   ├── Security/               # Anti-cheat emulation, auth, input validation
 │   ├── Time/                   # Time management and synchronization
 │   └── Utils/                  # Shared utilities (logging, threading, crypto)
 ├── telemetry/                  # Telemetry subsystem
-├── include/                    # Public headers
 ├── config/                     # Configuration files
 │   ├── server.ini              # Main server configuration
 │   ├── server_production.ini   # Production overrides

@@ -150,8 +150,8 @@ void PrometheusMetricsReporter::Shutdown() {
 }
 
 void PrometheusMetricsReporter::Report(const MetricsSnapshot& snapshot) {
-    Logger::Trace("[PrometheusMetricsReporter::Report] Entry - snapshot with activeConnections=%u, activeMatches=%u",
-                 snapshot.activeConnections, snapshot.activeMatches);
+    Logger::Trace("[PrometheusMetricsReporter::Report] Entry - snapshot with activeConnections=%llu, activeMatches=%llu",
+                 (unsigned long long)snapshot.activeConnections, (unsigned long long)snapshot.activeMatches);
     if (!m_healthy.load()) {
         Logger::Warn("[PrometheusMetricsReporter::Report] Reporter is unhealthy, discarding snapshot");
         m_reportsFailed.fetch_add(1, std::memory_order_relaxed);
@@ -571,8 +571,8 @@ std::string PrometheusMetricsReporter::FormatPrometheusMetrics() const {
     metrics << FormatMetricLine("disk_write_bytes_total", static_cast<double>(snapshot.diskWriteBytes));
 
     // Network application metrics
-    Logger::Debug("[PrometheusMetricsReporter::FormatPrometheusMetrics] Formatting network application metrics: connections=%u, players=%u, packets=%llu",
-                 snapshot.activeConnections, snapshot.authenticatedPlayers, (unsigned long long)snapshot.totalPacketsProcessed);
+    Logger::Debug("[PrometheusMetricsReporter::FormatPrometheusMetrics] Formatting network application metrics: connections=%llu, players=%llu, packets=%llu",
+                 (unsigned long long)snapshot.activeConnections, (unsigned long long)snapshot.authenticatedPlayers, (unsigned long long)snapshot.totalPacketsProcessed);
     metrics << FormatMetricLine("active_connections", static_cast<double>(snapshot.activeConnections));
     metrics << FormatMetricLine("authenticated_players", static_cast<double>(snapshot.authenticatedPlayers));
     metrics << FormatMetricLine("packets_processed_total", static_cast<double>(snapshot.totalPacketsProcessed));
@@ -581,8 +581,8 @@ std::string PrometheusMetricsReporter::FormatPrometheusMetrics() const {
     metrics << FormatMetricLine("packet_loss_rate", snapshot.packetLossRate);
 
     // Gameplay metrics
-    Logger::Debug("[PrometheusMetricsReporter::FormatPrometheusMetrics] Formatting gameplay metrics: matches=%u, kills=%llu, deaths=%llu",
-                 snapshot.activeMatches, (unsigned long long)snapshot.totalKills, (unsigned long long)snapshot.totalDeaths);
+    Logger::Debug("[PrometheusMetricsReporter::FormatPrometheusMetrics] Formatting gameplay metrics: matches=%llu, kills=%llu, deaths=%llu",
+                 (unsigned long long)snapshot.activeMatches, (unsigned long long)snapshot.totalKills, (unsigned long long)snapshot.totalDeaths);
     metrics << FormatMetricLine("current_tick", static_cast<double>(snapshot.currentTick));
     metrics << FormatMetricLine("active_matches", static_cast<double>(snapshot.activeMatches));
     metrics << FormatMetricLine("kills_total", static_cast<double>(snapshot.totalKills));

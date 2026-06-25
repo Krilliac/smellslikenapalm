@@ -436,8 +436,8 @@ void TelemetryManager::CollectApplicationMetrics(MetricsSnapshot& snapshot) {
     snapshot.averageLatencyMs = m_customMetrics.averageLatencyMs.load(std::memory_order_relaxed);
     snapshot.packetLossRate = m_customMetrics.packetLossRate.load(std::memory_order_relaxed);
 
-    Logger::Trace("[TelemetryManager::CollectApplicationMetrics] Network metrics: activeConnections=%u, authenticatedPlayers=%u, totalPacketsProcessed=%llu, totalPacketsDropped=%llu, currentTick=%llu, avgLatency=%.2fms, packetLossRate=%.4f",
-                 snapshot.activeConnections, snapshot.authenticatedPlayers,
+    Logger::Trace("[TelemetryManager::CollectApplicationMetrics] Network metrics: activeConnections=%llu, authenticatedPlayers=%llu, totalPacketsProcessed=%llu, totalPacketsDropped=%llu, currentTick=%llu, avgLatency=%.2fms, packetLossRate=%.4f",
+                 (unsigned long long)snapshot.activeConnections, (unsigned long long)snapshot.authenticatedPlayers,
                  (unsigned long long)snapshot.totalPacketsProcessed, (unsigned long long)snapshot.totalPacketsDropped,
                  (unsigned long long)snapshot.currentTick, snapshot.averageLatencyMs, snapshot.packetLossRate);
 
@@ -447,8 +447,8 @@ void TelemetryManager::CollectApplicationMetrics(MetricsSnapshot& snapshot) {
     snapshot.objectivesCaptured = m_customMetrics.objectivesCaptured.load(std::memory_order_relaxed);
     snapshot.chatMessagesSent = m_customMetrics.chatMessagesSent.load(std::memory_order_relaxed);
 
-    Logger::Trace("[TelemetryManager::CollectApplicationMetrics] Gameplay metrics: activeMatches=%u, totalKills=%llu, totalDeaths=%llu, objectivesCaptured=%llu, chatMessages=%llu",
-                 snapshot.activeMatches, (unsigned long long)snapshot.totalKills, (unsigned long long)snapshot.totalDeaths,
+    Logger::Trace("[TelemetryManager::CollectApplicationMetrics] Gameplay metrics: activeMatches=%llu, totalKills=%llu, totalDeaths=%llu, objectivesCaptured=%llu, chatMessages=%llu",
+                 (unsigned long long)snapshot.activeMatches, (unsigned long long)snapshot.totalKills, (unsigned long long)snapshot.totalDeaths,
                  (unsigned long long)snapshot.objectivesCaptured, (unsigned long long)snapshot.chatMessagesSent);
 
     snapshot.frameTimeMs = m_customMetrics.frameTimeMs.load(std::memory_order_relaxed);

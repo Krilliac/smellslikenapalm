@@ -34,7 +34,7 @@ You need:
 Optional dependencies:
 - **OpenSSL 1.1.0+** — for Base64 encoding and cryptographic functions. If not found, a built-in implementation is used.
 - **zlib 1.2.11+** — for packet compression. If not found, a built-in stub is used.
-- **.NET SDK 7.0+** — required only if building with C# scripting support (`ENABLE_SCRIPTING=ON`).
+- **.NET SDK 7.0+** — required only if building with C# scripting support (`ENABLE_SCRIPTING=ON`). Note: scripting is currently **disabled by default and does not build** (see the Scripting & Plugins section).
 
 See [DEVELOPMENT.md](DEVELOPMENT.md) for platform-specific installation commands.
 
@@ -71,7 +71,7 @@ The binary is output to `build/rs2v_server` (Linux) or `build/Release/rs2v_serve
 | Option | Default | Description |
 |---|---|---|
 | `ENABLE_TELEMETRY` | `ON` | Build with telemetry subsystem (Prometheus metrics, file reporters) |
-| `ENABLE_SCRIPTING` | `ON` | Build with C# scripting support (requires .NET SDK) |
+| `ENABLE_SCRIPTING` | `OFF` | Build with C# scripting support (requires .NET SDK). **Currently does not build** — disabled pending a rework (see below). |
 | `ENABLE_COMPRESSION` | `ON` | Build with packet compression (uses zlib if available) |
 | `BUILD_TESTS` | `OFF` | Build the Google Test suite |
 
@@ -451,6 +451,8 @@ This is an **independent emulation** of EAC behavior, developed solely from publ
 
 ### How do I enable C# scripting?
 
+> **Status:** C# scripting is currently **disabled** and **does not build**. The host relies on a deprecated .NET COM hosting API (`ICorRuntimeHost`) and needs to be reworked onto a supported hosting API before it can be used. `ENABLE_SCRIPTING` defaults to `OFF`. The steps below describe the intended workflow once the host is restored.
+
 1. Build with scripting support: `cmake .. -DENABLE_SCRIPTING=ON`
 2. Enable in configuration:
    ```ini
@@ -490,7 +492,7 @@ Yes. When a `.cs` file in `data/scripts/enabled/` is modified, the server detect
 
 ### What example scripts are included?
 
-The project includes 17 example scripts in `data/scripts/disabled/`:
+The project includes a set of example scripts in `data/scripts/disabled/` (these target the scripting host, which is currently disabled — see above). A representative subset:
 
 | Script | Purpose |
 |---|---|

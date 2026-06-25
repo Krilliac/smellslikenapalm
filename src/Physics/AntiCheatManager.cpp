@@ -41,7 +41,7 @@ bool AntiCheatManager::Initialize() {
     return true;
 }
 
-void AntiCheatManager::OnReceive(uint32_t clientId, const Packet& pkt, const PacketMetadata& meta) {
+void AntiCheatManager::OnReceive(uint32_t clientId, const Packet& pkt, const PacketMetadata& /*meta*/) {
     Logger::Trace("[AntiCheatManager::OnReceive] Entry - clientId=%u, packet tag='%s', incoming=true",
                   clientId, pkt.GetTag().c_str());
     Logger::Debug("[AntiCheatManager::OnReceive] Forwarding received packet from client %u with tag '%s' to InspectPacket",

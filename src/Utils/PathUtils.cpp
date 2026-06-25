@@ -2,6 +2,8 @@
 #include "Utils/PathUtils.h"
 #include "Utils/Logger.h"
 
+#include <cstdint>
+
 #ifdef _WIN32
     #include <windows.h>
     #include <basetsd.h>

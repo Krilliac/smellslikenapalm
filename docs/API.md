@@ -42,11 +42,9 @@
 | Option | Default | Purpose |
 |--------|---------|---------|
 | `ENABLE_TELEMETRY` | `ON` | Compiles TelemetryManager & Reporters |
-| `ENABLE_SCRIPTING` | `ON` | Enables C# Roslyn scripting & native plugin loader |
-| `ENABLE_EAC` | `ON` | Builds Easy Anti-Cheat proxy |
-| `ENABLE_COMPRESSION` | `ON` | Links zlib / Brotli and activates `CompressionHandler` |
-| `BUILD_TESTS` | `ON` | Builds 70+ GoogleTest suites |
-| `BUILD_BENCHMARKS` | `OFF` | Google-Benchmark micro-benchmarks |
+| `ENABLE_SCRIPTING` | `OFF` | Enables the C# scripting host & native plugin loader. **Currently does not build** (deprecated .NET COM host) — disabled pending a rework. |
+| `ENABLE_COMPRESSION` | `ON` | Links zlib (or a built-in stub) and activates `CompressionHandler` |
+| `BUILD_TESTS` | `OFF` | Builds the GoogleTest suites |
 
 ## 3. Error-Handling Contract
 | Layer | Model | Typical Error Class |

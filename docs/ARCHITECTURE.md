@@ -40,13 +40,15 @@ The RS2V server follows **modular architecture** principles with clear separatio
 │ • UE3Protocol   │ • RigidBody     │ • CryptoUtils              │
 └─────────────────┴─────────────────┴─────────────────────────────┘
 ┌─────────────────────────────────────────────────────────────────┐
-│                      Scripting Layer                           │
+│              Scripting Layer (currently disabled)              │
 │                                                                 │
 │ • ScriptHost (C#/.NET)    • HandlerLibraryManager (Native)     │
-│ • Roslyn Compiler        • Dynamic Plugin Loading              │
+│ • .NET COM hosting       • Dynamic Plugin Loading              │
 │ • Sandbox Security       • Hot Reload Support                  │
 └─────────────────────────────────────────────────────────────────┘
 ```
+
+> **Status note:** This document describes the **intended** architecture. The main server target builds on MSVC and MinGW, but the live UE3 control-channel handshake is still being implemented (a stock client cannot fully connect yet), the C# scripting layer is **disabled** (the `.NET` COM host does not build), and telemetry/security are partially stubbed. See the README's *Current Status* section for what is actually wired up today.
 
 ## 2 · Core Subsystems
 
