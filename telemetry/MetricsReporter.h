@@ -23,6 +23,7 @@
 #include <functional>
 
 #include "TelemetryManager.h"
+#include "Network/PlatformSocket.h"  // SocketHandle, RS2V_INVALID_SOCKET
 
 namespace Telemetry {
 
@@ -286,10 +287,10 @@ private:
     static constexpr size_t MAX_ERRORS = 50;
     
     // HTTP server (simplified implementation)
-    int m_serverSocket = -1;
+    SocketHandle m_serverSocket = RS2V_INVALID_SOCKET;
     void HTTPServerLoop();
     bool CreateServerSocket();
-    void HandleClientConnection(int clientSocket);
+    void HandleClientConnection(SocketHandle clientSocket);
 };
 
 // Configuration for alert-based reporter

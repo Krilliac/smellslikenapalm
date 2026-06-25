@@ -77,7 +77,7 @@ target_link_libraries(rs2v_server PRIVATE Threads::Threads)
 
 # Platform-specific link libraries
 if(WIN32)
-    target_link_libraries(rs2v_server PRIVATE ws2_32 iphlpapi)
+    target_link_libraries(rs2v_server PRIVATE ws2_32 iphlpapi pdh psapi)
 else()
     target_link_libraries(rs2v_server PRIVATE dl)
 endif()

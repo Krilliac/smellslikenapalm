@@ -5,7 +5,9 @@
 #include "MetricsReporter.h"
 #include "TelemetryManager.h"
 #include "Utils/Logger.h"
+#include "Network/PlatformSocket.h"  // SocketHandle, RS2V_INVALID_SOCKET, ws2tcpip.h (inet_ntop)
 
+#include <cstdint>
 #include <sstream>
 #include <iomanip>
 #include <algorithm>
@@ -15,23 +17,24 @@
 #include <cstring>
 #include <cmath>
 
-// Platform-specific networking includes
+// Platform-specific networking extras not covered by PlatformSocket.h.
+// PlatformSocket.h already pulls in the right system headers and defines
+// SocketHandle / RS2V_INVALID_SOCKET; here we just add the Berkeley-socket
+// status sentinels and helpers this file still references.
 #ifdef _WIN32
-    #include <winsock2.h>
-    #include <ws2tcpip.h>
     #pragma comment(lib, "ws2_32.lib")
     typedef int socklen_t;
 #else
-    #include <sys/socket.h>
-    #include <netinet/in.h>
-    #include <arpa/inet.h>
-    #include <unistd.h>
-    #include <fcntl.h>
     #include <signal.h>
-    #define INVALID_SOCKET -1
-    #define SOCKET_ERROR -1
+    #ifndef INVALID_SOCKET
+    #define INVALID_SOCKET (-1)
+    #endif
+    #ifndef SOCKET_ERROR
+    #define SOCKET_ERROR (-1)
+    #endif
+    #ifndef closesocket
     #define closesocket close
-    typedef int SOCKET;
+    #endif
 #endif
 
 namespace Telemetry {
@@ -361,7 +364,7 @@ void PrometheusMetricsReporter::HTTPServerLoop() {
 #endif
 
             Logger::Trace("[PrometheusMetricsReporter::HTTPServerLoop] Calling accept() (attempt %llu)", (unsigned long long)acceptAttempts);
-            SOCKET clientSocket = accept(m_serverSocket,
+            SocketHandle clientSocket = accept(m_serverSocket,
                                        reinterpret_cast<struct sockaddr*>(&clientAddr),
                                        &clientAddrLen);
 
@@ -387,9 +390,15 @@ void PrometheusMetricsReporter::HTTPServerLoop() {
             }
 
             clientsAccepted++;
+            // Thread-safe address formatting (inet_ntop replaces the non-reentrant,
+            // deprecated inet_ntoa). Buffer is large enough for IPv4 dotted-quad.
+            char clientIpStr[INET_ADDRSTRLEN] = {0};
+            if (inet_ntop(AF_INET, &clientAddr.sin_addr, clientIpStr, sizeof(clientIpStr)) == nullptr) {
+                std::strncpy(clientIpStr, "unknown", sizeof(clientIpStr) - 1);
+            }
             Logger::Debug("[PrometheusMetricsReporter::HTTPServerLoop] Accepted client connection #%llu from %s:%d, socket fd=%d",
                          (unsigned long long)clientsAccepted,
-                         inet_ntoa(clientAddr.sin_addr), ntohs(clientAddr.sin_port), (int)clientSocket);
+                         clientIpStr, ntohs(clientAddr.sin_port), (int)clientSocket);
 
             // Handle client connection in separate thread for non-blocking operation
             Logger::Trace("[PrometheusMetricsReporter::HTTPServerLoop] Spawning detached thread for client %d", (int)clientSocket);
@@ -410,8 +419,8 @@ void PrometheusMetricsReporter::HTTPServerLoop() {
     Logger::Trace("[PrometheusMetricsReporter::HTTPServerLoop] Exit");
 }
 
-void PrometheusMetricsReporter::HandleClientConnection(int clientSocket) {
-    Logger::Trace("[PrometheusMetricsReporter::HandleClientConnection] Entry - clientSocket=%d", clientSocket);
+void PrometheusMetricsReporter::HandleClientConnection(SocketHandle clientSocket) {
+    Logger::Trace("[PrometheusMetricsReporter::HandleClientConnection] Entry - clientSocket=%d", (int)clientSocket);
     try {
         // Set socket timeout
         struct timeval timeout;
@@ -428,7 +437,7 @@ void PrometheusMetricsReporter::HandleClientConnection(int clientSocket) {
         int bytesReceived = recv(clientSocket, buffer, sizeof(buffer) - 1, 0);
 
         if (bytesReceived <= 0) {
-            Logger::Debug("[PrometheusMetricsReporter::HandleClientConnection] recv returned %d, closing client socket %d", bytesReceived, clientSocket);
+            Logger::Debug("[PrometheusMetricsReporter::HandleClientConnection] recv returned %d, closing client socket %d", bytesReceived, (int)clientSocket);
             closesocket(clientSocket);
             Logger::Trace("[PrometheusMetricsReporter::HandleClientConnection] Exit - early return (no data received)");
             return;
@@ -462,7 +471,7 @@ void PrometheusMetricsReporter::HandleClientConnection(int clientSocket) {
             response += "\r\n";
             response += metricsData;
 
-            Logger::Info("[PrometheusMetricsReporter::HandleClientConnection] Served metrics response (200 OK, %zu bytes) to client on socket %d", metricsData.length(), clientSocket);
+            Logger::Info("[PrometheusMetricsReporter::HandleClientConnection] Served metrics response (200 OK, %zu bytes) to client on socket %d", metricsData.length(), (int)clientSocket);
 
         } else if (method == "GET" && path == "/") {
             // Root path - provide basic info
@@ -478,7 +487,7 @@ void PrometheusMetricsReporter::HandleClientConnection(int clientSocket) {
             response += "\r\n";
             response += info;
 
-            Logger::Debug("[PrometheusMetricsReporter::HandleClientConnection] Served info response (200 OK) to client on socket %d", clientSocket);
+            Logger::Debug("[PrometheusMetricsReporter::HandleClientConnection] Served info response (200 OK) to client on socket %d", (int)clientSocket);
 
         } else {
             // 404 Not Found
@@ -492,20 +501,20 @@ void PrometheusMetricsReporter::HandleClientConnection(int clientSocket) {
             response += "\r\n";
             response += notFound;
 
-            Logger::Warn("[PrometheusMetricsReporter::HandleClientConnection] Returned 404 for %s %s to client on socket %d", method.c_str(), path.c_str(), clientSocket);
+            Logger::Warn("[PrometheusMetricsReporter::HandleClientConnection] Returned 404 for %s %s to client on socket %d", method.c_str(), path.c_str(), (int)clientSocket);
         }
 
         // Send response
-        Logger::Trace("[PrometheusMetricsReporter::HandleClientConnection] Sending %zu byte response to client socket %d", response.length(), clientSocket);
+        Logger::Trace("[PrometheusMetricsReporter::HandleClientConnection] Sending %zu byte response to client socket %d", response.length(), (int)clientSocket);
         int bytesSent = send(clientSocket, response.c_str(), static_cast<int>(response.length()), 0);
         Logger::Trace("[PrometheusMetricsReporter::HandleClientConnection] send() returned %d", bytesSent);
 
     } catch (const std::exception& ex) {
         Logger::Error("Error handling Prometheus HTTP client: %s", ex.what());
-        Logger::Error("[PrometheusMetricsReporter::HandleClientConnection] Exception details on socket %d: %s", clientSocket, ex.what());
+        Logger::Error("[PrometheusMetricsReporter::HandleClientConnection] Exception details on socket %d: %s", (int)clientSocket, ex.what());
     }
 
-    Logger::Trace("[PrometheusMetricsReporter::HandleClientConnection] Closing client socket %d", clientSocket);
+    Logger::Trace("[PrometheusMetricsReporter::HandleClientConnection] Closing client socket %d", (int)clientSocket);
     closesocket(clientSocket);
     Logger::Trace("[PrometheusMetricsReporter::HandleClientConnection] Exit");
 }

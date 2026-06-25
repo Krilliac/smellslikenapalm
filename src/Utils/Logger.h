@@ -5,6 +5,15 @@
 #include <memory>
 #include <vector>
 
+// printf-style format-string checking under GCC/Clang. These are static member
+// functions (no implicit 'this'), so the format string is argument 1 and the
+// variadic arguments begin at argument 2 — i.e. RS2V_PRINTF_FORMAT(1, 2).
+#if defined(__GNUC__)
+  #define RS2V_PRINTF_FORMAT(fmtIdx, argIdx) __attribute__((format(printf, fmtIdx, argIdx)))
+#else
+  #define RS2V_PRINTF_FORMAT(fmtIdx, argIdx)
+#endif
+
 // Logging levels
 enum class LogLevel {
     Trace,
@@ -34,12 +43,12 @@ public:
     static void Log(LogLevel level, const char* fmt, ...);
 
     // Level-specific helpers
-    static void Trace(const char* fmt, ...);
-    static void Debug(const char* fmt, ...);
-    static void Info(const char* fmt, ...);
-    static void Warn(const char* fmt, ...);
-    static void Error(const char* fmt, ...);
-    static void Fatal(const char* fmt, ...);
+    static void Trace(const char* fmt, ...) RS2V_PRINTF_FORMAT(1, 2);
+    static void Debug(const char* fmt, ...) RS2V_PRINTF_FORMAT(1, 2);
+    static void Info(const char* fmt, ...)  RS2V_PRINTF_FORMAT(1, 2);
+    static void Warn(const char* fmt, ...)  RS2V_PRINTF_FORMAT(1, 2);
+    static void Error(const char* fmt, ...) RS2V_PRINTF_FORMAT(1, 2);
+    static void Fatal(const char* fmt, ...) RS2V_PRINTF_FORMAT(1, 2);
 
     // Structured logging - outputs in JSON format
     static void SetStructuredLogging(bool enabled);
