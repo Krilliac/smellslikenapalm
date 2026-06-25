@@ -44,6 +44,7 @@ endfunction()
 # -----------------------------------------------------------------------------
 # ALLOW-LIST — building + linking against rs2v_core
 # -----------------------------------------------------------------------------
+rs2v_add_test(StackTraceTests)   # crash-handler stack capture: frames non-empty, addresses non-zero, symbol name when available
 rs2v_add_test(Vector3Tests)      # reconciled: global Vector3, LengthSquared/DistanceSquared, member Lerp, inline clamp
 rs2v_add_test(ThreadPoolTests)   # reconciled: future-based waits (no WaitAll/GetThisThreadIndex)
 rs2v_add_test(INIParserTests)    # reconciled: self-contained TestINIParser; dead mocks + INISection clash removed

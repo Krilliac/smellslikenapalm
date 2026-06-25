@@ -13,6 +13,7 @@
 #include "Config/ServerConfig.h"
 #include "Config/SecurityConfig.h"
 #include "Utils/Logger.h"
+#include "Utils/CrashHandler.h"
 #include "Utils/FileUtils.h"
 #include "Time/GameClock.h"
 
@@ -167,6 +168,11 @@ CmdArgs ParseArgs(int argc, char* argv[])
 
 int main(int argc, char* argv[])
 {
+    // Install crash diagnostics FIRST — before any other init — so even a crash
+    // during early startup prints a banner + symbolized stack trace instead of
+    // dying silently with a bare exit code.
+    rs2v::InstallCrashHandler();
+
     // Pre-logging initialization: parse args first since logging depends on config
     auto args = ParseArgs(argc, argv);
     if (args.help) {
