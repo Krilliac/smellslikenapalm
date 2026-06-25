@@ -52,6 +52,7 @@ rs2v_add_test(PacketFramingTests)  # UE3 packet/bunch framing codec; fixtures = 
 rs2v_add_test(ControlChannelTests) # UE3 control-channel message-body codec; round-trips per spec §4
 rs2v_add_test(PacketAssemblerTests) # UE3 outbound control-channel packet assembler (sequencing/fragmentation)
 rs2v_add_test(ControlReassemblerTests) # UE3 inbound control-channel reassembler (ordering/dedup/delimiting)
+rs2v_add_test(HandshakeIntegrationTests) # end-to-end client<->server handshake over the real wire codec
 
 # Scripting is OFF by default (deprecated .NET COM hosting). The scripting test
 # is gated on ENABLE_SCRIPTING, but it ALSO references Scripting/ScriptEngine.h
