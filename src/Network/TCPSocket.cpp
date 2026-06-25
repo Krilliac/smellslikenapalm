@@ -2,17 +2,7 @@
 
 #include "Network/TCPSocket.h"
 #include "Utils/Logger.h"
-
-#ifdef _WIN32
-  #include <ws2tcpip.h>
-#else
-  #include <sys/socket.h>
-  #include <netinet/in.h>
-  #include <arpa/inet.h>
-  #include <fcntl.h>
-  #include <unistd.h>
-  #include <cstring>
-#endif
+#include "Network/PlatformSocket.h"
 
 TCPSocket::TCPSocket() {
     Logger::Trace("[TCPSocket::TCPSocket] Entry: default constructor");
@@ -261,10 +251,9 @@ void TCPSocket::SetBlocking(bool blocking) {
 
 void TCPSocket::SetRecvTimeout(std::chrono::milliseconds timeout) {
     Logger::Trace("[TCPSocket::SetRecvTimeout] Entry: timeout=%lld ms, fd=%d", (long long)timeout.count(), m_sock);
-    timeval tv{
-        .tv_sec = (long)(timeout.count()/1000),
-        .tv_usec = (long)((timeout.count()%1000)*1000)
-    };
+    timeval tv{};
+    tv.tv_sec  = (long)(timeout.count()/1000);
+    tv.tv_usec = (long)((timeout.count()%1000)*1000);
     setsockopt(m_sock, SOL_SOCKET, SO_RCVTIMEO, (char*)&tv, sizeof(tv));
     Logger::Debug("[TCPSocket::SetRecvTimeout] Set SO_RCVTIMEO: %ld sec, %ld usec on fd=%d",
                   tv.tv_sec, tv.tv_usec, m_sock);
@@ -273,10 +262,9 @@ void TCPSocket::SetRecvTimeout(std::chrono::milliseconds timeout) {
 
 void TCPSocket::SetSendTimeout(std::chrono::milliseconds timeout) {
     Logger::Trace("[TCPSocket::SetSendTimeout] Entry: timeout=%lld ms, fd=%d", (long long)timeout.count(), m_sock);
-    timeval tv{
-        .tv_sec = (long)(timeout.count()/1000),
-        .tv_usec = (long)((timeout.count()%1000)*1000)
-    };
+    timeval tv{};
+    tv.tv_sec  = (long)(timeout.count()/1000);
+    tv.tv_usec = (long)((timeout.count()%1000)*1000);
     setsockopt(m_sock, SOL_SOCKET, SO_SNDTIMEO, (char*)&tv, sizeof(tv));
     Logger::Debug("[TCPSocket::SetSendTimeout] Set SO_SNDTIMEO: %ld sec, %ld usec on fd=%d",
                   tv.tv_sec, tv.tv_usec, m_sock);

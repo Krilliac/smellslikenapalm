@@ -1,5 +1,8 @@
 // src/Security/EACMemoryScanner.cpp
 #include "Security/EACMemoryScanner.h"
+#ifdef _WIN32
+#include <windows.h>
+#endif
 #include "Utils/Logger.h"
 #include <thread>
 #include <future>

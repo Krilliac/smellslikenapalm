@@ -2,12 +2,9 @@
 #include "Network/SteamQuery.h"
 #include "Network/SocketFactory.h"
 #include "Utils/Logger.h"
+#include "Network/PlatformSocket.h"
 #include <cstring>
 #include <chrono>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <unistd.h>
 
 SteamQuery::SteamQuery(const std::string& masterServerIp, uint16_t masterServerPort)
     : m_masterIp(masterServerIp), m_masterPort(masterServerPort)
@@ -161,7 +158,7 @@ bool SteamQuery::SendAndReceive(const std::vector<uint8_t>& req,
     inet_pton(AF_INET, ip.c_str(), &dest.sin_addr);
 
     Logger::Debug("[SteamQuery::SendAndReceive] Sending %zu bytes to %s:%u", req.size(), ip.c_str(), port);
-    ssize_t sentBytes = sendto(sock, req.data(), (int)req.size(), 0, (sockaddr*)&dest, sizeof(dest));
+    ssize_t sentBytes = sendto(sock, reinterpret_cast<const char*>(req.data()), (int)req.size(), 0, (sockaddr*)&dest, sizeof(dest));
     Logger::Debug("[SteamQuery::SendAndReceive] sendto returned %zd", sentBytes);
     if (sentBytes < 0) {
         Logger::Error("[SteamQuery::SendAndReceive] sendto failed for %s:%u", ip.c_str(), port);
@@ -170,9 +167,9 @@ bool SteamQuery::SendAndReceive(const std::vector<uint8_t>& req,
     // Receive
     socklen_t addrLen = sizeof(dest);
     Logger::Debug("[SteamQuery::SendAndReceive] Waiting for response from %s:%u (timeout=%u ms)", ip.c_str(), port, timeoutMs);
-    int len = recvfrom(sock, resp.data(), (int)resp.size(), 0, (sockaddr*)&dest, &addrLen);
+    int len = recvfrom(sock, reinterpret_cast<char*>(resp.data()), (int)resp.size(), 0, (sockaddr*)&dest, &addrLen);
     Logger::Debug("[SteamQuery::SendAndReceive] recvfrom returned %d", len);
-    close(sock);
+    CloseSocket(sock);
     Logger::Debug("[SteamQuery::SendAndReceive] Socket fd=%d closed", sock);
     if (len <= 0) {
         Logger::Warn("[SteamQuery::SendAndReceive] No response received from %s:%u (recvfrom returned %d)",

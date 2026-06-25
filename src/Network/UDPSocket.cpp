@@ -2,17 +2,7 @@
 
 #include "Network/UDPSocket.h"
 #include "Utils/Logger.h"
-
-#ifdef _WIN32
-  #include <ws2tcpip.h>
-#else
-  #include <sys/socket.h>
-  #include <netinet/in.h>
-  #include <arpa/inet.h>
-  #include <fcntl.h>
-  #include <unistd.h>
-  #include <cstring>
-#endif
+#include "Network/PlatformSocket.h"
 
 UDPSocket::UDPSocket() {
     Logger::Trace("[UDPSocket::UDPSocket] Entry: default constructor");

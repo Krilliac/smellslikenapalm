@@ -4,7 +4,7 @@
 
 #include <string>
 #include <cstdint>
-#include "Physics/Vector3.h"
+#include "Math/Vector3.h"
 
 struct SpawnPoint {
     uint32_t    id = 0;

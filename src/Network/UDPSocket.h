@@ -7,12 +7,7 @@
 #include <cstdint>
 #include <chrono>
 
-#ifdef _WIN32
-  #include <winsock2.h>
-  using SocketHandle = SOCKET;
-#else
-  using SocketHandle = int;
-#endif
+#include "Network/PlatformSocket.h"
 
 struct SocketConfig {
     std::chrono::milliseconds recvTimeout{500};
@@ -45,7 +40,7 @@ public:
     bool IsOpen() const;
 
 private:
-    SocketHandle            m_sock{-1};
+    SocketHandle            m_sock{RS2V_INVALID_SOCKET};
     SocketConfig            m_cfg;
 
     bool Configure(const SocketConfig& cfg);

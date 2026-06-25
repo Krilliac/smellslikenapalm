@@ -533,7 +533,7 @@ double TelemetryManager::GetCPUUsage() {
     if (!initialized) {
         Logger::Debug("[TelemetryManager::GetCPUUsage] PDH not yet initialized, initializing CPU counter");
         if (PdhOpenQuery(nullptr, 0, &query) == ERROR_SUCCESS) {
-            if (PdhAddEnglishCounter(query, L"\\Processor(_Total)\\% Processor Time", 0, &counter) == ERROR_SUCCESS) {
+            if (PdhAddEnglishCounter(query, "\\Processor(_Total)\\% Processor Time", 0, &counter) == ERROR_SUCCESS) {
                 PdhCollectQueryData(query);
                 initialized = true;
                 Logger::Debug("[TelemetryManager::GetCPUUsage] PDH CPU counter initialized successfully");

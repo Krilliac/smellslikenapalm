@@ -8,7 +8,10 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 # Build options
 option(ENABLE_TELEMETRY   "Enable telemetry system"       ON)
-option(ENABLE_SCRIPTING   "Enable C# scripting support"   ON)
+# NOTE: the C# scripting engine uses deprecated .NET COM hosting
+# (mscorlib.tlb / ICorRuntimeHost) and does not currently build. Disabled by
+# default until reworked (e.g. onto a supported hosting API). See src/Scripting.
+option(ENABLE_SCRIPTING   "Enable C# scripting support"   OFF)
 option(ENABLE_COMPRESSION "Enable packet compression"     ON)
 option(BUILD_TESTS        "Build test suite"              OFF)
 
@@ -27,15 +30,6 @@ endif()
 
 # Include paths — src/ holds both headers and sources
 include_directories(${CMAKE_SOURCE_DIR}/src)
-include_directories(${CMAKE_SOURCE_DIR}/include)
-
-# Create Math/ -> Physics/ symlink so #include "Math/Vector3.h" resolves
-if(NOT EXISTS "${CMAKE_SOURCE_DIR}/src/Math")
-    file(CREATE_LINK
-         "${CMAKE_SOURCE_DIR}/src/Physics"
-         "${CMAKE_SOURCE_DIR}/src/Math"
-         SYMBOLIC)
-endif()
 
 # Find dependencies
 find_package(OpenSSL QUIET)
@@ -46,6 +40,7 @@ find_package(ZLIB QUIET)
 file(GLOB_RECURSE CORE_SOURCES
     src/Config/*.cpp
     src/Game/*.cpp
+    src/Math/*.cpp
     src/Network/*.cpp
     src/Physics/*.cpp
     src/Protocol/*.cpp

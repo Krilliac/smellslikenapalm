@@ -4,6 +4,11 @@
 
 #ifdef _WIN32
     #include <windows.h>
+    #include <basetsd.h>
+    #ifndef RS2V_SSIZE_T_DEFINED
+        #define RS2V_SSIZE_T_DEFINED
+        using ssize_t = SSIZE_T;
+    #endif
 #elif defined(__linux__)
     #include <unistd.h>
     #include <limits.h>
