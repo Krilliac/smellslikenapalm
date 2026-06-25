@@ -4,6 +4,7 @@
 #include "Network/ControlReassembler.h"
 
 #include "Network/NetMessages.h"
+#include "Utils/Logger.h"
 
 #include <algorithm>
 
@@ -13,6 +14,9 @@ ControlReassembler::ControlReassembler(MessageFn onMessage)
     : m_onMessage(std::move(onMessage)) {}
 
 void ControlReassembler::OnBunch(const Bunch& bunch) {
+    Logger::Trace("[ControlReassembler] OnBunch ch=%u reliable=%d open=%d ctrl=%d seq=%u type=%u bits=%u | m_nextSeq=%u pending=%zu",
+                  bunch.chIndex, (int)bunch.bReliable, (int)bunch.bOpen, (int)bunch.bControl,
+                  bunch.chSequence, bunch.chType, bunch.payloadBits, m_nextSeq, m_pending.size());
     // Only reliable control-channel (index 0) bunches participate in the ordered
     // message stream. Everything else is ignored here.
     if (bunch.chIndex != static_cast<uint32_t>(kControlChannelIndex) || !bunch.bReliable) {
@@ -46,8 +50,33 @@ void ControlReassembler::Drain() {
     // in a single bunch, so per-bunch delivery is correct here. (A genuinely
     // multi-bunch message - e.g. the large Login auth blob - would need
     // cross-bunch re-accumulation; that is deferred until the NMT phase needs it.)
-    auto it = m_pending.find(m_nextSeq);
-    while (it != m_pending.end()) {
+    //
+    // IMPORTANT: UE3's reliable ChSequence is effectively a connection-global
+    // counter shared across channels - so the control channel's (chIndex 0) own
+    // reliable bunches arrive with GAPS in their sequence numbers (e.g. 3,5,6,7,...
+    // where 4 was a bunch on another channel, or was lost and not retransmitted in
+    // this stream). A strictly-contiguous "deliver only m_nextSeq" loop would
+    // deadlock forever on the first such gap, blocking EVERY control message after
+    // it (observed live: login completed at seq 3, then seqs 5,6,7,11,12... piled
+    // up unread because seq 4 never arrived). So we skip a gap once enough later
+    // bunches have accumulated: the missing sequence is not coming.
+    constexpr size_t kSkipGapThreshold = 4; // buffered bunches before we skip a gap
+    for (;;) {
+        auto it = m_pending.find(m_nextSeq);
+        if (it == m_pending.end()) {
+            // m_nextSeq is missing. If enough later bunches have piled up, the gap
+            // won't fill - skip ahead to the lowest buffered sequence.
+            if (m_pending.size() >= kSkipGapThreshold) {
+                uint32_t lowest = m_pending.begin()->first;
+                if (lowest > m_nextSeq) {
+                    Logger::Debug("[ControlReassembler] skipping gap: m_nextSeq %u -> %u (%zu buffered)",
+                                  m_nextSeq, lowest, m_pending.size());
+                    m_nextSeq = lowest;
+                    continue;
+                }
+            }
+            break;
+        }
         const Bunch& b = it->second;
         if (m_onMessage && b.payloadBits > 0) {
             const size_t nbytes = std::min(static_cast<size_t>((b.payloadBits + 7) / 8), b.payload.size());
@@ -55,7 +84,6 @@ void ControlReassembler::Drain() {
         }
         m_pending.erase(it);
         ++m_nextSeq;
-        it = m_pending.find(m_nextSeq);
     }
 }
 

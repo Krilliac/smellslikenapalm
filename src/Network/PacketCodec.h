@@ -36,11 +36,15 @@ constexpr uint32_t kControlChannelType = 1; // ChType for the control channel [U
 // and thus where the payload starts - changes with MaxPacket. The caller passes
 // the right value per connection phase (see PacketCodec::Decode/Encode).
 constexpr uint32_t kHandshakeMaxPacketBytes = 8;     // StatelessConnect phase
-// 1024 is the empirically-clean value: the NMT-phase Login bunch carries 6256
-// BunchDataBits, which only decodes if MaxPacket*8 > 6256 (=> >=783); the whole
-// 803-byte Login datagram parses byte-exactly at 1024. (Binary static default is
-// 512, but the live connection's MaxPacket is negotiated up by the NMT phase.)
-constexpr uint32_t kNmtMaxPacketBytes       = 1024;  // established / NMT phase
+// 2048 is the bit-exact value (reversed from VNGame.exe [conn+0x10c] and proven
+// against the real capture): BunchDataBits = SerializeInt(2048*8 = 16384), which
+// is 14 bits wide. The Hello version fields (MinVer=7038, Ver=7258), the SteamId
+// (0x0110000103E8DBBB), the rate (80000) and the login URL all decode byte-exactly
+// ONLY at this width. 1024 (bound 8192, width 13) is one bit too narrow and
+// right-shifts the whole NMT-phase payload by one bit per bunch, mis-reading every
+// NMT byte (Hello 0x00 -> 0x20, Login 0x10 -> 0x08, etc). (Binary static default
+// is 512; the live connection's MaxPacket is negotiated up to 2048 by the NMT phase.)
+constexpr uint32_t kNmtMaxPacketBytes       = 2048;  // established / NMT phase
 constexpr uint32_t kBunchDataBitsMax = kHandshakeMaxPacketBytes * 8; // 64 (handshake default)
 
 // One decoded bunch. `payload` holds the bunch data bits packed LSB-first (the

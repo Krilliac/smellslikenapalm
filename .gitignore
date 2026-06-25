@@ -47,9 +47,13 @@ IDE files
 
 Logs and runtime files
 *.log
+*.err
 *.pid
 *.pid.lock
 .remember/logs/
+server_iter*
+protocol_analysis/
+telemetry/output/
 
 Configuration backups
 *.swp

@@ -82,6 +82,16 @@ void HandshakeState::HandleControlMessage(const uint8_t* data, size_t len) {
         return;
     }
 
+    // Once the client has Joined, the reliable stream is world/actor replication,
+    // NOT control-channel NMT messages. Interpreting those bytes as NMT produces
+    // garbage (e.g. bogus Netspeed values, phantom 0x84 "messages"). Stop feeding
+    // the handshake switch past Join; replication is handled elsewhere.
+    if (m_phase == HandshakePhase::Joined) {
+        Logger::Trace("[HandshakeState] client %u: post-Join stream byte (len=%zu), not control NMT - ignoring",
+                      m_clientId, len);
+        return;
+    }
+
     NMT type;
     if (!ControlChannel::PeekType(data, len, type)) {
         Logger::Debug("[HandshakeState] client %u: could not peek message type, ignoring", m_clientId);
@@ -237,7 +247,14 @@ void HandshakeState::OnLogin(const uint8_t* data, size_t len) {
 }
 
 void HandshakeState::CompleteLogin() {
-    if (m_phase != HandshakePhase::ChallengeSent &&
+    // In the RS2 EOS build the challenge/response happens in the StatelessConnect
+    // phase, so the NMT phase opens directly at AwaitingHello and the FIRST NMT
+    // message is the Steam login (0x10) - there is no separate NMT Hello->Challenge
+    // ->Login round. So AwaitingHello is a valid pre-login state here, alongside the
+    // classic ChallengeSent/AwaitingLogin. Anything past WelcomeSent is a
+    // retransmit and must be ignored.
+    if (m_phase != HandshakePhase::AwaitingHello &&
+        m_phase != HandshakePhase::ChallengeSent &&
         m_phase != HandshakePhase::AwaitingLogin) {
         return; // already past login (e.g. a retransmitted Steam login)
     }
@@ -264,8 +281,11 @@ void HandshakeState::CompleteLogin() {
 }
 
 void HandshakeState::OnJoin(const uint8_t* /*data*/, size_t /*len*/) {
-    if (m_phase != HandshakePhase::WelcomeSent && m_phase != HandshakePhase::Joined) {
-        Logger::Debug("[HandshakeState] client %u: Join in unexpected state %s, ignoring",
+    // Only the WelcomeSent -> Joined transition is a real Join. A Join seen while
+    // already Joined is a duplicate/retransmit (or a mis-parsed replication byte)
+    // and must NOT re-fire ClientJoined (which would spawn the player repeatedly).
+    if (m_phase != HandshakePhase::WelcomeSent) {
+        Logger::Debug("[HandshakeState] client %u: Join in state %s, ignoring (already joined or too early)",
                       m_clientId, HandshakePhaseName(m_phase));
         return;
     }
@@ -288,7 +308,9 @@ void HandshakeState::HandleSteamAuthStub(NMT type) {
     // retransmits it; only the first (in ChallengeSent) advances.
     Logger::Info("[HandshakeState] client %u: Steam auth/login type=0x%02X accepted blindly (STUB)",
                  m_clientId, (unsigned)NMTByte(type));
-    if (m_phase == HandshakePhase::ChallengeSent || m_phase == HandshakePhase::AwaitingLogin) {
+    if (m_phase == HandshakePhase::AwaitingHello ||
+        m_phase == HandshakePhase::ChallengeSent ||
+        m_phase == HandshakePhase::AwaitingLogin) {
         Logger::Info("[HandshakeState] client %u: treating Steam login as login completion -> Welcome", m_clientId);
         CompleteLogin();
     }
