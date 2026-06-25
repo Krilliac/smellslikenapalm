@@ -41,19 +41,14 @@ public:
 
     // Test/diagnostic accessors.
     uint32_t NextSequence() const { return m_nextSeq; }
-    size_t BufferedBits() const { return m_accumBits; }
     size_t PendingBunchCount() const { return m_pending.size(); }
 
 private:
-    void Drain();          // append in-order ready bunches to the accumulator
-    void PeelMessages();   // dispatch every complete message in the accumulator
-    void DropFrontBits(size_t bitCount); // remove consumed bits from the front
+    void Drain();   // deliver in-order ready bunches (per-bunch) to the callback
 
     MessageFn m_onMessage;
     std::map<uint32_t, Bunch> m_pending;  // chSequence -> bunch awaiting in-order drain
     uint32_t m_nextSeq = 1;               // next ChSequence to consume (starts 1)
-    std::vector<uint8_t> m_accumBytes;    // packed in-order payload bits (LSB-first)
-    size_t m_accumBits = 0;               // valid bit count within m_accumBytes
 };
 
 } // namespace PacketCodec

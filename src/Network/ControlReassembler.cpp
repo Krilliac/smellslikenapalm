@@ -3,23 +3,11 @@
 
 #include "Network/ControlReassembler.h"
 
-#include "Network/BitReader.h"
-#include "Network/BitWriter.h"
-#include "Network/ControlChannel.h"
 #include "Network/NetMessages.h"
 
+#include <algorithm>
+
 namespace PacketCodec {
-
-namespace {
-
-// Copy `count` bits from `in` (current position) into `out`, LSB-first.
-void CopyBits(BitReader& in, BitWriter& out, size_t count) {
-    for (size_t i = 0; i < count; ++i) {
-        out.WriteBit(in.ReadBit());
-    }
-}
-
-} // namespace
 
 ControlReassembler::ControlReassembler(MessageFn onMessage)
     : m_onMessage(std::move(onMessage)) {}
@@ -52,70 +40,23 @@ void ControlReassembler::OnBunch(const Bunch& bunch) {
 }
 
 void ControlReassembler::Drain() {
-    // Append every in-order ready bunch's payload bits to the accumulator.
+    // Deliver each in-order reliable control bunch's payload as ONE complete
+    // message. RS2 control messages in the handshake + early NMT phase
+    // (HandshakeStart/Challenge/Response/Complete, Hello, Netspeed, ...) each fit
+    // in a single bunch, so per-bunch delivery is correct here. (A genuinely
+    // multi-bunch message - e.g. the large Login auth blob - would need
+    // cross-bunch re-accumulation; that is deferred until the NMT phase needs it.)
     auto it = m_pending.find(m_nextSeq);
     while (it != m_pending.end()) {
         const Bunch& b = it->second;
-
-        BitWriter w;
-        if (m_accumBits > 0) {
-            BitReader existing(m_accumBytes.data(), m_accumBytes.size(), m_accumBits);
-            CopyBits(existing, w, m_accumBits);
+        if (m_onMessage && b.payloadBits > 0) {
+            const size_t nbytes = std::min(static_cast<size_t>((b.payloadBits + 7) / 8), b.payload.size());
+            m_onMessage(std::vector<uint8_t>(b.payload.begin(), b.payload.begin() + nbytes));
         }
-        BitReader br(b.payload.data(), b.payload.size(), b.payloadBits);
-        CopyBits(br, w, b.payloadBits);
-
-        m_accumBytes = w.GetBytes();
-        m_accumBits += b.payloadBits;
-
         m_pending.erase(it);
         ++m_nextSeq;
         it = m_pending.find(m_nextSeq);
     }
-
-    PeelMessages();
-}
-
-void ControlReassembler::PeelMessages() {
-    while (m_accumBits > 0) {
-        BitReader r(m_accumBytes.data(), m_accumBytes.size(), m_accumBits);
-        NMT type;
-        if (!ControlChannel::ConsumeMessage(r, type)) {
-            // Incomplete (need more bunches) or an NMT we can't delimit. Stop.
-            break;
-        }
-        const size_t consumed = r.BitPos();
-        if (consumed == 0 || consumed > m_accumBits) {
-            break; // safety: never loop forever / over-read
-        }
-
-        // Extract the consumed bits as the byte-aligned message payload.
-        BitReader src(m_accumBytes.data(), m_accumBytes.size(), m_accumBits);
-        BitWriter msg;
-        CopyBits(src, msg, consumed);
-        if (m_onMessage) {
-            m_onMessage(msg.GetBytes());
-        }
-
-        DropFrontBits(consumed);
-    }
-}
-
-void ControlReassembler::DropFrontBits(size_t bitCount) {
-    if (bitCount >= m_accumBits) {
-        m_accumBytes.clear();
-        m_accumBits = 0;
-        return;
-    }
-    const size_t remaining = m_accumBits - bitCount;
-    BitReader r(m_accumBytes.data(), m_accumBytes.size(), m_accumBits);
-    for (size_t i = 0; i < bitCount; ++i) {
-        r.ReadBit(); // skip consumed prefix
-    }
-    BitWriter w;
-    CopyBits(r, w, remaining);
-    m_accumBytes = w.GetBytes();
-    m_accumBits = remaining;
 }
 
 } // namespace PacketCodec

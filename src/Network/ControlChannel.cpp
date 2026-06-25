@@ -83,6 +83,23 @@ std::vector<uint8_t> BuildJoin(const JoinMessage& /*msg*/) {
     return w.GetBytes();
 }
 
+std::vector<uint8_t> BuildHandshakeChallenge(uint32_t nonce) {
+    BitWriter w;
+    w.WriteByte(Handshake::kFamilyByte);   // 0x00
+    w.WriteByte(Handshake::kChallenge);    // 0x1e
+    w.WriteByte(static_cast<uint8_t>(nonce & 0xFF));
+    w.WriteByte(static_cast<uint8_t>((nonce >> 8) & 0xFF));
+    w.WriteByte(static_cast<uint8_t>((nonce >> 16) & 0xFF));
+    return w.GetBytes();
+}
+
+std::vector<uint8_t> BuildHandshakeComplete() {
+    BitWriter w;
+    w.WriteByte(Handshake::kFamilyByte);   // 0x00
+    w.WriteByte(Handshake::kComplete);     // 0x20
+    return w.GetBytes();
+}
+
 std::string BuildLoginURL(const std::string& portal,
                           const std::vector<std::pair<std::string, std::string>>& options) {
     std::string url = portal;

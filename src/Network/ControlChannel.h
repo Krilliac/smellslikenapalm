@@ -112,6 +112,30 @@ std::vector<uint8_t> BuildFailure(const FailureMessage& msg);
 std::vector<uint8_t> BuildUpgrade(const UpgradeMessage& msg);
 std::vector<uint8_t> BuildJoin(const JoinMessage& msg);
 
+// ---------------------------------------------------------------------------
+//  StatelessConnect / pre-NMT handshake messages (RS2 7258, reversed from
+//  VNGame.exe + capture). These ride as reliable control-channel bunches BEFORE
+//  the NMT phase. Payload = [0x00 family byte][subtype byte][data].
+//  Exchange: C->S 0x1d HandshakeStart -> S->C 0x1e HandshakeChallenge(+nonce)
+//         -> C->S 0x1f HandshakeResponse -> S->C 0x20 HandshakeComplete.
+//  The server's nonce is just rand() (no crypto); the emulator accepts the
+//  client's response blindly. See docs/RS2V_ControlChannel_WireSpec_7258.md.
+// ---------------------------------------------------------------------------
+namespace Handshake {
+    constexpr uint8_t kFamilyByte = 0x00;       // leading payload byte for all 4 msgs
+    constexpr uint8_t kStart      = 0x1d;       // C->S
+    constexpr uint8_t kChallenge  = 0x1e;       // S->C (+ 3 nonce bytes)
+    constexpr uint8_t kResponse   = 0x1f;       // C->S (+ response bytes)
+    constexpr uint8_t kComplete   = 0x20;       // S->C
+}
+
+// HandshakeChallenge: 0x00, 0x1e, then the low 3 bytes of `nonce` (matches the
+// 3-byte-branch the official server takes on the wire).
+std::vector<uint8_t> BuildHandshakeChallenge(uint32_t nonce);
+
+// HandshakeComplete: 0x00, 0x20.
+std::vector<uint8_t> BuildHandshakeComplete();
+
 // Convenience: build a Login URL FURL string from option pairs. The leading
 // portal/map is `portal`; each option is appended as "?Key=Value" (or "?Key" for
 // a bare flag where value is empty). Mirrors the client-side builder in spec §6.

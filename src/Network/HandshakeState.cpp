@@ -76,6 +76,12 @@ void HandshakeState::HandleControlMessage(const uint8_t* data, size_t len) {
         return;
     }
 
+    // StatelessConnect handshake runs first. Until it completes, route by subtype.
+    if (!m_controlHandshakeComplete) {
+        HandleHandshakeMessage(data, len);
+        return;
+    }
+
     NMT type;
     if (!ControlChannel::PeekType(data, len, type)) {
         Logger::Debug("[HandshakeState] client %u: could not peek message type, ignoring", m_clientId);
@@ -109,6 +115,44 @@ void HandshakeState::HandleControlMessage(const uint8_t* data, size_t len) {
             // NEVER crash on an unexpected type byte.
             Logger::Debug("[HandshakeState] client %u: unhandled control message type=0x%02X, ignoring",
                           m_clientId, (unsigned)NMTByte(type));
+            break;
+    }
+}
+
+void HandshakeState::HandleHandshakeMessage(const uint8_t* data, size_t len) {
+    // Payload = [0x00 family][subtype][data]. Switch on the subtype byte (the 2nd
+    // byte). We blind-accept: any nonce on the challenge, no validation of the
+    // client's response. See ControlChannel::Handshake.
+    if (len < 2) {
+        Logger::Debug("[HandshakeState] client %u: short handshake msg (%zu bytes), ignoring", m_clientId, len);
+        return;
+    }
+    const uint8_t subtype = data[1];
+    switch (subtype) {
+        case ControlChannel::Handshake::kStart: {  // 0x1d  C->S HandshakeStart
+            m_handshakeNonce = MakeServerNonce(m_clientId);
+            Emit(ControlChannel::BuildHandshakeChallenge(m_handshakeNonce));
+            Logger::Info("[HandshakeState] client %u: HandshakeStart -> sent HandshakeChallenge (nonce=0x%06X)",
+                         m_clientId, m_handshakeNonce & 0xFFFFFF);
+            break;
+        }
+        case ControlChannel::Handshake::kResponse: {  // 0x1f  C->S HandshakeResponse
+            // Accept blindly (no CRC32 validation - the server owns that choice).
+            Emit(ControlChannel::BuildHandshakeComplete());
+            m_controlHandshakeComplete = true;
+            m_phase = HandshakePhase::AwaitingHello;
+            Logger::Info("[HandshakeState] client %u: HandshakeResponse accepted -> sent HandshakeComplete; entering NMT phase",
+                         m_clientId);
+            break;
+        }
+        case ControlChannel::Handshake::kChallenge:   // 0x1e (server-sent; shouldn't arrive inbound)
+        case ControlChannel::Handshake::kComplete:    // 0x20 (server-sent)
+            Logger::Debug("[HandshakeState] client %u: ignoring inbound server-side handshake subtype 0x%02X",
+                          m_clientId, subtype);
+            break;
+        default:
+            Logger::Warn("[HandshakeState] client %u: unknown handshake subtype 0x%02X (len=%zu), ignoring",
+                         m_clientId, subtype, len);
             break;
     }
 }

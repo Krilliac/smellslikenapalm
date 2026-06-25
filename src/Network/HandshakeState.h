@@ -124,6 +124,11 @@ public:
     static constexpr int32_t kMaxAcceptedNetspeed = 100000;
 
 private:
+    // Pre-NMT StatelessConnect handshake: routes the 0x1d/0x1f subtypes (the
+    // payload's 2nd byte) before the NMT phase begins. See ControlChannel
+    // Handshake constants + docs/RS2V_ControlChannel_WireSpec_7258.md.
+    void HandleHandshakeMessage(const uint8_t* data, size_t len);
+
     // Per-message handlers.
     void OnHello(const uint8_t* data, size_t len);
     void OnNetspeed(const uint8_t* data, size_t len);
@@ -141,6 +146,12 @@ private:
     RawSendFn         m_rawSend;
     ClientLoggedInCallback m_onLoggedIn;  // may be null
     ClientJoinedCallback   m_onJoined;    // may be null
+
+    // The StatelessConnect handshake runs BEFORE the NMT phase; until it
+    // completes, inbound control messages are routed to HandleHandshakeMessage
+    // (by subtype), not the NMT switch.
+    bool              m_controlHandshakeComplete = false;
+    uint32_t          m_handshakeNonce = 0; // the rand() nonce we sent in 0x1e
 
     HandshakePhase    m_phase = HandshakePhase::AwaitingHello;
 
