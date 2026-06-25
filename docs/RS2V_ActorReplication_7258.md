@@ -453,3 +453,158 @@ ServerMove first bytes (BOTH sessions): 68 5a 00 00 00 98 72 22 ...   (ch2, hand
 short ServerMove: 98 8e 60 01 00  (33 bits, handle 664 + timestamp + zero move)
 PC property delta: 17 6a 00  (handle 23) ; 33 ea d0 ... (handle 51) ; 40 ... (handle 64)
 ```
+
+---
+
+## 6. Generation templates (regeneration recipe for `MakeOpeningActorBunch`)
+
+Bit-decoded from **Session A** (`udp.port==57867`), the opening-actor burst f1484-1494,
+cross-checked against **Session B** (`udp.port==56400`, burst f60859). This section is
+the per-class recipe our emulator fills with per-session values and emits.
+
+### 6.0 Decoded wire structure of a SerializeNewActor open (corrected) **[H]**
+
+Each open-bunch payload is, in order:
+
+```
+[ classNetGUID ]   ; 1 flag bit + SerializeInt  -> CONSTANT per class family
+[ actorNetGUID ]   ; 1 flag bit + SerializeInt  -> per-actor (the new instance)
+[ initial property block ]  ; handle(SerializeInt(maxHandle)) + typed value, ascending
+```
+
+Empirically confirmed by family clustering: the **leading bytes are constant per class**
+(`60c10100`=PlayerController, `5aa50200`=PlayerReplicationInfo ×65, `86bb0800`/`8ebb0800`=
+Pawn/ROPawn ×9/×14, `0ac10200`=TeamInfo ×3, `ce290200`=GameReplicationInfo ×1). The
+recurring leading block is the **class reference** (the doc's earlier "class field"); the
+per-actor NetGUID follows it. **Export NetGUIDs read as `SerializeInt(0x80000000)` =
+~31 fixed bits** (so the class+actor header is ~64 bits for an export/export pair; ~43
+bits when the class resolves statically via `SerializeInt(1023)`).
+
+> **maxHandle pinning status [M/L]:** the *tiny* opens (TeamInfo) decode with a sub-8-bit
+> property region and an all-zero tail (initial TeamIndex only). The **PlayerController /
+> Pawn initial blocks are dominated by native-serialized compressed Location/Rotation/View
+> vectors** (variable, non-byte-aligned widths), so a single constant `maxHandle` that
+> consumes them bit-exactly was **not** pinnable from the capture alone (matches §2.2/§3.1
+> open item — the native ReceivedBunch type table is unpinned). **The robust recipe below
+> therefore regenerates each initial block VERBATIM per class and patches only the
+> per-session fields** (actor NetGUID; FString ServerName / PlayerName). The handle-level
+> `maxHandle` only matters for authoring *novel* property values; the verbatim templates
+> already carry the correct RemoteRole / bNetOwner / TeamIndex bits.
+
+### 6.1 PlayerController — ch2, open FIRST **[H]**
+
+- **class NetGUID:** `60 c1 01 00` (flag=0 export, idx `0xc160`/57568-class-slot). **[H]**
+- **maxHandle:** native (PC is `nativereplication`); not a single constant — see note above.
+- **Template payload (Session A, 925b, 116B) — BYTE-IDENTICAL in Session B (first 5 bytes
+  `60c101001bccea3f4904…` match exactly):** **[H, cross-session]**
+  ```
+  60c101001bccea3f490460e07d7411444007160988130040226396c6400000444045070500000000
+  405d6520430000440072ab0600000000c02d246d5100004400d95e0700000000c0ed13874c000044
+  4068b69f410000440050eb974000004480d586dd400000444085372d82590900b8e9c30c
+  ```
+- The `1bccea3f` immediately after the class ref is **static** (identical across sessions),
+  i.e. the PC actor NetGUID is a fixed/known object — emit it verbatim. The block carries
+  the inherited `Actor` initial role fields: per §2.3 this is where `RemoteRole=
+  ROLE_AutonomousProxy(2)`, `Role=ROLE_Authority(3)` (wire-swapped), `bNetOwner=true` live.
+  Because the bytes are session-invariant, **regenerate verbatim — do not re-author.** **[H
+  bytes / M field-level role-bit positions]**
+- Flags: `bOpen=1 bReliable=1 ChType=2 ChSeq=1`.
+
+### 6.2 GameReplicationInfo — singleton, opens at f1489 (ch54 in A) **[H]**
+
+- **class NetGUID:** `ce 29 02 00` (flag=0 export). Identify by class ref OR the readable
+  **ServerName FString**. **[H]**
+- **maxHandle:** GRI replicated set (see §3.2): initial `ElapsedTime, GameClass, GoalScore,
+  RemainingTime, ServerName` + dirty timer fields → field count is the SerializeInt bound;
+  not bit-pinned (native + arrays). Regenerate verbatim, patch the two FStrings. **[M]**
+- **Per-session patch points (FStrings, ANSI, INT-length-prefixed):**
+  - **ServerName** at ~**bit 437** of the payload: captured value
+    `-=PR=-GAMING #5 | RESORT 24/7 | LOW PING | P-R.ONL…`.
+  - **second FString** (MOTD/server-tag) at ~**bit 4206**: `-=PR=- #5 |Resort 24/7 Server`,
+    plus an asset URL `http://rs2assets.phantomrebels.com/…png`.
+- **Template payload (Session A, 4662b, 583B):** stored as `gri_open.hex` recipe; first
+  bytes `ce2902004005f131830601002044f843…` (the `2044f843`/`8b00…` region = the
+  GoalScore/RemainingTime/ElapsedTime floats). Emit verbatim, splice ServerName. **[H bytes]**
+- Flags: `bOpen=1 bReliable=1 ChType=2 ChSeq=1`.
+
+### 6.3 TeamInfo — ×3 (ch21, ch56, ch76), tiny opens **[H]**
+
+- **class NetGUID:** `0a c1 02 00` (flag=0 export). **[H]**
+- **maxHandle:** TeamInfo replicates `Score(dirty), TeamIndex(initial), TeamName(initial)`;
+  RS2 sends an **empty TeamName** (no readable string found), so the **initial block is just
+  TeamIndex** (a few bits) followed by zero padding. **[H — verified: ch21 has 17 all-zero
+  trailing bits after the 64-bit header].**
+- **Templates (verbatim, Session A — `0ac1020040bd040000…` byte-identical in Session B):**
+  ```
+  ch21 (81b , 11B): 0ac1020040bd0400000000                    ; team A (TeamIndex bits differ)
+  ch56 (389b, 49B): 0ac1020040c50000007fae00000080e6873f…     ; team B + ROTeamInfo float array
+  ch76 (483b, 61B): 0ac1020040bd000000009a1efe4a0000803a…     ; third team/neutral + floats
+  ```
+  The differing region right after the class ref (`40bd04` vs `40c500` vs `40bd00`) encodes
+  the **per-team actor NetGUID + TeamIndex**. The two larger TeamInfos additionally carry
+  the ROTeamInfo reinforcement/score float arrays (the `873f`≈0.5 floats); for the menu
+  bootstrap the **tiny 81-bit form (TeamIndex only) is sufficient** — open one per team. **[H]**
+- Flags: `bOpen=1 bReliable=1 ChType=2 ChSeq=1`.
+
+### 6.4 (local) PlayerReplicationInfo — class `5aa50200` **[H]**
+
+- **class NetGUID:** `5a a5 02 00`. The **local** player's PRI is the one whose PlayerName
+  FString matches the connecting player — in BOTH captures that is **"Krill"** (ch26 in A,
+  ch4 in B). **[H]**
+- **Per-session patch points (decl order §3.2: `Score, Deaths, Ping, PlayerName, PlayerID,
+  Team, … UniqueId`):**
+  - **PlayerName** FString at ~**bit 81** (after `5aa50200`+actorGUID+Score/Deaths/Ping):
+    captured `Krill`. Other PRIs decode cleanly to real names (`DodgR, Latte, Johann The
+    Terrible, Bronzon, PANZER_SS, Tanza_RF, …`) confirming the offset. **[H]**
+  - **Team** = a NetGUID reference to one of the TeamInfo actors above (must resolve).
+  - **PlayerID / UniqueId** = per-session ints/Steam id.
+- **Template (Session A local PRI ch26, 316b, 40B):**
+  `5aa50200402d0d00000096e4d2d8d80042413f33da03000097dd6df48100008800926b0000a00900`
+  (the `Krill` bytes are spliced in; here Session A's `Krill` PRI is ch26). **[H bytes]**
+- Flags: `bOpen=1 bReliable=1 ChType=2 ChSeq=1`.
+
+### 6.5 Minimal spectator / team-select-menu bootstrap **[H ordering / M sufficiency]**
+
+Observed open ORDER and timing (Session A):
+
+```
+f1477 C->S NMT 0x09 (Join)
+f1484 OPEN ch2  PlayerController (60c10100)
+f1485 OPEN ch21 TeamInfo #1     (0ac10200)
+f1486 OPEN ch26 PRI "Krill"     (5aa50200)   <- the local player's PRI
+f1489 OPEN ch54 GRI             (ce290200)   <- ServerName, GameClass
+f1489 OPEN ch56 TeamInfo #2
+f1494 OPEN ch76 TeamInfo #3
+…(140+ more PRIs/Pawns)…
+f1522 C->S ch2 first ServerMove (0x68) + ch26 PRI RPC 0x52   <- client now interacting
+```
+
+The client does **not** send anything until f1522, after the whole burst — but the bunches
+that the **HUD / team-select menu** read are: **the GRI** (root replicated object; the menu
+binds to `WorldInfo.GRI`), **the TeamInfo set** (`GRI.Teams[]` must resolve to populate the
+team buttons), and **the local PlayerController + its PRI** (so the menu has an owning player
+to apply the selection to). Pawn channels are **NOT** required for the menu — the menu is a
+pre-spawn/spectator UI. So:
+
+> **MINIMAL menu bootstrap = ch2 PlayerController + GRI + the (≥2) TeamInfos + the local
+> player's PRI**, opened in that order, each as a verbatim §6.1-6.4 template with the
+> actor NetGUIDs made self-consistent against our PackageMap and the FStrings patched. No
+> Pawn channel and none of the other 60 PRIs are needed to reach the menu. **[H that the
+> menu is pre-pawn; M that GRI+TeamInfo+PC+localPRI is both necessary and sufficient — it
+> is the full singleton set the capture opens before any client interaction.]**
+
+The menu is therefore gated on **PC + GRI + TeamInfo (+ local PRI)** — **not** on the PC
+alone, and **not** on a Pawn. Camera-unlock/controllable (§5 Phase 3) is the *next*
+milestone after the menu (needs the Pawn open + `ClientRestart`), and is separable.
+
+### 6.6 Emitter checklist for `MakeOpeningActorBunch`
+
+1. On C->S `NMT 0x09`: open **ch2** with the §6.1 PC template (verbatim). 
+2. Open the **GRI** (§6.2) with our ServerName/GameClass spliced into the FStrings.
+3. Open **2-3 TeamInfos** (§6.3) — the tiny 81-bit form is enough; set TeamIndex 0/1.
+4. Open the **local PRI** (§6.4) with our PlayerName + a `Team` ref into a TeamInfo above.
+5. Each open: `bControl=1,bOpen=1,bReliable=1,ChType=2`, ascending `ChIndex` from 2,
+   `ChSeq=1`. After this set the client should present the team-select menu.
+6. (Later, for control) spawn+possess a Pawn, open its channel, send `ClientRestart` on
+   ch2 (§5 Phase 3).
+```

@@ -350,22 +350,24 @@ def react(host, port):
         return got
 
     print(f"react: live handshake against {host}:{port}\n")
-    # 1. StatelessConnect: HandshakeStart (0x00 0x1d) -> HandshakeChallenge
-    #    (0x00 0x1e + 3 nonce bytes). Bound 64.
-    step("HandshakeStart 0x1d", bytes([0x00, 0x1d]), 8, bytes([0x00, 0x1e]), 64, want_open=True)
-    # 2. HandshakeResponse (0x00 0x1f) -> HandshakeComplete (0x00 0x20). Bound 64.
-    step("HandshakeResponse 0x1f", bytes([0x00, 0x1f]), 8, bytes([0x00, 0x20]), 64)
-    # 3. NMT phase: Steam login (0x10) -> Welcome (0x01 ...). We DECODE the server's
-    #    S2C bunches at the server-send bound 1500*8=12000 (asymmetric: the client
-    #    sends C2S at 2048, the server sends S2C at ~1500). See PacketCodec.h.
+    # The whole connection uses the established bound from packet 1 (NO small-bound
+    # phase): the client (us) sends C2S at MaxPacket 2048; the server sends S2C at
+    # ~1500 (bound 12000). The handshake NMT byte (0x1d/0x1f) is the FIRST payload
+    # byte - there is NO 0x00 family prefix.
     SERVER_BD = 1500 * 8
-    login_got = step("SteamLogin 0x10", bytes([0x10, 0x00, 0x00, 0x00]), 2048, bytes([0x01]), SERVER_BD)
+    # 1. StatelessConnect: HandshakeStart [1d 01] -> HandshakeChallenge [1e + nonce].
+    step("HandshakeStart 0x1d", bytes([0x1d, 0x01]), 2048, bytes([0x1e]), SERVER_BD, want_open=True)
+    # 2. HandshakeResponse [1f ...] -> HandshakeComplete [20].
+    step("HandshakeResponse 0x1f", bytes([0x1f, 0x00, 0x00, 0x00, 0x00]), 2048, bytes([0x20]), SERVER_BD)
+    # 3. NMT phase: Steam login (0x10) -> the server sends NMT 0x11 (then 0x03 then
+    #    PackageMap) - NOT NMT_Welcome(0x01).
+    login_got = step("SteamLogin 0x10", bytes([0x10, 0x00, 0x00, 0x00]), 2048, bytes([0x11]), SERVER_BD)
     pkgmap = sum(1 for d in login_got for b2 in d.get("bunches", [])
                  if b2["chIndex"] == 0 and b2["nmt"] == 0x07)
     if pkgmap:
-        print(f"     REPLICATION: server sent {pkgmap} PackageMap (NMT 0x07) bunch(es) right after Welcome")
+        print(f"     REPLICATION: server sent {pkgmap} PackageMap (NMT 0x07) bunch(es) after login")
     else:
-        print("     (no PackageMap after Welcome - replication bootstrap not loaded)")
+        print("     (no PackageMap after login - replication bootstrap not loaded)")
     # 4. Join (0x09) -> server reaches Joined; post-Join the server should send the
     #    world-replication bootstrap (PackageMap export = NMT 0x07 bunches). If the
     #    server has no bootstrap data loaded, this is just an ack (no 0x07) - which
