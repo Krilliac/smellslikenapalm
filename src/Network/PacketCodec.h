@@ -95,4 +95,15 @@ Packet Decode(const uint8_t* data, size_t numBytes,
 std::vector<uint8_t> Encode(const Packet& pkt,
                             uint32_t maxPacketBytes = kHandshakeMaxPacketBytes);
 
+// ---- Debug observability -------------------------------------------------
+// When enabled, Decode/Encode emit a per-bunch structured trace (packetId,
+// chIndex, bControl/bOpen/bClose/bReliable, chSequence, chType, payloadBits and
+// a hex dump of the payload) plus NON-FATAL invariant warnings (payloadBits
+// exceeding maxPacketBytes*8, unexpected leftover bits, or a malformed datagram
+// that yields ok=false) through the project Logger. This is observability only:
+// it NEVER alters the wire bytes, the parse result, or any control flow. Off by
+// default; toggle at runtime (e.g. from a debug console / config flag).
+void SetDebugTracing(bool enabled);
+bool IsDebugTracing();
+
 } // namespace PacketCodec

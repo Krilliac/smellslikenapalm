@@ -5,6 +5,9 @@
 
 #include "Network/BitReader.h"
 
+#include "Utils/Logger.h"
+
+#include <cstdio>
 #include <cstring>
 
 BitReader::BitReader(const uint8_t* data, size_t numBytes)
@@ -16,19 +19,37 @@ BitReader::BitReader(const std::vector<uint8_t>& data)
 BitReader::BitReader(const uint8_t* data, size_t numBytes, size_t validBits)
     : m_data(data), m_numBits(validBits <= numBytes * 8 ? validBits : numBytes * 8) {}
 
-bool BitReader::EnsureBits(size_t count) {
+bool BitReader::EnsureBits(size_t count, const char* op) {
     if (m_overflow) {
         return false;
     }
     if (m_bitPos + count > m_numBits) {
+        // Non-fatal: flag overflow, capture context, notify, and bail. The caller
+        // returns a zero/default value; we never read out of bounds and never throw.
         m_overflow = true;
+        m_overflowOp = (op != nullptr) ? op : "read";
+        m_overflowBitPos = m_bitPos;
+        m_overflowWantBits = count;
+        ReportOverflow();
         return false;
     }
     return true;
 }
 
+void BitReader::ReportOverflow() {
+    const size_t left = (m_overflowBitPos < m_numBits) ? (m_numBits - m_overflowBitPos) : 0;
+    if (m_overflowHandler) {
+        // Handler is responsible for its own logging; contractually must not throw.
+        m_overflowHandler(m_overflowOp, m_overflowBitPos, m_overflowWantBits, m_numBits);
+        return;
+    }
+    Logger::Warn(
+        "[BitReader] overflow on '%s': want %zu bit(s) at pos %zu, but only %zu readable (%zu left)",
+        m_overflowOp, m_overflowWantBits, m_overflowBitPos, m_numBits, left);
+}
+
 bool BitReader::ReadBit() {
-    if (!EnsureBits(1)) {
+    if (!EnsureBits(1, "ReadBit")) {
         return false;
     }
     const size_t byteIndex = m_bitPos >> 3;
@@ -40,7 +61,7 @@ bool BitReader::ReadBit() {
 uint64_t BitReader::ReadBits(int count) {
     if (count < 0) count = 0;
     if (count > 64) count = 64;
-    if (!EnsureBits(static_cast<size_t>(count))) {
+    if (!EnsureBits(static_cast<size_t>(count), "ReadBits")) {
         return 0;
     }
     uint64_t value = 0;
@@ -116,7 +137,7 @@ std::string BitReader::ReadString() {
         // ANSI, `len` bytes INCLUDING the NUL terminator.
         const size_t count = static_cast<size_t>(len);
         // Bounds-check before reading the character payload.
-        if (!EnsureBits(count * 8)) {
+        if (!EnsureBits(count * 8, "ReadString(ANSI)")) {
             return std::string();
         }
         std::string out;
@@ -134,7 +155,7 @@ std::string BitReader::ReadString() {
     // Negative => UCS-2/UTF-16LE, (-len) code units INCLUDING the NUL.
     const int64_t neg = -static_cast<int64_t>(len);
     const size_t units = static_cast<size_t>(neg);
-    if (!EnsureBits(units * 16)) {
+    if (!EnsureBits(units * 16, "ReadString(UCS2)")) {
         return std::string();
     }
     std::string out;
@@ -146,6 +167,52 @@ std::string BitReader::ReadString() {
             // handshake strings are ASCII session ids / map names).
             out.push_back(static_cast<char>(cu & 0xFF));
         }
+    }
+    return out;
+}
+
+size_t BitReader::ReportTrailingBits(const char* context) const {
+    const size_t left = BitsLeft();
+    const char* ctx = (context != nullptr) ? context : "decode";
+    if (m_overflow) {
+        // Already overflowed; the bigger problem was logged at the failing read.
+        // Surface it here too so end-of-decode callers get a single, clear signal.
+        Logger::Warn("[BitReader] %s: ended in OVERFLOW state (last read '%s' at bit %zu)",
+                     ctx, (m_overflowOp != nullptr) ? m_overflowOp : "?", m_overflowBitPos);
+    } else if (left != 0) {
+        Logger::Warn("[BitReader] %s: %zu trailing bit(s) after decode (pos %zu / %zu)"
+                     " - likely misaligned/misparsed bunch",
+                     ctx, left, m_bitPos, m_numBits);
+    }
+    return left;
+}
+
+std::string BitReader::DumpRemainingBits(size_t maxBytes) const {
+    std::string out;
+    const size_t left = BitsLeft();
+    if (left == 0 || m_data == nullptr) {
+        return out;
+    }
+    const size_t totalBytes = (left + 7) / 8;        // bytes needed to hold the tail
+    const size_t n = (totalBytes < maxBytes) ? totalBytes : maxBytes;
+    char buf[8];
+    for (size_t i = 0; i < n; ++i) {
+        uint8_t b = 0;
+        for (int bit = 0; bit < 8; ++bit) {
+            const size_t pos = m_bitPos + i * 8 + static_cast<size_t>(bit);
+            if (pos >= m_numBits) {
+                break;
+            }
+            const size_t byteIndex = pos >> 3;
+            const int bitInByte = static_cast<int>(pos & 7);
+            const uint8_t v = (m_data[byteIndex] >> bitInByte) & 1u;
+            b |= static_cast<uint8_t>(v << bit);     // LSB-first, mirrors wire order
+        }
+        std::snprintf(buf, sizeof(buf), "%02X ", b);
+        out += buf;
+    }
+    if (n < totalBytes) {
+        out += "...";
     }
     return out;
 }

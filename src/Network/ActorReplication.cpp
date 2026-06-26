@@ -3,11 +3,77 @@
 
 #include "Network/ActorReplication.h"
 
+#include <vector>
+
+#include "Utils/Logger.h"
+
+// ---------------------------------------------------------------------------
+// Non-fatal encoder self-checks (observability layer).
+//
+// When RS2V_ACTORREPL_SELFCHECK is enabled (default), every encoding primitive
+// validates its own bit-stream invariants and reads back what it just wrote with
+// a BitReader, logging (NOT throwing) on any mismatch. This catches encoder bugs
+// such as the None-object-ref mis-encode that corrupted ChangedTeams BEFORE the
+// bytes reach the real client (where the symptom is an opaque channel hang).
+//
+// Everything here is side-effect-free w.r.t. the wire: it only inspects bits the
+// caller already committed. Disable by defining RS2V_ACTORREPL_SELFCHECK=0.
+// ---------------------------------------------------------------------------
+#ifndef RS2V_ACTORREPL_SELFCHECK
+#define RS2V_ACTORREPL_SELFCHECK 1
+#endif
+
 namespace ActorRepl {
 
+namespace {
+#if RS2V_ACTORREPL_SELFCHECK
+// Advance a fresh reader (positioned at bit 0) to absolute bit offset `startBit`
+// by reading-and-discarding. Returns false if the reader overflowed getting there
+// (which itself indicates a length bug worth logging).
+bool AdvanceReader(BitReader& r, size_t startBit) {
+    while (startBit >= 64) { r.ReadBits(64); startBit -= 64; }
+    if (startBit) r.ReadBits(static_cast<int>(startBit));
+    return !r.IsOverflowed();
+}
+#endif
+} // namespace
+
 void WriteNetGUID(BitWriter& w, const NetGUIDRef& ref) {
+    const uint32_t max = ref.isDynamic ? kDynamicChannelMax : kStaticObjectMax;
+#if RS2V_ACTORREPL_SELFCHECK
+    const size_t startBit = w.NumBits();
+    // Invariant: index must be representable in [0, max). A dynamic ref past
+    // MAX_CHANNELS, or a static index with the top bit set, would be silently
+    // truncated by SerializeInt and resolve to the wrong object on the client.
+    if (ref.index >= max) {
+        Logger::Warn("ActorRepl::WriteNetGUID: index %u out of range [0,%u) (%s) - "
+                     "will mis-encode object ref",
+                     ref.index, max, ref.isDynamic ? "dynamic/channel" : "static/object");
+    }
+    // The None-objref class of bug: a NULL/None reference must be a STATIC index 0
+    // (isDynamic=false). A dynamic ref with index 0 points at channel 0 (the
+    // control channel), never a valid actor - flag it.
+    if (ref.isDynamic && ref.index == 0) {
+        Logger::Warn("ActorRepl::WriteNetGUID: dynamic ref to channel 0 - likely a "
+                     "mis-encoded None/NULL object reference");
+    }
+#endif
     w.WriteBit(ref.isDynamic);  // flag: 1=dynamic (channel index), 0=static (object index)
-    w.SerializeInt(ref.index, ref.isDynamic ? kDynamicChannelMax : kStaticObjectMax);
+    w.SerializeInt(ref.index, max);
+#if RS2V_ACTORREPL_SELFCHECK
+    const std::vector<uint8_t> bytes = w.GetBytes();
+    BitReader r(bytes.data(), bytes.size(), w.NumBits());
+    if (AdvanceReader(r, startBit)) {
+        NetGUIDRef back = ReadNetGUID(r);
+        if (r.IsOverflowed() || back.isDynamic != ref.isDynamic || back.index != ref.index) {
+            Logger::Warn("ActorRepl::WriteNetGUID: round-trip mismatch wrote(%s,%u) "
+                         "read(%s,%u)%s",
+                         ref.isDynamic ? "dyn" : "stat", ref.index,
+                         back.isDynamic ? "dyn" : "stat", back.index,
+                         r.IsOverflowed() ? " [overflow]" : "");
+        }
+    }
+#endif
 }
 
 NetGUIDRef ReadNetGUID(BitReader& r) {
@@ -38,12 +104,39 @@ void WriteCompressedVector(BitWriter& w, float x, float y, float z) {
     if (bits < 1) bits = 1;
     if (bits > 20) bits = 20;
     bits -= 1;
+#if RS2V_ACTORREPL_SELFCHECK
+    const size_t startBit = w.NumBits();
+    // Invariant: the value handed to SerializeInt(bits,20) must be in [0,20) so it
+    // (and therefore the derived Bias/Max field widths) round-trips. The clamp
+    // above guarantees this; a violation means the clamp/decrement logic changed.
+    if (bits >= 20) {
+        Logger::Warn("ActorRepl::WriteCompressedVector: bits %u out of [0,20) "
+                     "(maxc=%u) - corrupt vector field width", bits, maxc);
+    }
+#endif
     w.SerializeInt(bits, 20);
     const uint32_t bias = 1u << (bits + 1);
     const uint32_t mx   = 1u << (bits + 2);
     w.SerializeInt(static_cast<uint32_t>(ix + static_cast<int32_t>(bias)), mx);
     w.SerializeInt(static_cast<uint32_t>(iy + static_cast<int32_t>(bias)), mx);
     w.SerializeInt(static_cast<uint32_t>(iz + static_cast<int32_t>(bias)), mx);
+#if RS2V_ACTORREPL_SELFCHECK
+    // Components are quantized to integers on the wire; compare against the rounded
+    // ints we actually encoded, not the input floats.
+    const std::vector<uint8_t> bytes = w.GetBytes();
+    BitReader r(bytes.data(), bytes.size(), w.NumBits());
+    if (AdvanceReader(r, startBit)) {
+        float rx = 0.f, ry = 0.f, rz = 0.f;
+        ReadCompressedVector(r, rx, ry, rz);
+        if (r.IsOverflowed() ||
+            RoundToInt(rx) != ix || RoundToInt(ry) != iy || RoundToInt(rz) != iz) {
+            Logger::Warn("ActorRepl::WriteCompressedVector: round-trip mismatch "
+                         "wrote(%d,%d,%d) read(%d,%d,%d)%s",
+                         ix, iy, iz, RoundToInt(rx), RoundToInt(ry), RoundToInt(rz),
+                         r.IsOverflowed() ? " [overflow]" : "");
+        }
+    }
+#endif
 }
 
 void ReadCompressedVector(BitReader& r, float& x, float& y, float& z) {
@@ -82,29 +175,109 @@ void WriteActorOpenHeader(BitWriter& w, const ActorOpenHeader& hdr) {
 }
 
 // ---- property serialization (handle + typed value) --------------------------
+namespace {
+#if RS2V_ACTORREPL_SELFCHECK
+// Invariant: a replicated property handle must be in [0, maxHandle). Outside it,
+// SerializeInt truncates and the client decodes the wrong property (or desyncs the
+// whole bunch). maxHandle==0 means the caller passed a bad ClassNetCache count.
+void CheckHandle(const char* what, uint32_t handle, uint32_t maxHandle) {
+    if (maxHandle == 0 || handle >= maxHandle) {
+        Logger::Warn("ActorRepl::WriteProp%s: handle %u out of range [0,%u) - "
+                     "mis-encoded property id", what, handle, maxHandle);
+    }
+}
+// Read back [handle][value] starting at bit `startBit` and compare. `cmpValue`
+// reads the typed value off `rr` and returns whether it matches what was written.
+template <typename CmpFn>
+void CheckProp(const BitWriter& w, size_t startBit, const char* what,
+               uint32_t handle, uint32_t maxHandle, CmpFn cmpValue) {
+    const std::vector<uint8_t> bytes = w.GetBytes();
+    BitReader r(bytes.data(), bytes.size(), w.NumBits());
+    if (!AdvanceReader(r, startBit)) return;
+    const uint32_t h = r.SerializeInt(maxHandle);
+    const bool valOk = cmpValue(r);
+    if (r.IsOverflowed() || h != handle || !valOk) {
+        Logger::Warn("ActorRepl::WriteProp%s: round-trip mismatch handle wrote=%u "
+                     "read=%u%s%s", what, handle, h,
+                     valOk ? "" : " [value]", r.IsOverflowed() ? " [overflow]" : "");
+    }
+}
+#endif // RS2V_ACTORREPL_SELFCHECK
+} // namespace
+
 void WritePropBool(BitWriter& w, uint32_t handle, uint32_t maxHandle, bool v) {
+#if RS2V_ACTORREPL_SELFCHECK
+    CheckHandle("Bool", handle, maxHandle);
+    const size_t startBit = w.NumBits();
+#endif
     w.SerializeInt(handle, maxHandle);
     w.WriteBit(v);
+#if RS2V_ACTORREPL_SELFCHECK
+    CheckProp(w, startBit, "Bool", handle, maxHandle,
+              [&](BitReader& rr){ return rr.ReadBit() == v; });
+#endif
 }
 void WritePropByte(BitWriter& w, uint32_t handle, uint32_t maxHandle, uint8_t v) {
+#if RS2V_ACTORREPL_SELFCHECK
+    CheckHandle("Byte", handle, maxHandle);
+    const size_t startBit = w.NumBits();
+#endif
     w.SerializeInt(handle, maxHandle);
     w.WriteByte(v);
+#if RS2V_ACTORREPL_SELFCHECK
+    CheckProp(w, startBit, "Byte", handle, maxHandle,
+              [&](BitReader& rr){ return rr.ReadByte() == v; });
+#endif
 }
 void WritePropInt(BitWriter& w, uint32_t handle, uint32_t maxHandle, int32_t v) {
+#if RS2V_ACTORREPL_SELFCHECK
+    CheckHandle("Int", handle, maxHandle);
+    const size_t startBit = w.NumBits();
+#endif
     w.SerializeInt(handle, maxHandle);
     w.WriteInt32(v);
+#if RS2V_ACTORREPL_SELFCHECK
+    CheckProp(w, startBit, "Int", handle, maxHandle,
+              [&](BitReader& rr){ return rr.ReadInt32() == v; });
+#endif
 }
 void WritePropFloat(BitWriter& w, uint32_t handle, uint32_t maxHandle, float v) {
+#if RS2V_ACTORREPL_SELFCHECK
+    CheckHandle("Float", handle, maxHandle);
+    const size_t startBit = w.NumBits();
+#endif
     w.SerializeInt(handle, maxHandle);
     w.WriteFloat(v);
+#if RS2V_ACTORREPL_SELFCHECK
+    CheckProp(w, startBit, "Float", handle, maxHandle,
+              [&](BitReader& rr){ const float f = rr.ReadFloat();
+                                  return f == v || (f != f && v != v); });
+#endif
 }
 void WritePropString(BitWriter& w, uint32_t handle, uint32_t maxHandle, const std::string& v) {
+#if RS2V_ACTORREPL_SELFCHECK
+    CheckHandle("String", handle, maxHandle);
+    const size_t startBit = w.NumBits();
+#endif
     w.SerializeInt(handle, maxHandle);
     w.WriteString(v);
+#if RS2V_ACTORREPL_SELFCHECK
+    CheckProp(w, startBit, "String", handle, maxHandle,
+              [&](BitReader& rr){ return rr.ReadString() == v; });
+#endif
 }
 void WritePropObject(BitWriter& w, uint32_t handle, uint32_t maxHandle, const NetGUIDRef& v) {
+#if RS2V_ACTORREPL_SELFCHECK
+    CheckHandle("Object", handle, maxHandle);
+    const size_t startBit = w.NumBits();
+#endif
     w.SerializeInt(handle, maxHandle);
     WriteNetGUID(w, v);
+#if RS2V_ACTORREPL_SELFCHECK
+    CheckProp(w, startBit, "Object", handle, maxHandle,
+              [&](BitReader& rr){ NetGUIDRef b = ReadNetGUID(rr);
+                                  return b.isDynamic == v.isDynamic && b.index == v.index; });
+#endif
 }
 
 PacketCodec::Bunch MakeOpeningActorBunch(

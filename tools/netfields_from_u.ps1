@@ -3,18 +3,38 @@
 # NetFields(class) = CPF_Net properties + FUNC_Net functions first-declared (Super==null),
 #   SORTED BY NetIndex (UClass::Link). Wire handle = FieldsBase(class) + rank-in-sorted.
 # maxHandle(ROPlayerController) = sum of NetFields counts over the whole chain.
+param([string]$Class = "ROPlayerController")
 $ErrorActionPreference = "Stop"
 [void][System.Reflection.Assembly]::LoadFrom("D:\RE-Tools\UE-Explorer\Eliot.UELib.dll")
 $CPF_Net = [uint32]0x20; $FUNC_Net = [uint32]0x40
 $BREW = "D:\rs2dedicatedserver\ROGame\BrewedPCServer"
-$chain = @(
-  @{ cls="Object";               pkg="Core.u" },
-  @{ cls="Actor";                pkg="Engine.u" },
-  @{ cls="Controller";           pkg="Engine.u" },
-  @{ cls="PlayerController";     pkg="Engine.u" },
-  @{ cls="GamePlayerController"; pkg="GameFramework.u" },
-  @{ cls="ROPlayerController";   pkg="ROGame.u" }
-)
+# Known class chains (super-first). Each entry: class -> package file.
+$chains = @{
+  "ROPlayerController" = @(
+    @{ cls="Object";pkg="Core.u" }, @{ cls="Actor";pkg="Engine.u" },
+    @{ cls="Controller";pkg="Engine.u" }, @{ cls="PlayerController";pkg="Engine.u" },
+    @{ cls="GamePlayerController";pkg="GameFramework.u" }, @{ cls="ROPlayerController";pkg="ROGame.u" })
+  "ROGameReplicationInfo" = @(
+    @{ cls="Object";pkg="Core.u" }, @{ cls="Actor";pkg="Engine.u" }, @{ cls="Info";pkg="Engine.u" },
+    @{ cls="ReplicationInfo";pkg="Engine.u" }, @{ cls="GameReplicationInfo";pkg="Engine.u" },
+    @{ cls="ROGameReplicationInfo";pkg="ROGame.u" })
+  "ROTeamInfo" = @(
+    @{ cls="Object";pkg="Core.u" }, @{ cls="Actor";pkg="Engine.u" }, @{ cls="Info";pkg="Engine.u" },
+    @{ cls="ReplicationInfo";pkg="Engine.u" }, @{ cls="TeamInfo";pkg="Engine.u" },
+    @{ cls="ROTeamInfo";pkg="ROGame.u" })
+  "ROPlayerReplicationInfo" = @(
+    @{ cls="Object";pkg="Core.u" }, @{ cls="Actor";pkg="Engine.u" }, @{ cls="Info";pkg="Engine.u" },
+    @{ cls="ReplicationInfo";pkg="Engine.u" }, @{ cls="PlayerReplicationInfo";pkg="Engine.u" },
+    @{ cls="ROPlayerReplicationInfo";pkg="ROGame.u" })
+  "ROPawn" = @(
+    @{ cls="Object";pkg="Core.u" }, @{ cls="Actor";pkg="Engine.u" }, @{ cls="Pawn";pkg="Engine.u" },
+    @{ cls="GamePawn";pkg="GameFramework.u" }, @{ cls="ROPawn";pkg="ROGame.u" })
+  "ROWeapon" = @(
+    @{ cls="Object";pkg="Core.u" }, @{ cls="Actor";pkg="Engine.u" }, @{ cls="Inventory";pkg="Engine.u" },
+    @{ cls="Weapon";pkg="Engine.u" }, @{ cls="ROWeapon";pkg="ROGame.u" })
+}
+if (-not $chains.ContainsKey($Class)) { Write-Host "Unknown class '$Class'. Known: $($chains.Keys -join ', ')"; exit 1 }
+$chain = $chains[$Class]
 $pkgCache = @{}
 function Get-Pkg($name) {
   if (-not $pkgCache.ContainsKey($name)) {
@@ -57,14 +77,15 @@ foreach ($entry in $chain) {
   foreach ($n in $allFuncNames) { [void]$anc.Add($n) }
   $fieldsBase += $sorted.Count
 }
-$globalLines | Set-Content "D:\smellslikenapalm\tools\netfields_u_global.txt" -Encoding utf8
+$outName = if ($Class -eq "ROPlayerController") { "netfields_u_global.txt" } else { "netfields_u_$Class.txt" }
+$globalLines | Set-Content "D:\smellslikenapalm\tools\$outName" -Encoding utf8
 Write-Host ""
 Write-Host ("{0,-22} {1,9} {2,9} {3,6} {4,11}" -f "class","netProps","netFuncs","count","FieldsBase")
 foreach ($r in $results) { Write-Host ("{0,-22} {1,9} {2,9} {3,6} {4,11}" -f $r.cls,$r.nprops,$r.nfuncs,$r.count,$r.fb) }
 Write-Host ""
 Write-Host "maxHandle = $fieldsBase"
 Write-Host ""
-Write-Host "Menu RPCs + anchors:"
+Write-Host "Net PROPERTIES (handle : class : name):"
 foreach ($ln in $globalLines) {
-  if ($ln -match "ClientShowTeamSelect|ChangedTeams|ClientShowRoleSelect|ShortClientAdjustPosition|ClientAdjustPosition\b|ServerMove\b|ClientSetHUD") { Write-Host "  $ln" }
+  if ($ln -match "\bprop\b") { Write-Host "  $ln" }
 }

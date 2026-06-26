@@ -5,7 +5,21 @@
 
 #include "Network/BitWriter.h"
 
+#include "Utils/Logger.h"
+
 #include <cstring>
+
+void BitWriter::CheckBunchLimit() {
+    // Non-fatal: log exactly once when the running bit count first exceeds the
+    // sane bunch bound. We do NOT truncate or alter output here.
+    if (!m_exceededBunchLimit && m_numBits > kMaxSaneBunchBits) {
+        m_exceededBunchLimit = true;
+        m_invariantViolated = true;
+        Logger::Warn("BitWriter: bunch size invariant exceeded: %zu bits written "
+                     "(> %zu). Continuing without truncation.",
+                     m_numBits, static_cast<size_t>(kMaxSaneBunchBits));
+    }
+}
 
 void BitWriter::WriteBit(bool bit) {
     const size_t byteIndex = m_numBits >> 3;
@@ -18,11 +32,25 @@ void BitWriter::WriteBit(bool bit) {
         m_buffer[byteIndex] |= static_cast<uint8_t>(1u << bitInByte);
     }
     ++m_numBits;
+    CheckBunchLimit();
 }
 
 void BitWriter::WriteBits(uint64_t value, int count) {
-    if (count < 0) count = 0;
-    if (count > 64) count = 64;
+    // Invariant: count must be in [0,64]. An out-of-range count indicates a
+    // caller bug; LOG it and clamp rather than reading/writing garbage. The
+    // clamp preserves the historical (silent) behavior so wire output for valid
+    // callers is unchanged.
+    if (count < 0 || count > 64) {
+        m_invariantViolated = true;
+        Logger::Warn("BitWriter::WriteBits: count %d out of range [0,64]; clamping.",
+                     count);
+        if (count < 0) count = 0;
+        if (count > 64) count = 64;
+    }
+    if (m_trace) {
+        Logger::Trace("BitWriter: WriteBits value=0x%llx count=%d @bit %zu",
+                      static_cast<unsigned long long>(value), count, m_numBits);
+    }
     for (int i = 0; i < count; ++i) {
         WriteBit((value >> i) & 1u);
     }
@@ -39,6 +67,21 @@ void BitWriter::SerializeInt(uint32_t value, uint32_t maxValue) {
     //       { write bit (Value & Mask); if set NewValue |= Mask; }
     if (maxValue == 0) {
         return; // degenerate; nothing to encode
+    }
+    // Invariant: value must be in [0, maxValue). A value at/above the exclusive
+    // bound cannot be represented by UE3's bounded encoding and would silently
+    // truncate on the wire, desyncing the client. LOG it and clamp to the
+    // largest representable value (maxValue-1) so we stay in sync rather than
+    // crash. This does not change behavior for valid (value < maxValue) callers.
+    if (value >= maxValue) {
+        m_invariantViolated = true;
+        Logger::Warn("BitWriter::SerializeInt: value %u >= maxValue %u; "
+                     "clamping to %u.", value, maxValue, maxValue - 1);
+        value = maxValue - 1;
+    }
+    if (m_trace) {
+        Logger::Trace("BitWriter: SerializeInt value=%u max=%u @bit %zu",
+                      value, maxValue, m_numBits);
     }
     uint32_t newValue = 0;
     for (uint32_t mask = 1; (newValue + mask) < maxValue && mask != 0; mask <<= 1) {

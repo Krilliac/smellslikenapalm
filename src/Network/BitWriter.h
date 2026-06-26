@@ -76,9 +76,43 @@ public:
     // Number of whole + partial bytes the current bits occupy.
     size_t NumBytes() const { return (m_numBits + 7) / 8; }
 
-    void Reset() { m_buffer.clear(); m_numBits = 0; }
+    void Reset() {
+        m_buffer.clear();
+        m_numBits = 0;
+        m_invariantViolated = false;
+        m_exceededBunchLimit = false;
+    }
+
+    // ---- diagnostics / invariants (non-fatal) ----
+
+    // A sane upper bound on the size of a single UE3 bunch. UE3's reliable bunch
+    // payload is well under this; crossing it almost always indicates a logic bug
+    // upstream (e.g. an unbounded loop emitting properties). Exceeding it is
+    // LOGGED once and exposed via ExceededBunchLimit(); it is NOT enforced.
+    static constexpr size_t kMaxSaneBunchBits = 16384;
+
+    // True if any invariant was violated since construction/Reset() (e.g. a
+    // SerializeInt value >= maxValue, or an out-of-range WriteBits count). The
+    // offending write is still performed (clamped) so the wire format is
+    // unchanged; this flag lets callers detect that something was off.
+    bool HadInvariantViolation() const { return m_invariantViolated; }
+
+    // True if total bits written has crossed kMaxSaneBunchBits.
+    bool ExceededBunchLimit() const { return m_exceededBunchLimit; }
+
+    // Optional per-op verbose tracing (default OFF). When enabled, each logical
+    // write op is logged at LogLevel::Trace. This does not affect output bytes.
+    void SetTrace(bool enabled) { m_trace = enabled; }
+    bool TraceEnabled() const { return m_trace; }
 
 private:
+    // Flag + log the first time total bits exceed kMaxSaneBunchBits. Called from
+    // the single bit-increment point so it fires exactly once per overrun.
+    void CheckBunchLimit();
+
     std::vector<uint8_t> m_buffer; // packed bytes; last byte may be partial
     size_t m_numBits = 0;          // total bits written
+    bool m_trace = false;          // verbose per-op trace (default off)
+    bool m_invariantViolated = false; // sticky: an invariant was violated
+    bool m_exceededBunchLimit = false; // sticky: crossed kMaxSaneBunchBits
 };
