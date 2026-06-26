@@ -53,8 +53,19 @@ Packet MessageEncoder::EncodeAction(uint32_t clientId,
     Packet pkt("PLAYER_ACTION");
     pkt.WriteUInt(clientId);
     pkt.WriteString(action);
-    pkt.WriteUInt(static_cast<uint32_t>(args.size()));
-    for (size_t i = 0; i < args.size(); ++i) {
+    // Defensive: argCount is serialized as a uint32. If args.size() ever exceeded
+    // the uint32 range the cast would truncate, desyncing the decoder's arg loop
+    // (declared count != bytes written). Clamp the declared count and the loop to
+    // the same value. This cannot trigger for any realistic arg list, so valid
+    // output is unchanged.
+    size_t argCount = args.size();
+    if (argCount > static_cast<size_t>(UINT32_MAX)) {
+        Logger::Error("[MessageEncoder::EncodeAction] args.size()=%zu exceeds uint32 max — clamping declared count to %u to avoid wire desync",
+                      argCount, UINT32_MAX);
+        argCount = static_cast<size_t>(UINT32_MAX);
+    }
+    pkt.WriteUInt(static_cast<uint32_t>(argCount));
+    for (size_t i = 0; i < argCount; ++i) {
         Logger::Trace("[MessageEncoder::EncodeAction] writing arg[%zu]='%s'", i, args[i].c_str());
         pkt.WriteString(args[i]);
     }

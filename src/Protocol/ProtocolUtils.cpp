@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <stdexcept>
 #include <cstring>
+#include <cctype>
 
 // OpenSSL for Base64 (optional — guarded so the file builds without OpenSSL,
 // e.g. under MinGW where OpenSSL may not be found by CMake).
@@ -78,6 +79,19 @@ std::optional<std::vector<uint8_t>> FromHexString(const std::string& hex) {
     Logger::Debug("[ProtocolUtils::FromHexString] parsing %zu hex chars into %zu bytes", hex.size(), hex.size()/2);
     try {
         for (size_t i = 0; i < hex.size(); i += 2) {
+            // Defensive: std::stoi(base 16) also accepts leading whitespace, a
+            // sign, or a "0x" prefix, which would silently decode malformed input
+            // to a wrong byte instead of failing. Require both chars of the pair
+            // to be plain hex digits before converting. (size() is even, so i+1 is
+            // always in range here.) Valid hex strings are unaffected.
+            const char hi = hex[i];
+            const char lo = hex[i + 1];
+            if (!std::isxdigit(static_cast<unsigned char>(hi)) ||
+                !std::isxdigit(static_cast<unsigned char>(lo))) {
+                Logger::Warn("[ProtocolUtils::FromHexString] non-hex character in pair at offset %zu — rejecting input", i);
+                Logger::Trace("[ProtocolUtils::FromHexString] exit — returning nullopt (non-hex char)");
+                return std::nullopt;
+            }
             uint8_t byte = static_cast<uint8_t>(
                 std::stoi(hex.substr(i,2), nullptr, 16)
             );
