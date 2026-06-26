@@ -15,7 +15,7 @@ src/Network/BitWriter, BitReader, PacketCodec, ActorReplication, WireTrace.h.
 - [x] Network inbound parse: HandshakeState, ControlReassembler, ControlChannel, ConnectionManager inbound path
 - [x] Protocol decoders (src/Protocol/*)
 - [x] Security / AuthManager / input validation
-- [ ] Game state / SpawnSystem / GameMode / ReplicationManager
+- [x] Game state / SpawnSystem / GameMode / ReplicationManager
 - [ ] Config / ConfigManager
 - [ ] Utils (StringUtils, PathUtils, MemoryPool, etc.)
 - [ ] Network: UDPSocket / NetworkManager / BandwidthManager / ClientConnection
@@ -26,3 +26,4 @@ src/Network/BitWriter, BitReader, PacketCodec, ActorReplication, WireTrace.h.
 2026-06-26 | Network inbound parse | NMT-range + login-URL caps (HandshakeState); reassembly byte-cap 256KiB + seq-ahead/payloadBits guards (ControlReassembler); ValidBuffer/StringSane caps (ControlChannel); datagram clamp + checked find() + per-packet bunch cap 4096 (ConnectionManager inbound) | 2d7714d
 2026-06-26 | Protocol decoders | BytesRemaining guards + bool-return + reserve clamps (Actor/PropertyReplication); null-handler reject (ProtocolHandler); arg-count clamp (MessageEncoder); hex validation (ProtocolUtils); payload/field bounds (ProtocolDecoder) | 5dcbd39
 2026-06-26 | Security/Auth | anti-enumeration timing equalizer + no auto-insert (AuthManager); constant-time verify + param guards (PasswordHasher); bounded token/session maps + empty-token reject (TokenManager/EAC) | 18b81b0
+2026-06-26 | Game state | null/bounds guards + chained-deref fix (GameServer/GameMode/SpawnSystem); chat caps (ChatManager/GameServer); uniform_real_distribution UB fix (MapManager); checked find() in dirty loop (ReplicationManager) | fb8520b
