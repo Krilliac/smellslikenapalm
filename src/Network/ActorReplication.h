@@ -40,8 +40,13 @@ namespace ActorRepl {
 //  STATIC = the archetype ref. A reference to an unopened channel / bad class ref =>
 //  NMT_ActorChannelFailure and the client CLOSES the channel - our observed failure.)
 constexpr uint32_t kStaticObjectMax   = 0x80000000u; // MAX_OBJECT_INDEX (static index)
-constexpr uint32_t kDynamicChannelMax = 1024;        // RS2 MAX_CHANNELS (dynamic = ChIndex;
-                                                     // disasm-confirmed ~1023 max, use 1024)
+constexpr uint32_t kDynamicChannelMax = 2048;        // UE3 MAX_CHANNELS = MAX_NET_CHANNELS = 2048
+                                                     // (UnConn.h:143/153). A dynamic objref index
+                                                     // is SerializeInt(ChIndex, 2048) = 11 bits.
+                                                     // (Was wrongly 1024 -> 10 bits: the client read
+                                                     // 1 bit past the bunch, FInBunch error, and
+                                                     // SerializeObject returned NULL - the PC->PRI
+                                                     // link + every dynamic ref silently failed.)
 
 struct NetGUIDRef {
     bool     isDynamic = false;  // true => flag bit 1, value is an actor channel index

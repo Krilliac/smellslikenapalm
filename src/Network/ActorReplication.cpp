@@ -176,7 +176,9 @@ void WriteActorOpenHeader(BitWriter& w, const ActorOpenHeader& hdr) {
         WriteCompressedRotator(w, hdr.pitch, hdr.yaw, hdr.roll);
     }
     if (hdr.isPlayerController) {
-        w.SerializeInt(hdr.netPlayerIndex, kDynamicChannelMax); // NetPlayerIndex (0 = owning client)
+        w.WriteByte(static_cast<uint8_t>(hdr.netPlayerIndex)); // NetPlayerIndex = raw BYTE
+                                                               // (UnChan.cpp:1417 `Bunch << NetPlayerIndex`),
+                                                               // NOT SerializeInt(_,MAX_CHANNELS).
     }
 }
 

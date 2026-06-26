@@ -886,8 +886,17 @@ void ConnectionManager::SendLocalPriLink(uint32_t clientId, int repeats) {
     // as the real server streams it (docs/re/pc_ch2_postjoin_timeline.md §C). Repeated for
     // delivery since it is unreliable; the client latches ROPC.PlayerReplicationInfo on
     // receipt, fixing the role-UI NULL deref (VNGame.exe+0xbbf712).
-    static const std::vector<uint8_t> kPriLink = { 0x17, 0x6a, 0x00 };
-    constexpr uint32_t kPriLinkBits = 20;
+    // Build correct-by-construction: SerializeInt(23,531) [9b] + dynamic-ref selector bit [1b]
+    // + SerializeInt(26, 2048) [11b] = 21 bits. The channel index MUST use UE3 MAX_CHANNELS
+    // (2048 = 11 bits), not 1024 (10 bits): at 10 bits the client reads 1 bit past the bunch,
+    // trips FInBunch's error flag, and SerializeObject returns NULL -> PlayerReplicationInfo
+    // never binds -> role-UI LocalPRI null (+0xbbf712). Bytes are still 17 6a 00 (high bit 0).
+    BitWriter lw;
+    lw.SerializeInt(23, kRoPcMaxHandle);   // Controller.PlayerReplicationInfo handle
+    lw.WriteBit(true);                      // object-ref selector = dynamic (1)
+    lw.SerializeInt(26, 2048);              // local PRI channel index (UE3 MAX_CHANNELS)
+    const std::vector<uint8_t> linkPayload = lw.GetBytes();
+    const uint32_t linkBits = static_cast<uint32_t>(lw.NumBits());
     ControlState& cs = GetControlState(clientId);
     for (int i = 0; i < repeats; ++i) {
         PacketCodec::Bunch b;
@@ -898,8 +907,8 @@ void ConnectionManager::SendLocalPriLink(uint32_t clientId, int repeats) {
         b.chIndex    = 2;
         b.chType     = cs.actorChType;   // ignored on the wire for unreliable bunches
         b.chSequence = 0;
-        b.payload    = kPriLink;
-        b.payloadBits = kPriLinkBits;
+        b.payload    = linkPayload;
+        b.payloadBits = linkBits;
         SendReliableBunches(clientId, { b });   // sends; not recorded (bReliable=false)
     }
     Logger::Info("[ConnectionManager::SendLocalPriLink] client %u: sent PC.PlayerReplicationInfo"
@@ -1051,12 +1060,12 @@ void ConnectionManager::DecodeInboundActorBunch(uint32_t clientId,
         // populate the null object the role UI compares against), DO NOT send the advance -
         // it is a guaranteed client crash. The team is still recorded server-side above.
         // Re-enable by flipping this flag once role-state replication lands.
-        // Held again: the PC->PRI link (handle 23 -> ch26) is NOT being adopted by the
-        // client (LocalPRI still null -> +0xbbf712 crash once past the spectator gate),
-        // despite ch26 staying open. Root cause = an owning-PlayerController PRI mechanism
-        // we haven't cracked yet (under RE). Keep the advance + clear-spectator + link code
-        // ready; re-enable once the client actually adopts ROPC.PlayerReplicationInfo.
-        constexpr bool kEnableRoleSelectAdvance = false;
+        // Re-enabled: the PC->PRI link now binds. The adoption failure was the dynamic-objref
+        // width bug (kDynamicChannelMax 1024->2048): the client read 1 bit past our link bunch,
+        // FInBunch errored, SerializeObject returned NULL. With the index at the correct 11 bits
+        // the client resolves ch26, sets ROPC.PlayerReplicationInfo, and the role-UI LocalPRI is
+        // non-null. (RE: UnConn.h:143, UnChan.cpp ReceivedBunch, Controller.uc:536.)
+        constexpr bool kEnableRoleSelectAdvance = true;
         if (kEnableRoleSelectAdvance) {
             // Clear the local PRI's spectator flags FIRST so ShowRoleSelectScene does not
             // early-return at uc:5932 (if PRI.bOnlySpectator return) - the "no crash but no

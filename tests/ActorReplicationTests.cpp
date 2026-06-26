@@ -34,7 +34,7 @@ TEST(ActorReplication, StaticObjectRefRoundTrips) {
 
 // A dynamic actor reference (flag bit 1, value = channel index, bound 1024) round-trips.
 TEST(ActorReplication, DynamicActorRefRoundTrips) {
-    for (uint32_t idx : {0u, 2u, 54u, 511u, 1023u}) {  // channel indices < 1024
+    for (uint32_t idx : {0u, 2u, 54u, 511u, 1023u, 1500u, 2047u}) {  // channel indices < 2048
         BitWriter w;
         ActorRepl::WriteNetGUID(w, NetGUIDRef{/*isDynamic=*/true, idx});
         std::vector<uint8_t> bytes = w.GetBytes();
@@ -139,7 +139,7 @@ TEST(ActorReplication, ActorOpenHeaderRoundTrips) {
     EXPECT_EQ(cls.index, 0xABCDEu);
     float x, y, z; ActorRepl::ReadCompressedVector(r, x, y, z);
     EXPECT_EQ(x, 100); EXPECT_EQ(y, -250); EXPECT_EQ(z, 64);
-    EXPECT_EQ(r.SerializeInt(ActorRepl::kDynamicChannelMax), 0u);  // NetPlayerIndex
+    EXPECT_EQ(r.ReadByte(), 0u);  // NetPlayerIndex = raw byte (8 bits)
     EXPECT_FALSE(r.IsOverflowed());
     EXPECT_EQ(r.BitPos(), w.NumBits());
 }
@@ -221,7 +221,7 @@ TEST(ActorReplication, OpeningActorBunchDecodes) {
     EXPECT_FALSE(cls.isDynamic);
     EXPECT_EQ(cls.index, 90u);
     float lx, ly, lz; ActorRepl::ReadCompressedVector(r, lx, ly, lz);  // Location
-    EXPECT_EQ(r.SerializeInt(ActorRepl::kDynamicChannelMax), 0u);      // NetPlayerIndex
+    EXPECT_EQ(r.ReadByte(), 0u);      // NetPlayerIndex = raw byte (8 bits)
 
     EXPECT_EQ(r.SerializeInt(maxHandle), 6u);  EXPECT_EQ(r.ReadBits(3), 2u);  // 3-bit enum
     EXPECT_EQ(r.SerializeInt(maxHandle), 7u);  EXPECT_EQ(r.ReadBits(3), 3u);  // 3-bit enum
