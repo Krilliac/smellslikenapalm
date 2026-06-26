@@ -105,7 +105,8 @@ void WriteActorOpenHeader(BitWriter& w, const ActorOpenHeader& hdr);
 //   bool=1 bit, byte=8 bits, int=int32, float=float32, FString=length-prefixed,
 //   object ref=NetGUID (WriteNetGUID).
 void WritePropBool  (BitWriter& w, uint32_t handle, uint32_t maxHandle, bool v);
-void WritePropByte  (BitWriter& w, uint32_t handle, uint32_t maxHandle, uint8_t v);
+void WritePropByte  (BitWriter& w, uint32_t handle, uint32_t maxHandle, uint8_t v,
+                     uint32_t numBits = 8);   // enum bytes use appCeilLogTwo(NumEnums-1) bits
 void WritePropInt   (BitWriter& w, uint32_t handle, uint32_t maxHandle, int32_t v);
 void WritePropFloat (BitWriter& w, uint32_t handle, uint32_t maxHandle, float v);
 void WritePropString(BitWriter& w, uint32_t handle, uint32_t maxHandle, const std::string& v);

@@ -162,8 +162,10 @@ TEST(ActorReplication, OpeningActorBunchDecodes) {
     PacketCodec::Bunch b = ActorRepl::MakeOpeningActorBunch(
         /*chIndex=*/2, /*chSeq=*/1, hdr,
         [&](BitWriter& w) {
-            ActorRepl::WritePropByte(w, 6, maxHandle, 2);  // RemoteRole=AutonomousProxy
-            ActorRepl::WritePropByte(w, 7, maxHandle, 3);  // Role=Authority
+            // Role/RemoteRole are byte(enum ENetRole) -> 3-bit enum encoding (UE3
+            // appCeilLogTwo(NumEnums-1)), NOT a plain 8-bit byte.
+            ActorRepl::WritePropByte(w, 6, maxHandle, 2, /*numBits=*/3);  // RemoteRole=AutonomousProxy
+            ActorRepl::WritePropByte(w, 7, maxHandle, 3, /*numBits=*/3);  // Role=Authority
             ActorRepl::WritePropBool(w, 8, maxHandle, true); // bNetOwner
         });
 
@@ -181,8 +183,8 @@ TEST(ActorReplication, OpeningActorBunchDecodes) {
     float lx, ly, lz; ActorRepl::ReadCompressedVector(r, lx, ly, lz);  // Location
     EXPECT_EQ(r.SerializeInt(ActorRepl::kDynamicChannelMax), 0u);      // NetPlayerIndex
 
-    EXPECT_EQ(r.SerializeInt(maxHandle), 6u);  EXPECT_EQ(r.ReadByte(), 2u);
-    EXPECT_EQ(r.SerializeInt(maxHandle), 7u);  EXPECT_EQ(r.ReadByte(), 3u);
+    EXPECT_EQ(r.SerializeInt(maxHandle), 6u);  EXPECT_EQ(r.ReadBits(3), 2u);  // 3-bit enum
+    EXPECT_EQ(r.SerializeInt(maxHandle), 7u);  EXPECT_EQ(r.ReadBits(3), 3u);  // 3-bit enum
     EXPECT_EQ(r.SerializeInt(maxHandle), 8u);  EXPECT_TRUE(r.ReadBit());
     EXPECT_FALSE(r.IsOverflowed());
     EXPECT_EQ(r.BitPos(), static_cast<size_t>(b.payloadBits));

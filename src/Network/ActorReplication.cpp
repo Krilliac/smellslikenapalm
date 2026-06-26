@@ -4,6 +4,7 @@
 #include "Network/ActorReplication.h"
 
 #include <vector>
+#include <cmath>
 
 #include "Utils/Logger.h"
 
@@ -50,12 +51,14 @@ void WriteNetGUID(BitWriter& w, const NetGUIDRef& ref) {
                      "will mis-encode object ref",
                      ref.index, max, ref.isDynamic ? "dynamic/channel" : "static/object");
     }
-    // The None-objref class of bug: a NULL/None reference must be a STATIC index 0
-    // (isDynamic=false). A dynamic ref with index 0 points at channel 0 (the
-    // control channel), never a valid actor - flag it.
-    if (ref.isDynamic && ref.index == 0) {
-        Logger::Warn("ActorRepl::WriteNetGUID: dynamic ref to channel 0 - likely a "
-                     "mis-encoded None/NULL object reference");
+    // The None-objref class of bug: per UE3 UPackageMapLevel::SerializeObject
+    // (UnNetDrv.cpp), a NULL/None reference is the DYNAMIC index-0 form (selector bit 1 +
+    // SerializeInt(0, MAX_CHANNELS), Index<=0 => None). So the actual mis-encode is a
+    // STATIC (isDynamic=false) index-0 ref - a static object index 0 is the package's
+    // first export, never None. Flag THAT.
+    if (!ref.isDynamic && ref.index == 0) {
+        Logger::Warn("ActorRepl::WriteNetGUID: static ref to object index 0 - likely a "
+                     "mis-encoded None/NULL (None is the dynamic index-0 form)");
     }
 #endif
     w.WriteBit(ref.isDynamic);  // flag: 1=dynamic (channel index), 0=static (object index)
@@ -92,7 +95,10 @@ uint32_t CeilLogTwo(uint32_t v) {
     return n;
 }
 uint32_t AbsI(int32_t v) { return v < 0 ? static_cast<uint32_t>(-(int64_t)v) : static_cast<uint32_t>(v); }
-int32_t RoundToInt(float f) { return static_cast<int32_t>(f < 0 ? f - 0.5f : f + 0.5f); }
+// UE3 appRound (UnVcWin32.h) rounds half toward +inf == floor(f+0.5), NOT half-away-from-
+// zero. They differ only at exact negative half-integers (appRound(-0.5)=0, ours was -1) -
+// but a 1-unit difference shifts the compressed-vector bit width. Match UE3 exactly.
+int32_t RoundToInt(float f) { return static_cast<int32_t>(std::floor(f + 0.5f)); }
 } // namespace
 
 void WriteCompressedVector(BitWriter& w, float x, float y, float z) {
@@ -217,16 +223,20 @@ void WritePropBool(BitWriter& w, uint32_t handle, uint32_t maxHandle, bool v) {
               [&](BitReader& rr){ return rr.ReadBit() == v; });
 #endif
 }
-void WritePropByte(BitWriter& w, uint32_t handle, uint32_t maxHandle, uint8_t v) {
+void WritePropByte(BitWriter& w, uint32_t handle, uint32_t maxHandle, uint8_t v,
+                   uint32_t numBits) {
 #if RS2V_ACTORREPL_SELFCHECK
     CheckHandle("Byte", handle, maxHandle);
     const size_t startBit = w.NumBits();
 #endif
+    // UE3 UByteProperty::NetSerializeItem (UnProp.cpp): an ENUM byte serializes in
+    // appCeilLogTwo(NumEnums-1) bits, a plain byte in 8. Caller passes numBits (default 8;
+    // e.g. ENetRole -> 3). Emitting a fixed 8 bits for an enum desyncs the rest of the bunch.
     w.SerializeInt(handle, maxHandle);
-    w.WriteByte(v);
+    w.WriteBits(v, static_cast<int>(numBits));
 #if RS2V_ACTORREPL_SELFCHECK
     CheckProp(w, startBit, "Byte", handle, maxHandle,
-              [&](BitReader& rr){ return rr.ReadByte() == v; });
+              [&](BitReader& rr){ return rr.ReadBits(static_cast<int>(numBits)) == v; });
 #endif
 }
 void WritePropInt(BitWriter& w, uint32_t handle, uint32_t maxHandle, int32_t v) {
