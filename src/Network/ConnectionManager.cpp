@@ -633,7 +633,22 @@ void ConnectionManager::SendActorBootstrap(uint32_t clientId) {
         return;
     }
     ControlState& cs = GetControlState(clientId);
-    Logger::Info("[ConnectionManager::SendActorBootstrap] client %u: opening %zu bootstrap actor channels",
+
+    // Match the real server's pre-actor control sequence. In the capture the official
+    // server sends one NMT 0x24 message (payload int32 LE = 1; bytes 24 01 00 00 00) on
+    // the control channel at f1484, immediately AFTER the client's Join and immediately
+    // BEFORE it opens any actor channels. Our flow previously went Join -> Joined ->
+    // actor opens with nothing in between. Diagnosis from server_live.log: the retail
+    // client KEEPS its own PlayerController (ch2, NetPlayerIndex==0) but tears down every
+    // other bootstrap actor channel (ch3..ch140) with empty bClose bunches and NO
+    // NMT_ActorChannelFailure - i.e. the actors spawn then get torn down (a state gate),
+    // not a class-resolution or encoding failure. NMT 0x24 is the one control message the
+    // real pre-actor sequence has that ours lacked; send it first and let the live client
+    // tell us whether it is the missing state transition. See .remember/remember.md.
+    static const std::vector<uint8_t> kPreActorNmt24 = {0x24, 0x01, 0x00, 0x00, 0x00};
+    SendRawToClient(clientId, kPreActorNmt24);
+
+    Logger::Info("[ConnectionManager::SendActorBootstrap] client %u: NMT 0x24 sent; opening %zu bootstrap actor channels",
                  clientId, records.size());
     for (const ActorBunchRecord& r : records) {
         if (r.chIndex == 0) {
