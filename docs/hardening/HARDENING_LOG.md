@@ -16,8 +16,8 @@ src/Network/BitWriter, BitReader, PacketCodec, ActorReplication, WireTrace.h.
 - [x] Protocol decoders (src/Protocol/*)
 - [x] Security / AuthManager / input validation
 - [x] Game state / SpawnSystem / GameMode / ReplicationManager
-- [ ] Config / ConfigManager
-- [ ] Utils (StringUtils, PathUtils, MemoryPool, etc.)
+- [x] Config / ConfigManager
+- [x] Utils (StringUtils, PathUtils, MemoryPool, etc.)
 - [ ] Network: UDPSocket / NetworkManager / BandwidthManager / ClientConnection
 - [ ] (overflow) deepen tests, fuzz packet/bunch decoders, fill doc gaps
 
@@ -27,3 +27,4 @@ src/Network/BitWriter, BitReader, PacketCodec, ActorReplication, WireTrace.h.
 2026-06-26 | Protocol decoders | BytesRemaining guards + bool-return + reserve clamps (Actor/PropertyReplication); null-handler reject (ProtocolHandler); arg-count clamp (MessageEncoder); hex validation (ProtocolUtils); payload/field bounds (ProtocolDecoder) | 5dcbd39
 2026-06-26 | Security/Auth | anti-enumeration timing equalizer + no auto-insert (AuthManager); constant-time verify + param guards (PasswordHasher); bounded token/session maps + empty-token reject (TokenManager/EAC) | 18b81b0
 2026-06-26 | Game state | null/bounds guards + chained-deref fix (GameServer/GameMode/SpawnSystem); chat caps (ChatManager/GameServer); uniform_real_distribution UB fix (MapManager); checked find() in dirty loop (ReplicationManager) | fb8520b
+2026-06-26 | Config + Utils | URL oversize/option caps (URLOptions, join path); safe numeric coercion (ConfigManager); path-traversal reject (PathUtils); distribution UB fixes (RandomGenerator); Split/ToDouble guards (StringUtils); pool null-bail + worker clamp (MemoryPool/ThreadPool) | 07592a5
