@@ -23,4 +23,4 @@ src/Network/BitWriter, BitReader, PacketCodec, ActorReplication, WireTrace.h.
 
 ## Iteration log
 <!-- one line per completed iteration: date | subsystem | what was hardened | commit -->
-2026-06-26 | Network inbound parse | NMT-range + login-URL caps (HandshakeState); reassembly byte-cap 256KiB + seq-ahead/payloadBits guards (ControlReassembler); ValidBuffer/StringSane caps (ControlChannel); datagram clamp + checked find() + per-packet bunch cap 4096 (ConnectionManager inbound) | commit pending
+2026-06-26 | Network inbound parse | NMT-range + login-URL caps (HandshakeState); reassembly byte-cap 256KiB + seq-ahead/payloadBits guards (ControlReassembler); ValidBuffer/StringSane caps (ControlChannel); datagram clamp + checked find() + per-packet bunch cap 4096 (ConnectionManager inbound) | 2d7714d
