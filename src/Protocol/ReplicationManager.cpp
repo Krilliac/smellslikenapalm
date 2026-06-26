@@ -106,7 +106,17 @@ void ReplicationManager::BuildAndSendActorReplication() {
 
         Logger::Debug("[ReplicationManager::BuildAndSendActorReplication] actorId=%u is dirty with flags=0x%08X — adding to send list",
                       actorId, flags);
-        ActorState& st = m_actorStates[actorId];
+        // Only replicate actors that have a registered state. Using operator[] here
+        // would silently insert a default-constructed ActorState for a stale/unknown
+        // dirty-flag entry, replicating a bogus actor. Skip and clear instead.
+        auto stIt = m_actorStates.find(actorId);
+        if (stIt == m_actorStates.end()) {
+            Logger::Warn("[ReplicationManager::BuildAndSendActorReplication] actorId=%u has dirty flags but no registered state — skipping",
+                         actorId);
+            m_actorDirtyFlags[actorId] = 0;
+            continue;
+        }
+        ActorState& st = stIt->second;
         st.stateFlags = flags;
         // Assume external game logic has updated st.position, orientation, etc.
         toSend.push_back(st);

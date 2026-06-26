@@ -7,11 +7,15 @@
 #include <algorithm>
 #include <stdexcept>
 #include <cstring>
+#include <cctype>
 
-// OpenSSL for Base64
+// OpenSSL for Base64 (optional — guarded so the file builds without OpenSSL,
+// e.g. under MinGW where OpenSSL may not be found by CMake).
+#ifdef RS2V_HAS_OPENSSL
 #include <openssl/evp.h>
 #include <openssl/bio.h>
 #include <openssl/buffer.h>
+#endif
 
 namespace ProtocolUtils {
 
@@ -75,6 +79,19 @@ std::optional<std::vector<uint8_t>> FromHexString(const std::string& hex) {
     Logger::Debug("[ProtocolUtils::FromHexString] parsing %zu hex chars into %zu bytes", hex.size(), hex.size()/2);
     try {
         for (size_t i = 0; i < hex.size(); i += 2) {
+            // Defensive: std::stoi(base 16) also accepts leading whitespace, a
+            // sign, or a "0x" prefix, which would silently decode malformed input
+            // to a wrong byte instead of failing. Require both chars of the pair
+            // to be plain hex digits before converting. (size() is even, so i+1 is
+            // always in range here.) Valid hex strings are unaffected.
+            const char hi = hex[i];
+            const char lo = hex[i + 1];
+            if (!std::isxdigit(static_cast<unsigned char>(hi)) ||
+                !std::isxdigit(static_cast<unsigned char>(lo))) {
+                Logger::Warn("[ProtocolUtils::FromHexString] non-hex character in pair at offset %zu — rejecting input", i);
+                Logger::Trace("[ProtocolUtils::FromHexString] exit — returning nullopt (non-hex char)");
+                return std::nullopt;
+            }
             uint8_t byte = static_cast<uint8_t>(
                 std::stoi(hex.substr(i,2), nullptr, 16)
             );
@@ -130,6 +147,8 @@ bool VerifyAndStripChecksum(std::vector<uint8_t>& payload) {
 //-------------------------------------------------------------------------------------------------
 // Base64 encode / decode (no newlines)
 
+#ifdef RS2V_HAS_OPENSSL
+
 static std::string b64Encode(const uint8_t* data, size_t len) {
     Logger::Trace("[ProtocolUtils::b64Encode] entry — data=%p, len=%zu", (const void*)data, len);
     BIO* bmem = BIO_new(BIO_s_mem());
@@ -166,6 +185,81 @@ static std::vector<uint8_t> b64Decode(const std::string& b64str) {
     Logger::Trace("[ProtocolUtils::b64Decode] exit — returning %d bytes", len);
     return out;
 }
+
+#else // !RS2V_HAS_OPENSSL
+
+// Portable, dependency-free Base64 (NOT a cryptographic operation, so a built-in
+// implementation is fully correct and matches OpenSSL's NO_NL output).
+static const char kB64Alphabet[] =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+static std::string b64Encode(const uint8_t* data, size_t len) {
+    Logger::Trace("[ProtocolUtils::b64Encode] entry (built-in) — data=%p, len=%zu", (const void*)data, len);
+    std::string ret;
+    ret.reserve(((len + 2) / 3) * 4);
+    size_t i = 0;
+    for (; i + 2 < len; i += 3) {
+        uint32_t n = (uint32_t(data[i]) << 16) | (uint32_t(data[i + 1]) << 8) | data[i + 2];
+        ret.push_back(kB64Alphabet[(n >> 18) & 0x3F]);
+        ret.push_back(kB64Alphabet[(n >> 12) & 0x3F]);
+        ret.push_back(kB64Alphabet[(n >> 6) & 0x3F]);
+        ret.push_back(kB64Alphabet[n & 0x3F]);
+    }
+    size_t rem = len - i;
+    if (rem == 1) {
+        uint32_t n = uint32_t(data[i]) << 16;
+        ret.push_back(kB64Alphabet[(n >> 18) & 0x3F]);
+        ret.push_back(kB64Alphabet[(n >> 12) & 0x3F]);
+        ret.push_back('=');
+        ret.push_back('=');
+    } else if (rem == 2) {
+        uint32_t n = (uint32_t(data[i]) << 16) | (uint32_t(data[i + 1]) << 8);
+        ret.push_back(kB64Alphabet[(n >> 18) & 0x3F]);
+        ret.push_back(kB64Alphabet[(n >> 12) & 0x3F]);
+        ret.push_back(kB64Alphabet[(n >> 6) & 0x3F]);
+        ret.push_back('=');
+    }
+    Logger::Debug("[ProtocolUtils::b64Encode] (built-in) encoded %zu raw bytes to %zu base64 chars", len, ret.size());
+    Logger::Trace("[ProtocolUtils::b64Encode] exit — returning base64 string of length %zu", ret.size());
+    return ret;
+}
+
+static int b64DecodeChar(char c) {
+    if (c >= 'A' && c <= 'Z') return c - 'A';
+    if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+    if (c >= '0' && c <= '9') return c - '0' + 52;
+    if (c == '+') return 62;
+    if (c == '/') return 63;
+    return -1; // padding or invalid
+}
+
+static std::vector<uint8_t> b64Decode(const std::string& b64str) {
+    Logger::Trace("[ProtocolUtils::b64Decode] entry (built-in) — b64str length=%zu", b64str.size());
+    std::vector<uint8_t> out;
+    out.reserve((b64str.size() / 4) * 3);
+    uint32_t buf = 0;
+    int bits = 0;
+    for (char c : b64str) {
+        if (c == '=' || c == '\n' || c == '\r') continue;
+        int v = b64DecodeChar(c);
+        if (v < 0) {
+            Logger::Error("[ProtocolUtils::b64Decode] (built-in) invalid base64 char — decode failed for %zu-char input", b64str.size());
+            Logger::Trace("[ProtocolUtils::b64Decode] exit — returning empty vector (decode failure)");
+            return {};
+        }
+        buf = (buf << 6) | uint32_t(v);
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            out.push_back(static_cast<uint8_t>((buf >> bits) & 0xFF));
+        }
+    }
+    Logger::Debug("[ProtocolUtils::b64Decode] (built-in) decoded %zu base64 chars to %zu raw bytes", b64str.size(), out.size());
+    Logger::Trace("[ProtocolUtils::b64Decode] exit — returning %zu bytes", out.size());
+    return out;
+}
+
+#endif // RS2V_HAS_OPENSSL
 
 std::string Base64Encode(const std::vector<uint8_t>& data) {
     Logger::Trace("[ProtocolUtils::Base64Encode] entry — data.size()=%zu bytes", data.size());

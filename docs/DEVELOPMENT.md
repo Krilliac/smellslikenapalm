@@ -33,7 +33,7 @@ The repository uses **CMake** as its single build system and **GitHub Actions** 
 git clone https://github.com/Krilliac/smellslikenapalm.git
 cd smellslikenapalm
 mkdir build && cd build
-cmake .. -DCMAKE_BUILD_TYPE=Debug -DENABLE_TELEMETRY=ON -DENABLE_SCRIPTING=ON
+cmake .. -DCMAKE_BUILD_TYPE=Debug -DENABLE_TELEMETRY=ON
 cmake --build . --parallel
 ```
 
@@ -44,11 +44,9 @@ The binary is `build/bin/rs2v_server`.
 | Flag | Default | Description |
 |------|---------|-------------|
 | `-DENABLE_TELEMETRY` | `ON`  | Build telemetry subsystem |
-| `-DENABLE_EAC`       | `ON`  | Build Easy-Anti-Cheat proxy |
-| `-DENABLE_SCRIPTING` | `ON`  | Embed Roslyn C# host |
-| `-DBUILD_TESTS`      | `ON`  | Compile Google-Test suites |
-| `-DBUILD_BENCHMARKS` | `OFF` | Google-Benchmark targets |
-| `-DENABLE_ASAN`      | `OFF` | GCC/Clang Address-Sanitizer |
+| `-DENABLE_SCRIPTING` | `OFF` | Embed the C# scripting host. **Currently does not build** (deprecated .NET COM host) — disabled pending a rework. |
+| `-DENABLE_COMPRESSION` | `ON` | Build packet compression (zlib if available, otherwise a built-in stub) |
+| `-DBUILD_TESTS`      | `OFF` | Compile Google-Test suites |
 
 Add `-G "Visual Studio 17 2022"` on Windows.
 

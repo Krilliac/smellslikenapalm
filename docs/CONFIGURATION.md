@@ -174,7 +174,7 @@ C# scripting engine configuration.
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `enable_csharp_scripting` | boolean | `false` | When `true`, the Roslyn-based C# scripting engine is loaded at startup. Scripts in the `scripts_path` directory are compiled and executed. Requires the `ENABLE_SCRIPTING` CMake option and .NET SDK at build time. |
+| `enable_csharp_scripting` | boolean | `false` | When `true`, the C# scripting engine is loaded at startup and scripts in `scripts_path` are compiled and executed. Requires the `ENABLE_SCRIPTING` CMake option and .NET SDK at build time. **Note:** C# scripting is currently disabled — `ENABLE_SCRIPTING` defaults to `OFF` and the host does not build, so this setting has no effect in a default build (see the Scripting guide). |
 | `scripts_path` | path | `data/scripts/` | Directory containing C# script files (`.cs`). Scripts in the `enabled/` subdirectory are loaded automatically; scripts in `disabled/` are available for manual activation. |
 | `script_reload_interval_ms` | integer | `500` | Debounce interval in milliseconds for the file watcher. When a script file changes, the server waits this long before recompiling to avoid reloading during rapid edits. Valid range: 100–10000. |
 | `default_namespace` | string | `DynamicScripts` | Default C# namespace used when wrapping scripts that don't declare their own namespace. |

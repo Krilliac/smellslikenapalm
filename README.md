@@ -5,42 +5,57 @@
 
 <span style="color:#f0ad4e;">- Some subsystems are still stubs or proofs-of-concept.</span>
 
-<span style="color:#5bc0de;">- Comprehensive tests exist, but the main target currently does not compile on all platforms.</span>
+<span style="color:#5bc0de;">- The main server target now builds on MSVC and MinGW, but the live netcode is still a work in progress (see Current Status below) — a stock client cannot fully connect yet.</span>
 
 <span style="color:#428bca;">We welcome issues and pull-requests, but please sync often and review <a href="TODO.md">TODO.md</a> before starting major work.</span>
 
-A highly modular, extensible, and production-ready dedicated server implementation for Rising Storm 2: Vietnam, designed with enterprise-grade architecture, comprehensive telemetry, and advanced security features.
+A modular, extensible dedicated-server *emulator* for Rising Storm 2: Vietnam, written in C++17. The codebase is organized around a production-style architecture (telemetry, security, and networking subsystems), but many of those subsystems are still in development — see **Current Status** below before relying on any of them.
 
-## 🌟 Key Features
+## 📌 Current Status (as of this branch)
 
-### 🌐 Advanced Networking
-- **High-Performance Protocol Stack**: Custom TCP/UDP implementations with zero-copy optimizations
-- **UE3-Compatible Protocol**: Full "bunch" protocol support for seamless game integration  
-- **Adaptive Network Quality**: Automatic bandwidth management, congestion control, and quality monitoring
-- **Compression & Encryption**: Configurable packet compression and security layers
+**What this is:** a from-scratch, clean-room dedicated-**server emulator** for *Rising Storm 2: Vietnam*, a game built on Unreal Engine 3 (`EngineVersion 7258`). It is **not** an official server and is not affiliated with Tripwire Interactive or Epic Games.
 
-### 🎮 Complete Game Systems
-- **Physics Engine**: Full rigid-body dynamics, collision detection, and vehicle simulation
-- **Player Management**: Comprehensive player lifecycle, team balancing, and statistics tracking
+**Where it stands today:**
+
+- ✅ **Builds clean** on MSVC (`build/`) and MinGW (`build-mingw/`). The main server target compiles.
+- 🚧 **UE3 control-channel handshake is being implemented.** The Hello / Challenge / Login / Welcome message ordinals have been reverse-engineered from the retail client and are being wired up (see `src/Network/ControlChannel.*`, `NetMessages.h`, and `src/Protocol/ReverseEngineering/`). **A stock retail client cannot fully connect yet.**
+- 🚧 **Live netcode is still partly placeholder.** The socket, packet, and replication plumbing exists, but end-to-end gameplay traffic is not yet functional.
+- ⛔ **C# (.NET) scripting is currently disabled.** The scripting host relies on a deprecated .NET COM hosting API (`ICorRuntimeHost`) that does not build; `ENABLE_SCRIPTING` defaults to `OFF` and the engine needs to be reworked onto a supported hosting API. See `src/Scripting/`.
+- 🚧 **Telemetry and security are partially stubbed.** Interfaces and reporters exist, and the EAC layer is an independent *emulation* (not real EAC), but coverage is incomplete.
+
+The rest of this README describes the intended architecture and feature set. Treat feature claims below as **design targets / work in progress** rather than finished, battle-tested functionality. See [TODO.md](TODO.md) for the current roadmap.
+
+## 🌟 Key Features (design goals)
+
+> The items below describe the **target** feature set. Several are partial, stubbed, or not yet wired into the live server — see **Current Status** above.
+
+### 🌐 Networking
+- **TCP/UDP Protocol Stack**: Custom socket layer with a packet/replication pipeline
+- **UE3-Compatible Protocol**: Targeting the RS2:V "bunch" / control-channel protocol (handshake in progress — see Current Status)
+- **Network Quality Management**: Bandwidth accounting and connection-quality monitoring
+- **Compression**: Configurable packet compression (zlib, with a built-in fallback stub)
+
+### 🎮 Game Systems
+- **Physics**: Rigid-body, collision, and vehicle simulation scaffolding
+- **Player Management**: Player lifecycle, team balancing, and statistics tracking
 - **Match Management**: Round systems, objective tracking, and configurable game modes
-- **Map Systems**: Dynamic map loading, rotation management, and spawn point optimization
+- **Map Systems**: Map loading, rotation management, and spawn-point handling
 
-### 🔒 Enterprise Security
-- **Multi-Layer Anti-Cheat**: EAC integration, behavioral analysis, and statistical anomaly detection
-- **Authentication Framework**: Steam integration, secure session management, and role-based access
-- **Input Validation**: Comprehensive packet validation, movement verification, and exploit prevention
-- **Audit & Compliance**: Complete action logging, security event tracking, and forensic capabilities
+### 🔒 Security (emulated, partial)
+- **Anti-Cheat Emulation**: An independent EAC *emulation* layer plus behavioral/statistical checks (not real Easy Anti-Cheat)
+- **Authentication Framework**: Steam-style authentication and session management
+- **Input Validation**: Packet validation and movement verification
+- **Audit Logging**: Action and security-event logging
 
-### 📊 Production Telemetry
-- **Real-Time Monitoring**: System metrics (CPU, memory, network) and application metrics
-- **Multiple Export Formats**: JSON files, Prometheus endpoints, CSV exports, and in-memory buffers
-- **Performance Profiling**: Automatic timing, bottleneck detection, and optimization recommendations
-- **Alerting System**: Threshold-based monitoring with configurable notifications
+### 📊 Telemetry
+- **Metrics Collection**: System metrics (CPU, memory, network) and application metrics
+- **Multiple Export Formats**: JSON files, a Prometheus endpoint, CSV exports, and in-memory buffers
+- **Performance Profiling**: Timing and bottleneck instrumentation
+- **Alerting**: Threshold-based monitoring with configurable notifications
 
-### 🔧 Extensibility & Scripting
-- **Dynamic Plugin System**: Hot-loadable libraries with secure sandboxing
-- **Script Hook Architecture**: Runtime packet handling, game logic modification, and event processing
-- **API Framework**: Comprehensive C API for third-party integrations
+### 🔧 Extensibility & Scripting (scripting currently disabled)
+- **Plugin System**: Loadable native handler libraries
+- **Script Hook Architecture**: Event/packet hooks (the C# scripting host is **disabled** pending a rework — see Current Status)
 - **Configuration Management**: Live reloading, hierarchical configs, and environment-specific settings
 
 ## 📋 Table of Contents
@@ -72,7 +87,7 @@ cd smellslikenapalm
 mkdir build && cd build
 
 # Configure
-cmake .. -DCMAKE_BUILD_TYPE=Release -DENABLE_TELEMETRY=ON -DENABLE_EAC=ON
+cmake .. -DCMAKE_BUILD_TYPE=Release -DENABLE_TELEMETRY=ON
 
 # Build
 cmake --build . --config Release --parallel
@@ -168,11 +183,9 @@ vcpkg install openssl nlohmann-json gtest zlib
 | Option | Default | Description |
 |--------|---------|-------------|
 | `ENABLE_TELEMETRY` | `ON` | Build with telemetry system |
-| `ENABLE_EAC` | `ON` | Enable Easy Anti-Cheat support |
-| `ENABLE_SCRIPTING` | `ON` | Enable dynamic scripting system |
-| `ENABLE_COMPRESSION` | `ON` | Build with packet compression |
-| `BUILD_TESTS` | `ON` | Build comprehensive test suite |
-| `BUILD_BENCHMARKS` | `OFF` | Build performance benchmarks |
+| `ENABLE_SCRIPTING` | `OFF` | Enable the C# scripting host (currently does not build — see Current Status) |
+| `ENABLE_COMPRESSION` | `ON` | Build with packet compression (zlib if available, otherwise a built-in stub) |
+| `BUILD_TESTS` | `OFF` | Build the Google Test suite |
 
 ## ⚙️ Configuration
 
@@ -407,19 +420,18 @@ When reporting issues, please include:
 
 ### Performance Targets
 
-| Metric | Target | Typical |
-|--------|--------|---------|
-| **Player Capacity** | 64+ concurrent | 32-64 players |
-| **Tick Rate** | 60+ Hz | 60 Hz |
-| **Latency** | 80% |
-| `rs2v_server_memory_usage_percent` | Memory utilization | >90% |
-| `rs2v_server_active_connections` | Player count | 60 |
-| `rs2v_server_packet_loss_rate` | Network quality | >5% |
-| `rs2v_server_security_violations_total` | Security events | >0/hour |
+> These are **design targets**, not measured benchmarks. End-to-end gameplay is not yet functional (see Current Status), so no representative live numbers are available.
+
+| Metric | Target |
+|--------|--------|
+| **Player Capacity** | 64+ concurrent |
+| **Tick Rate** | 60+ Hz |
+| **Latency overhead** | low, sub-frame |
+| **Memory** | bounded, pre-allocated pools |
 
 ## 📄 License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+This project is licensed under the **RS2V Server Non-Commercial Open Source License** (modeled after emulator projects such as TrinityCore and MaNGOS) — see the [LICENSE](LICENSE) file for details. Commercial use and closed-source distribution are prohibited.
 
 ## 🙏 Acknowledgments
 

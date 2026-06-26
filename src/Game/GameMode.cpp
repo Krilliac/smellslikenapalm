@@ -41,7 +41,11 @@ void GameMode::OnEnd()
     Logger::Trace("[GameMode::OnEnd] Entry");
     Logger::Info("GameMode '%s' ending", m_def.name.c_str());
     // Clean up, tally scores, notify players
-    m_server->BroadcastChatMessage("[GameMode] Round results tallied.");
+    if (m_server) {
+        m_server->BroadcastChatMessage("[GameMode] Round results tallied.");
+    } else {
+        Logger::Error("[GameMode::OnEnd] Null server, cannot broadcast round results");
+    }
     Logger::Debug("[GameMode::OnEnd] Round results broadcast complete");
     Logger::Trace("[GameMode::OnEnd] Exit");
 }
@@ -92,12 +96,18 @@ void GameMode::AdvancePhase()
 {
     Logger::Trace("[GameMode::AdvancePhase] Entry, currentPhase=%d", static_cast<int>(m_phase));
     switch (m_phase) {
-        case Phase::Preparation:
+        case Phase::Preparation: {
             m_phase = Phase::Active;
-            m_phaseEndTime = std::chrono::steady_clock::now() + std::chrono::seconds(m_def.roundTimeLimit);
+            int roundSecs = m_def.roundTimeLimit;
+            if (roundSecs <= 0) {
+                Logger::Warn("[GameMode::AdvancePhase] Invalid roundTimeLimit=%d, clamping to default 900s", roundSecs);
+                roundSecs = 900;
+            }
+            m_phaseEndTime = std::chrono::steady_clock::now() + std::chrono::seconds(roundSecs);
             Logger::Info("GameMode '%s' entering Active phase", m_def.name.c_str());
-            Logger::Debug("[GameMode::AdvancePhase] Transitioned Preparation -> Active, roundTimeLimit=%d", m_def.roundTimeLimit);
+            Logger::Debug("[GameMode::AdvancePhase] Transitioned Preparation -> Active, roundTimeLimit=%d", roundSecs);
             break;
+        }
         case Phase::Active:
             m_phase = Phase::PostRound;
             m_phaseEndTime = std::chrono::steady_clock::now() + std::chrono::seconds(10);
@@ -107,7 +117,11 @@ void GameMode::AdvancePhase()
         case Phase::PostRound:
             Logger::Debug("[GameMode::AdvancePhase] PostRound complete, ending GameMode and triggering map change");
             OnEnd();
-            m_server->ChangeMap();  // trigger map rotation
+            if (m_server) {
+                m_server->ChangeMap();  // trigger map rotation
+            } else {
+                Logger::Error("[GameMode::AdvancePhase] Null server, cannot trigger map change");
+            }
             Logger::Trace("[GameMode::AdvancePhase] Exit (PostRound -> map change)");
             return;
     }
@@ -125,18 +139,39 @@ void GameMode::BroadcastPhase() const
         case Phase::PostRound:   msg = "Round over!";           break;
     }
     Logger::Debug("[GameMode::BroadcastPhase] Broadcasting phase message: '%s'", msg.c_str());
-    m_server->BroadcastChatMessage("[GameMode] " + msg);
+    if (m_server) {
+        m_server->BroadcastChatMessage("[GameMode] " + msg);
+    } else {
+        Logger::Error("[GameMode::BroadcastPhase] Null server, cannot broadcast phase message");
+    }
     Logger::Trace("[GameMode::BroadcastPhase] Exit");
 }
 
 void GameMode::HandleRespawns()
 {
     Logger::Trace("[GameMode::HandleRespawns] Entry");
+    if (!m_server) {
+        Logger::Error("[GameMode::HandleRespawns] Null server, skipping respawn pass");
+        return;
+    }
     auto* pm = m_server->GetPlayerManager();
+    if (!pm) {
+        Logger::Error("[GameMode::HandleRespawns] Null PlayerManager, skipping respawn pass");
+        return;
+    }
     auto deadPlayers = pm->GetDeadPlayers();
     Logger::Debug("[GameMode::HandleRespawns] Found %zu dead players to respawn", deadPlayers.size());
     for (auto& p : deadPlayers) {
-        uint32_t id = p->GetConnection()->GetClientId();
+        if (!p) {
+            Logger::Warn("[GameMode::HandleRespawns] Null player entry in dead list, skipping");
+            continue;
+        }
+        auto conn = p->GetConnection();
+        if (!conn) {
+            Logger::Warn("[GameMode::HandleRespawns] Dead player has no connection, skipping respawn");
+            continue;
+        }
+        uint32_t id = conn->GetClientId();
         Logger::Debug("[GameMode::HandleRespawns] Respawning player %u", id);
         pm->OnPlayerSpawn(id);
     }
@@ -146,7 +181,15 @@ void GameMode::HandleRespawns()
 void GameMode::HandleObjectiveCapture(uint32_t playerId, uint32_t objectiveId)
 {
     Logger::Trace("[GameMode::HandleObjectiveCapture] Entry, playerId=%u, objectiveId=%u", playerId, objectiveId);
+    if (!m_server) {
+        Logger::Error("[GameMode::HandleObjectiveCapture] Null server, ignoring capture from player %u", playerId);
+        return;
+    }
     auto* tm = m_server->GetTeamManager();
+    if (!tm) {
+        Logger::Error("[GameMode::HandleObjectiveCapture] Null TeamManager, ignoring capture from player %u", playerId);
+        return;
+    }
     uint32_t team = tm->GetPlayerTeam(playerId);
     Logger::Debug("[GameMode::HandleObjectiveCapture] Player %u is on team %u", playerId, team);
     if (tm->CaptureObjective(team, objectiveId)) {

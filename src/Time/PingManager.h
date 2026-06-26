@@ -4,7 +4,6 @@
 #include <chrono>
 #include <unordered_map>
 #include <mutex>
-#include <vector>
 #include <functional>
 #include "Network/BandwidthManager.h"
 
@@ -12,10 +11,6 @@ class PingManager {
 public:
     using Clock = std::chrono::steady_clock;
     using Millis = std::chrono::milliseconds;
-    struct PingSample {
-        uint32_t               id;
-        Clock::time_point      sentTime;
-    };
 
     // Callback when a ping round‐trip is measured: (addr, rtt)
     using PingCallback = std::function<void(const ClientAddress&, Millis)>;

@@ -37,6 +37,9 @@ class HelicopterPhysics;
 class TerritoryMode;
 class SupremacyMode;
 class SkirmishMode;
+class ProtocolHandler;
+class ReplicationManager;
+class ConnectionLoginBridge;
 
 struct PacketAnalysisResult;
 
@@ -139,6 +142,12 @@ private:
     std::unique_ptr<TerritoryMode>      m_territoryMode;
     std::unique_ptr<SupremacyMode>      m_supremacyMode;
     std::unique_ptr<SkirmishMode>       m_skirmishMode;
+
+    // Replication + the connection->player login bridge (the bridge owns the
+    // SecurityManager internally; see GameServer::Initialize for why).
+    std::unique_ptr<ProtocolHandler>      m_protocolHandler;
+    std::unique_ptr<ReplicationManager>   m_replicationManager;
+    std::unique_ptr<ConnectionLoginBridge> m_loginBridge;
 
     // Game tick timing
     float m_lastTickTime = 0.0f;

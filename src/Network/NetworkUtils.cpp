@@ -2,10 +2,10 @@
 
 #include "Network/NetworkUtils.h"
 #include "Utils/Logger.h"
+#include "Network/PlatformSocket.h"
 #include <sstream>
 #include <regex>
 #include <algorithm>
-#include <arpa/inet.h>
 
 namespace NetworkUtils {
 

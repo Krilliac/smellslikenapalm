@@ -2,6 +2,7 @@
 
 #include "Network/ClientConnection.h"
 #include "Network/ConnectionManager.h"
+#include "Network/PacketRecorder.h"
 #include "Game/Player.h"
 #include "Utils/Logger.h"
 #include "Protocol/ReverseEngineering/ProtocolDecoder.h"
@@ -60,6 +61,31 @@ std::string ClientConnection::GetSteamID() const {
 bool ClientConnection::SendPacket(const Packet& pkt) {
     Logger::Trace("[ClientConnection::SendPacket] Entry: clientId=%u, tag='%s', payloadSize=%u",
                   m_clientId, pkt.GetTag().c_str(), pkt.GetPayloadSize());
+    // Gate: NEVER send the emulator's internal Packet format to a UE3-protocol
+    // client - not during the handshake and not after Join. A real RS2 client
+    // mis-parses these as UE3 packets and corrupts its sequence/ack state (it can
+    // disconnect). UE3 clients receive only UE3-framed bytes via SendRaw (control
+    // bunches now; world-replication bunches once implemented). The legacy Packet
+    // path is reserved for non-UE3 peers (in-process tests/tools). (SendRaw is
+    // intentionally not gated.)
+    if (m_isUE3Client) {
+        Logger::Debug("[ClientConnection::SendPacket] Suppressing legacy game packet tag='%s' to UE3 client %u",
+                      pkt.GetTag().c_str(), m_clientId);
+        return false;
+    }
+    // Defensive: a disconnected/torn-down connection may still be referenced by a
+    // game-layer caller. Never push bytes after MarkDisconnected, and never deref a
+    // null socket (additive guard; correct path always has a live socket).
+    if (m_disconnected) {
+        Logger::Debug("[ClientConnection::SendPacket] Dropping packet tag='%s' to disconnected client %u",
+                      pkt.GetTag().c_str(), m_clientId);
+        return false;
+    }
+    if (!m_socket) {
+        Logger::Warn("[ClientConnection::SendPacket] Client %u has null socket, dropping packet tag='%s'",
+                     m_clientId, pkt.GetTag().c_str());
+        return false;
+    }
     auto data = pkt.Serialize();
     Logger::Debug("[ClientConnection::SendPacket] Serialized packet: tag='%s', serialized size=%zu bytes",
                   pkt.GetTag().c_str(), data.size());
@@ -87,17 +113,60 @@ bool ClientConnection::SendPacket(const Packet& pkt) {
     return ok;
 }
 
+bool ClientConnection::SendRaw(const uint8_t* data, size_t len) {
+    Logger::Trace("[ClientConnection::SendRaw] Entry: clientId=%u, len=%zu", m_clientId, len);
+    if (!m_socket || !data || len == 0) {
+        Logger::Warn("[ClientConnection::SendRaw] Client %u: invalid socket/data, dropping %zu bytes",
+                     m_clientId, len);
+        return false;
+    }
+    if (!CanSend((uint32_t)len)) {
+        Logger::Warn("[ClientConnection::SendRaw] Bandwidth limit exceeded for client %u, dropping %zu raw bytes",
+                     m_clientId, len);
+        return false;
+    }
+    bool ok = m_socket->SendTo(m_ip, m_port, data, len);
+    if (ok) {
+        OnBytesSent((uint32_t)len);
+        // GLOBAL PACKET RECORDER: every outbound datagram (S2C) -> packetlog/ sniff.
+        net::PacketRecorder::Instance().RecordDatagram(
+            net::PktDir::S2C, m_clientId, m_ip + ":" + std::to_string(m_port), data, len);
+        Logger::Debug("[ClientConnection::SendRaw] Sent %zu raw bytes to client %u (%s:%u)",
+                      len, m_clientId, m_ip.c_str(), m_port);
+    } else {
+        Logger::Error("[ClientConnection::SendRaw] Failed to send %zu raw bytes to client %u (%s:%u)",
+                      len, m_clientId, m_ip.c_str(), m_port);
+    }
+    Logger::Trace("[ClientConnection::SendRaw] Exit: returning %s", ok ? "true" : "false");
+    return ok;
+}
+
 bool ClientConnection::ReceiveRaw(std::vector<uint8_t>& outData, PacketMetadata& meta) {
     Logger::Trace("[ClientConnection::ReceiveRaw] Entry: clientId=%u", m_clientId);
-    outData.resize(1500);
+    // Defensive: never deref a null socket on the receive path (additive guard).
+    if (!m_socket) {
+        Logger::Warn("[ClientConnection::ReceiveRaw] Client %u has null socket, no data", m_clientId);
+        return false;
+    }
+    const int kRecvBufSize = 1500;
+    outData.resize(kRecvBufSize);
     std::string fromIp;
     uint16_t fromPort = 0;
-    Logger::Debug("[ClientConnection::ReceiveRaw] Receiving from socket, buffer size=1500");
+    Logger::Debug("[ClientConnection::ReceiveRaw] Receiving from socket, buffer size=%d", kRecvBufSize);
     int len = m_socket->ReceiveFrom(fromIp, fromPort, outData.data(), (int)outData.size());
     if (len <= 0) {
         Logger::Debug("[ClientConnection::ReceiveRaw] ReceiveFrom returned %d, no data available for client %u", len, m_clientId);
         Logger::Trace("[ClientConnection::ReceiveRaw] Exit: returning false (no data)");
         return false;
+    }
+    // Defensive: do NOT trust the returned length. ReceiveFrom only wrote up to
+    // kRecvBufSize bytes into the buffer; if it reports more (driver/impl bug),
+    // resizing to that value would expose value-initialized tail bytes as if they
+    // were received packet data. Clamp to what the buffer can actually hold.
+    if (len > kRecvBufSize) {
+        Logger::Warn("[ClientConnection::ReceiveRaw] Client %u: ReceiveFrom reported %d bytes > buffer %d, clamping",
+                     m_clientId, len, kRecvBufSize);
+        len = kRecvBufSize;
     }
     outData.resize(len);
     Logger::Debug("[ClientConnection::ReceiveRaw] Received %d bytes from %s:%u for client %u",
@@ -278,8 +347,18 @@ void ClientConnection::SendSessionState(uint32_t aliveCount) {
 bool ClientConnection::CanSend(uint32_t byteCount) {
     Logger::Trace("[ClientConnection::CanSend] Entry: clientId=%u, byteCount=%u", m_clientId, byteCount);
     ResetWindowIfNeeded();
+    // Defensive: never deref a null manager. The correct path always has a manager;
+    // if it is somehow null we cannot consult the limit, so allow the send rather
+    // than silently dropping a valid client's traffic (additive, non-fatal).
+    if (!m_manager) {
+        Logger::Warn("[ClientConnection::CanSend] Client %u has null manager, skipping bandwidth check", m_clientId);
+        return true;
+    }
     uint32_t limit = m_manager->GetBandwidthLimit();
-    bool canSend = m_sentBytesThisWindow + byteCount <= limit;
+    // Defensive: compute without integer overflow. m_sentBytesThisWindow + byteCount
+    // can wrap a uint32_t (byteCount is a size_t cast at the call site), and a wrapped
+    // sum could falsely pass the cap. Subtraction-form comparison cannot overflow.
+    bool canSend = (byteCount <= limit) && (m_sentBytesThisWindow <= limit - byteCount);
     Logger::Debug("[ClientConnection::CanSend] Client %u: sentBytesThisWindow=%u, requested=%u, limit=%u, canSend=%s",
                   m_clientId, m_sentBytesThisWindow, byteCount, limit, canSend ? "true" : "false");
     if (!canSend) {
@@ -294,7 +373,14 @@ void ClientConnection::OnBytesSent(uint32_t byteCount) {
     Logger::Trace("[ClientConnection::OnBytesSent] Entry: clientId=%u, byteCount=%u", m_clientId, byteCount);
     ResetWindowIfNeeded();
     uint32_t previousSent = m_sentBytesThisWindow;
-    m_sentBytesThisWindow += byteCount;
+    // Defensive: saturating add. If the window counter ever overflowed it would wrap
+    // to a small value and defeat the bandwidth cap, letting a stuck/abusive client
+    // resume flooding. Clamp at UINT32_MAX instead (additive guard).
+    if (m_sentBytesThisWindow > UINT32_MAX - byteCount) {
+        m_sentBytesThisWindow = UINT32_MAX;
+    } else {
+        m_sentBytesThisWindow += byteCount;
+    }
     Logger::Debug("[ClientConnection::OnBytesSent] Client %u: sentBytesThisWindow %u -> %u",
                   m_clientId, previousSent, m_sentBytesThisWindow);
     Logger::Trace("[ClientConnection::OnBytesSent] Exit");
@@ -304,7 +390,17 @@ void ClientConnection::ResetWindowIfNeeded() {
     Logger::Trace("[ClientConnection::ResetWindowIfNeeded] Entry: clientId=%u", m_clientId);
     auto now = std::chrono::steady_clock::now();
     auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - m_windowStart).count();
-    if (elapsed >= 1) {
+    // Defensive: guard against time going backwards. steady_clock should be
+    // monotonic, but if m_windowStart ever ends up ahead of now (clock anomaly,
+    // bad construction order) elapsed is negative and the window would NEVER reset,
+    // permanently wedging this client's bandwidth counter and blocking all sends.
+    // Treat a backwards jump as window expiry and re-anchor (additive, non-fatal).
+    if (elapsed < 0) {
+        Logger::Warn("[ClientConnection::ResetWindowIfNeeded] Client %u: time went backwards (elapsed=%lld s), re-anchoring window",
+                     m_clientId, (long long)elapsed);
+        m_windowStart = now;
+        m_sentBytesThisWindow = 0;
+    } else if (elapsed >= 1) {
         Logger::Debug("[ClientConnection::ResetWindowIfNeeded] Client %u: window expired (elapsed=%lld s), resetting sentBytesThisWindow=%u to 0",
                       m_clientId, (long long)elapsed, m_sentBytesThisWindow);
         m_windowStart = now;

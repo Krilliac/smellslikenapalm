@@ -2,13 +2,22 @@
 
 #include "Network/ConnectionManager.h"
 #include "Game/GameServer.h"
+#include "Game/TeamManager.h"
 #include "Config/ConfigManager.h"
 #include "Utils/Logger.h"
 #include "Network/Packet.h"
 #include "Network/BandwidthManager.h"
 #include "Protocol/ReverseEngineering/ProtocolDecoder.h"
+#include "Network/HandshakeState.h"
+#include "Network/ControlChannel.h"
+#include "Network/BitWriter.h"
+#include "Network/BitReader.h"
+#include "Network/PacketRecorder.h"
 #include "../../telemetry/TelemetryManager.h"
 #include <chrono>
+#include <fstream>
+#include <mutex>
+#include <algorithm>
 
 ConnectionManager::ConnectionManager(GameServer* server)
     : m_server(server)
@@ -95,6 +104,16 @@ void ConnectionManager::PumpNetwork() {
             break;
         }
 
+        // Defensive: recvfrom must never report more than the buffer it was handed,
+        // but clamp before resize() so a misbehaving socket layer can't make us grow
+        // the buffer past the bytes actually written (which would expose uninitialized
+        // memory to the parse path). Valid datagrams are always <= buffer.size().
+        if (len > static_cast<int>(buffer.size())) {
+            Logger::Warn("[ConnectionManager::PumpNetwork] ReceiveFrom reported %d bytes > buffer %zu from %s:%u, clamping",
+                         len, buffer.size(), srcIp.c_str(), srcPort);
+            len = static_cast<int>(buffer.size());
+        }
+
         buffer.resize(len);
         ClientAddress addr{srcIp, srcPort};
         Logger::Debug("[ConnectionManager::PumpNetwork] Received %d bytes from %s:%u (iteration %d)",
@@ -113,6 +132,12 @@ void ConnectionManager::PumpNetwork() {
         packetCount++;
     }
     Logger::Debug("[ConnectionManager::PumpNetwork] Drained %d packets this pump cycle", packetCount);
+
+    // Resend any reliable bunches the client hasn't acked within the timeout. Runs every
+    // pump cycle (the poll loop is tight) so a dropped bootstrap open is recovered in
+    // ~250ms instead of stalling the channel forever (the soft-lock).
+    RetransmitTick();
+
     Logger::Trace("[ConnectionManager::PumpNetwork] Exit");
 }
 
@@ -128,19 +153,55 @@ void ConnectionManager::HandleIncomingPacket(const std::vector<uint8_t>& data, c
     }
     Logger::Debug("[ConnectionManager::HandleIncomingPacket] clientId=%u for %s:%u", clientId, addr.ip.c_str(), addr.port);
 
-    // Feed raw UDP data to protocol decoder for UE3 bunch analysis
-    GetProtocolDecoder().OnRawUDPReceived(clientId, data.data(), data.size());
-    Logger::Debug("[ConnectionManager::HandleIncomingPacket] Fed %zu raw bytes to protocol decoder for client %u",
-                  data.size(), clientId);
+    // GLOBAL PACKET RECORDER: every inbound datagram (C2S) -> packetlog/ sniff.
+    net::PacketRecorder::Instance().RecordDatagram(
+        net::PktDir::C2S, clientId, addr.ip + ":" + std::to_string(addr.port),
+        data.data(), data.size());
 
-    auto conn = m_clients[addr];
+    // HANDSHAKE WIRE TRACE: dump small inbound datagrams (the handshake/control
+    // packets are tiny) so we can see exactly what the real client sends. Skipped
+    // for large datagrams to avoid spamming gameplay traffic.
+    if (data.size() <= 80) {
+        std::string hex; hex.reserve(data.size() * 2);
+        static const char* H = "0123456789abcdef";
+        for (uint8_t b : data) { hex += H[b >> 4]; hex += H[b & 0xF]; }
+        Logger::Debug("[WIRE<-] client %u %zuB: %s", clientId, data.size(), hex.c_str());
+    }
+
+    // CreateOrGetClient above guarantees this entry exists, but look it up with a
+    // checked find() rather than operator[]: operator[] would silently default-insert
+    // a null shared_ptr if the entry were ever missing, and the very next line would
+    // dereference it. Reject safely instead of crashing on attacker traffic.
+    auto connIt = m_clients.find(addr);
+    if (connIt == m_clients.end() || !connIt->second) {
+        Logger::Warn("[ConnectionManager::HandleIncomingPacket] no connection object for %s:%u (clientId=%u), dropping packet",
+                     addr.ip.c_str(), addr.port, clientId);
+        net::RecordNetNull("HandleIncomingPacket/connLookup",
+                           addr.ip + ":" + std::to_string(addr.port) + " has no connection object",
+                           clientId);
+        return;
+    }
+    auto conn = connIt->second;
+    conn->UpdateLastHeartbeat();
+    Logger::Debug("[ConnectionManager::HandleIncomingPacket] Updated heartbeat for client %u", clientId);
+
+    // ---- UE3 control-channel path (EXCLUSIVE) ----
+    // A well-formed UE3 packet is handled ONLY here. Running it through the legacy
+    // Packet pipeline below would mis-parse the UE3 bytes as a tagged Packet
+    // (Packet::FromBuffer) and enqueue garbage into the game queue (observed as a
+    // flood of "Rejecting malformed buffer" warns + bogus callback dispatches).
+    GetProtocolDecoder().OnRawUDPReceived(clientId, data.data(), data.size());
+    if (ParseIncomingControl(clientId, data)) {
+        Logger::Trace("[ConnectionManager::HandleIncomingPacket] client %u: handled as UE3 control packet", clientId);
+        return;
+    }
+
+    // ---- legacy / non-UE3 path (internal Packet format: in-process tests, tools) ----
     PacketMetadata meta;
     meta.clientId = clientId;
     Packet pkt = Packet::FromBuffer(data, meta);
     Logger::Debug("[ConnectionManager::HandleIncomingPacket] Parsed packet: tag='%s', clientId=%u, payloadSize=%u",
                   pkt.GetTag().c_str(), clientId, pkt.GetPayloadSize());
-    conn->UpdateLastHeartbeat();
-    Logger::Debug("[ConnectionManager::HandleIncomingPacket] Updated heartbeat for client %u", clientId);
 
     // Feed parsed packet to protocol decoder for structure analysis
     GetProtocolDecoder().OnPacketReceived(clientId, pkt.RawData(), pkt.GetTag());
@@ -295,7 +356,10 @@ void ConnectionManager::RemoveStaleConnections() {
     Logger::Trace("[ConnectionManager::RemoveStaleConnections] Entry: %zu clients", m_clients.size());
     auto now = std::chrono::steady_clock::now();
     auto cfgMgr = m_server->GetConfigManager();
-    int timeoutSecs = cfgMgr ? cfgMgr->GetInt("Network.timeout_seconds", 30) : 30;
+    // 120s (was 30s): 30 was too aggressive - a player pausing in the menu, or a brief
+    // reliable-channel stall, would be dropped and surface as a client-side "connection
+    // timed out". Real RS2 servers are far more lenient. Override via Network.timeout_seconds.
+    int timeoutSecs = cfgMgr ? cfgMgr->GetInt("Network.timeout_seconds", 120) : 120;
     Logger::Debug("[ConnectionManager::RemoveStaleConnections] Timeout threshold: %d seconds", timeoutSecs);
 
     std::vector<ClientAddress> toRemove;
@@ -309,6 +373,7 @@ void ConnectionManager::RemoveStaleConnections() {
             Logger::Debug("[ConnectionManager::RemoveStaleConnections] Client %u exceeded timeout (%lld > %d), marking for removal",
                           conn->GetClientId(), (long long)elapsed, timeoutSecs);
             GetProtocolDecoder().OnClientDisconnected(conn->GetClientId());
+            m_handshakes.erase(conn->GetClientId());
             conn->MarkDisconnected();
             toRemove.push_back(kv.first);
 
@@ -353,4 +418,925 @@ void ConnectionManager::SetMaxClients(size_t maxClients) {
 size_t ConnectionManager::GetMaxClients() const {
     Logger::Trace("[ConnectionManager::GetMaxClients] Entry/Exit: returning %zu", m_maxClients);
     return m_maxClients;
+}
+
+// ===========================================================================
+//  Game-facing handshake observer interface
+// ===========================================================================
+
+void ConnectionManager::SetClientLoggedInCallback(ClientLoggedInCallback cb) {
+    Logger::Debug("[ConnectionManager::SetClientLoggedInCallback] %s", cb ? "set" : "cleared");
+    m_clientLoggedInCb = std::move(cb);
+}
+
+void ConnectionManager::SetClientJoinedCallback(ClientJoinedCallback cb) {
+    Logger::Debug("[ConnectionManager::SetClientJoinedCallback] %s", cb ? "set" : "cleared");
+    m_clientJoinedCb = std::move(cb);
+}
+
+void ConnectionManager::FireClientLoggedIn(const ClientLoggedInEvent& ev) {
+    Logger::Info("[ConnectionManager::FireClientLoggedIn] client %u logged in (steamId=%llu, name='%s')",
+                 ev.clientId, (unsigned long long)ev.steamId, ev.options.PlayerName().c_str());
+    // Mirror the parsed player name onto the connection for convenience.
+    if (auto conn = GetConnection(ev.clientId)) {
+        if (!ev.options.PlayerName().empty()) conn->SetPlayerName(ev.options.PlayerName());
+    }
+
+    // World-replication bootstrap goes out HERE - immediately after NMT_Welcome -
+    // exactly as the official server does (capture: Welcome f162 -> PackageMap
+    // f167-f185, BEFORE the client's "packages verified" reply at f227). Sending it
+    // on Join instead would deadlock a real client: it won't send Join/ready until
+    // it has reconciled the PackageMap. See docs/RS2V_PostJoin_Replication_7258.md.
+    SendReplicationBootstrap(ev.clientId);
+
+    if (m_clientLoggedInCb) {
+        m_clientLoggedInCb(ev);
+    } else {
+        Logger::Debug("[ConnectionManager::FireClientLoggedIn] no Game subscriber for ClientLoggedIn (client %u)",
+                      ev.clientId);
+    }
+}
+
+void ConnectionManager::FireClientJoined(const ClientJoinedEvent& ev) {
+    Logger::Info("[ConnectionManager::FireClientJoined] client %u joined", ev.clientId);
+    // The UE3 handshake is complete: from here the game layer may send to this
+    // client (until now SendPacket was suppressed to keep the handshake's wire
+    // stream clean).
+    if (auto conn = GetConnection(ev.clientId)) {
+        conn->SetHandshakeComplete(true);
+    }
+    // The PackageMap export went out earlier (on ClientLoggedIn / right after
+    // Welcome). Now that the client has Joined, open the bootstrap ACTOR channels
+    // (ROGameReplicationInfo, TeamInfo, the local PlayerController, PRIs) so it can
+    // build the world and spawn. Best-effort verbatim replay of the official f231
+    // burst - see SendActorBootstrap.
+    SendActorBootstrap(ev.clientId);
+
+    if (m_clientJoinedCb) {
+        m_clientJoinedCb(ev);
+    } else {
+        Logger::Debug("[ConnectionManager::FireClientJoined] no Game subscriber for ClientJoined (client %u)",
+                      ev.clientId);
+    }
+}
+
+bool ConnectionManager::SendRawToClient(uint32_t clientId, const std::vector<uint8_t>& bytes) {
+    auto conn = GetConnection(clientId);
+    if (!conn) {
+        Logger::Error("[ConnectionManager::SendRawToClient] No connection for client %u (%zu bytes dropped)",
+                      clientId, bytes.size());
+        return false;
+    }
+    // `bytes` is a control-channel MESSAGE payload (a ControlChannel::Build*
+    // result: <BYTE NMT><fields>). Frame it into UE3 packets - reliable control
+    // bunch(es) with a rolling PacketId/ChSequence, fragmented to MaxPacket, with
+    // any pending acks drained onto the first packet - then encode and send each.
+    // The BunchDataBits SerializeInt bound is phase-dependent on the wire and MUST
+    // match what the client decodes with, or the client mis-reads the bunch (it
+    // still acks at the packet level, masking the bug). During the StatelessConnect
+    // handshake MaxPacket is 8 (bound 64); once the NMT phase begins it is 2048
+    // (bound 16384) and large messages (Welcome, PackageMap export) go out as one
+    // big bunch rather than 63-bit fragments. Pick both from the handshake state.
+    // We are the SERVER: encode S2C bunches with the server's MaxPacket (~1500,
+    // bound ~12000) from the FIRST packet (including the HandshakeChallenge) - the
+    // client decodes server bunches at that bound from the start. (Asymmetric vs the
+    // client's 2048 that we DECODE inbound with - see PacketCodec.h. There is NO
+    // small-bound handshake phase; the old bound-64 encode made our challenge
+    // unparseable to the real client, stalling it on the loading screen.)
+    const uint32_t maxPacketBytes = PacketCodec::kServerSendMaxPacketBytes;
+    const uint32_t maxBunchDataBits = maxPacketBytes * 8u - 1u;
+
+    ControlState& cs = GetControlState(clientId);
+    bool ok = true;
+    for (const PacketCodec::Packet& pkt :
+         cs.outbound.BuildControlMessagePackets(bytes, maxBunchDataBits)) {
+        const std::vector<uint8_t> wire = PacketCodec::Encode(pkt, maxPacketBytes);
+        if (wire.size() <= 80) {  // HANDSHAKE WIRE TRACE (small control sends)
+            std::string hex; hex.reserve(wire.size() * 2);
+            static const char* H = "0123456789abcdef";
+            for (uint8_t b : wire) { hex += H[b >> 4]; hex += H[b & 0xF]; }
+            Logger::Debug("[WIRE->] client %u %zuB: %s", clientId, wire.size(), hex.c_str());
+        }
+        if (!conn->SendRaw(wire.data(), wire.size())) {
+            ok = false;
+        }
+    }
+    return ok;
+}
+
+HandshakeState& ConnectionManager::GetOrCreateHandshake(uint32_t clientId) {
+    auto it = m_handshakes.find(clientId);
+    if (it != m_handshakes.end()) return *it->second;
+
+    // The handshake's raw-send callback funnels outbound control bytes back to
+    // this connection. Capturing `this` + clientId is safe: the handshake is
+    // owned by m_handshakes and erased no later than this ConnectionManager.
+    auto hs = std::make_unique<HandshakeState>(
+        clientId,
+        [this, clientId](const std::vector<uint8_t>& payload) {
+            this->SendRawToClient(clientId, payload);
+        },
+        [this](const ClientLoggedInEvent& ev) { this->FireClientLoggedIn(ev); },
+        [this](const ClientJoinedEvent& ev)   { this->FireClientJoined(ev); });
+    auto* raw = hs.get();
+    m_handshakes[clientId] = std::move(hs);
+    Logger::Debug("[ConnectionManager::GetOrCreateHandshake] Created handshake for client %u", clientId);
+    return *raw;
+}
+
+ConnectionManager::ControlState& ConnectionManager::GetControlState(uint32_t clientId) {
+    ControlState& cs = m_controlState[clientId];
+    if (!cs.reassembler) {
+        // Reassembled control messages are dispatched straight into the client's
+        // handshake state machine. Capturing `this` + clientId is safe: both maps
+        // outlive no later than this ConnectionManager.
+        cs.reassembler = std::make_unique<PacketCodec::ControlReassembler>(
+            [this, clientId](const std::vector<uint8_t>& payload) {
+                this->GetOrCreateHandshake(clientId).HandleControlMessage(payload);
+            });
+    }
+    return cs;
+}
+
+void ConnectionManager::SendEncodedPacket(uint32_t clientId, const PacketCodec::Packet& pkt) {
+    auto conn = GetConnection(clientId);
+    if (!conn) {
+        return;
+    }
+    // Ack-only packets carry no bunches, so the BunchDataBits bound is moot here,
+    // but keep the server-send MaxPacket for consistency (always, no phase).
+    const std::vector<uint8_t> wire =
+        PacketCodec::Encode(pkt, PacketCodec::kServerSendMaxPacketBytes);
+    conn->SendRaw(wire.data(), wire.size());
+}
+
+namespace {
+// Load the replication-bootstrap record stream once and cache it. Format:
+// repeated [uint32 LE length][length payload bytes]. Each record is one complete
+// control-channel message payload (e.g. an NMT 0x07 PackageMap chunk) to send as
+// one reliable control bunch. Returns an empty vector if the file is absent/empty
+// (replication simply doesn't run - the handshake itself is unaffected).
+const std::vector<std::vector<uint8_t>>& GetReplicationBootstrapRecords() {
+    static std::once_flag once;
+    static std::vector<std::vector<uint8_t>> records;
+    std::call_once(once, [] {
+        const char* kPath = "data/replication_bootstrap.bin";
+        std::ifstream f(kPath, std::ios::binary);
+        if (!f) {
+            Logger::Info("[ReplicationBootstrap] '%s' not present - post-Join replication disabled",
+                         kPath);
+            return;
+        }
+        std::vector<uint8_t> all((std::istreambuf_iterator<char>(f)),
+                                 std::istreambuf_iterator<char>());
+        size_t off = 0;
+        while (off + 4 <= all.size()) {
+            const uint32_t len = static_cast<uint32_t>(all[off]) |
+                                 (static_cast<uint32_t>(all[off + 1]) << 8) |
+                                 (static_cast<uint32_t>(all[off + 2]) << 16) |
+                                 (static_cast<uint32_t>(all[off + 3]) << 24);
+            off += 4;
+            if (len == 0 || off + len > all.size()) {
+                Logger::Warn("[ReplicationBootstrap] truncated/invalid record at offset %zu (len=%u) - stopping",
+                             off - 4, len);
+                break;
+            }
+            records.emplace_back(all.begin() + off, all.begin() + off + len);
+            off += len;
+        }
+        Logger::Info("[ReplicationBootstrap] loaded %zu records (%zu bytes) from '%s'",
+                     records.size(), all.size(), kPath);
+    });
+    return records;
+}
+} // namespace
+
+namespace {
+// One bootstrap actor bunch descriptor parsed from data/actor_bootstrap.bin.
+struct ActorBunchRecord {
+    uint16_t chIndex = 0;
+    uint8_t  chType = 0;
+    bool     bOpen = false, bClose = false, bReliable = false, bControl = false;
+    uint16_t chSequence = 0;
+    uint32_t bunchDataBits = 0;       // EXACT bit count (payload is ceil/8 bytes)
+    std::vector<uint8_t> payload;
+};
+
+const std::vector<ActorBunchRecord>& GetActorBootstrapRecords() {
+    static std::once_flag once;
+    static std::vector<ActorBunchRecord> records;
+    std::call_once(once, [] {
+        const char* kPath = "data/actor_bootstrap.bin";
+        std::ifstream f(kPath, std::ios::binary);
+        if (!f) {
+            Logger::Info("[ActorBootstrap] '%s' not present - bootstrap actor channels disabled", kPath);
+            return;
+        }
+        std::vector<uint8_t> all((std::istreambuf_iterator<char>(f)),
+                                 std::istreambuf_iterator<char>());
+        size_t off = 0;
+        // record: u16 chIndex | u8 chType | u8 flags | u16 chSeq | u32 len | payload
+        while (off + 10 <= all.size()) {
+            ActorBunchRecord r;
+            r.chIndex = static_cast<uint16_t>(all[off] | (all[off + 1] << 8));
+            r.chType = all[off + 2];
+            const uint8_t flags = all[off + 3];
+            r.bOpen = flags & 0x1; r.bClose = flags & 0x2;
+            r.bReliable = flags & 0x4; r.bControl = flags & 0x8;
+            r.chSequence = static_cast<uint16_t>(all[off + 4] | (all[off + 5] << 8));
+            r.bunchDataBits = static_cast<uint32_t>(all[off + 6]) |
+                              (static_cast<uint32_t>(all[off + 7]) << 8) |
+                              (static_cast<uint32_t>(all[off + 8]) << 16) |
+                              (static_cast<uint32_t>(all[off + 9]) << 24);
+            const size_t len = (r.bunchDataBits + 7) / 8;  // payload bytes
+            off += 10;
+            if (off + len > all.size()) {
+                Logger::Warn("[ActorBootstrap] truncated record (bits=%u) - stopping", r.bunchDataBits);
+                break;
+            }
+            r.payload.assign(all.begin() + off, all.begin() + off + len);
+            off += len;
+            records.push_back(std::move(r));
+        }
+        Logger::Info("[ActorBootstrap] loaded %zu actor bunch descriptors from '%s'",
+                     records.size(), kPath);
+    });
+    return records;
+}
+} // namespace
+
+void ConnectionManager::SendActorBootstrap(uint32_t clientId) {
+    const std::vector<ActorBunchRecord>& records = GetActorBootstrapRecords();
+    if (records.empty()) {
+        return;
+    }
+    auto conn = GetConnection(clientId);
+    if (!conn) {
+        return;
+    }
+    ControlState& cs = GetControlState(clientId);
+
+    // Match the real server's pre-actor control sequence. In the capture the official
+    // server sends one NMT 0x24 message (payload int32 LE = 1; bytes 24 01 00 00 00) on
+    // the control channel at f1484, immediately AFTER the client's Join and immediately
+    // BEFORE it opens any actor channels. Our flow previously went Join -> Joined ->
+    // actor opens with nothing in between. Diagnosis from server_live.log: the retail
+    // client KEEPS its own PlayerController (ch2, NetPlayerIndex==0) but tears down every
+    // other bootstrap actor channel (ch3..ch140) with empty bClose bunches and NO
+    // NMT_ActorChannelFailure - i.e. the actors spawn then get torn down (a state gate),
+    // not a class-resolution or encoding failure. NMT 0x24 is the one control message the
+    // real pre-actor sequence has that ours lacked; send it first and let the live client
+    // tell us whether it is the missing state transition. See .remember/remember.md.
+    static const std::vector<uint8_t> kPreActorNmt24 = {0x24, 0x01, 0x00, 0x00, 0x00};
+    SendRawToClient(clientId, kPreActorNmt24);
+
+    Logger::Info("[ConnectionManager::SendActorBootstrap] client %u: NMT 0x24 sent; opening %zu bootstrap actor channels",
+                 clientId, records.size());
+    // BATCH the actor opens into MaxPacket-sized packets instead of one datagram each.
+    // Sending 139 back-to-back single-bunch datagrams overflows the client's UDP receive
+    // buffer (even on loopback) and intermittently drops the ch2 open, so the client's
+    // PlayerController never binds (no menu). Packing ~10-14 opens per ~1500-byte packet
+    // cuts the burst to ~12 packets and makes binding reliable - and matches how the real
+    // server frames its open burst (multiple bunches per packet).
+    std::vector<PacketCodec::Bunch> batch;
+    size_t batchBits = 0;
+    // Budget must keep each datagram UNDER the retail client's UDP receive buffer, or the
+    // client drops the whole packet with WSAEMSGSIZE (10040) and the actors in it are NEVER
+    // created. CLIENT LOG PROOF (DevNetTraffic): an ~1337-byte actor-open batch carrying
+    // ch25-34 (incl. ch26 = the local PRI) was dropped -> "Created channel 24 ... recvfrom
+    // error 10040 ... Created channel 35" (25-34 missing) -> the PC->PRI link could not
+    // resolve ch26 -> role-select crash. The 1261-byte PackageMap chunks DO arrive, so the
+    // client's buffer is ~1280; budget to 8192 bits (~1024 B) for safe margin. Reliable
+    // retransmit resends the same batch, so an oversized packet fails forever - keep it small.
+    constexpr size_t kBatchBitBudget = 8192;
+    auto flushBatch = [&]() {
+        if (batch.empty()) return;
+        SendReliableBunches(clientId, batch);  // sent + recorded for retransmission
+        batch.clear();
+        batchBits = 0;
+    };
+    // Deliver the PlayerController channel (ch2) FIRST, in its own packet, before the
+    // rest of the flood. The client adopts ch2 (NetPlayerIndex==0) as its LOCAL
+    // PlayerController via HandleClientPlayer - and the team menu only opens when that
+    // adoption succeeds (ShowTeamSelect's LocalPlayer(Player)!=none gate). Burying the
+    // ch2 open in the middle of 138 other opens makes the adoption intermittent; giving
+    // it a clean, standalone packet up front makes it reliable.
+    for (const ActorBunchRecord& r : records) {
+        if (r.chIndex == 2) {
+            PacketCodec::Bunch pcb;
+            pcb.bControl = r.bControl; pcb.bOpen = r.bOpen; pcb.bClose = r.bClose;
+            pcb.bReliable = r.bReliable; pcb.chIndex = r.chIndex; pcb.chType = r.chType;
+            pcb.chSequence = r.chSequence; pcb.payload = r.payload;
+            pcb.payloadBits = r.bunchDataBits;
+            SendReliableBunches(clientId, { pcb });  // ch2 standalone, recorded for retransmit
+            break;
+        }
+    }
+
+    for (const ActorBunchRecord& r : records) {
+        if (r.chIndex == 2) continue;   // already sent first, standalone
+        if (r.chIndex == 0) {
+            // A ch0 control bunch in the burst rides the normal control path; flush the
+            // pending actor batch first so ordering is preserved.
+            flushBatch();
+            SendRawToClient(clientId, r.payload);
+            continue;
+        }
+        PacketCodec::Bunch b;
+        b.bControl = r.bControl;
+        b.bOpen = r.bOpen;
+        b.bClose = r.bClose;
+        b.bReliable = r.bReliable;
+        b.chIndex = r.chIndex;
+        b.chType = r.chType;
+        b.chSequence = r.chSequence;
+        b.payload = r.payload;
+        b.payloadBits = r.bunchDataBits;  // exact bit count (not byte-padded)
+        const size_t est = r.bunchDataBits + 64;  // payload + bunch-header allowance
+        if (batchBits + est > kBatchBitBudget) {
+            flushBatch();
+        }
+        batch.push_back(std::move(b));
+        batchBits += est;
+    }
+    flushBatch();
+
+    // ---- Open the team-select menu: ClientShowTeamSelect() on ch2 (the PC) -----
+    // The live retail client reaches the world but sits in spectator/preload with no
+    // team. ROGameInfo.uc:2631 shows the real server calls ROPC.ClientShowTeamSelect()
+    // on a fresh joiner to pop the team-select menu (the if-branch at 2621 is
+    // ChangedTeams() for players who already have a team). ClientShowTeamSelect is a
+    // `reliable client` function taking NO parameters, so the actor-channel bunch body
+    // is exactly one field handle: SerializeInt(handle, maxHandle), nothing after.
+    // ShowTeamSelect() is safe against our opens-only (empty) GRI: its server-only
+    // guard (WorldInfo.Game!=none) is false on the client, it opens the scene from the
+    // default TeamSelectSceneTemplate, and InitTeamSelect tolerates an empty
+    // GRI.Teams (None.NumPlayers == 0 in UnrealScript). See ROPlayerController.uc:5818.
+    //
+    // handle / maxHandle from the compiled .u packages via UELib, sorted by the real
+    // engine NetIndex (tools/netfields_from_u.ps1) - this is GROUND TRUTH, not the
+    // decompiled .uc declaration order (which is reordered and gave a wrong handle).
+    // Triple-confirmed: (1) NetIndex sort -> handle 206; (2) decoding the real-server
+    // capture's 20571 S2C ch2 bunches with this map yields ZERO Server-function
+    // mismatches; (3) SerializeInt(206,531) = bytes CE 00 = the exact `ce00` bunch the
+    // official server sends at capture frame f1637 (its own ClientShowTeamSelect).
+    constexpr uint32_t kROPlayerControllerMaxHandle = 531;
+    constexpr uint32_t kClientShowTeamSelectHandle  = 206;
+
+    const ActorBunchRecord* pcRec = nullptr;
+    for (const ActorBunchRecord& r : records) {
+        if (r.chIndex == 2) { pcRec = &r; break; }
+    }
+    if (pcRec) {
+        // Seed ch2's outbound reliable sequence at the open's ChSequence; SendCh2Rpc
+        // increments it for each function bunch (ClientShowTeamSelect = seq+1).
+        cs.ch2OutReliable = static_cast<uint32_t>(pcRec->chSequence);
+        cs.actorChType    = pcRec->chType;
+        BitWriter fw;
+        fw.SerializeInt(kClientShowTeamSelectHandle, kROPlayerControllerMaxHandle);
+        SendCh2Rpc(clientId, fw.GetBytes(), static_cast<uint32_t>(fw.NumBits()),
+                   "ClientShowTeamSelect");
+        // Establish the local PC->PRI link (handle 23 -> ch26) so ROPC.PlayerReplicationInfo
+        // is non-none before the role/unit-select UI ever opens. Unreliable, so send a few.
+        SendLocalPriLink(clientId, 5);
+    }
+}
+
+// PlayerController (ROPlayerController) ClassNetCache maxHandle - see SendActorBootstrap.
+static constexpr uint32_t kRoPcMaxHandle = 531;
+
+static uint64_t NowMs() {
+    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+
+void ConnectionManager::SendReliableBunches(uint32_t clientId,
+                                            const std::vector<PacketCodec::Bunch>& bunches) {
+    auto conn = GetConnection(clientId);
+    if (!conn || bunches.empty()) return;
+    ControlState& cs = GetControlState(clientId);
+    const PacketCodec::Packet pkt = cs.outbound.BuildRawBunchesPacket(bunches);
+    const std::vector<uint8_t> wire =
+        PacketCodec::Encode(pkt, PacketCodec::kServerSendMaxPacketBytes);
+    conn->SendRaw(wire.data(), wire.size());
+    // Record the reliable bunches so we can retransmit until the client acks this packet.
+    std::vector<PacketCodec::Bunch> rel;
+    for (const auto& b : bunches) if (b.bReliable) rel.push_back(b);
+    if (!rel.empty()) {
+        ControlState::SentReliable sr;
+        sr.packetIds.push_back(pkt.packetId);
+        sr.lastSendMs = NowMs();
+        sr.resendCount = 0;
+        sr.bunches = std::move(rel);
+        cs.pendingReliable.push_back(std::move(sr));
+    }
+}
+
+void ConnectionManager::OnClientAck(uint32_t clientId, uint32_t ackedPacketId) {
+    auto it = m_controlState.find(clientId);
+    if (it == m_controlState.end()) return;
+    auto& pending = it->second.pendingReliable;
+    pending.erase(std::remove_if(pending.begin(), pending.end(),
+        [ackedPacketId](const ControlState::SentReliable& sr) {
+            for (uint32_t pid : sr.packetIds) if (pid == ackedPacketId) return true;
+            return false;
+        }), pending.end());
+}
+
+void ConnectionManager::RetransmitTick() {
+    const uint64_t now = NowMs();
+    constexpr uint64_t kRtoMs = 250;     // resend a reliable set un-acked for 250ms
+    constexpr int kMaxResends = 12;
+    for (auto& kv : m_controlState) {
+        ControlState& cs = kv.second;
+        if (cs.pendingReliable.empty()) continue;
+        auto conn = GetConnection(kv.first);
+        if (!conn) continue;
+        for (auto& sr : cs.pendingReliable) {
+            if (now - sr.lastSendMs < kRtoMs || sr.resendCount >= kMaxResends) continue;
+            // Resend the SAME reliable bunches (verbatim, same per-channel ChSequence) in a
+            // NEW packet (new PacketId). The client fills the gap or ignores the duplicate.
+            const PacketCodec::Packet pkt = cs.outbound.BuildRawBunchesPacket(sr.bunches);
+            const std::vector<uint8_t> wire =
+                PacketCodec::Encode(pkt, PacketCodec::kServerSendMaxPacketBytes);
+            conn->SendRaw(wire.data(), wire.size());
+            sr.packetIds.push_back(pkt.packetId);
+            sr.lastSendMs = now;
+            ++sr.resendCount;
+            Logger::Debug("[ConnectionManager::RetransmitTick] client %u: resent %zu reliable bunch(es) attempt %d (pkt %u)",
+                          kv.first, sr.bunches.size(), sr.resendCount, pkt.packetId);
+        }
+    }
+}
+
+void ConnectionManager::SendCh2Rpc(uint32_t clientId, const std::vector<uint8_t>& payload,
+                                   uint32_t payloadBits, const char* name) {
+    ControlState& cs = GetControlState(clientId);
+    PacketCodec::Bunch b;
+    b.bControl   = false;
+    b.bOpen      = false;
+    b.bClose     = false;
+    b.bReliable  = true;
+    b.chIndex    = 2;
+    b.chType     = cs.actorChType;
+    b.chSequence = ++cs.ch2OutReliable;   // next reliable on ch2
+    b.payload    = payload;
+    b.payloadBits = payloadBits;
+    Logger::Info("[ConnectionManager::SendCh2Rpc] client %u: sent %s on ch2 seq %u (%u bits)",
+                 clientId, name, b.chSequence, payloadBits);
+    SendReliableBunches(clientId, { b });   // recorded for retransmission until acked
+}
+
+// Build the (unreliable) PC.PlayerReplicationInfo link bunch on ch2: handle 23 +
+// dynamic object-ref to ch26 (= "176a00"). Shared by SendLocalPriLink and the ordered
+// role-advance packet so the bytes are identical.
+static PacketCodec::Bunch BuildPriLinkBunch() {
+    BitWriter lw;
+    lw.SerializeInt(23, kRoPcMaxHandle);   // Controller.PlayerReplicationInfo
+    lw.WriteBit(true);                      // dynamic objref selector
+    lw.SerializeInt(26, 2048);              // local PRI channel index (UE3 MAX_CHANNELS)
+    PacketCodec::Bunch b;
+    b.bReliable = false; b.chIndex = 2; b.chType = 2; b.chSequence = 0;  // chType ignored (unreliable)
+    b.payload = lw.GetBytes(); b.payloadBits = static_cast<uint32_t>(lw.NumBits());
+    return b;
+}
+
+// Build the (unreliable) PRI spectator-clear bunch on ch26: bWaitingPlayer(31) /
+// bOnlySpectator(32) / bIsSpectator(33) = 0 (PRI maxHandle 98).
+static PacketCodec::Bunch BuildClearSpectatorBunch() {
+    constexpr uint32_t kPriMaxHandle = 98;
+    BitWriter pw;
+    pw.SerializeInt(31, kPriMaxHandle); pw.WriteBit(false);
+    pw.SerializeInt(32, kPriMaxHandle); pw.WriteBit(false);
+    pw.SerializeInt(33, kPriMaxHandle); pw.WriteBit(false);
+    PacketCodec::Bunch b;
+    b.bReliable = false; b.chIndex = 26; b.chType = 2; b.chSequence = 0;
+    b.payload = pw.GetBytes(); b.payloadBits = static_cast<uint32_t>(pw.NumBits());
+    return b;
+}
+
+void ConnectionManager::SendLocalPriLink(uint32_t clientId, int repeats) {
+    // handle 23 (Controller.PlayerReplicationInfo) + dynamic object-ref to ch26 (local PRI):
+    //   SerializeInt(23,531) = 9 bits, selector bit 1 (dynamic), SerializeInt(26,1024).
+    // = the real server's exact 20-bit "176a00" bunch (decoded + confirmed by RE).
+    // Sent UNRELIABLE (bReliable=0, no chSequence/chType written by the encoder) exactly
+    // as the real server streams it (docs/re/pc_ch2_postjoin_timeline.md §C). Repeated for
+    // delivery since it is unreliable; the client latches ROPC.PlayerReplicationInfo on
+    // receipt, fixing the role-UI NULL deref (VNGame.exe+0xbbf712).
+    // Build correct-by-construction: SerializeInt(23,531) [9b] + dynamic-ref selector bit [1b]
+    // + SerializeInt(26, 2048) [11b] = 21 bits. The channel index MUST use UE3 MAX_CHANNELS
+    // (2048 = 11 bits), not 1024 (10 bits): at 10 bits the client reads 1 bit past the bunch,
+    // trips FInBunch's error flag, and SerializeObject returns NULL -> PlayerReplicationInfo
+    // never binds -> role-UI LocalPRI null (+0xbbf712). Bytes are still 17 6a 00 (high bit 0).
+    BitWriter lw;
+    lw.SerializeInt(23, kRoPcMaxHandle);   // Controller.PlayerReplicationInfo handle
+    lw.WriteBit(true);                      // object-ref selector = dynamic (1)
+    lw.SerializeInt(26, 2048);              // local PRI channel index (UE3 MAX_CHANNELS)
+    const std::vector<uint8_t> linkPayload = lw.GetBytes();
+    const uint32_t linkBits = static_cast<uint32_t>(lw.NumBits());
+    ControlState& cs = GetControlState(clientId);
+    for (int i = 0; i < repeats; ++i) {
+        PacketCodec::Bunch b;
+        b.bControl   = false;
+        b.bOpen      = false;
+        b.bClose     = false;
+        b.bReliable  = false;            // UNRELIABLE delta (chSeq=0, not retransmitted)
+        b.chIndex    = 2;
+        b.chType     = cs.actorChType;   // ignored on the wire for unreliable bunches
+        b.chSequence = 0;
+        b.payload    = linkPayload;
+        b.payloadBits = linkBits;
+        SendReliableBunches(clientId, { b });   // sends; not recorded (bReliable=false)
+    }
+    Logger::Info("[ConnectionManager::SendLocalPriLink] client %u: sent PC.PlayerReplicationInfo"
+                 "->ch26 link (handle 23) x%d (unreliable 176a00)", clientId, repeats);
+}
+
+void ConnectionManager::SendClearSpectator(uint32_t clientId, int repeats) {
+    // Our ch26 PRI open carries bWaitingPlayer(31)=bOnlySpectator(32)=bIsSpectator(33)=1
+    // (the captured local player was in the spectator/waiting state). After a team pick the
+    // player is no longer a spectator; replicate those flags = 0 so ShowRoleSelectScene does
+    // not early-return at ROPlayerController.uc:5932. Property bunch = ascending handle order,
+    // each bool = SerializeInt(handle,98) + 1 value bit. UNRELIABLE ch26 delta, repeated.
+    constexpr uint32_t kPriMaxHandle = 98;
+    BitWriter pw;
+    pw.SerializeInt(31, kPriMaxHandle); pw.WriteBit(false);  // bWaitingPlayer = 0
+    pw.SerializeInt(32, kPriMaxHandle); pw.WriteBit(false);  // bOnlySpectator = 0
+    pw.SerializeInt(33, kPriMaxHandle); pw.WriteBit(false);  // bIsSpectator   = 0
+    const std::vector<uint8_t> payload = pw.GetBytes();
+    const uint32_t bits = static_cast<uint32_t>(pw.NumBits());
+    for (int i = 0; i < repeats; ++i) {
+        PacketCodec::Bunch b;
+        b.bControl   = false;
+        b.bOpen      = false;
+        b.bClose     = false;
+        b.bReliable  = false;            // UNRELIABLE delta (no chSeq/chType on the wire)
+        b.chIndex    = 26;               // local player's PRI channel
+        b.chType     = 2;                // CHTYPE_Actor (ignored for unreliable)
+        b.chSequence = 0;
+        b.payload    = payload;
+        b.payloadBits = bits;
+        SendReliableBunches(clientId, { b });   // sends; not recorded (bReliable=false)
+    }
+    Logger::Info("[ConnectionManager::SendClearSpectator] client %u: cleared PRI spectator flags "
+                 "on ch26 (h31/32/33=0, %u bits) x%d", clientId, bits, repeats);
+}
+
+void ConnectionManager::SendPawnSpawn(uint32_t clientId) {
+    ControlState& cs = GetControlState(clientId);
+    constexpr uint32_t kPawnCh = 209;   // fresh channel above the bootstrap range (2..140, 481)
+
+    // Verbatim captured ROPawn open: classidx 286147, Location (1458,2644,297), 1137 bits.
+    // Replayed like our GRI/PRI opens. Its embedded Controller/PRI/InvManager refs point at the
+    // CAPTURE's channels (don't resolve here) -> fixed by the back-ref deltas below.
+    static const char* kPawnOpenHex =
+        "86bb08002b5ba9744a2c80604f0060d09442acea558320f3080902000098641a46004804204b0c204b14"
+        "204b1c204b24204b2c204b34f0483c204b44a0484c504854f0485c204b64a0486c50487418497c204b84a0"
+        "488c50489418499c204ba4a048ac5048b4204bbc203b05c0348c00704a805c1801e030a0b365a644fa232e"
+        "4525d225d1380001110080841cff01";
+    constexpr uint32_t kPawnOpenBits = 1137;
+    std::vector<uint8_t> pawnOpen;
+    {
+        auto nib = [](char c)->int {
+            if (c>='0'&&c<='9') return c-'0';
+            if (c>='a'&&c<='f') return c-'a'+10;
+            if (c>='A'&&c<='F') return c-'A'+10;
+            return 0;
+        };
+        for (const char* h = kPawnOpenHex; h[0] && h[1]; h += 2)
+            pawnOpen.push_back(static_cast<uint8_t>((nib(h[0]) << 4) | nib(h[1])));
+    }
+
+    auto pawnDelta = [&](std::vector<uint8_t> bytes, uint32_t bits) {
+        PacketCodec::Bunch b;
+        b.bReliable = false; b.chIndex = kPawnCh; b.chType = 2; b.chSequence = 0;  // unreliable
+        b.payload = std::move(bytes); b.payloadBits = bits;
+        return b;
+    };
+    auto ch2Bunch = [&](std::vector<uint8_t> bytes, uint32_t bits, bool reliable) {
+        PacketCodec::Bunch b;
+        b.bReliable = reliable; b.chIndex = 2; b.chType = cs.actorChType;
+        b.chSequence = reliable ? ++cs.ch2OutReliable : 0;
+        b.payload = std::move(bytes); b.payloadBits = bits;
+        return b;
+    };
+
+    // ONE ORDERED PACKET (processed in order by the client):
+    std::vector<PacketCodec::Bunch> pkt;
+    //  1) open the ROPawn channel (reliable, seq 1). NOTE: our PacketCodec encoder only writes
+    //     the bOpen/bClose flag bits when bControl is set, and a real actor OPEN decodes as
+    //     bControl=1 + bOpen=1 (verified against the canned GRI/ch54 open). So an encoded open
+    //     MUST set bControl=true too, or the client never sees it as an open and the channel is
+    //     never created (-> ClientRestart can't resolve the pawn -> AskForPawn spam).
+    PacketCodec::Bunch open;
+    open.bControl = true; open.bOpen = true; open.bReliable = true;
+    open.chIndex = kPawnCh; open.chType = 2; open.chSequence = 1;
+    open.payload = pawnOpen; open.payloadBits = kPawnOpenBits;
+    pkt.push_back(std::move(open));
+    //  2) fix the pawn's back-refs (objref props, same encoding family as the PRI link):
+    pkt.push_back(pawnDelta({0x34, 0x05, 0x00}, 20));  // h52 Controller -> ch2 (load-bearing)
+    pkt.push_back(pawnDelta({0x20, 0x35, 0x00}, 20));  // h32 PlayerReplicationInfo -> ch26
+    //  3) PC.Pawn (h24) on ch2 -> the pawn channel (unreliable, like the PRI link)
+    pkt.push_back(ch2Bunch({0x18, 0x8c, 0x06}, 22, /*reliable=*/false));
+    //  4) ClientRestart (h85) on ch2 (reliable) -> NewPawn = pawn channel: THE possession trigger
+    pkt.push_back(ch2Bunch({0x55, 0x1c, 0x0d}, 23, /*reliable=*/true));
+
+    SendReliableBunches(clientId, pkt);
+    Logger::Info("[ConnectionManager::SendPawnSpawn] client %u: opened ROPawn ch%u (286147) + "
+                 "Controller->ch2 + PRI->ch26 + PC.Pawn(h24) + ClientRestart(h85) - expecting "
+                 "the client to possess and switch to ServerMove(h65)", clientId, kPawnCh);
+}
+
+// Names for the handful of ROPlayerController net-field handles we recognise on the
+// wire (ground truth from tools/netfields_from_u.ps1). For logging/dispatch only.
+static const char* RoPcHandleName(uint32_t h) {
+    switch (h) {
+        case 170: return "SelectTeam";
+        case 172: return "ChangedTeams";
+        case 175: return "SelectRoleByClass";
+        case 206: return "ClientShowTeamSelect";
+        case 207: return "ClientShowRoleSelect";
+        case 210: return "ChangedRole";
+        case 82:  return "ServerChangeTeam";
+        case 80:  return "ServerSuicide";
+        case 65:  return "ServerMove";
+        case 27:  return "ServerRestartPlayer";
+        default:  return "?";
+    }
+}
+
+void ConnectionManager::DecodeInboundActorBunch(uint32_t clientId,
+                                                const PacketCodec::Bunch& bunch) {
+    // (Removed the old "proof-of-life re-send" of ClientShowTeamSelect: it sent a NEW
+    // bunch at ch2 seq+1, manufacturing a sequence GAP if the original seq was dropped ->
+    // ch2 stall -> soft-lock. Reliable retransmission now redelivers the original
+    // ClientShowTeamSelect (same ChSequence) until the client acks it.)
+
+    // Only reliable function/property bunches carry a handle worth dispatching; the
+    // open/close framing and tiny keepalives don't.
+    if (!bunch.bReliable || bunch.bOpen || bunch.bClose || bunch.payloadBits == 0) {
+        return;
+    }
+    BitReader r(bunch.payload.data(), bunch.payload.size(), bunch.payloadBits);
+    const uint32_t handle = r.SerializeInt(kRoPcMaxHandle);
+    if (r.IsOverflowed()) return;
+    Logger::Info("[ConnectionManager::DecodeInboundActorBunch] client %u: ch%u inbound RPC handle %u (%s), %u bits",
+                 clientId, bunch.chIndex, handle, RoPcHandleName(handle), bunch.payloadBits);
+
+    // SelectTeam(byte TeamID) - the client clicked a team in the team-select menu.
+    // ROPlayerController.uc:3440 (reliable server). On the real server this assigns the
+    // team then calls ChangedTeams() to open role select. We advance the client to the
+    // role-select scene via ClientShowRoleSelect (handle 207, optional bool).
+    if (bunch.chIndex == 2 && handle == 170) {
+        // UE3 function-call params carry a per-param "Send" PRESENCE BIT for NON-bool
+        // params (UnScript.cpp InternalProcessRemoteFunction:2980-3010; receive side
+        // UnChan.cpp:1628-1640): read the 1-bit Send flag first; the byte value follows
+        // ONLY if Send==1. Send==0 means the value equals its default and is OMITTED.
+        // SelectTeam(byte TeamID): TeamID==0 sends Send=0 and NO byte; reading the byte
+        // raw would overflow and silently drop the team-0 pick (team-1 previously only
+        // "worked" by a &1 masking accident). This is the real team-0 selection bug.
+        const bool hasTeamId = r.ReadBit();
+        uint8_t teamId = 0;                  // Send==0 -> default 0 (a VALID selection)
+        if (hasTeamId) {
+            teamId = r.ReadByte();
+            if (r.IsOverflowed()) {
+                Logger::Warn("[ConnectionManager::DecodeInboundActorBunch] client %u: SelectTeam truncated before TeamID byte, ignoring",
+                             clientId);
+                return;
+            }
+        }
+        if (teamId > 1) teamId = 1;          // RS2 has two playable teams (0/1)
+        ControlState& cs = GetControlState(clientId);
+        Logger::Info("[ConnectionManager] client %u: SelectTeam(TeamID=%u) -> JoinTeam (clear spectator + Team) then ChangedTeams",
+                     clientId, teamId);
+        cs.teamSelected = true;
+
+        // Persist the team SERVER-SIDE (the real JoinTeam result). Previously we only told
+        // the CLIENT its team (the ch26 delta + ChangedTeams below) but never updated the
+        // authoritative TeamManager - so the server kept the join-time auto-picked team and a
+        // player who clicked NVA got the US loadout/spawn (HandleRoleSelection reads
+        // TeamManager::GetPlayerTeam). Map RS2 0/1 -> TeamManager 1/2.
+        if (m_server) {
+            if (auto* tm = m_server->GetTeamManager()) {
+                tm->AddPlayerToTeam(clientId, (teamId == 0) ? 1u : 2u);  // also sets Player team
+            }
+        }
+
+        // --- ADVANCE TO ROLE-SELECT: ChangedTeams (handle 172) on ch2 -------------------
+        // ROPlayerController.uc:3533
+        //   reliable client simulated function ChangedTeams(byte TeamIndex,
+        //       bool bShowRoleSelection, optional Class<GameInfo> GameTypeClass,
+        //       optional bool bTeamBalancing, optional bool bShowLobby)
+        //
+        // The retail client's ChangedTeams() does the team->role transition itself:
+        //   * line 3618: PlayerReplicationInfo.Team = WorldInfo.GRI.Teams[TeamIndex]
+        //                -> it BINDS PRI.Team from GRI.Teams[] (already populated by our
+        //                   TeamInfo opens on ch21/56/76), so NO PRI.Team delta is needed.
+        //   * line 3627: ShowRoleSelectScene(GameTypeClass, TeamIndex, ...)
+        //                -> uses the GameTypeClass PARAM directly. If it is none, the
+        //                   client SKIPS InitSquadsForGametype (ROPlayerController.uc:5941),
+        //                   the squad/role tables stay empty, GetSelectedRoleInfoClass()
+        //                   returns none, and the role UI does RoleClass.default.X on a
+        //                   null class-default object -> EXCEPTION_ACCESS_VIOLATION (the
+        //                   VNGame.exe+0xbbf712 crash we saw). The fix is to SEND a real,
+        //                   client-resolvable GameTypeClass so squads build locally from
+        //                   the client's own loaded ROMapInfo (the map data is NOT
+        //                   replicated - confirmed: ROMI = ROMapInfo(WorldInfo.GetMapInfo)).
+        //
+        // GameTypeClass = ROGame.ROGameInfoTerritories, encoded as the SAME static
+        // PackageMap class index the real server already sent as GRI.GameClass (h33) in our
+        // verbatim ch54 GRI open: static index 69601 (selector 0). Reusing the exact captured
+        // index guarantees it resolves on the client (it already accepted this ref in GRI).
+        // See docs/re/CLIENT_CRASH_team_select.md + docs/re/open_bunch_structure.md:185.
+        //
+        // Param wire layout (UE3 UnScript.cpp:2980-3010, validated against UE3-src):
+        //   non-bool param -> [Send presence bit][value iff Send] ; bool -> bare value bit.
+        // ROLE-SELECT ADVANCE GATE (default OFF).
+        // Packet-recorder ground truth (packetlog/, session 1782498358588) + crash dump
+        // VNGame.exe.1152.dmp PROVED sending ChangedTeams crashes the retail client: the
+        // client processes it, opens the role/unit-select UI, and the role UI dereferences a
+        // NULL game-state object (VNGame.exe+0xbbf712: `mov rax,[rdx]; call [rax+0x2b8]` with
+        // rdx = a cached local-player ref at [r12+0xf0] == NULL) -> AV. Adding the resolvable
+        // GameTypeClass param did NOT fix it (the role UI reads GRI/role state directly, not
+        // our param). Until the role-select state layer is actually replicated (identify +
+        // populate the null object the role UI compares against), DO NOT send the advance -
+        // it is a guaranteed client crash. The team is still recorded server-side above.
+        // Re-enable by flipping this flag once role-state replication lands.
+        // Re-enabled. The bind failure was an OVERSIZED-PACKET DROP, not width/timing: the
+        // client dropped our ~1337-byte actor-open batch (WSAEMSGSIZE) so ch26 (local PRI) was
+        // never created, and the PC->PRI link could not resolve. Fixed by shrinking the
+        // actor-open batch budget (see kBatchBitBudget) so every datagram fits the client's
+        // recv buffer. With ch26 delivered, the link binds ROPC.PlayerReplicationInfo, and with
+        // the spectator flags cleared the role-select scene opens. (Client-log confirmed.)
+        constexpr bool kEnableRoleSelectAdvance = true;
+        if (kEnableRoleSelectAdvance) {
+            // Clear the local PRI's spectator flags FIRST so ShowRoleSelectScene does not
+            // early-return at uc:5932 (if PRI.bOnlySpectator return) - the "no crash but no
+            // advance" gate. Then re-assert the PC->PRI link (handle 23 -> ch26): the
+            // unit-select scene's PostInitialize caches LocalPRI = ROPC.PlayerReplicationInfo,
+            // so that ref MUST be set when ChangedTeams runs the role scene.
+            SendClearSpectator(clientId, 3);
+            SendLocalPriLink(clientId, 3);
+            constexpr uint32_t kChangedTeamsHandle           = 172;
+            constexpr uint32_t kRoGameInfoTerritoriesClassIx = 69601;  // GRI.GameClass h33 (capture)
+            BitWriter fw;
+            fw.SerializeInt(kChangedTeamsHandle, kRoPcMaxHandle);      // handle (maxHandle 531)
+            // param 1: byte TeamIndex  -> Send only if != default(0)
+            if (teamId != 0) { fw.WriteBit(true); fw.WriteByte(teamId); }
+            else             { fw.WriteBit(false); }
+            // param 2: bool bShowRoleSelection = true  -> open the role-select scene
+            fw.WriteBit(true);
+            // param 3: Class<GameInfo> GameTypeClass = ROGameInfoTerritories  -> Send + objref
+            fw.WriteBit(true);
+            // Object-ref (UPackageMapLevel::SerializeObject), STATIC class path: selector bit 0
+            // then SerializeInt(index, MAX_OBJECT_INDEX=0x80000000). Bit-identical to
+            // ActorRepl::WriteNetGUID(NetGUIDRef{false,idx}); inlined to avoid a cross-TU link
+            // dep on src/Network/ActorReplication.cpp (obj-name collision, see HARDENING_LOG).
+            fw.WriteBit(false);                                            // selector = static
+            fw.SerializeInt(kRoGameInfoTerritoriesClassIx, 0x80000000u);   // static class index
+            fw.WriteBit(false);                                            // param 4: bTeamBalancing
+            fw.WriteBit(false);                                            // param 5: bShowLobby
+            // ORDERED SINGLE-PACKET ADVANCE: clear-spectator + PC->PRI link + ChangedTeams in
+            // ONE packet, in that order. Within a packet the client processes bunches in order,
+            // so bOnlySpectator=0 and the PRI link are applied BEFORE ShowRoleSelectScene runs -
+            // eliminating the intermittent first-click race (localhost can reorder/drop the
+            // separate unreliable bunches under the bootstrap burst). ChangedTeams is reliable
+            // (retransmitted until acked); the redundant clear/link sends above cover a drop of
+            // this packet (only ChangedTeams is retransmitted, but the separate sends already
+            // delivered the clear/link).
+            PacketCodec::Bunch ctBunch;
+            ctBunch.bReliable   = true;
+            ctBunch.chIndex     = 2;
+            ctBunch.chType      = cs.actorChType;
+            ctBunch.chSequence  = ++cs.ch2OutReliable;
+            ctBunch.payload     = fw.GetBytes();
+            ctBunch.payloadBits = static_cast<uint32_t>(fw.NumBits());
+            SendReliableBunches(clientId, { BuildClearSpectatorBunch(), BuildPriLinkBunch(), ctBunch });
+            Logger::Info("[ConnectionManager] client %u: SelectTeam(TeamID=%u) -> ordered "
+                         "[clear-spectator + PRI-link + ChangedTeams] advance packet sent "
+                         "(GameTypeClass idx %u)", clientId, teamId, kRoGameInfoTerritoriesClassIx);
+        } else {
+            Logger::Info("[ConnectionManager] client %u: SelectTeam(TeamID=%u) recorded server-side; "
+                         "role-select advance HELD (ChangedTeams crashes the client against "
+                         "unreplicated role-state - see packetlog + VNGame.exe+0xbbf712 crash)",
+                         clientId, teamId);
+        }
+    }
+
+    // SelectRoleByClass (handle 175) - the client picked a role / hit deploy.
+    // ROPlayerController.uc:3790; on a real server the bCloseMenu path calls RestartPlayer ->
+    // SpawnDefaultPawnFor -> Possess. We spawn the local player's pawn and make the client
+    // possess it. v1: spawn ONCE on the first handle-175 after team-select (refine to the
+    // bCloseMenu "deploy" bit once the WeaponSelectionInfo struct offset is pinned by testing).
+    if (bunch.chIndex == 2 && handle == 175) {
+        ControlState& cs = GetControlState(clientId);
+        if (cs.teamSelected && !cs.spawned) {
+            cs.spawned = true;
+            Logger::Info("[ConnectionManager] client %u: SelectRoleByClass -> spawning pawn + possession",
+                         clientId);
+            SendPawnSpawn(clientId);
+        }
+        return;
+    }
+}
+
+void ConnectionManager::SendReplicationBootstrap(uint32_t clientId) {
+    const std::vector<std::vector<uint8_t>>& records = GetReplicationBootstrapRecords();
+    if (records.empty()) {
+        return;
+    }
+    Logger::Info("[ConnectionManager::SendReplicationBootstrap] client %u: sending %zu replication bootstrap messages",
+                 clientId, records.size());
+    size_t sent = 0;
+    for (const std::vector<uint8_t>& msg : records) {
+        if (SendRawToClient(clientId, msg)) {
+            ++sent;
+        }
+    }
+    Logger::Info("[ConnectionManager::SendReplicationBootstrap] client %u: sent %zu/%zu messages",
+                 clientId, sent, records.size());
+}
+
+bool ConnectionManager::ParseIncomingControl(uint32_t clientId, const std::vector<uint8_t>& datagram) {
+    Logger::Trace("[ConnectionManager::ParseIncomingControl] Entry: client=%u, %zu bytes",
+                  clientId, datagram.size());
+    if (datagram.empty()) {
+        Logger::Trace("[ConnectionManager::ParseIncomingControl] empty datagram, ignoring");
+        return false;
+    }
+
+    // Decode the UE3 packet framing (PacketId, acks, bunches). MaxPacket (which
+    // sets the BunchDataBits SerializeInt bound) is phase-dependent: 8 during the
+    // StatelessConnect handshake, ~512 once the NMT phase begins. Pick it from the
+    // connection's handshake state. See docs/RS2V_ControlChannel_WireSpec_7258.md.
+    // The client (C2S) frames BunchDataBits at its MaxPacket = 2048 (bound 16384)
+    // from the VERY FIRST packet - including the StatelessConnect handshake bunches.
+    // There is NO small-bound "handshake phase": decoding the handshake bunches at
+    // the old bound 64 misaligned them (the NMT byte landed in the 2nd byte), so the
+    // client's HandshakeStart/Response were mis-keyed. Always decode at the NMT bound.
+    const uint32_t maxPacketBytes = PacketCodec::kNmtMaxPacketBytes;
+    PacketCodec::Packet pkt =
+        PacketCodec::Decode(datagram.data(), datagram.size(), maxPacketBytes);
+    if (!pkt.ok) {
+        Logger::Debug("[ConnectionManager::ParseIncomingControl] client %u: %zu bytes are not a decodable UE3 packet, ignoring",
+                      clientId, datagram.size());
+        return false;
+    }
+
+    // This peer speaks UE3: mark it so the legacy emulator-Packet send path is
+    // suppressed for it (a UE3 client mis-parses that format - see SendPacket).
+    if (auto conn = GetConnection(clientId)) {
+        conn->SetUE3Client(true);
+    }
+
+    ControlState& cs = GetControlState(clientId);
+
+    // Acknowledge this received packet ONLY if it carried bunch data. Acking a
+    // pure-ack packet would make the peer ack our ack, and us ack that, forever
+    // (an infinite ack ping-pong with no data - observed against the live client).
+    // UE3 only acks packets that delivered bunches. The ack rides on the next
+    // outbound packet (e.g. the handshake response), or a standalone ack below.
+    if (!pkt.bunches.empty()) {
+        cs.outbound.QueueAck(pkt.packetId);
+    }
+
+    // pkt.acks confirm OUR reliable bunches arrived: clear any pending reliable
+    // bunch-set that rode in an acked packet so RetransmitTick stops resending it.
+    for (uint32_t ackedId : pkt.acks) {
+        OnClientAck(clientId, ackedId);
+    }
+
+    // Feed control-channel bunches to the reassembler. Complete messages are
+    // dispatched to the handshake, which may emit responses via SendRawToClient
+    // (draining the queued ack onto the response packet).
+    // Per-packet dispatch backstop. The bunch count is already bounded by the
+    // datagram size (a single inbound datagram is <= the receive buffer), but cap
+    // the dispatch loop explicitly so a pathological packet can't drive an outsized
+    // amount of work. The cap is far above any decodable datagram's real bunch count,
+    // so valid handshake/bootstrap/actor traffic is never truncated.
+    constexpr size_t kMaxBunchesPerPacket = 4096;
+    size_t processed = 0;
+    for (const PacketCodec::Bunch& b : pkt.bunches) {
+        if (++processed > kMaxBunchesPerPacket) {
+            Logger::Warn("[ConnectionManager::ParseIncomingControl] client %u: packet %u carried %zu bunches (> cap %zu), dropping remainder",
+                         clientId, pkt.packetId, pkt.bunches.size(), kMaxBunchesPerPacket);
+            break;
+        }
+        if (b.chIndex == 0) {
+            cs.reassembler->OnBunch(b);          // control channel (handshake/NMT)
+        } else {
+            DecodeInboundActorBunch(clientId, b);  // ch>=2 actor-channel RPCs (SelectTeam, ...)
+        }
+    }
+
+    // If nothing we sent carried the ack, emit a standalone ack so the client
+    // advances its reliable window (e.g. while a multi-bunch Hello is still
+    // being received).
+    if (cs.outbound.PendingAckCount() > 0) {
+        SendEncodedPacket(clientId, cs.outbound.BuildAckOnlyPacket());
+    }
+
+    Logger::Trace("[ConnectionManager::ParseIncomingControl] Exit: client=%u now in state %s",
+                  clientId, HandshakePhaseName(GetOrCreateHandshake(clientId).Phase()));
+    return true;
 }

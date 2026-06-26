@@ -1,6 +1,8 @@
 *Version 0.9.0-alpha · Last updated 2025-07-12*  
 *Stability: 🚧 Work-in-progress — APIs may change until v1.0.0*
 
+> ⛔ **C# scripting is currently disabled and does not build.** The scripting host relies on a deprecated .NET COM hosting API (`ICorRuntimeHost`); the `ENABLE_SCRIPTING` CMake option defaults to `OFF` and the host must be reworked onto a supported hosting API before scripting can be used. The C#/Roslyn details below describe the **intended** design, not the current runtime. Native C++ handler plugins are unaffected by this. See `src/Scripting/` and the README's *Current Status* section.
+
 This document describes the **C# scripting runtime**, **native plugin system**, **API bindings**, and **best practices** for extending the RS2V Custom Server.
 
 ## Table of Contents
@@ -211,7 +213,7 @@ Use the [Script Debug Info](scripts/collect_debug_info.sh) tool to gather enviro
 
 | Milestone       | Status        | ETA         |
 |-----------------|---------------|-------------|
-| M1 Roslyn Host  | ✅ Completed  | July 2025   |
+| M1 Scripting Host | ⛔ Disabled — needs rework off the deprecated .NET COM host | TBD |
 | M2 Sandbox I/O  | 🔄 In Progress| Aug 2025    |
 | M3 IL Weaving   | 🔲 Planned    | Q4 2025     |
 | M4 NuGet Cache  | 🔲 Planned    | Q1 2026     |

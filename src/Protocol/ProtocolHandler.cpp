@@ -17,6 +17,16 @@ ProtocolHandler::~ProtocolHandler() {
 void ProtocolHandler::RegisterHandler(PacketType type, HandlerFunc handler) {
     Logger::Trace("[ProtocolHandler::RegisterHandler] entry — type=%s (%d), handler=%s",
                   ToString(type), static_cast<int>(type), handler ? "valid" : "null");
+    // Hardening: refuse to store an empty/null handler. An empty std::function
+    // would still satisfy the find() lookup in Handle() and then throw
+    // std::bad_function_call when invoked on attacker-supplied input. Reject
+    // here so dispatch can safely fall back to the default/unhandled path.
+    if (!handler) {
+        Logger::Warn("[ProtocolHandler::RegisterHandler] rejected null handler for type=%s (%d) — not registered",
+                     ToString(type), static_cast<int>(type));
+        Logger::Trace("[ProtocolHandler::RegisterHandler] exit — null handler rejected for type=%s", ToString(type));
+        return;
+    }
     m_handlers[type] = std::move(handler);
     Logger::Debug("ProtocolHandler: registered handler for %s", ToString(type));
     Logger::Info("[ProtocolHandler::RegisterHandler] handler registered for packet type '%s' — total registered handlers: %zu",
@@ -48,7 +58,10 @@ void ProtocolHandler::Handle(uint32_t clientId, const Packet& pkt, const PacketM
     Logger::Debug("[ProtocolHandler::Handle] resolved packet tag='%s' to type=%s (%d) for clientId=%u",
                   pkt.GetTag().c_str(), ToString(type), static_cast<int>(type), clientId);
     auto it = m_handlers.find(type);
-    if (it != m_handlers.end()) {
+    // Hardening: treat an empty handler entry as "not registered" so a stale or
+    // moved-from std::function can never be invoked (would throw
+    // std::bad_function_call on this attacker-reachable dispatch path).
+    if (it != m_handlers.end() && it->second) {
         Logger::Debug("[ProtocolHandler::Handle] found registered handler for type=%s — dispatching for clientId=%u",
                       ToString(type), clientId);
         it->second(clientId, pkt, meta);

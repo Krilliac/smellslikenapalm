@@ -1,0 +1,182 @@
+﻿   0  RelativeRotation               UStructProperty                    ni=2481
+   1  RelativeLocation               UStructProperty                    ni=2482
+   2  Velocity                       UStructProperty                    ni=2488
+   3  Instigator                     UObjectProperty(UClass)            ni=2502
+   4  Base                           UObjectProperty(UClass)            ni=2515
+   5  Owner                          UObjectProperty(UClass)            ni=2516
+   6  ReplicatedCollisionType        UByteProperty                      ni=2518
+   7  Role                           UByteProperty                      ni=2520
+   8  RemoteRole                     UByteProperty                      ni=2521
+   9  Physics                        UByteProperty                      ni=2522
+  10  DrawScale                      UFloatProperty                     ni=2528
+  11  Rotation                       UStructProperty                    ni=2529
+  12  Location                       UStructProperty                    ni=2530
+  13  bNetOwner                      UBoolProperty                      ni=2546
+  14  bProjTarget                    UBoolProperty                      ni=2560
+  15  bBlockActors                   UBoolProperty                      ni=2561
+  16  bCollideWorld                  UBoolProperty                      ni=2563
+  17  bCollideActors                 UBoolProperty                      ni=2564
+  18  bHardAttach                    UBoolProperty                      ni=2583
+  19  bTearOff                       UBoolProperty                      ni=2598
+  20  bHidden                        UBoolProperty                      ni=2626
+  21  bLoadedFromSavegame            UBoolProperty                      ni=2628
+  22  Winner                         UObjectProperty(UClass)            ni=16534
+  23  ServerName                     UStrProperty                       ni=16535
+  24  TimeLimit                      UIntProperty                       ni=16537
+  25  GoalScore                      UIntProperty                       ni=16538
+  26  RemainingMinute                UIntProperty                       ni=16539
+  27  ElapsedTime                    UIntProperty                       ni=16540
+  28  RemainingTime                  UIntProperty                       ni=16541
+  29  bMatchIsOver                   UBoolProperty                      ni=16543
+  30  bMatchHasBegun                 UBoolProperty                      ni=16544
+  31  bStopCountDown                 UBoolProperty                      ni=16545
+  32  GameClass                      UClassProperty(UClass)             ni=16547
+  33  WeaponXPMultiplier             UFloatProperty                     ni=31080
+  34  ClassXPMultiplier              UFloatProperty                     ni=31081
+  35  XPMultiplier                   UFloatProperty                     ni=31082
+  36  AllSpawnWindowsStaticDontUse   UIntProperty                       ni=31084 ArrayDim=20
+  37  SpawnWindowCloseTime           UIntProperty                       ni=31085 ArrayDim=2
+  38  PlayedRoundsCount              UIntProperty                       ni=31087
+  39  RoundTeamScoreLimit            UIntProperty                       ni=31088
+  40  RoundLimit                     UIntProperty                       ni=31089
+  41  NoTunnelVolumes                UObjectProperty(UClass)            ni=31090 ArrayDim=16
+  42  ServerMOTD                     UStrProperty                       ni=31091
+  43  ServerAdInfo                   UStructProperty                    ni=31092
+  44  WinStrengthPoints              UIntProperty                       ni=31093
+  45  SUPointsHeld                   UIntProperty                       ni=31094 ArrayDim=2
+  46  SUCurrentScore                 UIntProperty                       ni=31095
+  47  SUTargetScore                  UIntProperty                       ni=31096
+  48  AttackerTotalTime              UIntProperty                       ni=31097
+  49  ExtraWaves                     UIntProperty                       ni=31098
+  50  StartTimes                     UIntProperty                       ni=31099 ArrayDim=2
+  51  TotalTime                      UIntProperty                       ni=31100 ArrayDim=2
+  52  ReachedObjectiveName           UStrProperty                       ni=31101 ArrayDim=2
+  53  NextInstantRespawn             UIntProperty                       ni=31103 ArrayDim=2
+  54  AbilityThreeDelay              UIntProperty                       ni=31104 ArrayDim=2
+  55  AbilityTwoDelay                UIntProperty                       ni=31105 ArrayDim=2
+  56  AbilityOneDelay                UIntProperty                       ni=31106 ArrayDim=2
+  57  AbilityOneEndTime              UIntProperty                       ni=31107 ArrayDim=2
+  58  NextAbilityThreeTime           UIntProperty                       ni=31108 ArrayDim=2
+  59  NextAbilityTwoTime             UIntProperty                       ni=31109 ArrayDim=2
+  60  NextAbilityOneTime             UIntProperty                       ni=31110 ArrayDim=2
+  61  ArtySpawn                      UStructProperty                    ni=31111
+  62  TotalStrikes                   UIntProperty                       ni=31112 ArrayDim=2
+  63  ArtilleryStrikeLimit           UIntProperty                       ni=31113 ArrayDim=2
+  64  TeamSwitchAllowTimer           UIntProperty                       ni=31114
+  65  NextEstLockDownTime            UIntProperty                       ni=31115
+  66  NextLockDownTime               UIntProperty                       ni=31116
+  67  TeamObjectivesCaptured         UIntProperty                       ni=31117 ArrayDim=2
+  68  TeamsGrandScore                UIntProperty                       ni=31119 ArrayDim=2
+  69  TeamsStrengthPoints            UIntProperty                       ni=31123 ArrayDim=2
+  70  CampaignRegionFactionsSouth    UIntProperty                       ni=31124 ArrayDim=12
+  71  CampaignRegionFactionsNorth    UIntProperty                       ni=31125 ArrayDim=12
+  72  CampaignRegionMaps             UStrProperty                       ni=31126 ArrayDim=60
+  73  CampaignTimerSync              UIntProperty                       ni=31127
+  74  CampaignTeamCasualties         UIntProperty                       ni=31129 ArrayDim=2
+  75  CampaignTeamVictoryPoints      UIntProperty                       ni=31130 ArrayDim=2
+  76  CampaignTeamCombatPower        UFloatProperty                     ni=31131 ArrayDim=2
+  77  bUnlimitedRoles                UBoolProperty                      ni=31132
+  78  bAutoRespawnTimerActive        UBoolProperty                      ni=31133
+  79  bRoleKickVoteInProgress        UBoolProperty                      ni=31134
+  80  bKickVoteInProgress            UBoolProperty                      ni=31135
+  81  bAnonymousVoteKicking          UBoolProperty                      ni=31136
+  82  bOnlyTeamKickVotes             UBoolProperty                      ni=31137
+  83  bKickVotingEnabled             UBoolProperty                      ni=31138
+  84  bRoleKickEnabled               UBoolProperty                      ni=31139
+  85  bMidGameMapVoting              UBoolProperty                      ni=31140
+  86  bMapVotingEnabled              UBoolProperty                      ni=31141
+  87  bIsRanked                      UBoolProperty                      ni=31142
+  88  bLegDamageSlowsPlayer          UBoolProperty                      ni=31143
+  89  bForceHeloAdvancedFlightModel  UBoolProperty                      ni=31144
+  90  bAllowHeloAutoHover            UBoolProperty                      ni=31145
+  91  bDelayCannonAmmoSwitch         UBoolProperty                      ni=31146
+  92  bClientSideHitDetection        UBoolProperty                      ni=31147
+  93  bIncreasedBreathStaminaEffects UBoolProperty                      ni=31148
+  94  bIncreasedSuppressionEffects   UBoolProperty                      ni=31149
+  95  bDisableSpawnOnSquadLeader     UBoolProperty                      ni=31150
+  96  bDisablePeripheralActionIndicators UBoolProperty                      ni=31151
+  97  bDisablePeripheralWhips        UBoolProperty                      ni=31152
+  98  bDisableTeamDeathIcons         UBoolProperty                      ni=31153
+  99  bDisableObjectiveOverview      UBoolProperty                      ni=31154
+ 100  bDisableTeamVOIPChannel        UBoolProperty                      ni=31155
+ 101  bDisablePublicVOIPChannel      UBoolProperty                      ni=31156
+ 102  bRespawning                    UBoolProperty                      ni=31157
+ 103  bAllPlayersMustReadyUp         UBoolProperty                      ni=31158
+ 104  bReadyUpDelay                  UBoolProperty                      ni=31159
+ 105  bNoObjectivesCaptured          UBoolProperty                      ni=31160
+ 106  bSecondHalf                    UBoolProperty                      ni=31161
+ 107  bAllowDeadRoaming              UBoolProperty                      ni=31162
+ 108  bBalanceTeams                  UBoolProperty                      ni=31163
+ 109  bRealisticDrivingRestrictions  UBoolProperty                      ni=31165
+ 110  bRealisticPistolLoadouts       UBoolProperty                      ni=31166
+ 111  bNoWeaponLimits                UBoolProperty                      ni=31167
+ 112  bNoVehicleRoles                UBoolProperty                      ni=31168
+ 113  bAlliesAreAttacking            UBoolProperty                      ni=31169
+ 114  bHasExtraChance                UBoolProperty                      ni=31170
+ 115  bSuddenDeath                   UBoolProperty                      ni=31171
+ 116  bOverTime                      UBoolProperty                      ni=31172
+ 117  bReverseRolesAndSpawns         UBoolProperty                      ni=31173
+ 118  bIsCampaignGame                UBoolProperty                      ni=31174
+ 119  AlliesSpawnProtection          UObjectProperty(UClass)            ni=31177 ArrayDim=10
+ 120  AxisSpawnProtection            UObjectProperty(UClass)            ni=31178 ArrayDim=10
+ 121  MapBoundaries                  UObjectProperty(UClass)            ni=31179 ArrayDim=10
+ 122  ResupplyAreas                  UStructProperty                    ni=31180 ArrayDim=16
+ 123  ObjCappers                     UStructProperty                    ni=31181 ArrayDim=16
+ 124  Proximity3DVOIPSetting         UByteProperty                      ni=31193
+ 125  TeamWithOvertimeAdvantage      UByteProperty                      ni=31194
+ 126  SquadSpawnMethod               UByteProperty                      ni=31195 ArrayDim=2
+ 127  bHasHelicopters                UByteProperty                      ni=31196 ArrayDim=2
+ 128  PlayersAliveCount              UByteProperty                      ni=31197 ArrayDim=2
+ 129  NoTunnelsEnabled               UByteProperty                      ni=31198 ArrayDim=16
+ 130  EnemySpottedMode               UByteProperty                      ni=31199
+ 131  CurrentControlledBreathingZoomType UByteProperty                      ni=31200
+ 132  PlayerHitSoundMode             UByteProperty                      ni=31201
+ 133  VehicleCrewDamageMode          UByteProperty                      ni=31202
+ 134  TankTurretDamageMode           UByteProperty                      ni=31203
+ 135  VehicleMobilityDamageMode      UByteProperty                      ni=31204
+ 136  RoleOverrideMode               UByteProperty                      ni=31205
+ 137  RealismMode                    UByteProperty                      ni=31206
+ 138  ReachedObjectiveIndex          UByteProperty                      ni=31207 ArrayDim=2
+ 139  bAntiAirAvailable              UByteProperty                      ni=31208 ArrayDim=2
+ 140  bArtilleryAvailable            UByteProperty                      ni=31209 ArrayDim=2
+ 141  FriendlyPlayerNames            UByteProperty                      ni=31210
+ 142  DefendingTeam                  UByteProperty                      ni=31211
+ 143  CutOffTimer                    UByteProperty                      ni=31212
+ 144  CampaignAttackingTeamPerTurn   UByteProperty                      ni=31213 ArrayDim=23
+ 145  CampaignWinningTeamPerTurn     UByteProperty                      ni=31214 ArrayDim=23
+ 146  CampaignNextTurnSAAvail        UByteProperty                      ni=31215 ArrayDim=2
+ 147  CampaignTurn                   UByteProperty                      ni=31216
+ 148  CampaignWarPhase               UByteProperty                      ni=31217
+ 149  CampaignLength                 UByteProperty                      ni=31218
+ 150  CampaignFactionOverrides       UByteProperty                      ni=31219 ArrayDim=2
+ 151  CampaignTheatre                UByteProperty                      ni=31220
+ 152  CampaignRegionMultipliers      UByteProperty                      ni=31221 ArrayDim=12
+ 153  CampaignSpecialAbilityNoVotes  UByteProperty                      ni=31222
+ 154  CampaignSpecialAbilityYesVotes UByteProperty                      ni=31223
+ 155  CampaignSouthFactionVoteCount  UByteProperty                      ni=31224
+ 156  CampaignNorthFactionVoteCount  UByteProperty                      ni=31225
+ 157  CampaignSouthFactionVotes      UByteProperty                      ni=31226 ArrayDim=5
+ 158  CampaignNorthFactionVotes      UByteProperty                      ni=31227 ArrayDim=5
+ 159  CampaignRegionMapVoteCount     UByteProperty                      ni=31228
+ 160  CampaignRegionMapVotes         UByteProperty                      ni=31229 ArrayDim=5
+ 161  CampaignRegionVoteCount        UByteProperty                      ni=31230
+ 162  CampaignRegionVotes            UByteProperty                      ni=31231 ArrayDim=12
+ 163  CampaignDefendVotes            UByteProperty                      ni=31232
+ 164  CampaignAttackVotes            UByteProperty                      ni=31233
+ 165  CampaignPreviousRegionOwner    UByteProperty                      ni=31234
+ 166  CampaignCurrentRegion          UByteProperty                      ni=31235
+ 167  CampaignPreviousAttacker       UByteProperty                      ni=31236
+ 168  CampaignAttacker               UByteProperty                      ni=31237
+ 169  CampaignTeamCasualtyPercentage UByteProperty                      ni=31238 ArrayDim=2
+ 170  CampaignTeamCombatPowerLost    UByteProperty                      ni=31239 ArrayDim=2
+ 171  CampaignRegionOwners           UByteProperty                      ni=31240 ArrayDim=12
+ 172  MiniObjectiveStatus            UByteProperty                      ni=31241 ArrayDim=16
+ 173  ObjectiveConnectedToBase       UByteProperty                      ni=31242 ArrayDim=16
+ 174  ObjectiveSatchelProgress       UByteProperty                      ni=31243 ArrayDim=16
+ 175  ObjectiveCapProgress           UByteProperty                      ni=31244 ArrayDim=16
+ 176  ObjectiveForceRatio            UByteProperty                      ni=31245 ArrayDim=16
+ 177  ObjectiveStatus                UByteProperty                      ni=31246 ArrayDim=16
+ 178  ObjectiveRepIndices            UByteProperty                      ni=31247 ArrayDim=16
+ 179  RoleInfoItemsIdx               UByteProperty                      ni=31248
+ 180  MaxTeamDifference              UByteProperty                      ni=31249
+ 181  MaxPlayers                     UByteProperty                      ni=31250

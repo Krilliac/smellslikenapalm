@@ -1,5 +1,5 @@
-// src/Input/MovementValidator.cpp
-#include "Input/MovementValidator.h"
+// src/Physics/MovementValidator.cpp
+#include "Physics/MovementValidator.h"
 #include "Utils/Logger.h"
 #include "../../telemetry/TelemetryManager.h"
 #include <algorithm>
@@ -9,8 +9,8 @@ MovementValidator::MovementValidator(const Config& cfg)
 {
     Logger::Trace("[MovementValidator::MovementValidator] Entry - constructing with config (maxSpeed=%.2f, maxAccel=%.2f, maxTurnRateDeg=%.2f, maxTeleportDistance=%.2f)",
                   cfg.maxSpeed, cfg.maxAccel, cfg.maxTurnRateDeg, cfg.maxTeleportDistance);
-    Logger::Info("[MovementValidator::MovementValidator] MovementValidator constructed with config: maxSpeed=%.2f, maxAccel=%.2f, maxTurnRateDeg=%.2f, maxTeleportDistance=%.2f, maxUpdateInterval=%lums",
-                 cfg.maxSpeed, cfg.maxAccel, cfg.maxTurnRateDeg, cfg.maxTeleportDistance, cfg.maxUpdateInterval.count());
+    Logger::Info("[MovementValidator::MovementValidator] MovementValidator constructed with config: maxSpeed=%.2f, maxAccel=%.2f, maxTurnRateDeg=%.2f, maxTeleportDistance=%.2f, maxUpdateInterval=%lldms",
+                 cfg.maxSpeed, cfg.maxAccel, cfg.maxTurnRateDeg, cfg.maxTeleportDistance, static_cast<long long>(cfg.maxUpdateInterval.count()));
     Logger::Trace("[MovementValidator::MovementValidator] Exit");
 }
 
@@ -44,10 +44,10 @@ bool MovementValidator::ValidateMovement(uint32_t clientId,
 
     MovementState& st = it->second;
     auto dt_ms = std::chrono::duration_cast<std::chrono::milliseconds>(timestamp - st.lastUpdate);
-    Logger::Debug("[MovementValidator::ValidateMovement] Client %u: dt_ms=%lums, maxUpdateInterval=%lums", clientId, dt_ms.count(), m_cfg.maxUpdateInterval.count());
+    Logger::Debug("[MovementValidator::ValidateMovement] Client %u: dt_ms=%lldms, maxUpdateInterval=%lldms", clientId, static_cast<long long>(dt_ms.count()), static_cast<long long>(m_cfg.maxUpdateInterval.count()));
 
     if (dt_ms > m_cfg.maxUpdateInterval) {
-        Logger::Warn("MovementValidator: client %u update interval too large (%lums)", clientId, dt_ms.count());
+        Logger::Warn("MovementValidator: client %u update interval too large (%lldms)", clientId, static_cast<long long>(dt_ms.count()));
         Logger::Debug("[MovementValidator::ValidateMovement] Client %u: treating as teleport reset due to large update interval", clientId);
         // treat as teleport reset
         st = { newPos, Vector3{0,0,0}, timestamp };

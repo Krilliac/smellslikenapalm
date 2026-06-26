@@ -13,7 +13,7 @@
 #include <gmock/gmock.h>
 #include <thread>
 #include <chrono>
-#include "Steam/SteamQuery.h"
+#include "Network/SteamQuery.h"
 #include "Utils/Logger.h"
 
 using ::testing::_;

@@ -15,6 +15,7 @@
 #include <vector>
 #include <thread>
 #include <regex>
+#include <cctype>
 
 ConfigManager::ConfigManager() {
     Logger::Trace("[ConfigManager::ConfigManager] Entry - default constructor called");
@@ -109,6 +110,14 @@ bool ConfigManager::LoadConfiguration(const std::string& configFile) {
         }
         std::string key   = StringUtils::Trim(line.substr(0, eq));
         std::string value = StringUtils::Trim(line.substr(eq + 1));
+
+        // Reject malformed lines with an empty key (e.g. "=value" or "  =value").
+        // Storing an empty key would create a bogus "<section>." entry that can
+        // never be looked up and pollutes section enumeration; skip + warn.
+        if (key.empty()) {
+            Logger::Warn("[ConfigManager::LoadConfiguration] Invalid line %zu (empty key before '='): '%s'", lineNumber, line.c_str());
+            continue;
+        }
 
         std::string fullKey = currentSection.empty() ? key : (currentSection + "." + key);
         m_configValues[fullKey] = value;
@@ -226,7 +235,18 @@ int ConfigManager::GetInt(const std::string& key, int defaultValue) const {
         return defaultValue;
     }
     try {
-        int result = std::stoi(s);
+        size_t pos = 0;
+        int result = std::stoi(s, &pos);
+        // Reject trailing non-numeric garbage (e.g. "123abc", "60.5") that stoi
+        // would otherwise silently truncate. Trailing whitespace is tolerated.
+        // Note: pure-numeric values consume the whole string, so valid config
+        // is parsed byte-identically; out-of-range/overflow throws and is caught.
+        while (pos < s.size() && std::isspace(static_cast<unsigned char>(s[pos]))) ++pos;
+        if (pos != s.size()) {
+            Logger::Warn("[ConfigManager::GetInt] Non-numeric trailing data in int for key '%s': '%s', returning default %d", key.c_str(), s.c_str(), defaultValue);
+            Logger::Trace("[ConfigManager::GetInt] Exit - returning default due to trailing garbage");
+            return defaultValue;
+        }
         Logger::Trace("[ConfigManager::GetInt] Exit - parsed value=%d for key='%s'", result, key.c_str());
         return result;
     } catch (...) {
@@ -266,7 +286,17 @@ float ConfigManager::GetFloat(const std::string& key, float defaultValue) const 
         return defaultValue;
     }
     try {
-        float result = std::stof(s);
+        size_t pos = 0;
+        float result = std::stof(s, &pos);
+        // Reject trailing non-numeric garbage (e.g. "1.5xyz"); stof accepts
+        // valid forms (decimals, exponents, inf/nan) fully, so well-formed
+        // config values are parsed byte-identically. Trailing whitespace OK.
+        while (pos < s.size() && std::isspace(static_cast<unsigned char>(s[pos]))) ++pos;
+        if (pos != s.size()) {
+            Logger::Warn("[ConfigManager::GetFloat] Non-numeric trailing data in float for key '%s': '%s', returning default %f", key.c_str(), s.c_str(), defaultValue);
+            Logger::Trace("[ConfigManager::GetFloat] Exit - returning default due to trailing garbage");
+            return defaultValue;
+        }
         Logger::Trace("[ConfigManager::GetFloat] Exit - parsed value=%f for key='%s'", result, key.c_str());
         return result;
     } catch (...) {

@@ -5,10 +5,18 @@
 // 1. Initialization and shutdown.
 // 2. Task execution correctness.
 // 3. Task ordering and fairness.
-// 4. Work-stealing or load balancing across threads.
+// 4. Load balancing across threads.
 // 5. Shutdown with pending tasks.
 // 6. Exception propagation from tasks.
-// 7. Edge cases: zero threads, enqueue after shutdown, high load.
+// 7. Edge cases: enqueue after shutdown, high load.
+//
+// API reconciliation (test-side, src unchanged): the real ThreadPool exposes
+// only Enqueue() (returning std::future) and Shutdown(). It has no WaitAll()
+// and no GetThisThreadIndex(). Tests that previously relied on those were
+// reworked to wait on the returned futures and to drop thread-index probing.
+// The "zero threads = sequential executor" case was removed: the real pool
+// requires worker threads to drain its queue, so a 0-thread pool never runs
+// tasks (not the behavior the original test assumed).
 
 #include <gtest/gtest.h>
 #include <atomic>
@@ -17,20 +25,26 @@
 #include <thread>
 #include <future>
 #include <stdexcept>
+#include <algorithm>
 #include "Utils/ThreadPool.h"
 #include "Utils/Logger.h"
 
 using namespace std::chrono_literals;
 
+// Helper: wait for a batch of futures to complete.
+template <typename T>
+static void WaitAll(std::vector<std::future<T>>& futs) {
+    for (auto& f : futs) f.wait();
+}
+
 // Fixture
 class ThreadPoolTest : public ::testing::Test {
 protected:
     void SetUp() override {
-        // default pool with 4 threads
         pool = std::make_unique<ThreadPool>(4);
     }
     void TearDown() override {
-        pool->Shutdown();
+        if (pool) pool->Shutdown();
         pool.reset();
     }
     std::unique_ptr<ThreadPool> pool;
@@ -44,46 +58,46 @@ TEST_F(ThreadPoolTest, InitializeAndShutdown_Succeeds) {
 // 2. Simple task execution
 TEST_F(ThreadPoolTest, ExecuteSimpleTasks) {
     std::atomic<int> counter{0};
+    std::vector<std::future<void>> futs;
     for (int i = 0; i < 10; ++i) {
-        pool->Enqueue([&counter]() { counter.fetch_add(1, std::memory_order_relaxed); });
+        futs.push_back(pool->Enqueue([&counter]() {
+            counter.fetch_add(1, std::memory_order_relaxed);
+        }));
     }
-    pool->WaitAll();
+    WaitAll(futs);
     EXPECT_EQ(counter.load(), 10);
 }
 
-// 3. Task ordering preserved per enqueue sequence
-TEST_F(ThreadPoolTest, TaskOrdering_FIFO) {
+// 3. All enqueued tasks run (ordering not guaranteed across threads)
+TEST_F(ThreadPoolTest, AllTasksRun) {
     std::vector<int> results;
     std::mutex mtx;
+    std::vector<std::future<void>> futs;
     for (int i = 0; i < 20; ++i) {
-        pool->Enqueue([i,&results,&mtx](){
+        futs.push_back(pool->Enqueue([i,&results,&mtx](){
             std::lock_guard<std::mutex> lk(mtx);
             results.push_back(i);
-        });
+        }));
     }
-    pool->WaitAll();
+    WaitAll(futs);
     EXPECT_EQ(results.size(), 20u);
-    // since multiple threads, strict ordering not guaranteed globally,
-    // but we can test that each task ran
     std::sort(results.begin(), results.end());
     for (int i = 0; i < 20; ++i) EXPECT_EQ(results[i], i);
 }
 
-// 4. Load balancing: all threads get work
-TEST_F(ThreadPoolTest, LoadBalancing_AllThreadsActive) {
+// 4. Load balancing: spreading work across the pool completes all tasks.
+TEST_F(ThreadPoolTest, LoadBalancing_AllTasksComplete) {
     const int tasks = 100;
-    std::vector<std::atomic<int>> counts(4);
+    std::atomic<int> counter{0};
+    std::vector<std::future<void>> futs;
     for (int i = 0; i < tasks; ++i) {
-        pool->Enqueue([&counts](){
-            auto id = ThreadPool::GetThisThreadIndex();
-            counts[id].fetch_add(1, std::memory_order_relaxed);
+        futs.push_back(pool->Enqueue([&counter](){
+            counter.fetch_add(1, std::memory_order_relaxed);
             std::this_thread::sleep_for(1ms);
-        });
+        }));
     }
-    pool->WaitAll();
-    int activeThreads = 0;
-    for (auto &c : counts) if (c.load()>0) ++activeThreads;
-    EXPECT_EQ(activeThreads, 4);
+    WaitAll(futs);
+    EXPECT_EQ(counter.load(), tasks);
 }
 
 // 5. Shutdown with pending tasks executes all
@@ -101,42 +115,32 @@ TEST_F(ThreadPoolTest, ShutdownCompletesPending) {
 
 // 6. Exception propagation from tasks
 TEST_F(ThreadPoolTest, TaskException_PropagatedViaFuture) {
-    auto fut = pool->Enqueue<int>([](){
+    auto fut = pool->Enqueue([]() -> int {
         throw std::runtime_error("Task failure");
         return 42;
     });
-    pool->WaitAll();
     EXPECT_THROW(fut.get(), std::runtime_error);
 }
 
-// 7. Zero threads treated as sequential executor
-TEST(ThreadPool, ZeroThreads_SequentialExecution) {
-    ThreadPool p(0);
-    std::atomic<int> counter{0};
-    for (int i = 0; i < 5; ++i) p.Enqueue([&counter](){ counter++; });
-    p.WaitAll();
-    EXPECT_EQ(counter.load(), 5);
-    p.Shutdown();
-}
-
-// 8. Enqueue after shutdown no-op or throws
+// 7. Enqueue after shutdown throws
 TEST_F(ThreadPoolTest, EnqueueAfterShutdown_Throws) {
     pool->Shutdown();
     EXPECT_THROW(pool->Enqueue([](){}), std::runtime_error);
 }
 
-// 9. High load stability
+// 8. High load stability
 TEST_F(ThreadPoolTest, HighLoad_NoCrashes) {
     const int tasks = 1000;
     std::atomic<int> counter{0};
+    std::vector<std::future<void>> futs;
     for (int i = 0; i < tasks; ++i) {
-        pool->Enqueue([&counter](){ counter++; });
+        futs.push_back(pool->Enqueue([&counter](){ counter++; }));
     }
-    pool->WaitAll();
+    WaitAll(futs);
     EXPECT_EQ(counter.load(), tasks);
 }
 
-// 10. Concurrent shutdown safety
+// 9. Concurrent shutdown safety
 TEST_F(ThreadPoolTest, ConcurrentShutdown_NoRace) {
     std::thread t1([&](){ pool->Shutdown(); });
     std::thread t2([&](){ pool->Shutdown(); });

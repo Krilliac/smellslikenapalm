@@ -2,7 +2,7 @@
 
 #pragma once
 
-#include "Physics/Vector3.h"
+#include "Math/Vector3.h"
 
 struct Bounds {
     Vector3 min;

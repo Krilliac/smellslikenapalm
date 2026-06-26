@@ -2,11 +2,7 @@
 
 #include "Network/NetworkInterface.h"
 #include "Utils/Logger.h"
-#include <sys/types.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <unistd.h>
+#include "Network/PlatformSocket.h"
 #include <cstring>
 
 NetworkInterface::NetworkInterface()
@@ -104,7 +100,7 @@ void NetworkInterface::Close() {
     Logger::Trace("[NetworkInterface::Close] Entry: socketFd=%d", m_socketFd);
     if (m_socketFd >= 0) {
         Logger::Debug("[NetworkInterface::Close] Closing socket fd=%d on port %u", m_socketFd, m_listenPort);
-        close(m_socketFd);
+        CloseSocket(m_socketFd);
         m_socketFd = -1;
         Logger::Info("NetworkInterface: Socket closed");
     } else {
@@ -137,12 +133,12 @@ bool NetworkInterface::BindSocket(uint16_t port) {
     addr.sin_port = htons(port);
 
     int opt = 1;
-    setsockopt(m_socketFd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    setsockopt(m_socketFd, SOL_SOCKET, SO_REUSEADDR, (char*)&opt, sizeof(opt));
     Logger::Debug("[NetworkInterface::BindSocket] Set SO_REUSEADDR on fd=%d", m_socketFd);
 
     if (bind(m_socketFd, (sockaddr*)&addr, sizeof(addr)) < 0) {
         Logger::Error("[NetworkInterface::BindSocket] bind() failed on port %u, fd=%d", port, m_socketFd);
-        close(m_socketFd);
+        CloseSocket(m_socketFd);
         m_socketFd = -1;
         Logger::Debug("[NetworkInterface::BindSocket] Socket closed and reset to -1 after bind failure");
         Logger::Trace("[NetworkInterface::BindSocket] Exit: returning false (bind failed)");
@@ -157,7 +153,7 @@ int NetworkInterface::RecvFrom(std::string& outIp, uint16_t& outPort) {
     Logger::Trace("[NetworkInterface::RecvFrom] Entry: socketFd=%d", m_socketFd);
     sockaddr_in srcAddr{};
     socklen_t addrLen = sizeof(srcAddr);
-    int len = recvfrom(m_socketFd, m_recvBuffer.data(), MAX_PACKET_SIZE, 0,
+    int len = recvfrom(m_socketFd, reinterpret_cast<char*>(m_recvBuffer.data()), MAX_PACKET_SIZE, 0,
                        (sockaddr*)&srcAddr, &addrLen);
     if (len > 0) {
         outIp = inet_ntoa(srcAddr.sin_addr);
@@ -184,7 +180,7 @@ bool NetworkInterface::SendToInternal(const std::string& ip, uint16_t port, cons
     dest.sin_port = htons(port);
 
     Logger::Debug("[NetworkInterface::SendToInternal] Sending %zu bytes to %s:%u via fd=%d", len, ip.c_str(), port, m_socketFd);
-    ssize_t sent = sendto(m_socketFd, data, len, 0, (sockaddr*)&dest, sizeof(dest));
+    ssize_t sent = sendto(m_socketFd, reinterpret_cast<const char*>(data), (int)len, 0, (sockaddr*)&dest, sizeof(dest));
     if (sent != (ssize_t)len) {
         Logger::Warn("NetworkInterface: Partial/failed send to %s:%u", ip.c_str(), port);
         Logger::Error("[NetworkInterface::SendToInternal] sendto returned %zd, expected %zu for %s:%u",

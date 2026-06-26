@@ -1,6 +1,5 @@
-// src/Network/LatencyManager.cpp
+// src/Time/LatencyManager.cpp
 #include "Time/LatencyManager.h"
-#include <cstring>
 #include "Utils/Logger.h"
 
 LatencyManager::LatencyManager(size_t maxSamples)
@@ -124,7 +123,7 @@ void LatencyManager::AddSample(Info& info, std::chrono::milliseconds rtt) {
     Logger::Debug("[LatencyManager::AddSample] Sample added to history, new history size=%zu", info.history.size());
     // update EMA
     if (info.history.size() == 1) {
-        info.smoothedRtt = rtt.count();
+        info.smoothedRtt = static_cast<double>(rtt.count());
         Logger::Debug("[LatencyManager::AddSample] First sample — smoothedRtt initialized to %lld ms (no EMA blending)",
                       static_cast<long long>(rtt.count()));
     } else {

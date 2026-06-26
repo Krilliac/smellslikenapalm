@@ -4,6 +4,16 @@
 
 ThreadPool::ThreadPool(size_t numThreads) {
     Logger::Trace("[ThreadPool::ThreadPool] Entry: numThreads=%zu", numThreads);
+    // Hardening: 0 workers means enqueued tasks never run and their futures block forever.
+    // An absurdly large count exhausts OS thread/handle resources. Clamp to a sane range.
+    static constexpr size_t kMaxWorkers = 1024;
+    if (numThreads == 0) {
+        Logger::Warn("[ThreadPool::ThreadPool] numThreads=0 would deadlock all tasks; clamping to 1");
+        numThreads = 1;
+    } else if (numThreads > kMaxWorkers) {
+        Logger::Warn("[ThreadPool::ThreadPool] numThreads=%zu exceeds cap; clamping to %zu", numThreads, kMaxWorkers);
+        numThreads = kMaxWorkers;
+    }
     Logger::Info("[ThreadPool::ThreadPool] Creating thread pool with %zu worker threads", numThreads);
     for (size_t i = 0; i < numThreads; ++i) {
         workers_.emplace_back(&ThreadPool::Worker, this);

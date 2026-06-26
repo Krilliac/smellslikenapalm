@@ -1,3 +1,4 @@
+#define _USE_MATH_DEFINES
 #include "Utils/MathUtils.h"
 #include "Utils/Logger.h"
 #include <cmath>

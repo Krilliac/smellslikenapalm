@@ -24,6 +24,10 @@ MapManager::~MapManager() = default;
 bool MapManager::LoadMap(const std::string& mapName)
 {
     Logger::Info("Loading map: %s", mapName.c_str());
+    if (!m_mapConfig) {
+        Logger::Error("MapManager: No map config available — cannot load map: %s", mapName.c_str());
+        return false;
+    }
     const MapDefinition* def = m_mapConfig->GetDefinition(mapName);
     if (!def) {
         Logger::Error("MapManager: Map definition not found: %s", mapName.c_str());
@@ -146,10 +150,18 @@ void MapManager::GenerateFallbackSpawns()
 {
     Logger::Warn("Generating fallback spawn points");
     Bounds b = GetMapBounds();
+    // Guard against degenerate/inverted bounds: std::uniform_real_distribution
+    // has undefined behavior unless min <= max. Normalize before use.
+    float minX = std::min(b.min.x, b.max.x), maxX = std::max(b.min.x, b.max.x);
+    float minY = std::min(b.min.y, b.max.y), maxY = std::max(b.min.y, b.max.y);
+    float minZ = std::min(b.min.z, b.max.z), maxZ = std::max(b.min.z, b.max.z);
+    if (minX == maxX && minY == maxY && minZ == maxZ) {
+        Logger::Warn("MapManager: Map bounds are degenerate/empty — fallback spawns will all be at the same point");
+    }
     std::mt19937 rng(std::random_device{}());
-    std::uniform_real_distribution<float> dx(b.min.x, b.max.x);
-    std::uniform_real_distribution<float> dy(b.min.y, b.max.y);
-    std::uniform_real_distribution<float> dz(b.min.z, b.max.z);
+    std::uniform_real_distribution<float> dx(minX, maxX);
+    std::uniform_real_distribution<float> dy(minY, maxY);
+    std::uniform_real_distribution<float> dz(minZ, maxZ);
 
     for (size_t i = 0; i < 16; ++i) {
         SpawnPoint sp;
@@ -181,6 +193,10 @@ Bounds MapManager::GetMapBounds() const
 std::string MapManager::GetNextMap()
 {
     // Simple rotation through config list
+    if (!m_mapConfig) {
+        Logger::Warn("MapManager: No map config available — GetNextMap returning current map");
+        return m_currentMap.name;
+    }
     auto maps = m_mapConfig->GetAvailableMaps();
     if (maps.empty()) return m_currentMap.name;
     auto it = std::find(maps.begin(), maps.end(), m_currentMap.name);

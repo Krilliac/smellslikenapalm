@@ -2,8 +2,15 @@
 #include "Utils/PathUtils.h"
 #include "Utils/Logger.h"
 
+#include <cstdint>
+
 #ifdef _WIN32
     #include <windows.h>
+    #include <basetsd.h>
+    #ifndef RS2V_SSIZE_T_DEFINED
+        #define RS2V_SSIZE_T_DEFINED
+        using ssize_t = SSIZE_T;
+    #endif
 #elif defined(__linux__)
     #include <unistd.h>
     #include <limits.h>
@@ -87,6 +94,52 @@ std::string GetExecutableDirectory() {
 
 std::string ResolveFromExecutable(const std::string& relativePath) {
     Logger::Trace("[PathUtils::ResolveFromExecutable] Entry: relativePath='%s'", relativePath.c_str());
+
+    // --- Defensive input validation (additive, non-fatal) ---------------------
+    // This helper resolves trusted, executable-relative resource paths. Reject
+    // hostile shapes so a malformed/attacker-influenced value can never escape
+    // the executable directory or smuggle a path past the OS layer. Legitimate
+    // relative paths (no NUL, not absolute, no "..") are unaffected and produce
+    // byte-identical output.
+
+    // 1) Embedded NUL bytes can truncate the path at the C/OS boundary.
+    if (relativePath.find('\0') != std::string::npos) {
+        Logger::Warn("[PathUtils::ResolveFromExecutable] Rejecting path containing embedded null byte");
+        Logger::Trace("[PathUtils::ResolveFromExecutable] Exit: returning empty string (null byte)");
+        return "";
+    }
+
+    // 2) Cap absurd lengths to avoid unbounded allocation / OS path limits.
+    static constexpr size_t kMaxPathLen = 4096;
+    if (relativePath.size() > kMaxPathLen) {
+        Logger::Warn("[PathUtils::ResolveFromExecutable] Rejecting oversized path (length=%zu > %zu)",
+                     relativePath.size(), kMaxPathLen);
+        Logger::Trace("[PathUtils::ResolveFromExecutable] Exit: returning empty string (oversized)");
+        return "";
+    }
+
+    std::filesystem::path relPath(relativePath);
+
+    // 3) Absolute paths: operator/ below would DISCARD execDir entirely and use
+    //    the supplied absolute path verbatim, pointing anywhere on disk.
+    if (relPath.is_absolute()) {
+        Logger::Warn("[PathUtils::ResolveFromExecutable] Rejecting absolute path '%s' (only executable-relative paths allowed)",
+                     relativePath.c_str());
+        Logger::Trace("[PathUtils::ResolveFromExecutable] Exit: returning empty string (absolute)");
+        return "";
+    }
+
+    // 4) Parent-directory traversal ("..") would escape the executable dir.
+    for (const auto& part : relPath) {
+        if (part == "..") {
+            Logger::Warn("[PathUtils::ResolveFromExecutable] Rejecting path with '..' traversal: '%s'",
+                         relativePath.c_str());
+            Logger::Trace("[PathUtils::ResolveFromExecutable] Exit: returning empty string (traversal)");
+            return "";
+        }
+    }
+    // --------------------------------------------------------------------------
+
     std::string execDir = GetExecutableDirectory();
     if (execDir.empty()) {
         Logger::Warn("[PathUtils::ResolveFromExecutable] Executable directory is empty, falling back to relative path: '%s'", relativePath.c_str());

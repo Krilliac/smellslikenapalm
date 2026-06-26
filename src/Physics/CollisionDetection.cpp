@@ -1,6 +1,7 @@
 // src/Physics/CollisionDetection.cpp
 #include "Physics/CollisionDetection.h"
 #include "Utils/Logger.h"
+#include <algorithm>
 #include <cmath>
 #include <unordered_set>
 

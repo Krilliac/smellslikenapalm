@@ -1,4 +1,4 @@
-// src/Network/LatencyManager.h
+// src/Time/LatencyManager.h
 #pragma once
 
 #include <cstdint>

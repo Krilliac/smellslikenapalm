@@ -262,7 +262,19 @@ void ProtocolDecoder::AnalyzeUE3Bunch(const uint8_t* data, size_t len) {
         ba.closeChannel = header.Close;
         ba.payloadLength = payloadLen;
         if (payload && payloadLen > 0) {
-            ba.rawPayload.assign(payload, payload + payloadLen);
+            // Defensive (trust boundary): ParseBunch returns a pointer/length into
+            // the attacker-supplied UDP buffer. Verify the reported payload range
+            // lies fully within [data, data+len) before copying, so a bad
+            // length/offset can never drive an out-of-bounds read here.
+            if (payload >= data && payload <= data + len &&
+                payloadLen <= static_cast<size_t>((data + len) - payload)) {
+                ba.rawPayload.assign(payload, payload + payloadLen);
+            } else {
+                Logger::Warn("ProtocolDecoder: UE3 bunch payload out of bounds "
+                             "(payloadLen=%zu, bufLen=%zu) — skipping payload copy",
+                             payloadLen, len);
+                ba.payloadLength = 0;
+            }
         }
 
         m_bunchHistory.push_back(std::move(ba));
@@ -348,6 +360,20 @@ void ProtocolDecoder::DetectFieldTypes(DecodedPacketStructure& structure, const 
 
             field.suggestedName = GenerateFieldName(field.type, fieldIndex);
             field.confidence = 0.3f; // low initial confidence
+
+            // Defensive: a classified field must (a) advance the cursor by at
+            // least one byte — otherwise the loop could spin forever on crafted
+            // input — and (b) never claim more bytes than remain in the buffer,
+            // which would let subsequent-sample stats read past the payload.
+            // Valid inputs always satisfy both, so this cannot change behavior.
+            if (field.size > remaining) {
+                field.size = remaining;
+            }
+            if (field.size == 0) {
+                Logger::Warn("ProtocolDecoder: zero-width field at offset %zu in '%s' — "
+                             "stopping field scan", offset, structure.packetTag.c_str());
+                break;
+            }
 
             if (m_config.trackFieldStatistics && field.type != DetectedFieldType::BlobData) {
                 UpdateFieldStatistics(field, data, offset);

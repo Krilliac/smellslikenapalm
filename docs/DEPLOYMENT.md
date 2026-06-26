@@ -3,9 +3,11 @@
 This guide covers **production deployment**, **security hardening**, **monitoring setup**, and **operational maintenance** for the RS2V Custom Server.  
 For development workflow and API details, see **DEVELOPMENT.md** and **API.md**.
 
+> ⚠️ **Status:** This is a forward-looking guide. The server is still an in-development **emulator** — the live UE3 handshake is not finished and a stock client cannot fully connect yet (see the README's *Current Status* section). Treat the procedures below as the intended production-deployment workflow, not a description of a battle-tested production service.
+
 ## 1 · Overview
 
-The RS2V server is designed for **bare-metal**, **containerized**, or **cloud** deployment with enterprise-grade monitoring and security features.
+The RS2V server is intended to support **bare-metal**, **containerized**, or **cloud** deployment with monitoring and security features.
 
 | Deployment Type | Best For | Complexity |
 |-----------------|----------|------------|

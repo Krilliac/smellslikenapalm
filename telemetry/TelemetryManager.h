@@ -10,6 +10,7 @@
 
 #pragma once
 
+#include <cstdint>
 #include <string>
 #include <memory>
 #include <vector>
@@ -267,22 +268,6 @@ private:
     };
     CPUTimes m_lastCPUTimes;
     bool m_hasPreviousCPUTimes = false;
-    
-    // Network usage tracking
-    struct NetworkStats {
-        uint64_t bytesSent = 0;
-        uint64_t bytesReceived = 0;
-    };
-    NetworkStats m_lastNetworkStats;
-    bool m_hasPreviousNetworkStats = false;
-    
-    // Disk usage tracking
-    struct DiskStats {
-        uint64_t readBytes = 0;
-        uint64_t writeBytes = 0;
-    };
-    DiskStats m_lastDiskStats;
-    bool m_hasPreviousDiskStats = false;
 };
 
 // Convenience macros for common telemetry operations

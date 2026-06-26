@@ -1,0 +1,190 @@
+// src/Network/ControlChannel.h
+//
+// Build & parse functions for the UE3 / RS2 control-channel handshake messages.
+//
+// SCOPE: this is an ISOLATED, SWAPPABLE MESSAGE CODEC, not live integration. Each
+// Build* function serializes ONE control message payload (the message-type BYTE
+// followed by the message fields) into a byte buffer using BitWriter. Each Parse*
+// function consumes such a payload with BitReader and returns a struct plus a
+// success flag.
+//
+// The payload these functions produce/consume is the BUNCH PAYLOAD content:
+// `<BYTE NMT type><fields...>`. The surrounding UE3 packet/bunch FRAMING
+// (PacketId, ack bitfield, bunch header bits) is version-sensitive and only
+// thinly modeled here - see BunchFraming below, which is TODO-marked. The point
+// is a correct, isolated message codec; framing can be layered on once the
+// capture in spec §9 pins the header bits.
+//
+// All wire constants come from NetMessages.h (the single source of truth).
+// Confidence tags ([CB]/[UE3]/[?]) follow RS2V_ControlChannel_WireSpec_7258.md.
+
+#pragma once
+
+#include <cstdint>
+#include <string>
+#include <vector>
+
+#include "Network/NetMessages.h"
+
+class BitReader;
+
+namespace ControlChannel {
+
+// ===========================================================================
+//  Message structs (parsed representations)
+// ===========================================================================
+
+// NMT_Hello (C->S) - RS2 EGS/EOS "Leech" extended layout [CB body]:
+//   BYTE  bIsLittleEndian   [?] presence/position (UE3 stock has it; spec §4)
+//   INT   MinVersion        client's GEngineMinNetVersion          [CB]
+//   INT   Version           client's GEngineVersion (== 7258)      [CB]
+//   QWORD SteamId           64-bit Steam ID                        [CB]
+//   FSTR  LeechSessionId    EOS/"Leech" session id                 [CB]
+//   FSTR  Token             second FString (purpose [?])           [CB present]
+struct HelloMessage {
+    uint8_t  bIsLittleEndian = 1;
+    int32_t  minVersion = kMinNetVersion;
+    int32_t  version = kEngineVersion;
+    uint64_t steamId = 0;
+    std::string leechSessionId;
+    std::string token;
+};
+
+// NMT_Challenge (S->C): { INT ServerFlags, FSTR ServerNonce }
+// Spec §4: the body is `int32, FString` (a leading int32 precedes the nonce),
+// NOT a bare FString as previously assumed.
+struct ChallengeMessage {
+    // RS2 on-wire NMT_Challenge body is a single 32-bit cookie (the live Challenge
+    // bunch is 40 bits: NMT + DWORD). The earlier {int32, FString} layout was wrong
+    // (it bloated the Challenge across 4 bunches and the client ignored it).
+    uint32_t nonce = 0;
+};
+
+// NMT_Netspeed (C->S): { INT Netspeed } [UE3]
+struct NetspeedMessage {
+    int32_t netspeed = kNetspeedInternet;
+};
+
+// NMT_Login (C->S): { FSTR ClientResponse, FSTR URL, QWORD SteamId }
+// Spec §4: the body is `FString, FString, QWORD` (a trailing QWORD follows the
+// URL), NOT just two FStrings.
+struct LoginMessage {
+    std::string response; // computed from the Challenge nonce
+    std::string url;      // FURL option string (see URLOptions.h)
+    uint64_t    steamId = 0; // trailing QWORD (spec §4)
+};
+
+// NMT_Welcome (S->C): { FSTR LevelName, FSTR GameName, QWORD }
+// Spec §4: the body is `FString, FString, QWORD` (a trailing QWORD), NOT three
+// FStrings. The third field is the previously-assumed "Redirect" slot, but the
+// binary serializes a QWORD there.
+struct WelcomeMessage {
+    std::string levelName;
+    std::string gameName;
+    uint64_t    flags = 0;   // trailing QWORD (spec §4 medium-confidence)
+};
+
+// NMT_Failure (S->C): { FSTR ErrorKey } [UE3]
+struct FailureMessage {
+    std::string errorKey;
+};
+
+// NMT_Upgrade (S->C): { INT RemoteMinVer, INT RemoteVer }
+// Spec §4: the body is `int32, int32` (two ints), NOT a single int.
+struct UpgradeMessage {
+    int32_t remoteMinVer = kMinNetVersion;
+    int32_t remoteVer = kEngineVersion;  // second int32 (spec §4)
+};
+
+// NMT_Join (C->S): empty body [UE3]
+struct JoinMessage {};
+
+// ===========================================================================
+//  Build functions - return the message payload bytes (BYTE type + fields).
+// ===========================================================================
+
+std::vector<uint8_t> BuildHello(const HelloMessage& msg);
+std::vector<uint8_t> BuildChallenge(const ChallengeMessage& msg);
+std::vector<uint8_t> BuildNetspeed(const NetspeedMessage& msg);
+std::vector<uint8_t> BuildLogin(const LoginMessage& msg);
+std::vector<uint8_t> BuildWelcome(const WelcomeMessage& msg);
+std::vector<uint8_t> BuildFailure(const FailureMessage& msg);
+std::vector<uint8_t> BuildUpgrade(const UpgradeMessage& msg);
+std::vector<uint8_t> BuildJoin(const JoinMessage& msg);
+
+// ---------------------------------------------------------------------------
+//  StatelessConnect / pre-NMT handshake messages (RS2 7258, reversed from
+//  VNGame.exe + capture). These ride as reliable control-channel bunches BEFORE
+//  the NMT phase. Payload = [0x00 family byte][subtype byte][data].
+//  Exchange: C->S 0x1d HandshakeStart -> S->C 0x1e HandshakeChallenge(+nonce)
+//         -> C->S 0x1f HandshakeResponse -> S->C 0x20 HandshakeComplete.
+//  The server's nonce is just rand() (no crypto); the emulator accepts the
+//  client's response blindly. See docs/RS2V_ControlChannel_WireSpec_7258.md.
+// ---------------------------------------------------------------------------
+namespace Handshake {
+    constexpr uint8_t kFamilyByte = 0x00;       // leading payload byte for all 4 msgs
+    constexpr uint8_t kStart      = 0x1d;       // C->S
+    constexpr uint8_t kChallenge  = 0x1e;       // S->C (+ 3 nonce bytes)
+    constexpr uint8_t kResponse   = 0x1f;       // C->S (+ response bytes)
+    constexpr uint8_t kComplete   = 0x20;       // S->C
+}
+
+// HandshakeChallenge: 0x00, 0x1e, then the low 3 bytes of `nonce` (matches the
+// 3-byte-branch the official server takes on the wire).
+std::vector<uint8_t> BuildHandshakeChallenge(uint32_t nonce);
+
+// HandshakeComplete: 0x00, 0x20.
+std::vector<uint8_t> BuildHandshakeComplete();
+
+// Convenience: build a Login URL FURL string from option pairs. The leading
+// portal/map is `portal`; each option is appended as "?Key=Value" (or "?Key" for
+// a bare flag where value is empty). Mirrors the client-side builder in spec §6.
+std::string BuildLoginURL(const std::string& portal,
+                          const std::vector<std::pair<std::string, std::string>>& options);
+
+// ===========================================================================
+//  Parse functions - consume a payload (BYTE type + fields).
+//
+//  Each returns true on success. On any malformed/truncated input the BitReader
+//  overflow flag trips and the function returns false (never reads OOB). When
+//  `expectType` is true the leading type byte is verified to match the expected
+//  NMT; pass false if the caller already consumed/dispatched the type byte.
+// ===========================================================================
+
+bool ParseHello(const uint8_t* data, size_t len, HelloMessage& out, bool expectType = true);
+bool ParseChallenge(const uint8_t* data, size_t len, ChallengeMessage& out, bool expectType = true);
+bool ParseNetspeed(const uint8_t* data, size_t len, NetspeedMessage& out, bool expectType = true);
+bool ParseLogin(const uint8_t* data, size_t len, LoginMessage& out, bool expectType = true);
+bool ParseWelcome(const uint8_t* data, size_t len, WelcomeMessage& out, bool expectType = true);
+bool ParseFailure(const uint8_t* data, size_t len, FailureMessage& out, bool expectType = true);
+bool ParseUpgrade(const uint8_t* data, size_t len, UpgradeMessage& out, bool expectType = true);
+bool ParseJoin(const uint8_t* data, size_t len, JoinMessage& out, bool expectType = true);
+
+// Peek the leading message-type byte of a payload without fully parsing.
+// Returns false if the buffer is empty.
+bool PeekType(const uint8_t* data, size_t len, NMT& outType);
+
+// Consume the first complete control message from `r` (its leading type BYTE
+// plus the body fields for that NMT), advancing `r` past it. Returns true and
+// sets `outType` on success; returns false (with `r` overflowed, position
+// unspecified) if `r` does not yet hold a complete message OR the NMT is not a
+// recognized control message whose body length we can determine.
+//
+// This is the message DELIMITER used by the inbound reassembler to peel complete
+// messages off the continuous control-channel bit stream (UE3 has no per-message
+// length marker - the size is implicit in the NMT's fields). Its per-NMT field
+// reads MUST stay in lockstep with the Parse* functions above.
+bool ConsumeMessage(BitReader& r, NMT& outType);
+
+// ---------------------------------------------------------------------------
+//  TODO (spec §3, §9): UE3 packet/bunch framing.
+//  The functions above operate on the BUNCH PAYLOAD only. Wrapping a payload in
+//  an open-control-channel-0 bunch inside an FBitWriter packet (PacketId, ack
+//  bitfield, bControl/bOpen/bClose/bReliable, ChIndex, ChSequence, ChType,
+//  BunchDataBits, and the version-dependent bHasReferencedGUIDs bit) is NOT
+//  implemented here because those bits are [UE3]/[?] and MUST be validated by a
+//  real packet capture before they can be trusted. Stream R2's capture pins
+//  them; framing then layers cleanly on top of this codec.
+// ---------------------------------------------------------------------------
+
+} // namespace ControlChannel

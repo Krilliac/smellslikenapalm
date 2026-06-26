@@ -28,6 +28,10 @@
 #include "Game/TerritoryMode.h"
 #include "Game/SupremacyMode.h"
 #include "Game/SkirmishMode.h"
+#include "Game/ConnectionLoginBridge.h"
+#include "Protocol/ProtocolHandler.h"
+#include "Protocol/ReplicationManager.h"
+#include "Network/ClientConnection.h"
 #include "Utils/PathUtils.h"
 #include "Utils/HandlerLibraryManager.h"
 #include "Protocol/ReverseEngineering/ProtocolDecoder.h"
@@ -47,6 +51,22 @@ void GameServer::Cmd_RegenHandlers(const std::vector<std::string>& /*args*/) {
 #ifdef _WIN32
     if (codeGenExe.find(".exe") == std::string::npos) codeGenExe += ".exe";
 #endif
+
+    // GUARD (latent-defect fix): never shell out to a tool that isn't there.
+    // The PacketHandlerCodeGen executable is a build-time tool and is not
+    // guaranteed to be deployed next to the server. If it's missing, log a
+    // clear warning and no-op instead of invoking std::system() on a bogus
+    // command line (which previously fired every hour from a detached thread).
+    if (!std::filesystem::exists(codeGenExe)) {
+        Logger::Warn("[GameServer::Cmd_RegenHandlers] Code generator not found at '%s'. "
+                     "Skipping handler regeneration. Generated handlers are compiled "
+                     "statically at build time; runtime regeneration is optional and "
+                     "only available when PacketHandlerCodeGen is deployed.",
+                     codeGenExe.c_str());
+        Logger::Trace("[GameServer::Cmd_RegenHandlers] Exit (code generator missing)");
+        return;
+    }
+
     std::string handlersDir = PathUtils::ResolveFromExecutable("src/Generated/Handlers");
     std::string cmd = codeGenExe + " " + handlersDir;
 
@@ -99,6 +119,9 @@ void GameServer::StopAutoRegen() {
 
 void GameServer::DynamicReloadGeneratedHandlers() {
     Logger::Trace("[GameServer::DynamicReloadGeneratedHandlers] Entry");
+
+    auto& mgr = HandlerLibraryManager::Instance();
+
     if (m_handlerLibraryPath.empty()) {
         Logger::Debug("[GameServer::DynamicReloadGeneratedHandlers] Library path empty, resolving platform-specific path");
 #ifdef _WIN32
@@ -109,22 +132,40 @@ void GameServer::DynamicReloadGeneratedHandlers() {
         m_handlerLibraryPath = PathUtils::ResolveFromExecutable("libGeneratedHandlers.so");
 #endif
         Logger::Debug("[GameServer::DynamicReloadGeneratedHandlers] Resolved library path: %s", m_handlerLibraryPath.c_str());
+
+        // GUARD (latent-defect fix): the dynamic hot-reload library is OFF by
+        // default and is not shipped. If it isn't present, do NOT try to load
+        // it — fall back to the statically-compiled handlers (the normal path).
         if (!std::filesystem::exists(m_handlerLibraryPath)) {
-            Logger::Warn("Handler library not found: %s", m_handlerLibraryPath.c_str());
-            Logger::Trace("[GameServer::DynamicReloadGeneratedHandlers] Exit (library not found)");
+            if (mgr.HasStaticHandlers()) {
+                Logger::Info("Using statically-compiled generated handlers (no dynamic library present at '%s').",
+                             m_handlerLibraryPath.c_str());
+            } else {
+                Logger::Warn("No generated handlers available: dynamic library '%s' not found and "
+                             "no static handler registry was compiled in. Packet handling will rely "
+                             "on built-in handlers only.", m_handlerLibraryPath.c_str());
+            }
+            Logger::Trace("[GameServer::DynamicReloadGeneratedHandlers] Exit (no dynamic library; using static fallback)");
             return;
         }
-        if (!HandlerLibraryManager::Instance().Initialize(m_handlerLibraryPath)) {
-            Logger::Error("[GameServer::DynamicReloadGeneratedHandlers] Failed to initialize handler library manager");
+
+        // A dynamic library IS present — opt into the hot-reload path.
+        if (!mgr.Initialize(m_handlerLibraryPath)) {
+            Logger::Error("[GameServer::DynamicReloadGeneratedHandlers] Failed to initialize handler library manager; "
+                          "continuing with static handlers if available");
             Logger::Trace("[GameServer::DynamicReloadGeneratedHandlers] Exit (init failed)");
             return;
         }
         Logger::Debug("[GameServer::DynamicReloadGeneratedHandlers] Handler library manager initialized");
     }
-    if (HandlerLibraryManager::Instance().ForceReload()) {
+
+    // Only force a reload when a dynamic library has actually been initialized.
+    // ForceReload() itself no-ops + warns otherwise, so this is doubly safe.
+    if (mgr.ForceReload()) {
         Logger::Info("Generated handlers reloaded successfully.");
     } else {
-        Logger::Error("[GameServer::DynamicReloadGeneratedHandlers] Failed to reload generated handlers.");
+        Logger::Warn("[GameServer::DynamicReloadGeneratedHandlers] Dynamic reload unavailable; "
+                     "using statically-compiled handlers.");
     }
     Logger::Trace("[GameServer::DynamicReloadGeneratedHandlers] Exit");
 }
@@ -233,9 +274,15 @@ bool GameServer::Initialize() {
     m_projectileManager->Initialize();
     m_damageSystem->SetOnKill([this](const KillEvent& kill) {
         if (m_ticketSystem && !kill.isTeamKill) {
-            auto* tm = GetTeamManager();
-            uint32_t victimTeam = tm->GetPlayerTeam(kill.victimId);
-            m_ticketSystem->OnPlayerKilled(victimTeam);
+            // GUARD: TeamManager can be null/destroyed during shutdown; the kill
+            // callback may still fire from DamageSystem. Skip ticket accounting
+            // rather than dereference a null manager.
+            if (auto* tm = GetTeamManager()) {
+                uint32_t victimTeam = tm->GetPlayerTeam(kill.victimId);
+                m_ticketSystem->OnPlayerKilled(victimTeam);
+            } else {
+                Logger::Warn("[GameServer] Kill callback: TeamManager unavailable; skipping ticket update for victim %u", kill.victimId);
+            }
         }
         if (m_territoryMode) m_territoryMode->OnPlayerKilled(kill.killerId, kill.victimId);
         if (m_supremacyMode) m_supremacyMode->OnPlayerKilled(kill.killerId, kill.victimId);
@@ -255,6 +302,57 @@ bool GameServer::Initialize() {
     m_skirmishMode->Initialize();
 
     Logger::Info("RS2V game systems initialized");
+
+    // ------------------------------------------------------------------
+    // Security + replication + the connection->player login bridge.
+    //
+    // This is the wiring that turns a connected client into a spawned player:
+    // SecurityManager runs the PreLogin ban gate, ReplicationManager carries the
+    // GRI/PRI, and ConnectionLoginBridge mirrors the UE3 Login/PostLogin flow
+    // onto the control-channel ClientLoggedIn / ClientJoined events.
+    // ------------------------------------------------------------------
+    Logger::Debug("[GameServer::Initialize] Creating ProtocolHandler + ReplicationManager");
+    m_protocolHandler    = std::make_unique<ProtocolHandler>();
+    m_replicationManager = std::make_unique<ReplicationManager>(*m_protocolHandler);
+
+    Logger::Debug("[GameServer::Initialize] Creating ConnectionLoginBridge and subscribing handshake callbacks");
+    {
+        // The bridge constructs and owns the SecurityManager itself (from
+        // m_securityConfig). This keeps the Security headers out of this TU,
+        // avoiding the duplicate ClientAddress definition shared between
+        // Security/NetworkBlocker.h and Network/BandwidthManager.h.
+        ConnectionLoginBridge::Dependencies deps;
+        deps.playerManager      = m_playerManager.get();
+        deps.teamManager        = m_teamManager.get();
+        deps.spawnSystem        = m_spawnSystem.get();
+        deps.securityConfig     = m_securityConfig;
+        deps.replicationManager = m_replicationManager.get();
+        deps.serverConfig       = m_serverConfig;
+        deps.resolveConnection  = [this](uint32_t clientId) {
+            return GetClientConnection(clientId);
+        };
+        deps.dropConnection     = [this](uint32_t clientId, const std::string& reason) {
+            Logger::Info("[GameServer] Dropping client %u after failed PreLogin: %s", clientId, reason.c_str());
+            if (auto conn = GetClientConnection(clientId)) {
+                conn->MarkDisconnected();
+            }
+        };
+        m_loginBridge = std::make_unique<ConnectionLoginBridge>(std::move(deps));
+    }
+
+    // Subscribe GameServer to the two control-channel handshake events. This is
+    // the GameServer subscription point that routes Network -> Game.
+    if (m_networkManager) {
+        m_networkManager->SetClientLoggedInCallback(
+            [this](const ClientLoggedInEvent& ev) {
+                if (m_loginBridge) m_loginBridge->OnClientLoggedIn(ev);
+            });
+        m_networkManager->SetClientJoinedCallback(
+            [this](const ClientJoinedEvent& ev) {
+                if (m_loginBridge) m_loginBridge->OnClientJoined(ev);
+            });
+        Logger::Info("[GameServer::Initialize] Subscribed to ClientLoggedIn/ClientJoined handshake callbacks");
+    }
 
     // Start first map and game mode
     std::string mapName = m_gameConfig->GetGameSettings().mapName;
@@ -291,9 +389,30 @@ bool GameServer::Initialize() {
         });
     }
 
-    // Start periodic handler regeneration (every 1 hour by default)
-    Logger::Debug("[GameServer::Initialize] Starting periodic handler regeneration (3600s interval)");
-    StartAutoRegen(3600);
+    // Periodic handler regeneration is OFF by default. Generated packet
+    // handlers are compiled statically into the server at build time, so no
+    // runtime regeneration is needed for normal operation. The auto-regen
+    // thread only makes sense for developers who deploy the PacketHandlerCodeGen
+    // tool alongside the server and want live regeneration; it is opt-in via
+    // config and StartAutoRegen() itself guards against a missing tool.
+    bool autoRegenEnabled = false;
+    int  autoRegenInterval = 3600;
+    if (m_configManager) {
+        autoRegenEnabled  = m_configManager->GetBool("Handlers.auto_regen", false);
+        autoRegenInterval = m_configManager->GetInt("Handlers.auto_regen_interval", 3600);
+    }
+    if (autoRegenEnabled) {
+        Logger::Info("[GameServer::Initialize] Handler auto-regeneration ENABLED via config (interval=%ds)", autoRegenInterval);
+        StartAutoRegen(autoRegenInterval);
+    } else {
+        Logger::Debug("[GameServer::Initialize] Handler auto-regeneration disabled (default). "
+                      "Using statically-compiled generated handlers.");
+    }
+
+    // Resolve generated handlers for runtime use. Prefers the dynamic library
+    // when present, otherwise falls back to the statically-compiled registry.
+    // Fully guarded — never crashes when neither is available.
+    DynamicReloadGeneratedHandlers();
 
     m_running = true;
     Logger::Info("GameServer initialized successfully");
@@ -338,6 +457,15 @@ void GameServer::Run() {
         if (tag == "CHAT_MESSAGE" && m_chatManager) {
             Packet pktCopy = qpkt.packet;
             std::string chatText = pktCopy.ReadString();
+            // GUARD: chat text is attacker-controlled. Cap its length before it
+            // propagates into chat history / broadcast buffers. Valid chat is
+            // short; this only rejects abusive/oversized payloads. Non-fatal.
+            constexpr size_t kMaxChatLen = 1024;
+            if (chatText.size() > kMaxChatLen) {
+                Logger::Warn("[GameServer::Run] Oversized chat from clientId=%u (%zu bytes); truncating to %zu",
+                             qpkt.clientId, chatText.size(), kMaxChatLen);
+                chatText.resize(kMaxChatLen);
+            }
             m_chatManager->ProcessChatCommand(qpkt.clientId, chatText);
         } else if (tag == "ROLE_SELECT") {
             HandleRoleSelection(qpkt.clientId, qpkt.packet.RawData());
@@ -367,6 +495,7 @@ void GameServer::Run() {
 
         if (m_gameMode) m_gameMode->Update();
         if (m_playerManager) m_playerManager->Update();
+        if (m_replicationManager) m_replicationManager->Tick(dt);
 
         // Tick RS2V game systems
         if (m_ticketSystem) m_ticketSystem->Update(dt);
@@ -412,6 +541,13 @@ void GameServer::Shutdown() {
 
     m_running = false;
     StopAutoRegen();
+
+    // Shutdown login bridge / replication first (they reference the game
+    // subsystems below). The bridge owns and shuts down its SecurityManager.
+    Logger::Debug("[GameServer::Shutdown] Destroying login bridge and replication");
+    m_loginBridge.reset();
+    m_replicationManager.reset();
+    m_protocolHandler.reset();
 
     // Shutdown RS2V systems
     Logger::Debug("[GameServer::Shutdown] Destroying RS2V game systems");
@@ -519,7 +655,20 @@ std::shared_ptr<ConfigManager> GameServer::GetConfigManager() const { return m_c
 
 void GameServer::ChangeMap() {
     Logger::Trace("[GameServer::ChangeMap] Entry");
+    // GUARD: MapManager may be absent (init failed) or already torn down.
+    if (!m_mapManager) {
+        Logger::Error("[GameServer::ChangeMap] No MapManager available; cannot change map");
+        Logger::Trace("[GameServer::ChangeMap] Exit (no MapManager)");
+        return;
+    }
     std::string nextMap = m_mapManager->GetNextMap();
+    // GUARD: an empty next-map (no rotation configured / lookup miss) must not be
+    // fed to LoadMap. Keep the current map running instead of unloading to nothing.
+    if (nextMap.empty()) {
+        Logger::Warn("[GameServer::ChangeMap] Next map is empty (no rotation entry); staying on current map");
+        Logger::Trace("[GameServer::ChangeMap] Exit (empty next map)");
+        return;
+    }
     Logger::Info("[GameServer::ChangeMap] Changing to next map: '%s'", nextMap.c_str());
     if (m_mapManager->LoadMap(nextMap)) {
         Logger::Debug("[GameServer::ChangeMap] Map loaded successfully, transitioning GameMode");
@@ -602,13 +751,22 @@ void GameServer::HandleRoleSelection(uint32_t clientId, const std::vector<uint8_
         Logger::Info("Player %u selected role: %s", clientId, m_roleSystem->GetRoleName(role).c_str());
 
         // Apply role loadout to player
+        // GUARD: TeamManager/PlayerManager are dereferenced below; either can be
+        // null during shutdown or a partial init. The role was already assigned;
+        // just skip loadout application rather than crash.
         auto* tm = GetTeamManager();
+        auto* pm = GetPlayerManager();
+        if (!tm || !pm) {
+            Logger::Warn("[GameServer::HandleRoleSelection] TeamManager/PlayerManager unavailable; "
+                         "role assigned but loadout skipped for player %u", clientId);
+            Logger::Trace("[GameServer::HandleRoleSelection] Exit (manager unavailable)");
+            return;
+        }
         Faction faction = m_roleSystem->GetTeamFaction(tm->GetPlayerTeam(clientId));
         RoleLoadout loadout = m_roleSystem->GetRoleLoadout(role, faction);
         Logger::Debug("[GameServer::HandleRoleSelection] Applying loadout: primary='%s', secondary='%s'",
                      loadout.primaryWeapon.c_str(), loadout.secondaryWeapon.c_str());
 
-        auto* pm = GetPlayerManager();
         auto player = pm->GetPlayer(clientId);
         if (player) {
             player->ClearInventory();
@@ -718,7 +876,13 @@ void GameServer::HandleSquadAction(uint32_t clientId, const std::vector<uint8_t>
     switch (action) {
         case 0: {  // Create squad
             Logger::Debug("[GameServer::HandleSquadAction] Action: Create squad");
-            uint32_t teamId = GetTeamManager()->GetPlayerTeam(clientId);
+            // GUARD: TeamManager may be null during shutdown/partial init.
+            auto* tm = GetTeamManager();
+            if (!tm) {
+                Logger::Warn("[GameServer::HandleSquadAction] TeamManager unavailable; cannot create squad for player %u", clientId);
+                break;
+            }
+            uint32_t teamId = tm->GetPlayerTeam(clientId);
             uint32_t squadId = m_roleSystem->CreateSquad(teamId);
             if (squadId > 0) {
                 m_roleSystem->JoinSquad(clientId, squadId);
@@ -769,6 +933,19 @@ void GameServer::HandleVehicleAction(uint32_t clientId, const std::vector<uint8_
 
     uint8_t action = data[0];
     Logger::Debug("[GameServer::HandleVehicleAction] Player %u vehicle action=%u", clientId, action);
+
+    // SECURITY: heliId for Start/Stop engine is attacker-controlled. Without an ownership
+    // check any connected client could start or stop the engine of ANY helicopter on the map
+    // by spoofing heliId (a cross-player griefing vector). Mirror the case-2 control path,
+    // which already requires the requester to be the heli's pilot. Additive: the legitimate
+    // pilot is unaffected; only spoofed/foreign heliIds are rejected. (Review wf_fff418dc-46f.)
+    auto requesterPilotsHeli = [this](uint32_t cid, uint32_t hid) -> bool {
+        for (auto* h : m_helicopterPhysics->GetAllHelicopters()) {
+            if (h->vehicleId == hid) return h->pilotId == cid;
+        }
+        return false;  // unknown heli id -> not authorized
+    };
+
     switch (action) {
         case 0: {  // Enter helicopter
             Logger::Debug("[GameServer::HandleVehicleAction] Action: Enter helicopter");
@@ -818,6 +995,11 @@ void GameServer::HandleVehicleAction(uint32_t clientId, const std::vector<uint8_
             if (data.size() >= 5) {
                 uint32_t heliId = 0;
                 memcpy(&heliId, data.data() + 1, sizeof(uint32_t));
+                if (!requesterPilotsHeli(clientId, heliId)) {
+                    Logger::Warn("[GameServer::HandleVehicleAction] Player %u tried to START engine of heli %u it does not pilot - rejected",
+                                 clientId, heliId);
+                    break;
+                }
                 Logger::Debug("[GameServer::HandleVehicleAction] Starting engine on heli %u", heliId);
                 m_helicopterPhysics->StartEngine(heliId);
             } else {
@@ -830,6 +1012,11 @@ void GameServer::HandleVehicleAction(uint32_t clientId, const std::vector<uint8_
             if (data.size() >= 5) {
                 uint32_t heliId = 0;
                 memcpy(&heliId, data.data() + 1, sizeof(uint32_t));
+                if (!requesterPilotsHeli(clientId, heliId)) {
+                    Logger::Warn("[GameServer::HandleVehicleAction] Player %u tried to STOP engine of heli %u it does not pilot - rejected",
+                                 clientId, heliId);
+                    break;
+                }
                 Logger::Debug("[GameServer::HandleVehicleAction] Stopping engine on heli %u", heliId);
                 m_helicopterPhysics->StopEngine(heliId);
             } else {
@@ -885,9 +1072,11 @@ void GameServer::HandleWeaponFire(uint32_t clientId, const std::vector<uint8_t>&
         return;  // Miss — no damage
     }
 
-    // Calculate damage using weapon database
-    float distance = origin.Distance(m_playerManager->GetPlayer(victimId) ?
-                     m_playerManager->GetPlayer(victimId)->GetPosition() : origin);
+    // Calculate damage using weapon database.
+    // GUARD: m_playerManager can be null during shutdown; also avoid the
+    // double GetPlayer() lookup (and a possible null deref on the second call).
+    auto victimPlayer = m_playerManager ? m_playerManager->GetPlayer(victimId) : nullptr;
+    float distance = victimPlayer ? origin.Distance(victimPlayer->GetPosition()) : 0.0f;
 
     auto* weaponDef = m_weaponDatabase ? m_weaponDatabase->GetWeapon(weaponId) : nullptr;
     if (!weaponDef) {

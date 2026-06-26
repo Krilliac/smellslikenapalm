@@ -525,6 +525,28 @@ EACServerEmulator::ClientSession* EACServerEmulator::FindOrCreateSession(const s
         }
     }
 
+    // Sessions are keyed off the (spoofable) UDP source ip:port, so an attacker
+    // can otherwise create unlimited sessions and exhaust memory before the
+    // 5-minute stale cleanup runs. Cap the table: once full, evict the
+    // least-recently-active session to make room for the new one.
+    constexpr size_t kMaxSessions = 4096;
+    if (m_sessions.size() >= kMaxSessions) {
+        auto oldest = m_sessions.end();
+        for (auto it = m_sessions.begin(); it != m_sessions.end(); ++it) {
+            if (oldest == m_sessions.end() ||
+                it->second.lastActivity < oldest->second.lastActivity) {
+                oldest = it;
+            }
+        }
+        if (oldest != m_sessions.end()) {
+            Logger::Warn("[EACServerEmulator::FindOrCreateSession] Session cap (%zu) reached; "
+                         "evicting least-recently-active session clientId=%u (%s:%u) to admit %s:%u",
+                         kMaxSessions, oldest->first, oldest->second.ip.c_str(),
+                         oldest->second.port, ip.c_str(), port);
+            m_sessions.erase(oldest);
+        }
+    }
+
     // Create new session
     uint32_t newClientId = GenerateClientId();
     ClientSession newSession;

@@ -1,6 +1,7 @@
 // src/Config/ConfigValidator.cpp
 
 #include "Config/ConfigValidator.h"
+#include <algorithm>
 #include "Utils/Logger.h"
 #include "Utils/StringUtils.h"
 #include "Utils/FileUtils.h"

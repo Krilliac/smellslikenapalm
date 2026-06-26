@@ -696,7 +696,7 @@ INIParser::LineType INIParser::ProcessKeyValueLine(const std::string& line, cons
     return LineType::KEY_VALUE;
 }
 
-void INIParser::ProcessMultilineValue(std::istream& stream, const std::string& currentSection, size_t& lineNumber) {
+void INIParser::ProcessMultilineValue(std::istream& /*stream*/, const std::string& /*currentSection*/, size_t& /*lineNumber*/) {
     // TODO: Implement multiline value processing
     Logger::Debug("Processing multiline value (not implemented)");
 }
@@ -1158,7 +1158,7 @@ void INIParser::WritePreservedComments(std::ostream& stream, const std::string& 
     }
 }
 
-void INIParser::WritePreservedCommentsForKey(std::ostream& stream, const std::string& section, const std::string& key, bool beforeKey) {
+void INIParser::WritePreservedCommentsForKey(std::ostream& /*stream*/, const std::string& /*section*/, const std::string& /*key*/, bool /*beforeKey*/) {
     // Implementation for key-specific comment preservation
     // This would require more sophisticated comment tracking
 }

@@ -49,24 +49,80 @@ std::vector<uint8_t> Packet::Serialize() const {
 Packet Packet::FromBuffer(const std::vector<uint8_t>& buffer, PacketMetadata& meta) {
     Logger::Trace("[Packet::FromBuffer] Entry: buffer size=%zu", buffer.size());
     Packet pkt;
-    size_t offset=0;
-    uint32_t tagLen=0;
-    std::memcpy(&tagLen, &buffer[offset],4); offset+=4;
+
+    // Roadmap T0 hardening: fully validate every length/offset against the actual
+    // buffer size BEFORE reading. The legacy format is
+    //   [4B tagLen][tagLen bytes][4B payloadLen][payloadLen bytes]
+    // and previously the leading bytes were trusted blindly, allowing a malformed
+    // or real-client datagram to drive an out-of-bounds read. Now any
+    // inconsistency yields an empty parse-failure packet instead of OOB access.
+    //
+    // We always populate metadata so callers can timestamp even a rejected
+    // datagram. A rejected packet has an empty tag and empty payload.
+
+    // Always fill the timestamp first so even failures carry one.
+    meta.timestamp = (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+
+    auto rejectEmpty = [&](const char* why) -> Packet {
+        Logger::Warn("[Packet::FromBuffer] Rejecting malformed buffer (size=%zu): %s",
+                     buffer.size(), why);
+        Packet empty;
+        empty.m_readOffset = 0;
+        meta.rawTag.clear();
+        return empty;
+    };
+
+    const size_t bufSize = buffer.size();
+
+    // Need at least the 4-byte tag-length header.
+    if (bufSize < 4) {
+        return rejectEmpty("buffer smaller than 4-byte tag-length header");
+    }
+
+    size_t offset = 0;
+    uint32_t tagLen = 0;
+    std::memcpy(&tagLen, &buffer[offset], 4);
+    offset += 4;
     Logger::Debug("[Packet::FromBuffer] Read tagLen=%u", tagLen);
-    pkt.m_tag.assign((char*)&buffer[offset], tagLen); offset+=tagLen;
+
+    // tagLen must fit within the remaining buffer AND leave room for the
+    // subsequent 4-byte payload-length header. Guard against overflow in the
+    // additions by checking against the remaining byte count instead of adding.
+    const size_t afterTagHeader = offset; // == 4
+    if (tagLen > bufSize - afterTagHeader) {
+        return rejectEmpty("tag length exceeds buffer");
+    }
+    offset += tagLen;
+
+    // Read tag bytes (validated to be in range).
+    if (tagLen > 0) {
+        pkt.m_tag.assign(reinterpret_cast<const char*>(&buffer[afterTagHeader]), tagLen);
+    }
     Logger::Debug("[Packet::FromBuffer] Read tag='%s'", pkt.m_tag.c_str());
-    uint32_t payloadLen=0;
-    std::memcpy(&payloadLen, &buffer[offset],4); offset+=4;
+
+    // Need 4 bytes for the payload-length header.
+    if (offset > bufSize || bufSize - offset < 4) {
+        return rejectEmpty("missing payload-length header");
+    }
+    uint32_t payloadLen = 0;
+    std::memcpy(&payloadLen, &buffer[offset], 4);
+    offset += 4;
     Logger::Debug("[Packet::FromBuffer] Read payloadLen=%u", payloadLen);
+
+    // payloadLen must fit exactly within the remaining buffer.
+    if (payloadLen > bufSize - offset) {
+        return rejectEmpty("payload length exceeds buffer");
+    }
+
     if (payloadLen) {
-        pkt.m_payload.assign(buffer.begin()+offset, buffer.begin()+offset+payloadLen);
+        pkt.m_payload.assign(buffer.begin() + offset,
+                             buffer.begin() + offset + payloadLen);
         Logger::Debug("[Packet::FromBuffer] Copied %u payload bytes", payloadLen);
     } else {
         Logger::Debug("[Packet::FromBuffer] No payload in packet");
     }
-    // fill metadata
-    meta.timestamp = (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::system_clock::now().time_since_epoch()).count();
+
     meta.rawTag = pkt.m_tag;
     pkt.m_readOffset = 0;
     Logger::Debug("[Packet::FromBuffer] Metadata filled: timestamp=%llu, rawTag='%s'",
@@ -139,9 +195,16 @@ void Packet::WriteBytes(const std::vector<uint8_t>& data) {
 uint32_t Packet::ReadUInt() const {
     Logger::Trace("[Packet::ReadUInt] Entry: readOffset=%zu", m_readOffset);
     uint32_t v=0;
-    std::memcpy(&v, &m_payload[m_readOffset],4);
-    m_readOffset+=4;
-    Logger::Debug("[Packet::ReadUInt] Read %u, readOffset now %zu", v, m_readOffset);
+    // Bounds-check the wire-controlled read (mirror ReadUInt32). Without this, a short
+    // legacy payload causes an out-of-bounds read of m_payload[m_readOffset]. Additive.
+    if (m_readOffset + 4 <= m_payload.size()) {
+        std::memcpy(&v, &m_payload[m_readOffset],4);
+        m_readOffset+=4;
+        Logger::Debug("[Packet::ReadUInt] Read %u, readOffset now %zu", v, m_readOffset);
+    } else {
+        Logger::Warn("[Packet::ReadUInt] Not enough bytes (need 4, have %zu), returning 0",
+                     m_payload.size() - m_readOffset);
+    }
     Logger::Trace("[Packet::ReadUInt] Exit: returning %u", v);
     return v;
 }
@@ -155,9 +218,16 @@ int32_t Packet::ReadInt() const {
 
 float Packet::ReadFloat() const {
     Logger::Trace("[Packet::ReadFloat] Entry: readOffset=%zu", m_readOffset);
-    float f=0; std::memcpy(&f, &m_payload[m_readOffset],4);
-    m_readOffset+=4;
-    Logger::Debug("[Packet::ReadFloat] Read %f, readOffset now %zu", f, m_readOffset);
+    float f=0;
+    // Bounds-check the wire-controlled read (mirror ReadUInt32). Additive.
+    if (m_readOffset + 4 <= m_payload.size()) {
+        std::memcpy(&f, &m_payload[m_readOffset],4);
+        m_readOffset+=4;
+        Logger::Debug("[Packet::ReadFloat] Read %f, readOffset now %zu", f, m_readOffset);
+    } else {
+        Logger::Warn("[Packet::ReadFloat] Not enough bytes (need 4, have %zu), returning 0",
+                     m_payload.size() - m_readOffset);
+    }
     Logger::Trace("[Packet::ReadFloat] Exit: returning %f", f);
     return f;
 }
@@ -181,6 +251,14 @@ Vector3 Packet::ReadVector3() const {
 
 std::vector<uint8_t> Packet::ReadBytes(size_t count) const {
     Logger::Trace("[Packet::ReadBytes] Entry: count=%zu, readOffset=%zu", count, m_readOffset);
+    // Bounds-check: reject a count that runs past the payload (the subtraction is
+    // overflow-safe because m_readOffset <= size is an invariant of the guarded reads).
+    // Additive: an in-range count behaves exactly as before.
+    if (m_readOffset > m_payload.size() || count > m_payload.size() - m_readOffset) {
+        Logger::Warn("[Packet::ReadBytes] Not enough bytes (need %zu, have %zu), returning empty",
+                     count, (m_readOffset < m_payload.size()) ? (m_payload.size() - m_readOffset) : 0);
+        return {};
+    }
     std::vector<uint8_t> out(m_payload.begin()+m_readOffset,
                               m_payload.begin()+m_readOffset+count);
     m_readOffset+=count;
@@ -298,11 +376,30 @@ std::vector<uint8_t> Packet::EncodeString(const std::string& s) {
 
 std::string Packet::DecodeString(const std::vector<uint8_t>& buf, size_t& offset) {
     Logger::Trace("[Packet::DecodeString] Entry: offset=%zu, buf size=%zu", offset, buf.size());
+    // SECURITY: len is a fully attacker-controlled uint32 from the wire. Without the
+    // bounds checks below, an oversize len (e.g. 0xFFFFFFFF) constructs a multi-GB string
+    // reading far past the buffer (OOB read -> crash/DoS or heap info disclosure), and a
+    // payload shorter than 4 bytes reads the length prefix out of bounds. Both are
+    // attacker-reachable via a legacy-path CHAT_MESSAGE. These checks are purely additive:
+    // a correctly-framed string (len <= remaining) is byte-for-byte unaffected.
+    if (offset > buf.size() || buf.size() - offset < 4) {
+        Logger::Warn("[Packet::DecodeString] Truncated before 4-byte length prefix (offset=%zu, size=%zu), returning empty",
+                     offset, buf.size());
+        offset = buf.size();
+        return std::string();
+    }
     uint32_t len=0;
     std::memcpy(&len, &buf[offset],4);
     offset+=4;
     Logger::Debug("[Packet::DecodeString] String length=%u, reading from offset=%zu", len, offset);
-    std::string s((char*)&buf[offset], len);
+    if (len > buf.size() - offset) {
+        Logger::Warn("[Packet::DecodeString] String length %u exceeds remaining %zu bytes, returning empty",
+                     len, buf.size() - offset);
+        offset = buf.size();
+        return std::string();
+    }
+    // buf.data()+offset is well-defined for offset==size() with len==0 (unlike &buf[offset]).
+    std::string s(reinterpret_cast<const char*>(buf.data()) + offset, len);
     offset+=len;
     Logger::Debug("[Packet::DecodeString] Decoded string='%s', offset now=%zu", s.c_str(), offset);
     Logger::Trace("[Packet::DecodeString] Exit: returning string of length %u", len);

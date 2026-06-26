@@ -1,5 +1,10 @@
 // tests/LoadTests.cpp
 // Comprehensive load testing and performance validation
+//
+// API reconciliation (test-side, src unchanged): std::atomic<double> has no
+// operator+= before C++20, so the latency accumulator is updated via a small
+// compare-exchange helper (AtomicAdd) instead. No server APIs are exercised —
+// this file is a self-contained traffic simulation.
 
 #include <gtest/gtest.h>
 #include <memory>
@@ -8,6 +13,12 @@
 #include <thread>
 #include <atomic>
 #include <random>
+
+// Portable atomic floating-point add (pre-C++20 compatible).
+static inline void AtomicAdd(std::atomic<double>& acc, double v) {
+    double cur = acc.load(std::memory_order_relaxed);
+    while (!acc.compare_exchange_weak(cur, cur + v, std::memory_order_relaxed)) {}
+}
 
 // Core headers
 #include "Game/GameServer.h"
@@ -31,9 +42,15 @@ struct LoadMetrics {
     std::atomic<uint32_t> latencyCount{0};
     std::atomic<uint32_t> connections{0};
     std::atomic<uint32_t> failures{0};
-    float avgLatency() const { return latencyCount? totalLatency/latencyCount : 0; }
-    float lossRate() const { return sent? (float)dropped/sent : 0; }
-    float throughputMbps() const { return (bytes*8.0f)/(1000000.0f); }
+    float avgLatency() const {
+        uint32_t n = latencyCount.load();
+        return n ? static_cast<float>(totalLatency.load() / n) : 0.0f;
+    }
+    float lossRate() const {
+        uint64_t s = sent.load();
+        return s ? static_cast<float>(dropped.load()) / s : 0.0f;
+    }
+    float throughputMbps() const { return (bytes.load() * 8.0f) / 1000000.0f; }
 };
 
 class LoadClient {
@@ -66,7 +83,7 @@ private:
                 } else {
                     metrics.received++;
                     double lat = std::normal_distribution<double>(50,10)(rng);
-                    metrics.totalLatency += lat;
+                    AtomicAdd(metrics.totalLatency, lat);
                     metrics.latencyCount++;
                 }
                 last = now;
@@ -132,4 +149,11 @@ TEST_F(LoadTests, HighLoad_NearCapacity) {
 
 TEST_F(LoadTests, StressLoad_MaxCapacity) {
     EXPECT_TRUE(runScenario(MAX_CLIENTS, 30, PACKETS_PER_CLIENT_PER_SEC));
+}
+
+// This file did not define its own main() (unlike most test files), and we do
+// not link gtest_main — so provide the entry point here.
+int main(int argc, char** argv) {
+    ::testing::InitGoogleTest(&argc, argv);
+    return RUN_ALL_TESTS();
 }

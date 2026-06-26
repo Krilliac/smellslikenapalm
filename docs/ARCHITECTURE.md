@@ -1,762 +1,188 @@
-# ARCHITECTURE.md — System Design & Architecture
+# ARCHITECTURE — System Overview
 
-This document provides a **comprehensive overview** of the RS2V Custom Server architecture, including **system design**, **component interactions**, **data flow patterns**, and **architectural decision rationale**.  
-For API details, see **API.md**. For deployment architecture, see **DEPLOYMENT.md**.
+A from-scratch C++17 server emulator for **Rising Storm 2: Vietnam** (Unreal
+Engine 3, `EngineVersion 7258`). The goal is to let the *retail* client connect,
+complete the UE3 control-channel handshake, bootstrap the world, and reach the
+team-select menu. This document is the map for a new engineer: what the
+subsystems are, how a packet flows end-to-end, and how the process is threaded.
 
-## 1 · Architectural Overview
+> For the bit-exact wire formats this code targets, see the RE docs (ground
+> truth, not invented): [`docs/re/MASTER_replication_reference.md`](re/MASTER_replication_reference.md),
+> [`docs/RS2V_ControlChannel_WireSpec_7258.md`](RS2V_ControlChannel_WireSpec_7258.md),
+> [`docs/RS2V_PostJoin_Replication_7258.md`](RS2V_PostJoin_Replication_7258.md),
+> [`docs/re/open_bunch_structure.md`](re/open_bunch_structure.md).
 
-### 1.1 Design Philosophy
+---
 
-The RS2V server follows **modular architecture** principles with clear separation of concerns:
+## 1 · Subsystem map
 
-| Principle | Implementation | Benefit |
-|-----------|----------------|---------|
-| **Modularity** | Independent subsystems with defined interfaces | Maintainability, testability |
-| **Performance** | Multi-threaded, zero-copy where possible | Low latency, high throughput |
-| **Extensibility** | Plugin system, script hooks | Customization without core changes |
-| **Observability** | Comprehensive telemetry and logging | Production monitoring and debugging |
-| **Security** | Defense-in-depth, input validation | Robust against attacks and exploits |
+Source lives under `src/`. Each directory is one subsystem.
 
-### 1.2 High-Level Architecture
+| Subsystem | Dir | Responsibility | Key files |
+|-----------|-----|----------------|-----------|
+| **Network** | `src/Network` | UDP I/O, UE3 packet/bunch **framing**, per-connection handshake + reliability, actor-channel bootstrap. This is where the live client connection lives. | `ConnectionManager`, `PacketCodec`, `BitReader`/`BitWriter`, `HandshakeState`, `ControlChannel`, `PacketAssembler`, `ControlReassembler`, `NetworkManager`, `UDPSocket` |
+| **Protocol** | `src/Protocol` | Higher-level message/RPC/replication layer above framing: property replication, RPC dispatch, compression, UE3 protocol glue. | `ReplicationManager`, `RPCHandler`, `PropertyReplication`, `ActorReplication`, `UE3Protocol`, `MessageEncoder`/`Decoder`, `CompressionHandler` |
+| **Game** | `src/Game` | Game state and gameplay rules: players, teams, roles, spawns, maps, rounds, modes, scoring. Hosts the **login bridge** that turns a connected socket into a spawned player. | `GameServer`, `ConnectionLoginBridge`, `PlayerManager`, `TeamManager`, `RoleSystem`, `SpawnSystem`, `MapManager`, `GameMode`, `ReplicationInfo.h` (PRI/GRI/TeamInfo) |
+| **Security** | `src/Security` | Auth (stubbed Steam), bans, EAC server **emulation** (the retail client expects EAC), token/password handling. | `EACServerEmulator`, `SecurityManager`, `BanManager`, `AuthManager`, `SteamAuth` |
+| **Config** | `src/Config` | INI parsing + typed config wrappers loaded at startup. | `ConfigManager`, `INIParser`, `ServerConfig`, `NetworkConfig`, `SecurityConfig`, `GameConfig`, `MapConfig` |
+| **Utils** | `src/Utils` | Cross-cutting helpers: logging, crash handler, threadpool, memory pool, crypto, string/file/path. | `Logger`, `CrashHandler`, `ThreadPool`, `MemoryPool`, `CryptoUtils` |
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                          RS2V Server                           │
-├─────────────────┬─────────────────┬─────────────────────────────┤
-│   Game Logic    │    Security     │        Telemetry           │
-│                 │                 │                            │
-│ • GameServer    │ • EAC Proxy     │ • TelemetryManager         │
-│ • PlayerManager │ • AuthManager   │ • MetricsReporter[]        │
-│ • TeamManager   │ • BanManager    │ • PrometheusReporter       │
-│ • RoundManager  │ • InputValidator│ • FileReporter             │
-│ • MapManager    │ • MovementValid │ • AlertReporter            │
-├─────────────────┼─────────────────┼─────────────────────────────┤
-│   Networking    │     Physics     │        Utilities           │
-│                 │                 │                            │
-│ • NetworkMgr    │ • PhysicsEngine │ • ThreadPool               │
-│ • PacketSerial  │ • CollisionDet  │ • MemoryPool               │
-│ • Replication   │ • VehicleMgr    │ • ConfigManager            │
-│ • Compression   │ • ProjectileMgr │ • Logger                   │
-│ • UE3Protocol   │ • RigidBody     │ • CryptoUtils              │
-└─────────────────┴─────────────────┴─────────────────────────────┘
-┌─────────────────────────────────────────────────────────────────┐
-│                      Scripting Layer                           │
-│                                                                 │
-│ • ScriptHost (C#/.NET)    • HandlerLibraryManager (Native)     │
-│ • Roslyn Compiler        • Dynamic Plugin Loading              │
-│ • Sandbox Security       • Hot Reload Support                  │
-└─────────────────────────────────────────────────────────────────┘
-```
+Supporting dirs: **Time** (`GameClock`, the fixed-timestep driver; tick/latency
+managers), **Physics** (`PhysicsEngine`, movement/input validators, anti-cheat),
+**Math** (`Vector3`), **Scripting** (C# host — **disabled**, does not build; see
+`CMakeLists.txt`), and top-level `telemetry/` (metrics sampling + reporters).
 
-## 2 · Core Subsystems
+---
 
-### 2.1 Network Layer
+## 2 · End-to-end pipeline
 
-#### 2.1.1 Component Hierarchy
+What happens from a UDP datagram to a player standing in the world. Each arrow
+cites the function that does the work.
 
 ```
-NetworkManager (Singleton)
-├── UDPSocket (Platform abstraction)
-├── PacketSerializer (Protocol handling)
-├── CompressionHandler (zlib/Brotli)
-├── RateLimiter (DDoS protection)
-└── ClientConnectionManager
-    ├── ClientConnection[1..N]
-    ├── HeartbeatManager
-    └── TimeoutDetector
+ retail client (UDP :7777)
+        │  datagram
+        ▼
+┌──────────────────────────────────────────────────────────────────────────┐
+│ NETWORK LAYER (src/Network)                                                │
+│                                                                            │
+│  ConnectionManager::PumpNetwork()        drain ≤256 datagrams/pump,        │
+│    └─ CreateOrGetClient()                bandwidth-gate, map addr→clientId │
+│    └─ HandleIncomingPacket()                                               │
+│         └─ ParseIncomingControl()        PacketCodec::Decode → bunches,    │
+│              │                           ack the packet, feed reliable     │
+│              │                           bunches to ControlReassembler     │
+│              ▼                                                             │
+│         HandshakeState::HandleControlMessage()   per-connection state m/c  │
+│           StatelessConnect (0x1d→0x20)                                     │
+│             → Hello → Challenge → Login → Welcome → Join                   │
+│           fires ClientLoggedIn / ClientJoined  (observer callbacks)        │
+└───────────────────────────────┬────────────────────────────────────────────┘
+            ClientLoggedIn / ClientJoined (no Network→Game compile dependency)
+                                ▼
+┌──────────────────────────────────────────────────────────────────────────┐
+│ GAME LAYER (src/Game)                                                       │
+│                                                                            │
+│  ConnectionLoginBridge::OnClientLoggedIn()                                 │
+│     PreLogin gate → Login → make PlayerReplicationInfo, ensure GRI         │
+│  ConnectionLoginBridge::OnClientJoined()                                   │
+│     PostLogin → PickTeam → SpawnSystem spawn → mark active                 │
+└───────────────────────────────┬────────────────────────────────────────────┘
+                                ▼
+┌──────────────────────────────────────────────────────────────────────────┐
+│ WORLD BOOTSTRAP + MENU (back in ConnectionManager, post-Join)             │
+│                                                                            │
+│  SendReplicationBootstrap()  PackageMap export (NetGUID/package list)      │
+│  SendActorBootstrap()        open actor channels: ROGameReplicationInfo,   │
+│                              ROTeamInfo, local ROPlayerController, PRIs     │
+│  SendCh2Rpc(ClientShowTeamSelect)   → client renders team-select menu      │
+│                                                                            │
+│  inbound: DecodeInboundActorBunch() → SelectTeam RPC                       │
+│            → ClientShowRoleSelect → role → SPAWN_REQUEST                   │
+└──────────────────────────────────────────────────────────────────────────┘
 ```
 
-#### 2.1.2 Packet Flow
+**Framing detail (Network).** `PacketCodec` decodes/encodes the
+`<PacketId><acks><bunches><terminator>` UE3 wire structure using LSB-first
+`BitReader`/`BitWriter` (FBitReader/FBitWriter-compatible). `MaxPacket` is
+phase-dependent: 8 bytes during StatelessConnect, then 2048 for inbound NMT
+decode and 1500 for our outbound encode — the exact bounds matter bit-for-bit
+(`src/Network/PacketCodec.h` documents why). Outbound framing (PacketId /
+ChSequence assignment, fragmentation, acks) is `PacketAssembler`; inbound
+ordering/dedup of reliable control bunches is `ControlReassembler`. Reliable
+bunches are retransmitted until acked — `ConnectionManager::SendReliableBunches`
+records them, `OnClientAck` clears them, `RetransmitTick` (run every pump) resends.
 
-```mermaid
-graph TD
-    A[Client UDP Packet] --> B[NetworkManager::ReceivePacket]
-    B --> C[RateLimiter::CheckLimit]
-    C --> D[PacketSerializer::Deserialize]
-    D --> E[CompressionHandler::Decompress]
-    E --> F[InputValidator::Validate]
-    F --> G[GameServer::ProcessPacket]
-    G --> H[Handler Dispatch]
-    H --> I[Generate Response]
-    I --> J[PacketSerializer::Serialize]
-    J --> K[NetworkManager::SendPacket]
-```
+**Decoupling.** The Network layer never `#include`s anything from Game. The
+handshake notifies Game purely through `std::function` observers
+(`ClientLoggedInEvent` / `ClientJoinedEvent` in `HandshakeState.h`), wired in
+`GameServer::Initialize` to the `ConnectionLoginBridge`. The bridge reaches back
+into Network only through a connection-resolver callback, so it is unit-testable
+without a socket.
 
-#### 2.1.3 Threading Model
+---
 
-| Thread | Responsibility | Frequency |
-|--------|----------------|-----------|
-| **Network I/O** | UDP recv/send, socket management | ~2kHz event-driven |
-| **Main/Game** | Game logic, physics, packet processing | 60Hz fixed |
-| **Telemetry** | Metrics collection and reporting | 1Hz configurable |
-| **Script Worker** | C# script execution (pooled) | On-demand |
+## 3 · Threading model
 
-### 2.2 Game Logic Layer
-
-#### 2.2.1 Game State Management
-
-```cpp
-class GameServer {
-private:
-    std::unique_ptr m_playerMgr;
-    std::unique_ptr m_teamMgr;
-    std::unique_ptr m_roundMgr;
-    std::unique_ptr m_mapMgr;
-    std::unique_ptr m_physics;
-    
-    GameState m_state;
-    uint64_t m_currentTick;
-    std::chrono::steady_clock::time_point m_lastTickTime;
-};
-```
-
-#### 2.2.2 Entity-Component System (Lightweight)
+The server is, in practice, **single-threaded for game + network**. There is no
+separate network thread in the live path.
 
 ```
-Entity (uint32_t ID)
-├── Transform Component (Position, Rotation, Scale)
-├── Physics Component (RigidBody, Collision)
-├── Network Component (Replication flags)
-├── Health Component (HP, Max HP, Regen)
-└── [Custom Components via Scripts]
+main() ─ src/main.cpp
+  │  InstallCrashHandler, InitializeLogging, SocketFactory::Initialize (WSAStartup)
+  │  GameServer::Initialize()  → ConfigManager, NetworkManager(→ConnectionManager,
+  │                              binds UDP), all Game subsystems, ProtocolHandler,
+  │                              ReplicationManager, ConnectionLoginBridge
+  │  EACServerEmulator::Initialize(port 7957)
+  │  TelemetryManager::Initialize + StartSampling
+  │
+  └─ GameClock::RunLoop()   fixed timestep @ tickRate (default 60 Hz)
+        every tick → callback:
+          GameServer::Run()                       ← all game + network work here
+            ├ NetworkManager::PollNetwork()
+            │    └ ConnectionManager::PumpNetwork()  recv, decode, handshake,
+            │                                        RetransmitTick
+            │    └ RemoveStaleConnections, BandwidthManager::Update
+            ├ FetchPendingPackets() → dispatch by tag (CHAT/ROLE_SELECT/SPAWN_…)
+            ├ tick subsystems (GameMode, PlayerManager, ReplicationManager,
+            │   TicketSystem, ObjectiveSystem, SpawnSystem, DamageSystem,
+            │   ProjectileManager, HelicopterPhysics, active GameMode)
+            └ NetworkManager::Flush()
+          EACServerEmulator::ProcessRequests()
 ```
 
-#### 2.2.3 Game Loop
-
-```cpp
-void GameServer::TickLoop() {
-    auto now = std::chrono::steady_clock::now();
-    auto dt = std::chrono::duration(now - m_lastTickTime).count();
-    
-    // 1. Process network input
-    m_networkMgr->ProcessIncomingPackets();
-    
-    // 2. Update game logic
-    m_playerMgr->Update(dt);
-    m_teamMgr->Update(dt);
-    m_roundMgr->Update(dt);
-    
-    // 3. Step physics simulation
-    m_physics->Update(dt);
-    
-    // 4. Execute scripts
-    m_scriptHost->BroadcastEvent("OnTick", {{"dt", dt}});
-    
-    // 5. Generate replication snapshot
-    auto snapshot = m_replicationMgr->CreateSnapshot();
-    
-    // 6. Send network updates
-    m_networkMgr->BroadcastSnapshot(snapshot);
-    
-    // 7. Update telemetry
-    TELEMETRY_UPDATE_TICK(++m_currentTick);
-    
-    m_lastTickTime = now;
-}
-```
-
-### 2.3 Physics Engine
-
-#### 2.3.1 Architecture
-
-```
-PhysicsEngine
-├── BroadPhase (Sweep and Prune)
-│   └── AABB[] (Spatial partitioning)
-├── NarrowPhase (SAT collision detection)
-│   └── ContactManifold[] (Collision pairs)
-├── Dynamics (Integration)
-│   └── RigidBody[] (Entities)
-└── Constraints (Joints, limits)
-    ├── VehicleConstraint[]
-    └── ProjectileConstraint[]
-```
-
-#### 2.3.2 Integration Pipeline
-
-```mermaid
-graph LR
-    A[Collect Forces] --> B[Integrate Velocity]
-    B --> C[Broad Phase]
-    C --> D[Narrow Phase]
-    D --> E[Solve Constraints]
-    E --> F[Integrate Position]
-    F --> G[Update Game State]
-```
-
-### 2.4 Replication System
-
-#### 2.4.1 Actor Replication
-
-```cpp
-struct ReplicatedActor {
-    uint32_t actorId;
-    ActorType type;
-    uint32_t ownerId;           // Client that controls this actor
-    ReplicationFlags flags;     // What to replicate
-    
-    std::unordered_map properties;
-    std::vector queuedRPCs;
-    
-    std::chrono::steady_clock::time_point lastUpdate;
-    uint32_t priority;          // Replication priority
-};
-```
-
-#### 2.4.2 Delta Compression
-
-| Strategy | Use Case | Compression Ratio |
-|----------|----------|-------------------|
-| **Property Delta** | Changed properties only | 60-80% |
-| **Quantization** | Position, rotation vectors | 40-60% |
-| **Prediction** | Extrapolated movement | 70-90% |
-| **Run-Length Encoding** | Repeated values | 30-50% |
-
-### 2.5 Security Architecture
-
-#### 2.5.1 Security Layers
-
-```
-┌─────────────────────────────────────────┐
-│           Application Layer             │
-│  • Input Validation  • Access Control  │
-├─────────────────────────────────────────┤
-│          Anti-Cheat Layer               │
-│  • EAC Integration  • Behavior Analysis │
-├─────────────────────────────────────────┤
-│          Protocol Layer                 │
-│  • Packet Validation  • Rate Limiting  │
-├─────────────────────────────────────────┤
-│          Transport Layer                │
-│  • HMAC Integrity  • Optional Encrypt  │
-├─────────────────────────────────────────┤
-│          Network Layer                  │
-│  • Firewall Rules  • DDoS Protection   │
-└─────────────────────────────────────────┘
-```
-
-#### 2.5.2 Authentication Flow
-
-```mermaid
-sequenceDiagram
-    participant C as Client
-    participant S as RS2V Server
-    participant ST as Steam API
-    participant E as EAC Service
-    
-    C->>S: Connect Request + Steam Ticket
-    S->>ST: Validate Steam Ticket
-    ST->>S: Validation Response
-    S->>E: Register Client for EAC
-    E->>S: EAC Registration OK
-    S->>C: Authentication Success
-```
-
-## 3 · Data Flow and Communication
-
-### 3.1 Inter-Component Communication
-
-#### 3.1.1 Event System
-
-```cpp
-template
-class EventBus {
-public:
-    using Handler = std::function;
-    
-    void Subscribe(Handler handler);
-    void Publish(const EventType& event);
-    
-private:
-    std::vector m_handlers;
-    std::mutex m_mutex;
-};
-
-// Global event types
-namespace Events {
-    struct PlayerConnected { uint32_t playerId; std::string steamId; };
-    struct PlayerDisconnected { uint32_t playerId; std::string reason; };
-    struct RoundStarted { std::string mapName; GameMode mode; };
-    struct SecurityViolation { uint32_t playerId; ViolationType type; };
-}
-```
-
-#### 3.1.2 Message Passing Patterns
-
-| Pattern | Use Case | Implementation |
-|---------|----------|----------------|
-| **Observer** | Event notifications | EventBus template |
-| **Command** | Network packet handling | HandlerRegistry |
-| **Publish-Subscribe** | Telemetry reporting | MetricsReporter interface |
-| **Producer-Consumer** | Script execution | ThreadPool work queue |
-
-### 3.2 Memory Management
-
-#### 3.2.1 Memory Pools
-
-```cpp
-template
-class MemoryPool {
-public:
-    void* Allocate();
-    void Deallocate(void* ptr);
-    
-private:
-    static constexpr size_t POOL_SIZE = 1024 * 1024; // 1MB pools
-    std::vector> m_pools;
-    std::stack m_freeBlocks;
-    std::mutex m_mutex;
-};
-
-// Specialized pools for common sizes
-extern MemoryPool g_smallBlockPool;     // Packets, small objects
-extern MemoryPool g_mediumBlockPool;   // Player data, medium objects
-extern MemoryPool g_largeBlockPool;   // Maps, large objects
-```
-
-#### 3.2.2 Object Lifetime Management
-
-| Object Type | Lifetime | Management Strategy |
-|-------------|----------|-------------------|
-| **Static Config** | Process lifetime | Global singletons |
-| **Game Entities** | Round/match | Smart pointers, RAII |
-| **Network Packets** | Single frame | Memory pools |
-| **Telemetry Data** | Configurable | Circular buffers |
-| **Script Objects** | Script execution | Managed by .NET GC |
-
-### 3.3 Configuration Management
-
-#### 3.3.1 Configuration Hierarchy
-
-```
-Configuration Sources (Priority: High → Low)
-├── Command Line Arguments        (--port 8777)
-├── Environment Variables         ($RS2V_PORT)
-├── Config Files                  (server.ini)
-├── Default Values               (Hardcoded)
-└── Auto-Detected Values        (Hardware detection)
-```
-
-#### 3.3.2 Hot Reload Mechanism
-
-```cpp
-class ConfigWatcher {
-public:
-    void WatchFile(const std::string& path, 
-                   std::function callback);
-private:
-    std::thread m_watcherThread;
-    
-#ifdef _WIN32
-    HANDLE m_directoryHandle;
-#else
-    int m_inotifyFd;
-#endif
-};
-```
-
-## 4 · Threading and Concurrency
-
-### 4.1 Thread Architecture
-
-```
-┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐
-│   Main Thread   │  │ Network Thread  │  │Telemetry Thread │
-│                 │  │                 │  │                 │
-│ • Game Logic    │  │ • Socket I/O    │  │ • Metrics       │
-│ • Physics       │  │ • Packet Queue  │  │ • Reporting     │
-│ • Script Hooks  │  │ • Rate Limiting │  │ • File I/O      │
-│ • Rendering     │  │ • Compression   │  │ • HTTP Server   │
-└─────────────────┘  └─────────────────┘  └─────────────────┘
-         │                      │                      │
-         └──────────────────────┼──────────────────────┘
-                                │
-                    ┌─────────────────┐
-                    │  Thread Pool    │
-                    │                 │
-                    │ • Script Exec   │
-                    │ • File I/O      │
-                    │ • Background    │
-                    │   Tasks         │
-                    └─────────────────┘
-```
-
-### 4.2 Synchronization Primitives
-
-| Primitive | Use Case | Performance |
-|-----------|----------|-------------|
-| **std::shared_mutex** | Config, player lists | Reader-optimized |
-| **std::mutex** | Critical sections | Standard protection |
-| **std::atomic** | Counters, flags | Lock-free operations |
-| **thread_local** | Per-thread caches | Zero contention |
-
-### 4.3 Lock Hierarchy
-
-To prevent deadlocks, locks must be acquired in this order:
-
-```
-1. ConfigManager::m_configMutex
-2. PlayerManager::m_playerMutex
-3. NetworkManager::m_clientMutex
-4. TelemetryManager::m_snapshotMutex
-5. Logger::m_logMutex
-```
-
-## 5 · Scalability Considerations
-
-### 5.1 Performance Bottlenecks
-
-| Bottleneck | Mitigation Strategy | Implementation |
-|------------|-------------------|----------------|
-| **Network I/O** | Async UDP, packet batching | `epoll`/`IOCP` |
-| **Physics** | Spatial partitioning, multithreading | Broad-phase optimization |
-| **Script Execution** | Thread pooling, timeouts | .NET ThreadPool |
-| **Memory Allocation** | Object pooling, stack allocation | Custom allocators |
-| **Log I/O** | Async logging, ring buffers | Background thread |
-
-### 5.2 Horizontal Scaling Design
-
-```
-┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐
-│   Game Server   │  │   Game Server   │  │   Game Server   │
-│     Instance    │  │     Instance    │  │     Instance    │
-│       #1        │  │       #2        │  │       #3        │
-└─────────────────┘  └─────────────────┘  └─────────────────┘
-         │                      │                      │
-         └──────────────────────┼──────────────────────┘
-                                │
-                    ┌─────────────────┐
-                    │  Load Balancer  │
-                    │                 │
-                    │ • Health Check  │
-                    │ • Player Rout   │
-                    │ • Session Aff   │
-                    └─────────────────┘
-                                │
-                    ┌─────────────────┐
-                    │ Shared Services │
-                    │                 │
-                    │ • Auth Service  │
-                    │ • Ban Database  │
-                    │ • Telemetry     │
-                    │ • Config Store  │
-                    └─────────────────┘
-```
-
-### 5.3 Resource Optimization
-
-#### 5.3.1 Memory Optimization
-
-```cpp
-// Efficient player data structure
-struct Player {
-    uint32_t id;                    // 4 bytes
-    Vector3 position;               // 12 bytes
-    Quaternion rotation;            // 16 bytes  
-    uint16_t health;                // 2 bytes
-    uint16_t team : 1;              // Bitfield
-    uint16_t alive : 1;
-    uint16_t admin : 1;
-    uint16_t reserved : 13;
-    // Total: 36 bytes (cache-friendly)
-};
-```
-
-#### 5.3.2 Network Optimization
-
-| Technique | Savings | Implementation |
-|-----------|---------|----------------|
-| **Delta Compression** | 60-80% | Track property changes |
-| **Quantization** | 40-60% | Reduce float precision |
-| **Bit Packing** | 30-50% | Pack boolean flags |
-| **Huffman Coding** | 20-40% | Compress common strings |
-
-## 6 · Security Architecture
-
-### 6.1 Threat Model Implementation
-
-```cpp
-namespace Security {
-
-class ThreatMitigator {
-public:
-    // Network-level threats
-    bool MitigateDDoS(const PacketInfo& packet);
-    bool MitigateFlood(const ClientInfo& client);
-    
-    // Application-level threats  
-    bool MitigateInjection(const std::string& input);
-    bool MitigatePrivilegeEscalation(const Command& cmd);
-    
-    // Game-specific threats
-    bool MitigateSpeedHack(const MovementData& movement);
-    bool MitigateAimBot(const InputData& input);
-    
-private:
-    RateLimiter m_packetLimiter;
-    InputValidator m_inputValidator;
-    MovementValidator m_movementValidator;
-    BehaviorAnalyzer m_behaviorAnalyzer;
-};
-
-}
-```
-
-### 6.2 Cryptographic Architecture
-
-```cpp
-namespace Crypto {
-
-class CryptoManager {
-public:
-    // Session key management
-    SessionKey GenerateSessionKey();
-    bool ValidateSessionKey(const SessionKey& key);
-    
-    // Packet integrity
-    std::string ComputeHMAC(const PacketData& data, const SessionKey& key);
-    bool VerifyHMAC(const PacketData& data, const std::string& hmac, const SessionKey& key);
-    
-    // Optional encryption
-    EncryptedData Encrypt(const PacketData& data, const SessionKey& key);
-    PacketData Decrypt(const EncryptedData& encrypted, const SessionKey& key);
-    
-private:
-    std::unique_ptr m_cipherCtx;
-    std::unique_ptr m_hmacCtx;
-};
-
-}
-```
-
-## 7 · Monitoring and Observability
-
-### 7.1 Telemetry Architecture
-
-```
-Metrics Collection
-├── System Metrics (CPU, Memory, Network)
-├── Application Metrics (Players, Packets, Performance)
-├── Business Metrics (Kills, Deaths, Score)
-└── Security Metrics (Violations, Bans, Alerts)
-                    │
-                    ▼
-            TelemetryManager
-                    │
-         ┌──────────┼──────────┐
-         ▼          ▼          ▼
-   FileReporter PrometheusR MemoryReporter
-         │          │          │
-         ▼          ▼          ▼
-    JSON Files  HTTP Endpoint CircularBuffer
-                    │
-                    ▼
-                Grafana
-               Dashboard
-```
-
-### 7.2 Distributed Tracing
-
-```cpp
-namespace Tracing {
-
-class TraceContext {
-public:
-    static TraceContext* Current();
-    
-    SpanId StartSpan(const std::string& operation);
-    void FinishSpan(SpanId span);
-    void AddAttribute(const std::string& key, const std::string& value);
-    
-private:
-    thread_local static std::unique_ptr s_current;
-    std::stack m_spanStack;
-    std::unordered_map m_spans;
-};
-
-// Automatic span management
-class ScopedSpan {
-public:
-    ScopedSpan(const std::string& operation) 
-        : m_span(TraceContext::Current()->StartSpan(operation)) {}
-    ~ScopedSpan() { TraceContext::Current()->FinishSpan(m_span); }
-private:
-    SpanId m_span;
-};
-
-#define TRACE_SPAN(name) ScopedSpan _span(name)
-
-}
-```
-
-## 8 · Build and Deployment Architecture
-
-### 8.1 Build System Design
-
-```
-CMakeLists.txt (Root)
-├── dependencies.cmake      # Third-party libraries
-├── compiler-settings.cmake # C++ flags, warnings
-├── testing.cmake          # GoogleTest integration
-└── packaging.cmake        # CPack configuration
-    │
-    ├── Server/
-    │   ├── CMakeLists.txt
-    │   ├── Core/
-    │   ├── Network/
-    │   ├── Physics/
-    │   └── Security/
-    │
-    ├── telemetry/
-    │   └── CMakeLists.txt
-    │
-    └── tests/
-        └── CMakeLists.txt
-```
-
-### 8.2 Dependency Management
-
-| Dependency | Version | Purpose | Justification |
-|------------|---------|---------|---------------|
-| **OpenSSL** | 3.0+ | Cryptography | Industry standard |
-| **zlib** | 1.2.11+ | Compression | Lightweight, fast |
-| **GoogleTest** | 1.12+ | Testing | Comprehensive test framework |
-| **nlohmann/json** | 3.10+ | Configuration | Header-only, fast |
-| **.NET 7** | 7.0+ | C# Scripting | Microsoft-supported |
-
-### 8.3 Containerization Strategy
-
-```dockerfile
-# Multi-stage build for minimal runtime image
-FROM ubuntu:22.04 AS builder
-RUN apt-get update && apt-get install -y build-essential cmake
-COPY . /src
-WORKDIR /src
-RUN cmake -B build -DCMAKE_BUILD_TYPE=Release
-RUN cmake --build build --parallel
-
-FROM ubuntu:22.04 AS runtime
-RUN apt-get update && apt-get install -y libssl3 zlib1g
-COPY --from=builder /src/build/bin/rs2v_server /usr/local/bin/
-USER 1000:1000
-ENTRYPOINT ["/usr/local/bin/rs2v_server"]
-```
-
-## 9 · Future Architecture Considerations
-
-### 9.1 Planned Enhancements
-
-| Feature | Timeline | Architectural Impact |
-|---------|----------|---------------------|
-| **Kubernetes Native** | Q3 2025 | Service mesh integration |
-| **GraphQL API** | Q4 2025 | New API layer |
-| **Machine Learning** | Q1 2026 | ML pipeline integration |
-| **Blockchain Integration** | Q2 2026 | Distributed ledger |
-
-### 9.2 Technical Debt
-
-| Item | Priority | Effort | Impact |
-|------|----------|--------|--------|
-| **Replace custom JSON with faster library** | Medium | 2-3 weeks | 15% performance gain |
-| **Implement zero-copy networking** | High | 1-2 months | 25% network performance |
-| **Add formal API versioning** | Low | 1 week | Future compatibility |
-
-### 9.3 Architectural Evolution
-
-```mermaid
-graph LR
-    A[Monolithic v0.9] --> B[Modular v1.0]
-    B --> C[Microservices v1.5]
-    C --> D[Cloud Native v2.0]
-    D --> E[Edge Computing v2.5]
-```
-
-## 10 · Development Guidelines
-
-### 10.1 Design Patterns Used
-
-| Pattern | Application | Rationale |
-|---------|-------------|-----------|
-| **Singleton** | Managers (Network, Config, Telemetry) | Global access, controlled instantiation |
-| **Observer** | Event system | Loose coupling between components |
-| **Strategy** | Anti-cheat algorithms | Pluggable detection methods |
-| **Factory** | Telemetry reporters | Runtime reporter selection |
-| **RAII** | Resource management | Automatic cleanup, exception safety |
-
-### 10.2 Coding Standards
-
-```cpp
-// Example: Proper error handling and resource management
-class NetworkManager {
-public:
-    // Clear ownership semantics
-    std::unique_ptr CreateSocket(const EndpointConfig& config) {
-        auto socket = std::make_unique();
-        
-        if (!socket->Bind(config.port)) {
-            throw NetworkException("Failed to bind to port " + std::to_string(config.port));
-        }
-        
-        return socket;  // Transfer ownership
-    }
-    
-    // Exception-safe operations
-    bool ProcessPackets() noexcept {
-        try {
-            // Processing logic that might throw
-            return ProcessPacketsImpl();
-        } catch (const std::exception& e) {
-            Logger::Error("Packet processing failed: %s", e.what());
-            return false;
-        }
-    }
-    
-private:
-    bool ProcessPacketsImpl();  // Can throw
-};
-```
-
-### 10.3 Performance Guidelines
-
-| Guideline | Rationale | Example |
-|-----------|-----------|---------|
-| **Minimize allocations in hot paths** | Reduce GC pressure | Use object pools |
-| **Prefer stack allocation** | Cache locality | `std::array` over `std::vector` |
-| **Use const& for large objects** | Avoid copies | `const Vector3& position` |
-| **Mark functions noexcept when possible** | Compiler optimizations | `size_t GetPlayerCount() noexcept` |
-
-## 11 · Quality Assurance
-
-### 11.1 Testing Strategy
-
-```
-Testing Pyramid
-    ┌─────────────┐
-    │   E2E Tests │  ← Integration/System tests
-    ├─────────────┤
-    │Service Tests│  ← Component/Service tests  
-    ├─────────────┤
-    │ Unit Tests  │  ← Function/Class tests
-    └─────────────┘
-```
-
-### 11.2 Performance Testing
-
-| Test Type | Frequency | Metrics |
-|-----------|-----------|---------|
-| **Load Testing** | Pre-release | 64 concurrent players |
-| **Stress Testing** | Monthly | 150% capacity |
-| **Endurance Testing** | Quarterly | 72-hour run |
-| **Spike Testing** | Per feature | Sudden traffic increase |
-
-### 11.3 Security Testing
-
-| Test Category | Tools | Coverage |
-|---------------|-------|----------|
-| **Static Analysis** | Clang-tidy, SonarQube | 100% code |
-| **Dynamic Analysis** | Valgrind, AddressSanitizer | Runtime checks |
-| **Penetration Testing** | Custom tools, nmap | Network layer |
-| **Fuzzing** | LibFuzzer, AFL | Input validation |
-
-**End of ARCHITECTURE.md**  
-This document evolves with the codebase. For questions or clarifications about architectural decisions, open an issue with the **architecture** label.
+Auxiliary threads (not the game loop):
+- **Telemetry sampling thread** — `TelemetryManager::StartSampling` (default 1 Hz).
+- **Optional handler auto-regen thread** — `GameServer::m_regenThread`, off by
+  default (`StartAutoRegen`).
+- **EAC emulator** — may service requests on its own listener; the loop also calls
+  `ProcessRequests()` each tick for the non-threaded path.
+
+> **Note — `NetworkThread` is currently dead code.** `src/Network/NetworkThread.{h,cpp}`
+> implements an alternative model (its own thread calling `PumpNetwork` + a tick
+> callback at a set rate), but nothing instantiates it — the live server drives
+> `PumpNetwork` synchronously from `GameServer::Run` via `GameClock`. It is a
+> candidate to either wire up (move network I/O off the game tick) or remove.
+
+Concurrency is therefore minimal: the per-connection state (`m_clients`,
+`m_handshakes`, `m_controlState` in `ConnectionManager`) is touched only from the
+game tick. The cross-thread seams are the packet queue
+(`GameServer::m_packetQueue`, mutex-guarded) and telemetry.
+
+---
+
+## 4 · Client-connection lifecycle
+
+One `ClientConnection` per remote address (`ConnectionManager::CreateOrGetClient`
+allocates a `clientId`). Its progression, with the owning state:
+
+| Phase | Where the state lives | What happens |
+|-------|----------------------|--------------|
+| **StatelessConnect** | `HandshakeState` (`m_controlHandshakeComplete`) | UE3 cookie handshake `0x1d→0x1e→0x1f→0x20`; on completion `MaxPacket` grows 8→2048 and the NMT phase begins. |
+| **Hello → Challenge** | `HandshakePhase::ChallengeSent` | Client `NMT_Hello` (version, SteamId, rate, URL); server emits Challenge nonce. Steam auth is **stubbed** (accepted blindly). |
+| **Login → Welcome** | `HandshakePhase::WelcomeSent` | `NMT_Login` parsed → `ClientLoggedIn` fires → `ConnectionLoginBridge` runs PreLogin + Login, creates the PRI and (lazily) the single GRI. |
+| **Join** | `HandshakePhase::Joined` | `NMT_Join` → `ClientJoined` fires → bridge runs PostLogin (team pick + spawn). |
+| **World bootstrap** | `ConnectionManager::ControlState` (per-client) | `SendReplicationBootstrap` (PackageMap) then `SendActorBootstrap` open the bootstrap actor channels; ch2 carries `ClientShowTeamSelect`. |
+| **Team / role / spawn** | `ControlState` (`teamSelected`, `ch2OutReliable`) | Inbound `SelectTeam` (`DecodeInboundActorBunch`) persists the team and advances to `ClientShowRoleSelect`; role selection leads to a spawn request. |
+| **Teardown** | — | `RemoveStaleConnections` (heartbeat timeout) or explicit disconnect drops the `ClientConnection`, handshake, and control state. |
+
+Reliability spans the whole post-Join phase: every reliable server→client bunch
+is retransmitted (same per-channel `ChSequence`, new `PacketId`) until the client
+acks the packet it rode in — without this, a single dropped bootstrap bunch
+soft-locks the client. See `ConnectionManager::ControlState::SentReliable`.
+
+---
+
+## 5 · Where to start reading
+
+- **The connection** — `src/Network/ConnectionManager.{h,cpp}` (handshake driver,
+  bootstrap, reliability) and `src/Network/HandshakeState.{h,cpp}` (state machine).
+- **The framing** — `src/Network/PacketCodec.{h,cpp}` + `BitReader`/`BitWriter`.
+- **Game entry** — `src/Game/GameServer.cpp` (`Initialize`, `Run`) and
+  `src/Game/ConnectionLoginBridge.{h,cpp}` (login → spawn).
+- **The loop** — `src/main.cpp` + `src/Time/GameClock`.
+- **What the wire must look like** — the RE docs linked at the top.
+
+*This document describes the code as it actually is. When the live path changes
+(e.g. if `NetworkThread` is wired in, or Steam/EAC stops being stubbed), update
+this file.*

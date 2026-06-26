@@ -1,5 +1,6 @@
 // src/Security/ClientEACDetector.cpp
 #include "Security/ClientEACDetector.h"
+#include <algorithm>
 #include "Utils/Logger.h"
 #include <thread>
 #include <future>

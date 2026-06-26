@@ -1,16 +1,7 @@
 // src/Network/SocketFactory.cpp
 #include "Network/SocketFactory.h"
 #include "Utils/Logger.h"
-
-#ifdef _WIN32
-  #include <ws2tcpip.h>
-#else
-  #include <sys/socket.h>
-  #include <netinet/in.h>
-  #include <arpa/inet.h>
-  #include <fcntl.h>
-  #include <unistd.h>
-#endif
+#include "Network/PlatformSocket.h"
 
 bool SocketFactory::Initialize() {
     Logger::Trace("[SocketFactory::Initialize] Entry");
@@ -57,7 +48,7 @@ SocketHandle SocketFactory::CreateUdpSocket(uint16_t localPort, const SocketConf
     Logger::Debug("[SocketFactory::CreateUdpSocket] UDP socket created: fd=%d", sock);
     if (!ConfigureSocket(sock, cfg)) {
         Logger::Error("[SocketFactory::CreateUdpSocket] ConfigureSocket failed for fd=%d", sock);
-        close(sock);
+        CloseSocket(sock);
         Logger::Debug("[SocketFactory::CreateUdpSocket] Socket fd=%d closed after configuration failure", sock);
         Logger::Trace("[SocketFactory::CreateUdpSocket] Exit: returning -1 (configure failed)");
         return -1;
@@ -70,7 +61,7 @@ SocketHandle SocketFactory::CreateUdpSocket(uint16_t localPort, const SocketConf
     Logger::Debug("[SocketFactory::CreateUdpSocket] Binding to INADDR_ANY:%u", localPort);
     if (bind(sock, (sockaddr*)&addr, sizeof(addr)) < 0) {
         Logger::Error("SocketFactory: UDP bind to port %u failed", localPort);
-        close(sock);
+        CloseSocket(sock);
         Logger::Debug("[SocketFactory::CreateUdpSocket] Socket fd=%d closed after bind failure", sock);
         Logger::Trace("[SocketFactory::CreateUdpSocket] Exit: returning -1 (bind failed)");
         return -1;
@@ -97,7 +88,7 @@ SocketHandle SocketFactory::CreateTcpListenSocket(uint16_t localPort, int backlo
 
     if (!ConfigureSocket(sock, cfg)) {
         Logger::Error("[SocketFactory::CreateTcpListenSocket] ConfigureSocket failed for fd=%d", sock);
-        close(sock);
+        CloseSocket(sock);
         Logger::Debug("[SocketFactory::CreateTcpListenSocket] Socket fd=%d closed after configuration failure", sock);
         Logger::Trace("[SocketFactory::CreateTcpListenSocket] Exit: returning -1 (configure failed)");
         return -1;
@@ -110,7 +101,7 @@ SocketHandle SocketFactory::CreateTcpListenSocket(uint16_t localPort, int backlo
     Logger::Debug("[SocketFactory::CreateTcpListenSocket] Binding to INADDR_ANY:%u", localPort);
     if (bind(sock, (sockaddr*)&addr, sizeof(addr)) < 0) {
         Logger::Error("SocketFactory: TCP bind to port %u failed", localPort);
-        close(sock);
+        CloseSocket(sock);
         Logger::Debug("[SocketFactory::CreateTcpListenSocket] Socket fd=%d closed after bind failure", sock);
         Logger::Trace("[SocketFactory::CreateTcpListenSocket] Exit: returning -1 (bind failed)");
         return -1;
@@ -118,7 +109,7 @@ SocketHandle SocketFactory::CreateTcpListenSocket(uint16_t localPort, int backlo
     Logger::Debug("[SocketFactory::CreateTcpListenSocket] Bound successfully, calling listen with backlog=%d", backlog);
     if (listen(sock, backlog) < 0) {
         Logger::Error("SocketFactory: listen() failed");
-        close(sock);
+        CloseSocket(sock);
         Logger::Debug("[SocketFactory::CreateTcpListenSocket] Socket fd=%d closed after listen failure", sock);
         Logger::Trace("[SocketFactory::CreateTcpListenSocket] Exit: returning -1 (listen failed)");
         return -1;
@@ -142,7 +133,7 @@ SocketHandle SocketFactory::CreateTcpClientSocket(const std::string& remoteIp, u
     Logger::Debug("[SocketFactory::CreateTcpClientSocket] TCP client socket created: fd=%d", sock);
     if (!ConfigureSocket(sock, cfg)) {
         Logger::Error("[SocketFactory::CreateTcpClientSocket] ConfigureSocket failed for fd=%d", sock);
-        close(sock);
+        CloseSocket(sock);
         Logger::Debug("[SocketFactory::CreateTcpClientSocket] Socket fd=%d closed after configuration failure", sock);
         Logger::Trace("[SocketFactory::CreateTcpClientSocket] Exit: returning -1 (configure failed)");
         return -1;
@@ -155,7 +146,7 @@ SocketHandle SocketFactory::CreateTcpClientSocket(const std::string& remoteIp, u
     inet_pton(AF_INET, remoteIp.c_str(), &srv.sin_addr);
     if (connect(sock, (sockaddr*)&srv, sizeof(srv)) < 0) {
         Logger::Error("SocketFactory: connect to %s:%u failed", remoteIp.c_str(), remotePort);
-        close(sock);
+        CloseSocket(sock);
         Logger::Debug("[SocketFactory::CreateTcpClientSocket] Socket fd=%d closed after connect failure", sock);
         Logger::Trace("[SocketFactory::CreateTcpClientSocket] Exit: returning -1 (connect failed)");
         return -1;
