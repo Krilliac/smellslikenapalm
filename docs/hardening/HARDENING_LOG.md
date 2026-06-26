@@ -18,7 +18,7 @@ src/Network/BitWriter, BitReader, PacketCodec, ActorReplication, WireTrace.h.
 - [x] Game state / SpawnSystem / GameMode / ReplicationManager
 - [x] Config / ConfigManager
 - [x] Utils (StringUtils, PathUtils, MemoryPool, etc.)
-- [ ] Network: UDPSocket / NetworkManager / BandwidthManager / ClientConnection
+- [x] Network: UDPSocket / NetworkManager / BandwidthManager / ClientConnection
 - [ ] (overflow) deepen tests, fuzz packet/bunch decoders, fill doc gaps
 
 ## Iteration log
@@ -28,3 +28,4 @@ src/Network/BitWriter, BitReader, PacketCodec, ActorReplication, WireTrace.h.
 2026-06-26 | Security/Auth | anti-enumeration timing equalizer + no auto-insert (AuthManager); constant-time verify + param guards (PasswordHasher); bounded token/session maps + empty-token reject (TokenManager/EAC) | 18b81b0
 2026-06-26 | Game state | null/bounds guards + chained-deref fix (GameServer/GameMode/SpawnSystem); chat caps (ChatManager/GameServer); uniform_real_distribution UB fix (MapManager); checked find() in dirty loop (ReplicationManager) | fb8520b
 2026-06-26 | Config + Utils | URL oversize/option caps (URLOptions, join path); safe numeric coercion (ConfigManager); path-traversal reject (PathUtils); distribution UB fixes (RandomGenerator); Split/ToDouble guards (StringUtils); pool null-bail + worker clamp (MemoryPool/ThreadPool) | 07592a5
+2026-06-26 | Network transport | UDPSocket buffer clamps; BandwidthManager client-cap + overflow-safe (bit-identical verdict); ClientConnection guards (CanSend fails-open); NetworkManager/NetworkThread null + anti-busy-spin | 1bb6922
