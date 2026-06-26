@@ -57,19 +57,42 @@ void WriteNetGUID(BitWriter& w, const NetGUIDRef& ref);
 // meaningless.
 NetGUIDRef ReadNetGUID(BitReader& r);
 
-// ---- SerializeNewActor opening-bunch header ---------------------------------
-// The first bytes of an opening actor bunch (bOpen=1, ChType=2):
-//   [class NetGUID][actor NetGUID]   (then the bNetInitial property block)
-// The CLASS NetGUID comes FIRST (it is the recurring constant per class family in
-// the capture - e.g. 5aa50200 shared by 65 PRIs; doc §6.0). The actor NetGUID is
-// the per-instance reference.
-struct NewActorHeader {
-    NetGUIDRef actorGuid;  // usually export (isStatic=false)
-    NetGUIDRef classGuid;  // ref into the PackageMap (the actor's class)
+// ---- Compressed Vector / Rotator (FVector/FRotator::SerializeCompressed) ------
+// UE3 UnMath.cpp. Used for the actor-open header Location/Rotation and for
+// Vector/Rotator-typed replicated properties.
+//
+// Vector (UnMath.cpp:51): components rounded to INTEGERS, then
+//   Bits = Clamp(CeilLogTwo(1+Max3(|ix|,|iy|,|iz|)), 1, 20) - 1; SerializeInt(Bits,20);
+//   Bias = 1<<(Bits+1); Max = 1<<(Bits+2); SerializeInt(c+Bias, Max) x3.
+void WriteCompressedVector(BitWriter& w, float x, float y, float z);
+void ReadCompressedVector(BitReader& r, float& x, float& y, float& z);
+
+// Rotator (UnMath.cpp:84): each of (pitch,yaw,roll) as the TOP byte (angle>>8):
+//   1 presence bit (component>>8 != 0), then that byte iff non-zero.
+// Angles are UE 16-bit rotator units [0,65535].
+void WriteCompressedRotator(BitWriter& w, uint16_t pitch, uint16_t yaw, uint16_t roll);
+void ReadCompressedRotator(BitReader& r, uint16_t& pitch, uint16_t& yaw, uint16_t& roll);
+
+// ---- Actor-open (SerializeNewActor) header -----------------------------------
+// The opening bunch of an actor channel (bOpen=1, ChType=2) begins with, in order
+// (UnChan.cpp ReplicateActor / ReceivedBunch, doc UE3_ActorChannel.md):
+//   [class static-ref] [compressed Location] [compressed Rotation if bNetInitialRotation]
+//   [NetPlayerIndex (ranged int, max MAX_CHANNELS) if PlayerController]
+// then the bNetInitial property block. There is NO per-actor object ref - the
+// channel index IS the actor's identity. For the OWNING client's PlayerController,
+// NetPlayerIndex MUST be 0 (UnConn.cpp HandleClientPlayer adopts it as the local
+// autonomous PC). A class ref that does not resolve => NMT_ActorChannelFailure =>
+// the client closes the channel.
+struct ActorOpenHeader {
+    NetGUIDRef classRef;                 // static class/archetype ref (isDynamic=false)
+    float locX = 0.f, locY = 0.f, locZ = 0.f;   // compressed Location (always present)
+    bool  hasRotation = false;           // bNetInitialRotation
+    uint16_t pitch = 0, yaw = 0, roll = 0;       // compressed Rotation (if hasRotation)
+    bool  isPlayerController = false;     // writes NetPlayerIndex when true
+    uint32_t netPlayerIndex = 0;         // 0 for the owning client's PC
 };
 
-void WriteNewActorHeader(BitWriter& w, const NewActorHeader& hdr);
-NewActorHeader ReadNewActorHeader(BitReader& r);
+void WriteActorOpenHeader(BitWriter& w, const ActorOpenHeader& hdr);
 
 // ---- Replicated-property serialization ---------------------------------------
 // Each replicated property on the wire is `SerializeInt(handle, maxHandle)` then
@@ -89,13 +112,13 @@ void WritePropString(BitWriter& w, uint32_t handle, uint32_t maxHandle, const st
 void WritePropObject(BitWriter& w, uint32_t handle, uint32_t maxHandle, const NetGUIDRef& v);
 
 // Build an OPENING actor-channel bunch (bOpen=1, bReliable=1, ChType=2) on
-// `chIndex` with ChSequence `chSeq`: payload = SerializeNewActor(hdr) followed by
-// whatever `writeProps` writes (the bNetInitial property block). The returned
+// `chIndex` with ChSequence `chSeq`: payload = the actor-open header (hdr) followed
+// by whatever `writeProps` writes (the bNetInitial property block). The returned
 // Bunch's payloadBits is exact (not byte-padded), ready for
 // PacketAssembler::BuildRawBunchPacket + Encode at the server MaxPacket.
 PacketCodec::Bunch MakeOpeningActorBunch(
     uint32_t chIndex, uint32_t chSeq,
-    const NewActorHeader& hdr,
+    const ActorOpenHeader& hdr,
     const std::function<void(BitWriter&)>& writeProps);
 
 } // namespace ActorRepl

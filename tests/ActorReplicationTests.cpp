@@ -15,7 +15,7 @@
 #include <cstdint>
 
 using ActorRepl::NetGUIDRef;
-using ActorRepl::NewActorHeader;
+using ActorRepl::ActorOpenHeader;
 
 // A static object reference (class/archetype, flag bit 0, large index space) round-trips.
 TEST(ActorReplication, StaticObjectRefRoundTrips) {
@@ -47,24 +47,61 @@ TEST(ActorReplication, DynamicActorRefRoundTrips) {
     }
 }
 
-// The SerializeNewActor header (actor NetGUID + class NetGUID) round-trips,
-// modelling the common case: an exported actor referencing a known (static) class.
-TEST(ActorReplication, NewActorHeaderRoundTrips) {
-    NewActorHeader in;
-    in.classGuid = NetGUIDRef{/*isDynamic=*/false, 0xABCDEu};  // static class/archetype ref
-    in.actorGuid = NetGUIDRef{/*isDynamic=*/true, 42u};        // dynamic (channel index)
+// FVector::SerializeCompressed round-trips at integer precision (components are
+// rounded to ints by the codec), including the zero vector and signed values.
+TEST(ActorReplication, CompressedVectorRoundTrips) {
+    struct V { float x, y, z; };
+    for (const V& v : {V{0,0,0}, V{1,2,3}, V{-5,17,-1023}, V{1024,-2048,4095}}) {
+        BitWriter w;
+        ActorRepl::WriteCompressedVector(w, v.x, v.y, v.z);
+        const std::vector<uint8_t> bytes = w.GetBytes();
+        BitReader r(bytes.data(), bytes.size(), w.NumBits());
+        float x, y, z;
+        ActorRepl::ReadCompressedVector(r, x, y, z);
+        EXPECT_FALSE(r.IsOverflowed());
+        EXPECT_EQ(x, v.x); EXPECT_EQ(y, v.y); EXPECT_EQ(z, v.z);
+        EXPECT_EQ(r.BitPos(), w.NumBits());
+    }
+}
+
+// FRotator::SerializeCompressed: top byte per component, presence-bit gated.
+TEST(ActorReplication, CompressedRotatorRoundTrips) {
+    struct R { uint16_t p, y, r; };
+    for (const R& rot : {R{0,0,0}, R{0,0x4000,0}, R{0x8000,0x4000,0xC000}}) {
+        BitWriter w;
+        ActorRepl::WriteCompressedRotator(w, rot.p, rot.y, rot.r);
+        const std::vector<uint8_t> bytes = w.GetBytes();
+        BitReader r(bytes.data(), bytes.size(), w.NumBits());
+        uint16_t p, y, rl;
+        ActorRepl::ReadCompressedRotator(r, p, y, rl);
+        EXPECT_FALSE(r.IsOverflowed());
+        // Only the top byte (>>8 <<8) survives the codec.
+        EXPECT_EQ(p, rot.p & 0xFF00); EXPECT_EQ(y, rot.y & 0xFF00); EXPECT_EQ(rl, rot.r & 0xFF00);
+    }
+}
+
+// The actor-open header (class ref + compressed Location + NetPlayerIndex for a PC)
+// writes and reads back, modelling the owning client's PlayerController open.
+TEST(ActorReplication, ActorOpenHeaderRoundTrips) {
+    ActorOpenHeader in;
+    in.classRef = NetGUIDRef{/*isDynamic=*/false, 0xABCDEu};  // static PlayerController class
+    in.locX = 100; in.locY = -250; in.locZ = 64;
+    in.isPlayerController = true;
+    in.netPlayerIndex = 0;  // owning client
 
     BitWriter w;
-    ActorRepl::WriteNewActorHeader(w, in);
+    ActorRepl::WriteActorOpenHeader(w, in);
+    const std::vector<uint8_t> bytes = w.GetBytes();
+    BitReader r(bytes.data(), bytes.size(), w.NumBits());
 
-    const std::vector<uint8_t> bytes = w.GetBytes();  // keep alive (BitReader views it)
-    BitReader r(bytes);
-    NewActorHeader out = ActorRepl::ReadNewActorHeader(r);
+    NetGUIDRef cls = ActorRepl::ReadNetGUID(r);
+    EXPECT_FALSE(cls.isDynamic);
+    EXPECT_EQ(cls.index, 0xABCDEu);
+    float x, y, z; ActorRepl::ReadCompressedVector(r, x, y, z);
+    EXPECT_EQ(x, 100); EXPECT_EQ(y, -250); EXPECT_EQ(z, 64);
+    EXPECT_EQ(r.SerializeInt(ActorRepl::kDynamicChannelMax), 0u);  // NetPlayerIndex
     EXPECT_FALSE(r.IsOverflowed());
-    EXPECT_EQ(out.classGuid.isDynamic, in.classGuid.isDynamic);
-    EXPECT_EQ(out.classGuid.index, in.classGuid.index);
-    EXPECT_EQ(out.actorGuid.isDynamic, in.actorGuid.isDynamic);
-    EXPECT_EQ(out.actorGuid.index, in.actorGuid.index);
+    EXPECT_EQ(r.BitPos(), w.NumBits());
 }
 
 // Capture anchor: the real ch2 PlayerController open (Session A f1484) begins
@@ -117,9 +154,10 @@ TEST(ActorReplication, PropertyBlockRoundTrips) {
 // the owning client's (RemoteRole=AutonomousProxy, bNetOwner).
 TEST(ActorReplication, OpeningActorBunchDecodes) {
     const uint32_t maxHandle = 80;
-    NewActorHeader hdr;
-    hdr.classGuid = NetGUIDRef{/*isDynamic=*/false, 90u};    // static PlayerController class ref
-    hdr.actorGuid = NetGUIDRef{/*isDynamic=*/true, 2u};      // dynamic (channel index)
+    ActorOpenHeader hdr;
+    hdr.classRef = NetGUIDRef{/*isDynamic=*/false, 90u};  // static PlayerController class ref
+    hdr.isPlayerController = true;
+    hdr.netPlayerIndex = 0;
 
     PacketCodec::Bunch b = ActorRepl::MakeOpeningActorBunch(
         /*chIndex=*/2, /*chSeq=*/1, hdr,
@@ -137,11 +175,11 @@ TEST(ActorReplication, OpeningActorBunchDecodes) {
     EXPECT_EQ(b.chSequence, 1u);
 
     BitReader r(b.payload.data(), b.payload.size(), b.payloadBits);
-    NewActorHeader out = ActorRepl::ReadNewActorHeader(r);
-    EXPECT_FALSE(out.classGuid.isDynamic);
-    EXPECT_EQ(out.classGuid.index, 90u);
-    EXPECT_TRUE(out.actorGuid.isDynamic);
-    EXPECT_EQ(out.actorGuid.index, 2u);
+    NetGUIDRef cls = ActorRepl::ReadNetGUID(r);
+    EXPECT_FALSE(cls.isDynamic);
+    EXPECT_EQ(cls.index, 90u);
+    float lx, ly, lz; ActorRepl::ReadCompressedVector(r, lx, ly, lz);  // Location
+    EXPECT_EQ(r.SerializeInt(ActorRepl::kDynamicChannelMax), 0u);      // NetPlayerIndex
 
     EXPECT_EQ(r.SerializeInt(maxHandle), 6u);  EXPECT_EQ(r.ReadByte(), 2u);
     EXPECT_EQ(r.SerializeInt(maxHandle), 7u);  EXPECT_EQ(r.ReadByte(), 3u);

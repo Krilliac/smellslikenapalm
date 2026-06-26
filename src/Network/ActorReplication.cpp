@@ -17,19 +17,68 @@ NetGUIDRef ReadNetGUID(BitReader& r) {
     return ref;
 }
 
-void WriteNewActorHeader(BitWriter& w, const NewActorHeader& hdr) {
-    // Wire order is [class NetGUID][actor NetGUID] - the CLASS ref comes FIRST (the
-    // recurring constant per class family in the capture, e.g. 5aa50200 shared by 65
-    // PRIs). Confirmed by RE of the real session (doc §6.0).
-    WriteNetGUID(w, hdr.classGuid);
-    WriteNetGUID(w, hdr.actorGuid);
+namespace {
+// appCeilLogTwo: smallest n with 2^n >= v. CeilLogTwo(1)=0, (2)=1, (3)=2, (4)=2.
+uint32_t CeilLogTwo(uint32_t v) {
+    if (v <= 1) return 0;
+    uint32_t n = 0, x = v - 1;
+    while (x > 0) { x >>= 1; ++n; }
+    return n;
+}
+uint32_t AbsI(int32_t v) { return v < 0 ? static_cast<uint32_t>(-(int64_t)v) : static_cast<uint32_t>(v); }
+int32_t RoundToInt(float f) { return static_cast<int32_t>(f < 0 ? f - 0.5f : f + 0.5f); }
+} // namespace
+
+void WriteCompressedVector(BitWriter& w, float x, float y, float z) {
+    const int32_t ix = RoundToInt(x), iy = RoundToInt(y), iz = RoundToInt(z);
+    uint32_t maxc = AbsI(ix);
+    if (AbsI(iy) > maxc) maxc = AbsI(iy);
+    if (AbsI(iz) > maxc) maxc = AbsI(iz);
+    uint32_t bits = CeilLogTwo(1u + maxc);
+    if (bits < 1) bits = 1;
+    if (bits > 20) bits = 20;
+    bits -= 1;
+    w.SerializeInt(bits, 20);
+    const uint32_t bias = 1u << (bits + 1);
+    const uint32_t mx   = 1u << (bits + 2);
+    w.SerializeInt(static_cast<uint32_t>(ix + static_cast<int32_t>(bias)), mx);
+    w.SerializeInt(static_cast<uint32_t>(iy + static_cast<int32_t>(bias)), mx);
+    w.SerializeInt(static_cast<uint32_t>(iz + static_cast<int32_t>(bias)), mx);
 }
 
-NewActorHeader ReadNewActorHeader(BitReader& r) {
-    NewActorHeader hdr;
-    hdr.classGuid = ReadNetGUID(r);
-    hdr.actorGuid = ReadNetGUID(r);
-    return hdr;
+void ReadCompressedVector(BitReader& r, float& x, float& y, float& z) {
+    const uint32_t bits = r.SerializeInt(20);
+    const int32_t bias = static_cast<int32_t>(1u << (bits + 1));
+    const uint32_t mx  = 1u << (bits + 2);
+    x = static_cast<float>(static_cast<int32_t>(r.SerializeInt(mx)) - bias);
+    y = static_cast<float>(static_cast<int32_t>(r.SerializeInt(mx)) - bias);
+    z = static_cast<float>(static_cast<int32_t>(r.SerializeInt(mx)) - bias);
+}
+
+void WriteCompressedRotator(BitWriter& w, uint16_t pitch, uint16_t yaw, uint16_t roll) {
+    const uint8_t bp = static_cast<uint8_t>(pitch >> 8);
+    const uint8_t by = static_cast<uint8_t>(yaw >> 8);
+    const uint8_t br = static_cast<uint8_t>(roll >> 8);
+    w.WriteBit(bp != 0); if (bp) w.WriteByte(bp);
+    w.WriteBit(by != 0); if (by) w.WriteByte(by);
+    w.WriteBit(br != 0); if (br) w.WriteByte(br);
+}
+
+void ReadCompressedRotator(BitReader& r, uint16_t& pitch, uint16_t& yaw, uint16_t& roll) {
+    pitch = r.ReadBit() ? static_cast<uint16_t>(r.ReadByte() << 8) : 0;
+    yaw   = r.ReadBit() ? static_cast<uint16_t>(r.ReadByte() << 8) : 0;
+    roll  = r.ReadBit() ? static_cast<uint16_t>(r.ReadByte() << 8) : 0;
+}
+
+void WriteActorOpenHeader(BitWriter& w, const ActorOpenHeader& hdr) {
+    WriteNetGUID(w, hdr.classRef);                         // static class/archetype ref
+    WriteCompressedVector(w, hdr.locX, hdr.locY, hdr.locZ); // Location (always present)
+    if (hdr.hasRotation) {
+        WriteCompressedRotator(w, hdr.pitch, hdr.yaw, hdr.roll);
+    }
+    if (hdr.isPlayerController) {
+        w.SerializeInt(hdr.netPlayerIndex, kDynamicChannelMax); // NetPlayerIndex (0 = owning client)
+    }
 }
 
 // ---- property serialization (handle + typed value) --------------------------
@@ -60,10 +109,10 @@ void WritePropObject(BitWriter& w, uint32_t handle, uint32_t maxHandle, const Ne
 
 PacketCodec::Bunch MakeOpeningActorBunch(
     uint32_t chIndex, uint32_t chSeq,
-    const NewActorHeader& hdr,
+    const ActorOpenHeader& hdr,
     const std::function<void(BitWriter&)>& writeProps) {
     BitWriter w;
-    WriteNewActorHeader(w, hdr);
+    WriteActorOpenHeader(w, hdr);
     if (writeProps) {
         writeProps(w);
     }
