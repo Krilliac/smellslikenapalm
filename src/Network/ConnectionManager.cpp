@@ -2,6 +2,7 @@
 
 #include "Network/ConnectionManager.h"
 #include "Game/GameServer.h"
+#include "Game/TeamManager.h"
 #include "Config/ConfigManager.h"
 #include "Utils/Logger.h"
 #include "Network/Packet.h"
@@ -928,6 +929,17 @@ void ConnectionManager::DecodeInboundActorBunch(uint32_t clientId,
         Logger::Info("[ConnectionManager] client %u: SelectTeam(TeamID=%u) -> JoinTeam (clear spectator + Team) then ChangedTeams",
                      clientId, teamId);
         cs.teamSelected = true;
+
+        // Persist the team SERVER-SIDE (the real JoinTeam result). Previously we only told
+        // the CLIENT its team (the ch26 delta + ChangedTeams below) but never updated the
+        // authoritative TeamManager - so the server kept the join-time auto-picked team and a
+        // player who clicked NVA got the US loadout/spawn (HandleRoleSelection reads
+        // TeamManager::GetPlayerTeam). Map RS2 0/1 -> TeamManager 1/2.
+        if (m_server) {
+            if (auto* tm = m_server->GetTeamManager()) {
+                tm->AddPlayerToTeam(clientId, (teamId == 0) ? 1u : 2u);  // also sets Player team
+            }
+        }
 
         // --- The server-side JoinTeam result: transition the LOCAL player's PRI (ch26 =
         // "Krill") from spectator to a participant on the chosen team. Our replayed PRI

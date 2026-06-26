@@ -4,6 +4,7 @@
 #include "Utils/Logger.h"
 #include "Utils/PacketAnalysis.h"
 #include "Game/GameServer.h"
+#include "Game/TeamManager.h"
 #include "Config/ServerConfig.h"
 #include "Network/ClientConnection.h"
 #include <chrono>
@@ -48,6 +49,10 @@ void PlayerManager::OnPlayerDisconnect(uint32_t clientId)
         DumpPacketForAnalysis(conn->LastRawPacket(), "OnPlayerDisconnect");
     }
 
+    // Clear the player's TeamManager membership too, else m_playerTeamMap / team
+    // playerIds keep a ghost entry, inflating GetTeamSize and skewing auto-balance for
+    // future joins (TeamManager::RemovePlayer is otherwise only called from AddPlayerToTeam).
+    if (m_server) { if (auto* tm = m_server->GetTeamManager()) tm->RemovePlayer(clientId); }
     m_players.erase(clientId);
     Logger::Info("PlayerManager: Player %u disconnected", clientId);
     BroadcastPlayerList();
@@ -88,8 +93,13 @@ void PlayerManager::Update()
             DumpPacketForAnalysis(conn->LastRawPacket(), "Update_PlayerTelemetry");
         }
 
-        // Handle respawns
-        if (!pl->IsAlive() && pl->CanRespawn(m_respawnDelaySec)) {
+        // Handle respawns. Gate strictly on Dead (NOT Spectating) AND a real team:
+        // !IsAlive() matches both Dead and Spectating, and a fresh/menu player is Dead with
+        // no team - so the old time-only check force-promoted spectators and never-joined
+        // players to Alive after the respawn delay. Only respawn a player who has actually
+        // joined a team and died.
+        if (pl->GetState() == PlayerState::Dead && pl->GetTeam() != 0 &&
+            pl->CanRespawn(m_respawnDelaySec)) {
             OnPlayerSpawn(id);
         }
         pl->Update(deltaSeconds);
@@ -167,6 +177,7 @@ void PlayerManager::RemoveStalePlayers()
         }
     }
     for (auto id : toRemove) {
+        if (m_server) { if (auto* tm = m_server->GetTeamManager()) tm->RemovePlayer(id); }
         m_players.erase(id);
         m_playerStats.erase(id);
         Logger::Info("PlayerManager: Removed stale player %u", id);

@@ -177,8 +177,9 @@ void ConnectionLoginBridge::OnClientJoined(const ClientJoinedEvent& ev)
             finalTeam = 1u;
         }
     } else {
-        // Map UE3 0/1 onto TeamManager 1/2 if needed; pass through 1/2 as-is.
-        finalTeam = (pri.team == 0) ? 1u : (uint32_t)pri.team;
+        // Map RS2/UE3 team ids 0/1 onto TeamManager 1/2. (Was passing 1 through unchanged,
+        // landing UE3 team 1 / NVA on TeamManager team 1 / US Army - the wrong faction.)
+        finalTeam = (pri.team == 0) ? 1u : 2u;
     }
     pri.team = (int32_t)finalTeam;
 
