@@ -1060,12 +1060,13 @@ void ConnectionManager::DecodeInboundActorBunch(uint32_t clientId,
         // populate the null object the role UI compares against), DO NOT send the advance -
         // it is a guaranteed client crash. The team is still recorded server-side above.
         // Re-enable by flipping this flag once role-state replication lands.
-        // Re-enabled: the PC->PRI link now binds. The adoption failure was the dynamic-objref
-        // width bug (kDynamicChannelMax 1024->2048): the client read 1 bit past our link bunch,
-        // FInBunch errored, SerializeObject returned NULL. With the index at the correct 11 bits
-        // the client resolves ch26, sets ROPC.PlayerReplicationInfo, and the role-UI LocalPRI is
-        // non-null. (RE: UnConn.h:143, UnChan.cpp ReceivedBunch, Controller.uc:536.)
-        constexpr bool kEnableRoleSelectAdvance = true;
+        // Held again. The dynamic-objref width fix (1024->2048) corrected the link encoding
+        // (verified: 176a00 @ 21 bits decodes to handle 23 + dyn-ref ch26, no overflow) but the
+        // client STILL does not set ROPC.PlayerReplicationInfo -> same +0xbbf712 LocalPRI-null
+        // crash. Both the 20-bit and 21-bit links crash identically, so byte-width was NOT the
+        // blocker. The PC->PRI bind fails for a deeper reason (PostInitialize timing caching
+        // LocalPRI before the bind, or a channel/actor resolution nuance) - still under RE.
+        constexpr bool kEnableRoleSelectAdvance = false;
         if (kEnableRoleSelectAdvance) {
             // Clear the local PRI's spectator flags FIRST so ShowRoleSelectScene does not
             // early-return at uc:5932 (if PRI.bOnlySpectator return) - the "no crash but no
