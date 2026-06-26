@@ -933,6 +933,19 @@ void GameServer::HandleVehicleAction(uint32_t clientId, const std::vector<uint8_
 
     uint8_t action = data[0];
     Logger::Debug("[GameServer::HandleVehicleAction] Player %u vehicle action=%u", clientId, action);
+
+    // SECURITY: heliId for Start/Stop engine is attacker-controlled. Without an ownership
+    // check any connected client could start or stop the engine of ANY helicopter on the map
+    // by spoofing heliId (a cross-player griefing vector). Mirror the case-2 control path,
+    // which already requires the requester to be the heli's pilot. Additive: the legitimate
+    // pilot is unaffected; only spoofed/foreign heliIds are rejected. (Review wf_fff418dc-46f.)
+    auto requesterPilotsHeli = [this](uint32_t cid, uint32_t hid) -> bool {
+        for (auto* h : m_helicopterPhysics->GetAllHelicopters()) {
+            if (h->vehicleId == hid) return h->pilotId == cid;
+        }
+        return false;  // unknown heli id -> not authorized
+    };
+
     switch (action) {
         case 0: {  // Enter helicopter
             Logger::Debug("[GameServer::HandleVehicleAction] Action: Enter helicopter");
@@ -982,6 +995,11 @@ void GameServer::HandleVehicleAction(uint32_t clientId, const std::vector<uint8_
             if (data.size() >= 5) {
                 uint32_t heliId = 0;
                 memcpy(&heliId, data.data() + 1, sizeof(uint32_t));
+                if (!requesterPilotsHeli(clientId, heliId)) {
+                    Logger::Warn("[GameServer::HandleVehicleAction] Player %u tried to START engine of heli %u it does not pilot - rejected",
+                                 clientId, heliId);
+                    break;
+                }
                 Logger::Debug("[GameServer::HandleVehicleAction] Starting engine on heli %u", heliId);
                 m_helicopterPhysics->StartEngine(heliId);
             } else {
@@ -994,6 +1012,11 @@ void GameServer::HandleVehicleAction(uint32_t clientId, const std::vector<uint8_
             if (data.size() >= 5) {
                 uint32_t heliId = 0;
                 memcpy(&heliId, data.data() + 1, sizeof(uint32_t));
+                if (!requesterPilotsHeli(clientId, heliId)) {
+                    Logger::Warn("[GameServer::HandleVehicleAction] Player %u tried to STOP engine of heli %u it does not pilot - rejected",
+                                 clientId, heliId);
+                    break;
+                }
                 Logger::Debug("[GameServer::HandleVehicleAction] Stopping engine on heli %u", heliId);
                 m_helicopterPhysics->StopEngine(heliId);
             } else {
