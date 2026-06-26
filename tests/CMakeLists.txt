@@ -53,8 +53,12 @@ rs2v_add_test(PacketFramingTests)  # UE3 packet/bunch framing codec; fixtures = 
 rs2v_add_test(ControlChannelTests) # UE3 control-channel message-body codec; round-trips per spec §4
 rs2v_add_test(PacketAssemblerTests) # UE3 outbound control-channel packet assembler (sequencing/fragmentation)
 rs2v_add_test(ControlReassemblerTests) # UE3 inbound control-channel reassembler (ordering/dedup/delimiting)
+rs2v_add_test(ControlReassemblerFuzzTests) # fuzz/hostile-input: out-of-order/dup/huge-seq/oversized bunches -> bounded buffering, no crash/over-read/hang
+rs2v_add_test(HandshakeStateFuzzTests)     # fuzz/hostile-input: malformed/truncated/oversized NMT + bad type bytes -> never throws/crashes, phase stays valid
 rs2v_add_test(HandshakeIntegrationTests) # end-to-end client<->server handshake over the real wire codec
 rs2v_add_test(ActorReplicationTests)     # actor-channel NetGUID/SerializeNewActor codec (per-session replication)
+rs2v_add_test(BitReaderFuzzTests)        # fuzz + malformed-input hardening for BitReader/BitWriter (overflow safety, no OOB/hang, round-trip)
+rs2v_add_test(PacketCodecFuzzTests)      # fuzz/hostile-input: random+mutated+boundary bytes into Decode/Encode (no crash/OOB/hang), valid round-trip
 
 # Scripting is OFF by default (deprecated .NET COM hosting). The scripting test
 # is gated on ENABLE_SCRIPTING, but it ALSO references Scripting/ScriptEngine.h
