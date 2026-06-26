@@ -49,6 +49,7 @@ private:
     MessageFn m_onMessage;
     std::map<uint32_t, Bunch> m_pending;  // chSequence -> bunch awaiting in-order drain
     uint32_t m_nextSeq = 1;               // next ChSequence to consume (starts 1)
+    size_t m_pendingBytes = 0;            // total payload bytes currently buffered (DoS cap)
 };
 
 } // namespace PacketCodec

@@ -10,6 +10,14 @@
 
 namespace PacketCodec {
 
+// Bytes a buffered bunch occupies. Computed in size_t (not uint32_t) so the
+// "+7" round-up can never wrap, and clamped to the actual payload buffer size so
+// a bogus payloadBits can never imply more bytes than we actually hold.
+static size_t BunchByteSize(const Bunch& b) {
+    const size_t implied = (static_cast<size_t>(b.payloadBits) + 7u) / 8u;
+    return std::min(implied, b.payload.size());
+}
+
 ControlReassembler::ControlReassembler(MessageFn onMessage)
     : m_onMessage(std::move(onMessage)) {}
 
@@ -32,14 +40,43 @@ void ControlReassembler::OnBunch(const Bunch& bunch) {
     // grow without bound while waiting for a gap that will never arrive.
     constexpr uint32_t kMaxSeqAhead = 64;
     constexpr size_t kMaxPending = 128;
-    if (bunch.chSequence > m_nextSeq + kMaxSeqAhead) {
+    // Total buffered payload cap. NMT-phase bunches can be ~kNmtMaxPacketBytes
+    // each; without a byte cap an attacker could pin kMaxPending oversized bunches
+    // in memory. 256 KiB is far above any legitimate handshake/NMT reassembly need
+    // (control messages are tiny and almost always drain per-bunch immediately).
+    constexpr size_t kMaxPendingBytes = 256 * 1024;
+    // Use uint64_t for the seq-ahead comparison so m_nextSeq + kMaxSeqAhead can
+    // never wrap a uint32_t near the counter's top.
+    if (static_cast<uint64_t>(bunch.chSequence) >
+        static_cast<uint64_t>(m_nextSeq) + kMaxSeqAhead) {
         return;
     }
-    if (m_pending.size() >= kMaxPending && m_pending.find(bunch.chSequence) == m_pending.end()) {
+    // Reject a bunch whose declared payloadBits exceeds the bits actually present
+    // in its payload buffer - a malformed/forged bunch. Valid bunches always have
+    // payloadBits <= payload.size()*8, so this never rejects correct-path input.
+    if (static_cast<uint64_t>(bunch.payloadBits) >
+        static_cast<uint64_t>(bunch.payload.size()) * 8u) {
+        Logger::Warn("[ControlReassembler] dropping bunch seq=%u: payloadBits=%u exceeds payload bytes=%zu",
+                     bunch.chSequence, bunch.payloadBits, bunch.payload.size());
+        return;
+    }
+    const bool alreadyBuffered = m_pending.find(bunch.chSequence) != m_pending.end();
+    if (m_pending.size() >= kMaxPending && !alreadyBuffered) {
+        Logger::Warn("[ControlReassembler] pending bunch cap (%zu) hit; dropping seq=%u",
+                     kMaxPending, bunch.chSequence);
+        return;
+    }
+    const size_t addBytes = BunchByteSize(bunch);
+    if (!alreadyBuffered && m_pendingBytes + addBytes > kMaxPendingBytes) {
+        Logger::Warn("[ControlReassembler] pending byte cap (%zu) hit (have=%zu add=%zu); dropping seq=%u",
+                     kMaxPendingBytes, m_pendingBytes, addBytes, bunch.chSequence);
         return;
     }
     // dedup: keep the first copy of a given sequence (ignore later differing copies)
-    m_pending.emplace(bunch.chSequence, bunch);
+    auto ins = m_pending.emplace(bunch.chSequence, bunch);
+    if (ins.second) {
+        m_pendingBytes += addBytes;  // only count newly-inserted bunches
+    }
     Drain();
 }
 
@@ -78,10 +115,12 @@ void ControlReassembler::Drain() {
             break;
         }
         const Bunch& b = it->second;
-        if (m_onMessage && b.payloadBits > 0) {
-            const size_t nbytes = std::min(static_cast<size_t>((b.payloadBits + 7) / 8), b.payload.size());
+        const size_t nbytes = BunchByteSize(b);  // size_t math; cannot overflow or over-read
+        if (m_onMessage && b.payloadBits > 0 && nbytes > 0) {
             m_onMessage(std::vector<uint8_t>(b.payload.begin(), b.payload.begin() + nbytes));
         }
+        // Keep the buffered-byte accounting in lockstep with the map.
+        m_pendingBytes -= std::min(m_pendingBytes, BunchByteSize(b));
         m_pending.erase(it);
         ++m_nextSeq;
     }

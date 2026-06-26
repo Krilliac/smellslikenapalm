@@ -103,6 +103,18 @@ void HandshakeState::HandleControlMessage(const uint8_t* data, size_t len) {
                   len>0?data[0]:0, len>1?data[1]:0, len>2?data[2]:0,
                   HandshakePhaseName(m_phase));
 
+    // Validate the message-type byte is within the control dispatcher's accepted
+    // range BEFORE dispatch. The real UE3 UNetConnection::ReceivedBunch switch
+    // rejects any type byte > kNMTMaxCase (cmp eax,0x25; ja default). Mirror that
+    // here so an attacker cannot drive the switch with an out-of-range/garbage
+    // type byte; reject (ignore) with a Warn instead of proceeding. This cannot
+    // change behaviour on valid input - every handled NMT is <= kNMTMaxCase.
+    if (NMTByte(type) > kNMTMaxCase) {
+        Logger::Warn("[HandshakeState] client %u: control message type 0x%02X out of range (> 0x%02X), ignoring",
+                     m_clientId, (unsigned)NMTByte(type), (unsigned)kNMTMaxCase);
+        return;
+    }
+
     switch (type) {
         case NMT::Hello:
             OnHello(data, len);
@@ -232,6 +244,18 @@ void HandshakeState::OnLogin(const uint8_t* data, size_t len) {
     ControlChannel::LoginMessage login;
     if (!ControlChannel::ParseLogin(data, len, login)) {
         Logger::Warn("[HandshakeState] client %u: malformed Login, ignoring", m_clientId);
+        return;
+    }
+
+    // Defensive: login.url is an attacker-controlled FString. The codec already
+    // bounds it by the bunch/packet size, but cap its length before handing it to
+    // URLOptions::Parse so a pathologically long option string cannot drive
+    // unbounded parse work. A legitimate FURL login string is well under this, so
+    // this never trips on valid input.
+    constexpr size_t kMaxLoginUrlLen = 4096;
+    if (login.url.size() > kMaxLoginUrlLen) {
+        Logger::Warn("[HandshakeState] client %u: Login URL too long (%zu > %zu bytes), ignoring",
+                     m_clientId, login.url.size(), kMaxLoginUrlLen);
         return;
     }
 

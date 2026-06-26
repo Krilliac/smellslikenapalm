@@ -102,6 +102,16 @@ void ConnectionManager::PumpNetwork() {
             break;
         }
 
+        // Defensive: recvfrom must never report more than the buffer it was handed,
+        // but clamp before resize() so a misbehaving socket layer can't make us grow
+        // the buffer past the bytes actually written (which would expose uninitialized
+        // memory to the parse path). Valid datagrams are always <= buffer.size().
+        if (len > static_cast<int>(buffer.size())) {
+            Logger::Warn("[ConnectionManager::PumpNetwork] ReceiveFrom reported %d bytes > buffer %zu from %s:%u, clamping",
+                         len, buffer.size(), srcIp.c_str(), srcPort);
+            len = static_cast<int>(buffer.size());
+        }
+
         buffer.resize(len);
         ClientAddress addr{srcIp, srcPort};
         Logger::Debug("[ConnectionManager::PumpNetwork] Received %d bytes from %s:%u (iteration %d)",
@@ -151,7 +161,17 @@ void ConnectionManager::HandleIncomingPacket(const std::vector<uint8_t>& data, c
         Logger::Debug("[WIRE<-] client %u %zuB: %s", clientId, data.size(), hex.c_str());
     }
 
-    auto conn = m_clients[addr];
+    // CreateOrGetClient above guarantees this entry exists, but look it up with a
+    // checked find() rather than operator[]: operator[] would silently default-insert
+    // a null shared_ptr if the entry were ever missing, and the very next line would
+    // dereference it. Reject safely instead of crashing on attacker traffic.
+    auto connIt = m_clients.find(addr);
+    if (connIt == m_clients.end() || !connIt->second) {
+        Logger::Warn("[ConnectionManager::HandleIncomingPacket] no connection object for %s:%u (clientId=%u), dropping packet",
+                     addr.ip.c_str(), addr.port, clientId);
+        return;
+    }
+    auto conn = connIt->second;
     conn->UpdateLastHeartbeat();
     Logger::Debug("[ConnectionManager::HandleIncomingPacket] Updated heartbeat for client %u", clientId);
 
@@ -887,6 +907,14 @@ void ConnectionManager::DecodeInboundActorBunch(uint32_t clientId,
     // role-select scene via ClientShowRoleSelect (handle 207, optional bool).
     if (bunch.chIndex == 2 && handle == 170) {
         uint8_t teamId = r.ReadByte();
+        // Don't act on a TeamID byte that wasn't actually present: an overflowed read
+        // returns a 0 default, which would silently drive a real team transition off a
+        // truncated/malformed bunch. Valid SelectTeam always carries the byte.
+        if (r.IsOverflowed()) {
+            Logger::Warn("[ConnectionManager::DecodeInboundActorBunch] client %u: SelectTeam bunch truncated before TeamID byte, ignoring",
+                         clientId);
+            return;
+        }
         if (teamId > 1) teamId &= 1;   // RS2 has two teams (0/1); the byte may carry
                                        // merged-bunch noise in the high bits.
         ControlState& cs = GetControlState(clientId);
@@ -1020,7 +1048,19 @@ bool ConnectionManager::ParseIncomingControl(uint32_t clientId, const std::vecto
     // Feed control-channel bunches to the reassembler. Complete messages are
     // dispatched to the handshake, which may emit responses via SendRawToClient
     // (draining the queued ack onto the response packet).
+    // Per-packet dispatch backstop. The bunch count is already bounded by the
+    // datagram size (a single inbound datagram is <= the receive buffer), but cap
+    // the dispatch loop explicitly so a pathological packet can't drive an outsized
+    // amount of work. The cap is far above any decodable datagram's real bunch count,
+    // so valid handshake/bootstrap/actor traffic is never truncated.
+    constexpr size_t kMaxBunchesPerPacket = 4096;
+    size_t processed = 0;
     for (const PacketCodec::Bunch& b : pkt.bunches) {
+        if (++processed > kMaxBunchesPerPacket) {
+            Logger::Warn("[ConnectionManager::ParseIncomingControl] client %u: packet %u carried %zu bunches (> cap %zu), dropping remainder",
+                         clientId, pkt.packetId, pkt.bunches.size(), kMaxBunchesPerPacket);
+            break;
+        }
         if (b.chIndex == 0) {
             cs.reassembler->OnBunch(b);          // control channel (handshake/NMT)
         } else {

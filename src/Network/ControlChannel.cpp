@@ -8,6 +8,7 @@
 #include "Network/BitReader.h"
 #include "Network/BitWriter.h"
 #include "Network/URLOptions.h"
+#include "Utils/Logger.h"
 
 namespace ControlChannel {
 
@@ -124,6 +125,39 @@ std::string BuildLoginURL(const std::string& portal,
 
 namespace {
 
+// Defensive cap for any single attacker-supplied control-channel FString field.
+// Real handshake strings (map/level names, EOS session ids, FURL option strings)
+// are well under a kilobyte; this generous ceiling never trips on valid traffic
+// but rejects an absurd length that survived BitReader's per-read bounds check
+// (e.g. a deliberately bloated bunch buffer). Reject-and-log, never crash.
+constexpr size_t kMaxControlStringLen = 16 * 1024;
+
+// Reject a parse whose backing buffer is a null pointer paired with a non-zero
+// claimed length. BitReader's bounds check only compares BIT POSITIONS against
+// m_numBits (= len*8); it does NOT validate the data pointer, so a read on a
+// (nullptr, len>0) reader would dereference null. This guard closes that gap.
+// Purely additive: on valid input `data` is non-null so this never trips.
+bool ValidBuffer(const uint8_t* data, size_t len, const char* ctx) {
+    if (data == nullptr && len != 0) {
+        Logger::Warn("[ControlChannel] %s: null data pointer with len=%zu - rejecting",
+                     ctx, len);
+        return false;
+    }
+    return true;
+}
+
+// Bound an FString field decoded from the wire. Returns false (reject the whole
+// message) on an oversized field. On valid handshake input the field is tiny so
+// this is a no-op; it only fires on hostile/garbage input.
+bool StringSane(const std::string& s, const char* field, const char* ctx) {
+    if (s.size() > kMaxControlStringLen) {
+        Logger::Warn("[ControlChannel] %s: field '%s' length %zu exceeds cap %zu - rejecting",
+                     ctx, field, s.size(), kMaxControlStringLen);
+        return false;
+    }
+    return true;
+}
+
 // Verify (optionally) the leading type byte. Returns false on overflow or
 // mismatch.
 bool CheckType(BitReader& r, bool expectType, NMT expected) {
@@ -148,6 +182,9 @@ bool PeekType(const uint8_t* data, size_t len, NMT& outType) {
 }
 
 bool ParseHello(const uint8_t* data, size_t len, HelloMessage& out, bool expectType) {
+    if (!ValidBuffer(data, len, "ParseHello")) {
+        return false;
+    }
     BitReader r(data, len);
     if (!CheckType(r, expectType, NMT::Hello)) {
         return false;
@@ -158,10 +195,17 @@ bool ParseHello(const uint8_t* data, size_t len, HelloMessage& out, bool expectT
     out.steamId = r.ReadUInt64();
     out.leechSessionId = r.ReadString();
     out.token = r.ReadString();
-    return !r.IsOverflowed();
+    if (r.IsOverflowed()) {
+        return false;
+    }
+    return StringSane(out.leechSessionId, "leechSessionId", "ParseHello")
+        && StringSane(out.token, "token", "ParseHello");
 }
 
 bool ParseChallenge(const uint8_t* data, size_t len, ChallengeMessage& out, bool expectType) {
+    if (!ValidBuffer(data, len, "ParseChallenge")) {
+        return false;
+    }
     BitReader r(data, len);
     if (!CheckType(r, expectType, NMT::Challenge)) {
         return false;
@@ -171,6 +215,9 @@ bool ParseChallenge(const uint8_t* data, size_t len, ChallengeMessage& out, bool
 }
 
 bool ParseNetspeed(const uint8_t* data, size_t len, NetspeedMessage& out, bool expectType) {
+    if (!ValidBuffer(data, len, "ParseNetspeed")) {
+        return false;
+    }
     BitReader r(data, len);
     if (!CheckType(r, expectType, NMT::Netspeed)) {
         return false;
@@ -180,6 +227,9 @@ bool ParseNetspeed(const uint8_t* data, size_t len, NetspeedMessage& out, bool e
 }
 
 bool ParseLogin(const uint8_t* data, size_t len, LoginMessage& out, bool expectType) {
+    if (!ValidBuffer(data, len, "ParseLogin")) {
+        return false;
+    }
     BitReader r(data, len);
     if (!CheckType(r, expectType, NMT::Login)) {
         return false;
@@ -187,10 +237,17 @@ bool ParseLogin(const uint8_t* data, size_t len, LoginMessage& out, bool expectT
     out.response = r.ReadString();
     out.url = r.ReadString();
     out.steamId = r.ReadUInt64();      // spec §4: trailing QWORD
-    return !r.IsOverflowed();
+    if (r.IsOverflowed()) {
+        return false;
+    }
+    return StringSane(out.response, "response", "ParseLogin")
+        && StringSane(out.url, "url", "ParseLogin");
 }
 
 bool ParseWelcome(const uint8_t* data, size_t len, WelcomeMessage& out, bool expectType) {
+    if (!ValidBuffer(data, len, "ParseWelcome")) {
+        return false;
+    }
     BitReader r(data, len);
     if (!CheckType(r, expectType, NMT::Welcome)) {
         return false;
@@ -198,19 +255,32 @@ bool ParseWelcome(const uint8_t* data, size_t len, WelcomeMessage& out, bool exp
     out.levelName = r.ReadString();
     out.gameName = r.ReadString();
     out.flags = r.ReadUInt64();        // spec §4: trailing QWORD (not a 3rd FString)
-    return !r.IsOverflowed();
+    if (r.IsOverflowed()) {
+        return false;
+    }
+    return StringSane(out.levelName, "levelName", "ParseWelcome")
+        && StringSane(out.gameName, "gameName", "ParseWelcome");
 }
 
 bool ParseFailure(const uint8_t* data, size_t len, FailureMessage& out, bool expectType) {
+    if (!ValidBuffer(data, len, "ParseFailure")) {
+        return false;
+    }
     BitReader r(data, len);
     if (!CheckType(r, expectType, NMT::Failure)) {
         return false;
     }
     out.errorKey = r.ReadString();
-    return !r.IsOverflowed();
+    if (r.IsOverflowed()) {
+        return false;
+    }
+    return StringSane(out.errorKey, "errorKey", "ParseFailure");
 }
 
 bool ParseUpgrade(const uint8_t* data, size_t len, UpgradeMessage& out, bool expectType) {
+    if (!ValidBuffer(data, len, "ParseUpgrade")) {
+        return false;
+    }
     BitReader r(data, len);
     if (!CheckType(r, expectType, NMT::Upgrade)) {
         return false;
@@ -221,6 +291,9 @@ bool ParseUpgrade(const uint8_t* data, size_t len, UpgradeMessage& out, bool exp
 }
 
 bool ParseJoin(const uint8_t* data, size_t len, JoinMessage& /*out*/, bool expectType) {
+    if (!ValidBuffer(data, len, "ParseJoin")) {
+        return false;
+    }
     BitReader r(data, len);
     if (!CheckType(r, expectType, NMT::Join)) {
         return false;
@@ -272,6 +345,11 @@ bool ConsumeMessage(BitReader& r, NMT& outType) {
             break;
         default:
             // Unknown / not-yet-modeled body length: cannot delimit safely.
+            // Surface the offending NMT so a malformed/hostile stream that stalls
+            // the reassembler is diagnosable rather than silently dropped.
+            Logger::Warn("[ControlChannel] ConsumeMessage: unrecognized NMT 0x%02X - "
+                         "cannot determine body length, rejecting",
+                         static_cast<unsigned>(typeByte));
             return false;
     }
 
