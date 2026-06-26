@@ -116,9 +116,11 @@ private:
     }
 
     uint32_t m_h[8];
-    uint64_t m_len;
-    uint8_t  m_buf[64];
-    size_t   m_bufLen;
+    uint64_t m_len = 0;
+    uint8_t  m_buf[64] = {};   // zero-init (defense-in-depth; the block buffer is always
+                               // written before read, bounded by m_bufLen, but a zeroed
+                               // buffer is safer if that invariant ever breaks)
+    size_t   m_bufLen = 0;
 };
 
 std::array<uint8_t, 32> hmacSha256(const uint8_t* key, size_t keyLen,
