@@ -697,9 +697,15 @@ void ConnectionManager::SendActorBootstrap(uint32_t clientId) {
     // server frames its open burst (multiple bunches per packet).
     std::vector<PacketCodec::Bunch> batch;
     size_t batchBits = 0;
-    // Budget under the 1500-byte server MaxPacket: ~1400 bytes = 11200 bits, minus a
-    // per-bunch header allowance (~64 bits) folded into the running estimate below.
-    constexpr size_t kBatchBitBudget = 11000;
+    // Budget must keep each datagram UNDER the retail client's UDP receive buffer, or the
+    // client drops the whole packet with WSAEMSGSIZE (10040) and the actors in it are NEVER
+    // created. CLIENT LOG PROOF (DevNetTraffic): an ~1337-byte actor-open batch carrying
+    // ch25-34 (incl. ch26 = the local PRI) was dropped -> "Created channel 24 ... recvfrom
+    // error 10040 ... Created channel 35" (25-34 missing) -> the PC->PRI link could not
+    // resolve ch26 -> role-select crash. The 1261-byte PackageMap chunks DO arrive, so the
+    // client's buffer is ~1280; budget to 8192 bits (~1024 B) for safe margin. Reliable
+    // retransmit resends the same batch, so an oversized packet fails forever - keep it small.
+    constexpr size_t kBatchBitBudget = 8192;
     auto flushBatch = [&]() {
         if (batch.empty()) return;
         SendReliableBunches(clientId, batch);  // sent + recorded for retransmission
@@ -1060,13 +1066,13 @@ void ConnectionManager::DecodeInboundActorBunch(uint32_t clientId,
         // populate the null object the role UI compares against), DO NOT send the advance -
         // it is a guaranteed client crash. The team is still recorded server-side above.
         // Re-enable by flipping this flag once role-state replication lands.
-        // Held again. The dynamic-objref width fix (1024->2048) corrected the link encoding
-        // (verified: 176a00 @ 21 bits decodes to handle 23 + dyn-ref ch26, no overflow) but the
-        // client STILL does not set ROPC.PlayerReplicationInfo -> same +0xbbf712 LocalPRI-null
-        // crash. Both the 20-bit and 21-bit links crash identically, so byte-width was NOT the
-        // blocker. The PC->PRI bind fails for a deeper reason (PostInitialize timing caching
-        // LocalPRI before the bind, or a channel/actor resolution nuance) - still under RE.
-        constexpr bool kEnableRoleSelectAdvance = false;
+        // Re-enabled. The bind failure was an OVERSIZED-PACKET DROP, not width/timing: the
+        // client dropped our ~1337-byte actor-open batch (WSAEMSGSIZE) so ch26 (local PRI) was
+        // never created, and the PC->PRI link could not resolve. Fixed by shrinking the
+        // actor-open batch budget (see kBatchBitBudget) so every datagram fits the client's
+        // recv buffer. With ch26 delivered, the link binds ROPC.PlayerReplicationInfo, and with
+        // the spectator flags cleared the role-select scene opens. (Client-log confirmed.)
+        constexpr bool kEnableRoleSelectAdvance = true;
         if (kEnableRoleSelectAdvance) {
             // Clear the local PRI's spectator flags FIRST so ShowRoleSelectScene does not
             // early-return at uc:5932 (if PRI.bOnlySpectator return) - the "no crash but no
