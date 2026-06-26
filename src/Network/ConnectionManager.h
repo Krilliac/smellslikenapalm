@@ -101,6 +101,7 @@ private:
         bool     teamSelected = false;
         bool     menuResent = false;   // re-sent ClientShowTeamSelect on client proof-of-life
         bool     spawned = false;      // sent the pawn-spawn + possession once (SelectRoleByClass)
+        uint64_t lastAckFlushMs = 0;   // ack-storm throttle: last standalone ack-only datagram sent
 
         // ---- Reliable retransmission (UE3 UNetConnection-style) -----------------
         // UE3 reliability: a reliable bunch must be re-sent until the client acks the
@@ -185,6 +186,13 @@ private:
     // Build ONE packet from `bunches`, send it, and record any reliable bunches for
     // retransmission until acked. The single choke-point for sending actor bunches.
     void SendReliableBunches(uint32_t clientId, const std::vector<PacketCodec::Bunch>& bunches);
+
+    // Coalesce + throttle pending acks into at most one standalone ack-only datagram per
+    // client per pump cycle (~20ms). Acks also piggyback on any data packet we send. Replaces
+    // the old per-received-packet ack-only send, which produced an S2C ack-storm (~4000 ack
+    // datagrams during role-select spam) that congested loopback and DROPPED reliable packets
+    // (the pawn open, plus the soft-locks / first-click flakiness). Called once per PumpNetwork.
+    void FlushPendingAcks();
     // The client acked `ackedPacketId`: drop any pending reliable set that rode in it.
     void OnClientAck(uint32_t clientId, uint32_t ackedPacketId);
     // Per-poll: resend reliable bunch-sets the client hasn't acked within the timeout.

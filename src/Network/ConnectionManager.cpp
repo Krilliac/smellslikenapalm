@@ -138,6 +138,10 @@ void ConnectionManager::PumpNetwork() {
     // ~250ms instead of stalling the channel forever (the soft-lock).
     RetransmitTick();
 
+    // Flush queued acks coalesced (one throttled ack-only datagram per client), instead of
+    // one per received packet - the per-packet version was an ack-storm that dropped reliables.
+    FlushPendingAcks();
+
     Logger::Trace("[ConnectionManager::PumpNetwork] Exit");
 }
 
@@ -869,6 +873,25 @@ void ConnectionManager::RetransmitTick() {
     }
 }
 
+void ConnectionManager::FlushPendingAcks() {
+    const uint64_t now = NowMs();
+    for (auto& kv : m_controlState) {
+        ControlState& cs = kv.second;
+        const size_t nAcks = cs.outbound.PendingAckCount();
+        if (nAcks == 0) continue;
+        // Coalesce: at most one standalone ack-only datagram per ~20ms per client (acks also
+        // piggyback on any data packet we send). Escape the throttle if acks pile up (>=32)
+        // so a fast client's reliable window never stalls. This replaces the per-received
+        // -packet ack-only send that flooded loopback (~4000 ack datagrams) and dropped the
+        // pawn open + other reliables.
+        if (now - cs.lastAckFlushMs < 20 && nAcks < 32) continue;
+        auto conn = GetConnection(kv.first);
+        if (!conn) continue;
+        SendEncodedPacket(kv.first, cs.outbound.BuildAckOnlyPacket());
+        cs.lastAckFlushMs = now;
+    }
+}
+
 void ConnectionManager::SendCh2Rpc(uint32_t clientId, const std::vector<uint8_t>& payload,
                                    uint32_t payloadBits, const char* name) {
     ControlState& cs = GetControlState(clientId);
@@ -1021,30 +1044,35 @@ void ConnectionManager::SendPawnSpawn(uint32_t clientId) {
         return b;
     };
 
-    // ONE ORDERED PACKET (processed in order by the client):
-    std::vector<PacketCodec::Bunch> pkt;
-    //  1) open the ROPawn channel (reliable, seq 1). NOTE: our PacketCodec encoder only writes
-    //     the bOpen/bClose flag bits when bControl is set, and a real actor OPEN decodes as
-    //     bControl=1 + bOpen=1 (verified against the canned GRI/ch54 open). So an encoded open
-    //     MUST set bControl=true too, or the client never sees it as an open and the channel is
-    //     never created (-> ClientRestart can't resolve the pawn -> AskForPawn spam).
-    PacketCodec::Bunch open;
-    open.bControl = true; open.bOpen = true; open.bReliable = true;
-    open.chIndex = kPawnCh; open.chType = 2; open.chSequence = 1;
-    open.payload = pawnOpen; open.payloadBits = kPawnOpenBits;
-    pkt.push_back(std::move(open));
-    //  2) fix the pawn's back-refs (objref props, same encoding family as the PRI link):
-    pkt.push_back(pawnDelta({0x34, 0x05, 0x00}, 20));  // h52 Controller -> ch2 (load-bearing)
-    pkt.push_back(pawnDelta({0x20, 0x35, 0x00}, 20));  // h32 PlayerReplicationInfo -> ch26
-    //  3) PC.Pawn (h24) on ch2 -> the pawn channel (unreliable, like the PRI link)
-    pkt.push_back(ch2Bunch({0x18, 0x8c, 0x06}, 22, /*reliable=*/false));
-    //  4) ClientRestart (h85) on ch2 (reliable) -> NewPawn = pawn channel: THE possession trigger
-    pkt.push_back(ch2Bunch({0x55, 0x1c, 0x0d}, 23, /*reliable=*/true));
-
-    SendReliableBunches(clientId, pkt);
+    // PACKET 1 - open the pawn channel + its back-refs, in its OWN reliable packet. Decoupled
+    // from the ch2 ClientRestart (packet 2) per RE: coupling the open to the ch2 reliable chain
+    // means one dropped datagram blocks both. The open MUST set bControl=true (our encoder only
+    // writes the bOpen/bClose flag bits when bControl is set; a real actor open decodes as
+    // bControl=1+bOpen=1, verified vs the canned ch54 GRI open) or the client never opens ch209.
+    {
+        std::vector<PacketCodec::Bunch> openPkt;
+        PacketCodec::Bunch open;
+        open.bControl = true; open.bOpen = true; open.bReliable = true;
+        open.chIndex = kPawnCh; open.chType = 2; open.chSequence = 1;
+        open.payload = pawnOpen; open.payloadBits = kPawnOpenBits;
+        openPkt.push_back(std::move(open));
+        openPkt.push_back(pawnDelta({0x34, 0x05, 0x00}, 20));  // h52 Controller -> ch2 (load-bearing)
+        openPkt.push_back(pawnDelta({0x20, 0x35, 0x00}, 20));  // h32 PlayerReplicationInfo -> ch26
+        SendReliableBunches(clientId, openPkt);
+    }
+    // PACKET 2 - possession: PC.Pawn(h24) on ch2 -> the pawn channel, then ClientRestart(h85,
+    // reliable) -> NewPawn = the pawn channel (the trigger that makes the client leave the menu
+    // and possess). Separate packet so the open and the possession retransmit independently.
+    {
+        std::vector<PacketCodec::Bunch> possessPkt;
+        possessPkt.push_back(ch2Bunch({0x18, 0x8c, 0x06}, 22, /*reliable=*/false));
+        possessPkt.push_back(ch2Bunch({0x55, 0x1c, 0x0d}, 23, /*reliable=*/true));
+        SendReliableBunches(clientId, possessPkt);
+    }
     Logger::Info("[ConnectionManager::SendPawnSpawn] client %u: opened ROPawn ch%u (286147) + "
-                 "Controller->ch2 + PRI->ch26 + PC.Pawn(h24) + ClientRestart(h85) - expecting "
-                 "the client to possess and switch to ServerMove(h65)", clientId, kPawnCh);
+                 "Controller->ch2 + PRI->ch26 [pkt1], then PC.Pawn(h24) + ClientRestart(h85) "
+                 "[pkt2] - expecting the client to possess and switch to ServerMove(h65)",
+                 clientId, kPawnCh);
 }
 
 // Names for the handful of ROPlayerController net-field handles we recognise on the
@@ -1329,12 +1357,10 @@ bool ConnectionManager::ParseIncomingControl(uint32_t clientId, const std::vecto
         }
     }
 
-    // If nothing we sent carried the ack, emit a standalone ack so the client
-    // advances its reliable window (e.g. while a multi-bunch Hello is still
-    // being received).
-    if (cs.outbound.PendingAckCount() > 0) {
-        SendEncodedPacket(clientId, cs.outbound.BuildAckOnlyPacket());
-    }
+    // NOTE: acks are NOT flushed here per-packet (that produced an S2C ack-storm that
+    // congested loopback and dropped reliable packets). They stay queued and are flushed
+    // coalesced once per pump cycle by FlushPendingAcks() (and piggyback on any data packet
+    // we send in response). The handshake responses above already drain the queued ack.
 
     Logger::Trace("[ConnectionManager::ParseIncomingControl] Exit: client=%u now in state %s",
                   clientId, HandshakePhaseName(GetOrCreateHandshake(clientId).Phase()));
