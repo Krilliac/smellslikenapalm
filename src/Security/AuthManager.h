@@ -22,6 +22,7 @@
 #include <vector>
 #include <memory>
 #include <mutex>
+#include <chrono>
 #include <unordered_map>
 
 #include "Security/EACProxy.h"
@@ -73,7 +74,15 @@ private:
         std::string hash;
         int         failedAttempts = 0;
         bool        lockedOut = false;
+        // Last time this record was touched (created/used). Used to evict the
+        // oldest attacker-created attempt-tracking record when the map is capped.
+        std::chrono::steady_clock::time_point lastSeen{};
     };
+
+    // Evict the oldest attempt-only (unregistered) tracking record so a flood of
+    // distinct bogus user names cannot grow m_users without bound. Caller MUST
+    // hold m_mutex. Never evicts a registered credential (one with a hash).
+    void EvictOldestTrackingRecord_locked();
 
     std::shared_ptr<SecurityConfig> m_config;
     int m_maxLoginAttempts;

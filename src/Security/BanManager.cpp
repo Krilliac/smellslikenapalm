@@ -107,6 +107,17 @@ void BanManager::AddBan(const std::string& steamId,
                   type == BanType::Permanent ? "Permanent" : "Temporary",
                   static_cast<long long>(duration.count()),
                   reason.c_str());
+
+    // Validate the identity key before it becomes a persistent map key. An empty
+    // or absurdly long SteamID is never legitimate; storing it would pollute the
+    // ban table (and an empty key would later match an empty GetSteamID()).
+    constexpr size_t kMaxSteamIdLen = 128;
+    if (steamId.empty() || steamId.size() > kMaxSteamIdLen) {
+        Logger::Warn("[BanManager::AddBan] Rejecting ban with invalid SteamID (empty=%s, len=%zu)",
+                     steamId.empty() ? "true" : "false", steamId.size());
+        return;
+    }
+
     BanEntry entry;
     entry.steamId = steamId;
     entry.type    = type;

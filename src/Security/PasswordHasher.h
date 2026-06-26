@@ -40,4 +40,20 @@ public:
     // Length in bytes of the random salt and of the derived key.
     static constexpr uint32_t kSaltLength = 16;
     static constexpr uint32_t kKeyLength  = 32;
+
+    // ----- Defensive bounds (anti-DoS / malformed-input guards) -------------
+    // Upper bound on the PBKDF2 iteration count we will ever honour. A hostile
+    // or corrupted stored hash could otherwise encode a huge iteration count and
+    // pin a CPU for an unbounded time during Verify().
+    static constexpr uint32_t kMaxIterations = 10000000; // 10M
+
+    // Bounds on the decoded salt/key sizes accepted from an encoded hash. These
+    // cap memory/CPU spent on attacker-supplied (corrupted) hash strings while
+    // staying generous enough for any hash this class produces.
+    static constexpr uint32_t kMaxSaltLength = 1024;
+    static constexpr uint32_t kMaxKeyLength  = 1024;
+
+    // Maximum plaintext password length we will process. Bounds the work an
+    // attacker can force per auth attempt (PBKDF2 cost scales with input).
+    static constexpr size_t kMaxPasswordLength = 1024;
 };

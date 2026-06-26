@@ -245,7 +245,21 @@ std::string PasswordHasher::Hash(const std::string& password, uint32_t iteration
     Logger::Trace("[PasswordHasher::Hash] Entry: password.len=%zu, iterations=%u",
                   password.size(), iterations);
 
+    // Reject absurdly long passwords: PBKDF2 cost scales with input length, so an
+    // unbounded password is a CPU-exhaustion vector. (Length only is logged.)
+    if (password.size() > kMaxPasswordLength) {
+        Logger::Warn("[PasswordHasher::Hash] Password too long (len=%zu > %zu), refusing",
+                     password.size(), static_cast<size_t>(kMaxPasswordLength));
+        return std::string();
+    }
+
     if (iterations == 0) iterations = kDefaultIterations;
+    // Clamp pathological iteration counts so callers can't force unbounded work.
+    if (iterations > kMaxIterations) {
+        Logger::Warn("[PasswordHasher::Hash] Iteration count %u exceeds cap %u; clamping",
+                     iterations, kMaxIterations);
+        iterations = kMaxIterations;
+    }
 
     std::vector<uint8_t> salt = CryptoUtils::GenerateRandomBytes(kSaltLength);
     if (salt.size() != kSaltLength) {
@@ -274,6 +288,14 @@ std::string PasswordHasher::Hash(const std::string& password, uint32_t iteration
 bool PasswordHasher::Verify(const std::string& password, const std::string& encodedHash) {
     Logger::Trace("[PasswordHasher::Verify] Entry: encodedHash.len=%zu", encodedHash.size());
 
+    // Bound attacker-controlled password length before any key derivation so a
+    // single auth attempt can't be amplified into unbounded CPU work.
+    if (password.size() > kMaxPasswordLength) {
+        Logger::Warn("[PasswordHasher::Verify] Password too long (len=%zu > %zu), rejecting",
+                     password.size(), static_cast<size_t>(kMaxPasswordLength));
+        return false;
+    }
+
     auto parts = splitDollar(encodedHash);
     if (parts.size() != 4 || parts[0] != "pbkdf2") {
         Logger::Warn("[PasswordHasher::Verify] Malformed encoded hash (expected pbkdf2$iter$salt$key)");
@@ -282,14 +304,15 @@ bool PasswordHasher::Verify(const std::string& password, const std::string& enco
 
     uint32_t iterations = 0;
     try {
-        unsigned long v = std::stoul(parts[1]);
+        unsigned long long v = std::stoull(parts[1]);
+        // Reject (don't silently truncate) anything outside the honoured range.
+        if (v == 0ULL || v > static_cast<unsigned long long>(kMaxIterations)) {
+            Logger::Warn("[PasswordHasher::Verify] Iteration count out of accepted range");
+            return false;
+        }
         iterations = static_cast<uint32_t>(v);
     } catch (...) {
         Logger::Warn("[PasswordHasher::Verify] Invalid iteration count field");
-        return false;
-    }
-    if (iterations == 0) {
-        Logger::Warn("[PasswordHasher::Verify] Iteration count is zero");
         return false;
     }
 
@@ -297,6 +320,18 @@ bool PasswordHasher::Verify(const std::string& password, const std::string& enco
     auto keyOpt  = CryptoUtils::Base64Decode(parts[3]);
     if (!saltOpt.has_value() || !keyOpt.has_value()) {
         Logger::Warn("[PasswordHasher::Verify] Failed to base64-decode salt or key");
+        return false;
+    }
+
+    // Validate decoded field sizes from the (possibly corrupted/hostile) stored
+    // hash: an empty key would otherwise make the constant-time compare trivially
+    // satisfiable, and an oversized salt/key wastes memory + CPU in derive().
+    if (saltOpt->empty() || saltOpt->size() > kMaxSaltLength) {
+        Logger::Warn("[PasswordHasher::Verify] Salt length out of accepted range");
+        return false;
+    }
+    if (keyOpt->empty() || keyOpt->size() > kMaxKeyLength) {
+        Logger::Warn("[PasswordHasher::Verify] Key length out of accepted range");
         return false;
     }
 

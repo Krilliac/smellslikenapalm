@@ -32,14 +32,60 @@ bool TokenManager::IsExpired(const Entry& e) const {
     return std::chrono::steady_clock::now() > e.expiry;
 }
 
+size_t TokenManager::PruneExpiredLocked() {
+    size_t removed = 0;
+    for (auto it = m_tokens.begin(); it != m_tokens.end();) {
+        if (IsExpired(it->second)) {
+            it = m_tokens.erase(it);
+            ++removed;
+        } else {
+            ++it;
+        }
+    }
+    return removed;
+}
+
+void TokenManager::EvictOldestLocked() {
+    auto oldest = m_tokens.end();
+    for (auto it = m_tokens.begin(); it != m_tokens.end(); ++it) {
+        if (oldest == m_tokens.end() || it->second.created < oldest->second.created) {
+            oldest = it;
+        }
+    }
+    if (oldest != m_tokens.end()) {
+        Logger::Warn("[TokenManager] Token cap (%zu) reached; evicting oldest token for user='%s'",
+                     kMaxTokens, oldest->second.user.c_str());
+        m_tokens.erase(oldest);
+    }
+}
+
 std::string TokenManager::GenerateToken(const std::string& user) {
     Logger::Trace("[TokenManager::GenerateToken] Entry: user='%s'", user.c_str());
+
+    // Reject empty identities: a token must be bound to a real user so it cannot
+    // later be validated against an empty/spoofed identity.
+    if (user.empty()) {
+        Logger::Warn("[TokenManager::GenerateToken] Refusing to issue token for empty user");
+        return std::string();
+    }
 
     std::string token;
     // Defend against the astronomically-unlikely collision so we never alias two
     // users onto one token.
     {
         std::lock_guard<std::mutex> lock(m_mutex);
+
+        // Bound the token table so a flood of token issuance cannot exhaust
+        // memory. Purge expired entries first; if still at the ceiling, evict the
+        // oldest. Existing valid tokens for other users are preserved whenever
+        // possible (expired ones are dropped before any live one).
+        if (m_tokens.size() >= kMaxTokens) {
+            PruneExpiredLocked();
+            while (m_tokens.size() >= kMaxTokens) {
+                EvictOldestLocked();
+            }
+        }
+
         do {
             std::vector<uint8_t> raw = CryptoUtils::GenerateRandomBytes(kTokenBytes);
             token = CryptoUtils::Base64Encode(raw);
@@ -47,9 +93,10 @@ std::string TokenManager::GenerateToken(const std::string& user) {
 
         Entry e;
         e.user = user;
+        e.created = std::chrono::steady_clock::now();
         e.hasExpiry = (m_lifetime.count() > 0);
         if (e.hasExpiry) {
-            e.expiry = std::chrono::steady_clock::now() + m_lifetime;
+            e.expiry = e.created + m_lifetime;
         }
         m_tokens.emplace(token, std::move(e));
     }
@@ -62,6 +109,14 @@ std::string TokenManager::GenerateToken(const std::string& user) {
 
 bool TokenManager::ValidateToken(const std::string& user, const std::string& token) {
     Logger::Trace("[TokenManager::ValidateToken] Entry: user='%s'", user.c_str());
+
+    // An empty user or token can never correspond to a legitimately issued token
+    // (GenerateToken rejects empty users and never emits empty tokens). Reject
+    // early so hostile callers cannot probe with blank credentials.
+    if (user.empty() || token.empty()) {
+        Logger::Debug("[TokenManager::ValidateToken] Empty user or token; rejecting");
+        return false;
+    }
 
     std::lock_guard<std::mutex> lock(m_mutex);
     auto it = m_tokens.find(token);

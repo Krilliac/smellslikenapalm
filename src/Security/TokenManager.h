@@ -43,11 +43,23 @@ public:
 private:
     struct Entry {
         std::string user;
-        std::chrono::steady_clock::time_point expiry; // only meaningful if m_lifetime > 0
+        std::chrono::steady_clock::time_point expiry;  // only meaningful if m_lifetime > 0
+        std::chrono::steady_clock::time_point created;  // for bounded-cap LRU eviction
         bool hasExpiry;
     };
 
+    // Hard cap on the number of tracked tokens. Tokens are issued in response to
+    // (attacker-reachable) authentication, so without a ceiling the map is an
+    // unbounded memory-exhaustion DoS vector. When the cap is hit we first purge
+    // any expired entries and, failing that, evict the oldest one.
+    static constexpr size_t kMaxTokens = 100000;
+
     bool IsExpired(const Entry& e) const;
+
+    // Caller must hold m_mutex. Drops expired entries; returns how many removed.
+    size_t PruneExpiredLocked();
+    // Caller must hold m_mutex. Evicts the single oldest entry (by creation time).
+    void EvictOldestLocked();
 
     std::chrono::seconds m_lifetime;
     mutable std::mutex m_mutex;
