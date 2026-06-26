@@ -59,6 +59,7 @@ rs2v_add_test(HandshakeIntegrationTests) # end-to-end client<->server handshake 
 rs2v_add_test(ActorReplicationTests)     # actor-channel NetGUID/SerializeNewActor codec (per-session replication)
 rs2v_add_test(BitReaderFuzzTests)        # fuzz + malformed-input hardening for BitReader/BitWriter (overflow safety, no OOB/hang, round-trip)
 rs2v_add_test(PacketCodecFuzzTests)      # fuzz/hostile-input: random+mutated+boundary bytes into Decode/Encode (no crash/OOB/hang), valid round-trip
+rs2v_add_test(NetworkPacketSafetyTests)  # malformed-input bounds checks for legacy Packet readers (ReadString/DecodeString/ReadUInt/ReadFloat/ReadBytes)
 
 # Scripting is OFF by default (deprecated .NET COM hosting). The scripting test
 # is gated on ENABLE_SCRIPTING, but it ALSO references Scripting/ScriptEngine.h
