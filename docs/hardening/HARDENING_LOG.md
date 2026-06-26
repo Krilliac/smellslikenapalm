@@ -31,3 +31,4 @@ src/Network/BitWriter, BitReader, PacketCodec, ActorReplication, WireTrace.h.
 2026-06-26 | Config + Utils | URL oversize/option caps (URLOptions, join path); safe numeric coercion (ConfigManager); path-traversal reject (PathUtils); distribution UB fixes (RandomGenerator); Split/ToDouble guards (StringUtils); pool null-bail + worker clamp (MemoryPool/ThreadPool) | 07592a5
 2026-06-26 | Network transport | UDPSocket buffer clamps; BandwidthManager client-cap + overflow-safe (bit-identical verdict); ClientConnection guards (CanSend fails-open); NetworkManager/NetworkThread null + anti-busy-spin | 1bb6922
 2026-06-26 | Fuzz/tests | 41 malformed-input fuzz tests (BitReader/PacketCodec/ControlReassembler/HandshakeState), ~1.3M calls, all pass, 0 crashes - hardening validated | 0a2f390
+2026-06-26 | Static analysis | cppcheck pass (11 findings, mostly non-bugs); fixed uninit Sha256::m_buf; AuthenticationTests 32/32 pass | 02ee824
