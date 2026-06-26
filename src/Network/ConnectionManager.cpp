@@ -763,6 +763,22 @@ static const char* RoPcHandleName(uint32_t h) {
 
 void ConnectionManager::DecodeInboundActorBunch(uint32_t clientId,
                                                 const PacketCodec::Bunch& bunch) {
+    // Proof-of-life re-send: the very first inbound actor bunch means the client has
+    // bound its local PlayerController and is processing ch2. The initial
+    // ClientShowTeamSelect (sent right after the open burst) can race AHEAD of that
+    // bind and be dropped (menu never appears). Re-send it now that the client is
+    // demonstrably ready. Harmless if the menu is already up.
+    {
+        ControlState& cs = GetControlState(clientId);
+        if (!cs.menuResent && cs.ch2OutReliable > 0) {
+            cs.menuResent = true;
+            BitWriter fw;
+            fw.SerializeInt(206, kRoPcMaxHandle);   // ClientShowTeamSelect
+            SendCh2Rpc(clientId, fw.GetBytes(), static_cast<uint32_t>(fw.NumBits()),
+                       "ClientShowTeamSelect(resend)");
+        }
+    }
+
     // Only reliable function/property bunches carry a handle worth dispatching; the
     // open/close framing and tiny keepalives don't.
     if (!bunch.bReliable || bunch.bOpen || bunch.bClose || bunch.payloadBits == 0) {
@@ -779,16 +795,35 @@ void ConnectionManager::DecodeInboundActorBunch(uint32_t clientId,
     // team then calls ChangedTeams() to open role select. We advance the client to the
     // role-select scene via ClientShowRoleSelect (handle 207, optional bool).
     if (bunch.chIndex == 2 && handle == 170) {
-        const uint8_t teamId = r.ReadByte();
+        uint8_t teamId = r.ReadByte();
+        if (teamId > 1) teamId &= 1;   // RS2 has two teams (0/1); the byte may carry
+                                       // merged-bunch noise in the high bits.
         ControlState& cs = GetControlState(clientId);
-        Logger::Info("[ConnectionManager] client %u: SelectTeam(TeamID=%u) -> advancing to role select",
+        Logger::Info("[ConnectionManager] client %u: SelectTeam(TeamID=%u) -> replying ChangedTeams",
                      clientId, teamId);
         cs.teamSelected = true;
+        // ChangedTeams(byte TeamIndex, bool bShowRoleSelection, optional Class<GameInfo>
+        // GameTypeClass, optional bool bTeamBalancing, optional bool bShowLobby) -
+        // ROPlayerController.uc:3533, handle 172. This is what the real server calls after
+        // SelectTeam: it closes the team-select scene and opens role select. All params
+        // are serialized in declaration order. GameTypeClass is sent as None (null object
+        // ref) for now - if role select needs the real game class we'll replicate it.
         BitWriter fw;
-        fw.SerializeInt(207, kRoPcMaxHandle);   // ClientShowRoleSelect
-        fw.WriteBit(false);                      // optional bool bCacheOldRole = false
+        fw.SerializeInt(172, kRoPcMaxHandle);        // ChangedTeams
+        fw.WriteByte(teamId);                         // byte TeamIndex
+        fw.WriteBit(true);                            // bShowRoleSelection
+        // optional Class<GameInfo> GameTypeClass = None. EXACT UE3 7258 encoding from
+        // UPackageMapLevel::SerializeObject (UnNetDrv.cpp:97): selector bit then index.
+        // For None the client reads selector bit == 1 then SerializeInt(Index,MAX_CHANNELS)
+        // with Index <= 0 => NULL. (The static path is selector bit 0 + SerializeInt over
+        // MAX_OBJECT_INDEX, which is what we wrongly emitted before - it decoded to a real
+        // object at the wrong bit width and misaligned the whole bunch.)
+        fw.WriteBit(true);                            // selector: dynamic/None branch
+        fw.SerializeInt(0, 1024);                     // Index 0 (== None), max MAX_CHANNELS
+        fw.WriteBit(false);                           // bTeamBalancing
+        fw.WriteBit(false);                           // bShowLobby
         SendCh2Rpc(clientId, fw.GetBytes(), static_cast<uint32_t>(fw.NumBits()),
-                   "ClientShowRoleSelect");
+                   "ChangedTeams");
     }
 }
 

@@ -99,6 +99,7 @@ private:
         uint32_t ch2OutReliable = 0;
         uint32_t actorChType = 2;
         bool     teamSelected = false;
+        bool     menuResent = false;   // re-sent ClientShowTeamSelect on client proof-of-life
     };
     std::unordered_map<uint32_t, ControlState> m_controlState;
     uint32_t m_nextClientId{1};
