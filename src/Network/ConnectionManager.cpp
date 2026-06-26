@@ -12,6 +12,7 @@
 #include "Network/ControlChannel.h"
 #include "Network/BitWriter.h"
 #include "Network/BitReader.h"
+#include "Network/PacketRecorder.h"
 #include "../../telemetry/TelemetryManager.h"
 #include <chrono>
 #include <fstream>
@@ -152,6 +153,11 @@ void ConnectionManager::HandleIncomingPacket(const std::vector<uint8_t>& data, c
     }
     Logger::Debug("[ConnectionManager::HandleIncomingPacket] clientId=%u for %s:%u", clientId, addr.ip.c_str(), addr.port);
 
+    // GLOBAL PACKET RECORDER: every inbound datagram (C2S) -> packetlog/ sniff.
+    net::PacketRecorder::Instance().RecordDatagram(
+        net::PktDir::C2S, clientId, addr.ip + ":" + std::to_string(addr.port),
+        data.data(), data.size());
+
     // HANDSHAKE WIRE TRACE: dump small inbound datagrams (the handshake/control
     // packets are tiny) so we can see exactly what the real client sends. Skipped
     // for large datagrams to avoid spamming gameplay traffic.
@@ -170,6 +176,9 @@ void ConnectionManager::HandleIncomingPacket(const std::vector<uint8_t>& data, c
     if (connIt == m_clients.end() || !connIt->second) {
         Logger::Warn("[ConnectionManager::HandleIncomingPacket] no connection object for %s:%u (clientId=%u), dropping packet",
                      addr.ip.c_str(), addr.port, clientId);
+        net::RecordNetNull("HandleIncomingPacket/connLookup",
+                           addr.ip + ":" + std::to_string(addr.port) + " has no connection object",
+                           clientId);
         return;
     }
     auto conn = connIt->second;

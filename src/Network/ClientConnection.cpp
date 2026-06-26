@@ -2,6 +2,7 @@
 
 #include "Network/ClientConnection.h"
 #include "Network/ConnectionManager.h"
+#include "Network/PacketRecorder.h"
 #include "Game/Player.h"
 #include "Utils/Logger.h"
 #include "Protocol/ReverseEngineering/ProtocolDecoder.h"
@@ -127,6 +128,9 @@ bool ClientConnection::SendRaw(const uint8_t* data, size_t len) {
     bool ok = m_socket->SendTo(m_ip, m_port, data, len);
     if (ok) {
         OnBytesSent((uint32_t)len);
+        // GLOBAL PACKET RECORDER: every outbound datagram (S2C) -> packetlog/ sniff.
+        net::PacketRecorder::Instance().RecordDatagram(
+            net::PktDir::S2C, m_clientId, m_ip + ":" + std::to_string(m_port), data, len);
         Logger::Debug("[ClientConnection::SendRaw] Sent %zu raw bytes to client %u (%s:%u)",
                       len, m_clientId, m_ip.c_str(), m_port);
     } else {

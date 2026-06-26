@@ -103,3 +103,6 @@ Testing/
 # Python
 __pycache__/
 *.pyc
+
+# PacketRecorder sniff output (runtime-generated)
+packetlog/
