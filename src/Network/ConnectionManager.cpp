@@ -941,63 +941,29 @@ void ConnectionManager::DecodeInboundActorBunch(uint32_t clientId,
             }
         }
 
-        // --- The server-side JoinTeam result: transition the LOCAL player's PRI (ch26 =
-        // "Krill") from spectator to a participant on the chosen team. Our replayed PRI
-        // open carries bOnlySpectator=1/bWaitingPlayer=1/bIsSpectator=1, so role-select
-        // bounces back to team-select (ROPlayerController.uc:3482 sets bShowRoleSelection
-        // = !bOnlySpectator; ShowRoleSelect returns spectators to ShowTeamSelect). Clear
-        // those flags and bind PRI.Team, as ONE UNRELIABLE delta (bReliable=0, ChSeq=0) on
-        // ch26 - unreliable so it can't re-trigger the seq2 reliable-buffer hang. PRI
-        // handles at maxHandle 98 (docs/re/pri_channels_properties.md): bWaitingPlayer=31,
-        // bOnlySpectator=32, bIsSpectator=33, Team=35 (dynamic obj ref). team0->ch76,
-        // team1->ch56. Properties in ascending handle order.
-        if (auto conn = GetConnection(clientId)) {
-            const uint32_t teamChannel = (teamId == 0) ? 76u : 56u;
-            BitWriter pw;
-            pw.SerializeInt(31, 98); pw.WriteBit(false);   // bWaitingPlayer = 0
-            pw.SerializeInt(32, 98); pw.WriteBit(false);   // bOnlySpectator = 0
-            pw.SerializeInt(33, 98); pw.WriteBit(false);   // bIsSpectator   = 0
-            pw.SerializeInt(35, 98); pw.WriteBit(true);    // Team: selector 1 = dynamic
-            pw.SerializeInt(teamChannel, 1024);            //   -> TeamInfo open channel
-            PacketCodec::Bunch pb;
-            pb.bControl = false; pb.bOpen = false; pb.bClose = false;
-            pb.bReliable = false;            // UNRELIABLE delta
-            pb.chIndex = 26; pb.chType = 2; pb.chSequence = 0;
-            pb.payload = pw.GetBytes();
-            pb.payloadBits = static_cast<uint32_t>(pw.NumBits());
-            const PacketCodec::Packet pkt = cs.outbound.BuildRawBunchPacket(pb);
-            const std::vector<uint8_t> wire =
-                PacketCodec::Encode(pkt, PacketCodec::kServerSendMaxPacketBytes);
-            conn->SendRaw(wire.data(), wire.size());
-            Logger::Info("[ConnectionManager] client %u: PRI ch26 unreliable delta - clear spectator + Team->ch%u (%u bits)",
-                         clientId, teamChannel, pb.payloadBits);
-        }
-
-        // ChangedTeams(byte TeamIndex, bool bShowRoleSelection, optional Class<GameInfo>
-        // GameTypeClass, optional bool bTeamBalancing, optional bool bShowLobby) -
-        // ROPlayerController.uc:3533, handle 172. This is what the real server calls after
-        // SelectTeam: it closes the team-select scene and opens role select. All params
-        // are serialized in declaration order. GameTypeClass is sent as None (null object
-        // ref) for now - if role select needs the real game class we'll replicate it.
-        BitWriter fw;
-        fw.SerializeInt(172, kRoPcMaxHandle);   // handle ChangedTeams
-        // UE3 function-call param serialization (UnScript.cpp:2980-3010, mirrored at
-        // UnChan.cpp:1628-1640): each NON-bool param is preceded by a 1-bit "Send"
-        // presence flag; its value is written ONLY if Send==1 (Send==0 means the value
-        // equals its default and is omitted entirely). BOOL params get NO presence bit -
-        // just their value bit. (Our previous encoding wrote the byte with no Send bit and
-        // encoded GameTypeClass=None as a 1-bit selector + 10-bit index - 11 wrong bits -
-        // which misaligned the whole bunch so the client mis-decoded ChangedTeams.)
-        const bool sendTeamIdx = (teamId != 0);       // byte TeamIndex (non-bool)
-        fw.WriteBit(sendTeamIdx);                     //   Send presence bit
-        if (sendTeamIdx) fw.WriteByte(teamId);        //   value only if Send==1
-        fw.WriteBit(true);                            // bool bShowRoleSelection (value bit)
-        fw.WriteBit(false);                           // Class<GameInfo> GameTypeClass=None ==
-                                                      //   default -> Send=0, NO value
-        fw.WriteBit(false);                           // bool bTeamBalancing (value bit)
-        fw.WriteBit(false);                           // bool bShowLobby (value bit)
-        SendCh2Rpc(clientId, fw.GetBytes(), static_cast<uint32_t>(fw.NumBits()),
-                   "ChangedTeams");
+        // --- CLIENT-SIDE ADVANCE DISABLED (it CRASHES the retail client). ---------------
+        // We used to reply with a PRI.Team delta + ChangedTeams (handle 172) to advance the
+        // client from team-select to role-select. Crash-dump analysis of VNGame.exe
+        // (AppData/Local/CrashDumps, EXCEPTION_ACCESS_VIOLATION reading 0x0 at
+        // VNGame.exe+0xbbf712, in the UE3 script ProcessEvent path) proved the cause:
+        // ChangedTeams runs ShowRoleSelectScene on the client, which dereferences game
+        // state we DON'T replicate (WorldInfo.GRI.Teams populated with real ROTeamInfo,
+        // ROMapInfo Northern/SouthernSquads roles, ROGameReplicationInfo cast) -> NULL
+        // deref -> client crash. Ironically, correctly encoding ChangedTeams (the UE3
+        // per-param "Send" bit fix) is what made the client actually DECODE+RUN it and
+        // crash; before, it was misaligned and silently ignored.
+        //
+        // So: do NOT trigger the client-side role-select transition until the supporting
+        // state (GRI.Teams/ROTeamInfo with real data, ROMapInfo roles, PRI fields) is
+        // actually replicated. Sending ChangedTeams (or PRI.Team binding a half-populated
+        // ROTeamInfo) into the gap is a guaranteed client crash. The team menu stays up;
+        // the player can re-pick or disconnect cleanly. The team IS recorded server-side
+        // above (AddPlayerToTeam). Re-enable the advance only once role-select state is
+        // replicated (see docs/re/SAFE_STATE_REP_PLAN.md + the role->spawn TODO).
+        Logger::Info("[ConnectionManager] client %u: SelectTeam(TeamID=%u) recorded server-side; "
+                     "client-side role-select advance intentionally NOT sent (would crash the "
+                     "client against unreplicated role-select state - see crash-dump analysis)",
+                     clientId, teamId);
     }
 }
 
