@@ -906,17 +906,24 @@ void ConnectionManager::DecodeInboundActorBunch(uint32_t clientId,
     // team then calls ChangedTeams() to open role select. We advance the client to the
     // role-select scene via ClientShowRoleSelect (handle 207, optional bool).
     if (bunch.chIndex == 2 && handle == 170) {
-        uint8_t teamId = r.ReadByte();
-        // Don't act on a TeamID byte that wasn't actually present: an overflowed read
-        // returns a 0 default, which would silently drive a real team transition off a
-        // truncated/malformed bunch. Valid SelectTeam always carries the byte.
-        if (r.IsOverflowed()) {
-            Logger::Warn("[ConnectionManager::DecodeInboundActorBunch] client %u: SelectTeam bunch truncated before TeamID byte, ignoring",
-                         clientId);
-            return;
+        // UE3 function-call params carry a per-param "Send" PRESENCE BIT for NON-bool
+        // params (UnScript.cpp InternalProcessRemoteFunction:2980-3010; receive side
+        // UnChan.cpp:1628-1640): read the 1-bit Send flag first; the byte value follows
+        // ONLY if Send==1. Send==0 means the value equals its default and is OMITTED.
+        // SelectTeam(byte TeamID): TeamID==0 sends Send=0 and NO byte; reading the byte
+        // raw would overflow and silently drop the team-0 pick (team-1 previously only
+        // "worked" by a &1 masking accident). This is the real team-0 selection bug.
+        const bool hasTeamId = r.ReadBit();
+        uint8_t teamId = 0;                  // Send==0 -> default 0 (a VALID selection)
+        if (hasTeamId) {
+            teamId = r.ReadByte();
+            if (r.IsOverflowed()) {
+                Logger::Warn("[ConnectionManager::DecodeInboundActorBunch] client %u: SelectTeam truncated before TeamID byte, ignoring",
+                             clientId);
+                return;
+            }
         }
-        if (teamId > 1) teamId &= 1;   // RS2 has two teams (0/1); the byte may carry
-                                       // merged-bunch noise in the high bits.
+        if (teamId > 1) teamId = 1;          // RS2 has two playable teams (0/1)
         ControlState& cs = GetControlState(clientId);
         Logger::Info("[ConnectionManager] client %u: SelectTeam(TeamID=%u) -> JoinTeam (clear spectator + Team) then ChangedTeams",
                      clientId, teamId);
@@ -961,19 +968,22 @@ void ConnectionManager::DecodeInboundActorBunch(uint32_t clientId,
         // are serialized in declaration order. GameTypeClass is sent as None (null object
         // ref) for now - if role select needs the real game class we'll replicate it.
         BitWriter fw;
-        fw.SerializeInt(172, kRoPcMaxHandle);        // ChangedTeams
-        fw.WriteByte(teamId);                         // byte TeamIndex
-        fw.WriteBit(true);                            // bShowRoleSelection
-        // optional Class<GameInfo> GameTypeClass = None. EXACT UE3 7258 encoding from
-        // UPackageMapLevel::SerializeObject (UnNetDrv.cpp:97): selector bit then index.
-        // For None the client reads selector bit == 1 then SerializeInt(Index,MAX_CHANNELS)
-        // with Index <= 0 => NULL. (The static path is selector bit 0 + SerializeInt over
-        // MAX_OBJECT_INDEX, which is what we wrongly emitted before - it decoded to a real
-        // object at the wrong bit width and misaligned the whole bunch.)
-        fw.WriteBit(true);                            // selector: dynamic/None branch
-        fw.SerializeInt(0, 1024);                     // Index 0 (== None), max MAX_CHANNELS
-        fw.WriteBit(false);                           // bTeamBalancing
-        fw.WriteBit(false);                           // bShowLobby
+        fw.SerializeInt(172, kRoPcMaxHandle);   // handle ChangedTeams
+        // UE3 function-call param serialization (UnScript.cpp:2980-3010, mirrored at
+        // UnChan.cpp:1628-1640): each NON-bool param is preceded by a 1-bit "Send"
+        // presence flag; its value is written ONLY if Send==1 (Send==0 means the value
+        // equals its default and is omitted entirely). BOOL params get NO presence bit -
+        // just their value bit. (Our previous encoding wrote the byte with no Send bit and
+        // encoded GameTypeClass=None as a 1-bit selector + 10-bit index - 11 wrong bits -
+        // which misaligned the whole bunch so the client mis-decoded ChangedTeams.)
+        const bool sendTeamIdx = (teamId != 0);       // byte TeamIndex (non-bool)
+        fw.WriteBit(sendTeamIdx);                     //   Send presence bit
+        if (sendTeamIdx) fw.WriteByte(teamId);        //   value only if Send==1
+        fw.WriteBit(true);                            // bool bShowRoleSelection (value bit)
+        fw.WriteBit(false);                           // Class<GameInfo> GameTypeClass=None ==
+                                                      //   default -> Send=0, NO value
+        fw.WriteBit(false);                           // bool bTeamBalancing (value bit)
+        fw.WriteBit(false);                           // bool bShowLobby (value bit)
         SendCh2Rpc(clientId, fw.GetBytes(), static_cast<uint32_t>(fw.NumBits()),
                    "ChangedTeams");
     }

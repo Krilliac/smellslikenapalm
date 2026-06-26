@@ -99,7 +99,11 @@ constexpr int32_t kNetspeedLAN      = 20000; // ConfiguredLanSpeed      [CB]
 // and TODO-marked in ControlChannel.cpp; these maxima are the standard UE3 values.
 // ---------------------------------------------------------------------------
 constexpr int32_t kMaxPacketId = 16384;  // MAX_PACKETID  (14-bit packet seq)   [UE3]
-constexpr int32_t kMaxChannels = 1023;   // MAX_CHANNELS                        [UE3]
+constexpr int32_t kMaxChannels = 1024;   // MAX_CHANNELS (power-of-two)         [UE3]
+// MUST be 1024, not 1023: UE3 frames ChIndex via SerializeInt(ChIndex, MAX_CHANNELS), which
+// is exactly 10 bits for all 0..1023 ONLY when the bound is a power of two. With 1023,
+// ChIndex>=511 encodes in 9 bits instead of 10 and desyncs the bunch header on the wire.
+// (Today the bootstrap uses ch0..140 where 1023/1024 are bit-identical, so this was latent.)
 constexpr uint8_t kControlChannelIndex = 0; // control channel is index 0       [UE3]
 
 // Channel types (SerializeInt(CHTYPE_MAX)) [UE3].
