@@ -162,6 +162,12 @@ private:
     // (VNGame.exe+0xbbf712). Sent `repeats` times for unreliable delivery.
     void SendLocalPriLink(uint32_t clientId, int repeats);
 
+    // Clear the local PRI's spectator/waiting flags on ch26 (bWaitingPlayer h31,
+    // bOnlySpectator h32, bIsSpectator h33 -> 0) as an UNRELIABLE property delta, so
+    // ShowRoleSelectScene does not early-return at ROPlayerController.uc:5932
+    // (if PlayerReplicationInfo.bOnlySpectator return). Sent `repeats` times.
+    void SendClearSpectator(uint32_t clientId, int repeats);
+
     // Decode one inbound actor-channel (ChIndex>=2) bunch: read the field handle
     // (SerializeInt at the PlayerController maxHandle) and dispatch the client->server
     // RPC (e.g. SelectTeam). Logs the handle/name for visibility into client input.

@@ -906,6 +906,36 @@ void ConnectionManager::SendLocalPriLink(uint32_t clientId, int repeats) {
                  "->ch26 link (handle 23) x%d (unreliable 176a00)", clientId, repeats);
 }
 
+void ConnectionManager::SendClearSpectator(uint32_t clientId, int repeats) {
+    // Our ch26 PRI open carries bWaitingPlayer(31)=bOnlySpectator(32)=bIsSpectator(33)=1
+    // (the captured local player was in the spectator/waiting state). After a team pick the
+    // player is no longer a spectator; replicate those flags = 0 so ShowRoleSelectScene does
+    // not early-return at ROPlayerController.uc:5932. Property bunch = ascending handle order,
+    // each bool = SerializeInt(handle,98) + 1 value bit. UNRELIABLE ch26 delta, repeated.
+    constexpr uint32_t kPriMaxHandle = 98;
+    BitWriter pw;
+    pw.SerializeInt(31, kPriMaxHandle); pw.WriteBit(false);  // bWaitingPlayer = 0
+    pw.SerializeInt(32, kPriMaxHandle); pw.WriteBit(false);  // bOnlySpectator = 0
+    pw.SerializeInt(33, kPriMaxHandle); pw.WriteBit(false);  // bIsSpectator   = 0
+    const std::vector<uint8_t> payload = pw.GetBytes();
+    const uint32_t bits = static_cast<uint32_t>(pw.NumBits());
+    for (int i = 0; i < repeats; ++i) {
+        PacketCodec::Bunch b;
+        b.bControl   = false;
+        b.bOpen      = false;
+        b.bClose     = false;
+        b.bReliable  = false;            // UNRELIABLE delta (no chSeq/chType on the wire)
+        b.chIndex    = 26;               // local player's PRI channel
+        b.chType     = 2;                // CHTYPE_Actor (ignored for unreliable)
+        b.chSequence = 0;
+        b.payload    = payload;
+        b.payloadBits = bits;
+        SendReliableBunches(clientId, { b });   // sends; not recorded (bReliable=false)
+    }
+    Logger::Info("[ConnectionManager::SendClearSpectator] client %u: cleared PRI spectator flags "
+                 "on ch26 (h31/32/33=0, %u bits) x%d", clientId, bits, repeats);
+}
+
 // Names for the handful of ROPlayerController net-field handles we recognise on the
 // wire (ground truth from tools/netfields_from_u.ps1). For logging/dispatch only.
 static const char* RoPcHandleName(uint32_t h) {
@@ -1023,10 +1053,12 @@ void ConnectionManager::DecodeInboundActorBunch(uint32_t clientId,
         // Re-enable by flipping this flag once role-state replication lands.
         constexpr bool kEnableRoleSelectAdvance = true;
         if (kEnableRoleSelectAdvance) {
-            // Re-assert the local PC->PRI link (handle 23 -> ch26) right before opening the
-            // role scene: the unit-select scene's PostInitialize caches LocalPRI =
-            // ROPC.PlayerReplicationInfo, so that ref MUST be set when ChangedTeams runs.
-            // (RE: the null LocalPRI is the VNGame.exe+0xbbf712 crash.)
+            // Clear the local PRI's spectator flags FIRST so ShowRoleSelectScene does not
+            // early-return at uc:5932 (if PRI.bOnlySpectator return) - the "no crash but no
+            // advance" gate. Then re-assert the PC->PRI link (handle 23 -> ch26): the
+            // unit-select scene's PostInitialize caches LocalPRI = ROPC.PlayerReplicationInfo,
+            // so that ref MUST be set when ChangedTeams runs the role scene.
+            SendClearSpectator(clientId, 3);
             SendLocalPriLink(clientId, 3);
             constexpr uint32_t kChangedTeamsHandle           = 172;
             constexpr uint32_t kRoGameInfoTerritoriesClassIx = 69601;  // GRI.GameClass h33 (capture)
