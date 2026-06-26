@@ -112,6 +112,15 @@ Packet PacketAssembler::BuildRawBunchPacket(const Bunch& bunch) {
     return pkt;
 }
 
+Packet PacketAssembler::BuildRawBunchesPacket(const std::vector<Bunch>& bunches) {
+    Packet pkt;
+    pkt.packetId = AllocatePacketId();
+    pkt.ok = true;
+    pkt.bunches = bunches;
+    DrainAcksInto(pkt);
+    return pkt;
+}
+
 Packet PacketAssembler::BuildAckOnlyPacket() {
     Packet pkt;
     pkt.packetId = AllocatePacketId();

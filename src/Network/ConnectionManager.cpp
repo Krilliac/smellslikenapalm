@@ -652,17 +652,56 @@ void ConnectionManager::SendActorBootstrap(uint32_t clientId) {
 
     Logger::Info("[ConnectionManager::SendActorBootstrap] client %u: NMT 0x24 sent; opening %zu bootstrap actor channels",
                  clientId, records.size());
+    // BATCH the actor opens into MaxPacket-sized packets instead of one datagram each.
+    // Sending 139 back-to-back single-bunch datagrams overflows the client's UDP receive
+    // buffer (even on loopback) and intermittently drops the ch2 open, so the client's
+    // PlayerController never binds (no menu). Packing ~10-14 opens per ~1500-byte packet
+    // cuts the burst to ~12 packets and makes binding reliable - and matches how the real
+    // server frames its open burst (multiple bunches per packet).
+    std::vector<PacketCodec::Bunch> batch;
+    size_t batchBits = 0;
+    // Budget under the 1500-byte server MaxPacket: ~1400 bytes = 11200 bits, minus a
+    // per-bunch header allowance (~64 bits) folded into the running estimate below.
+    constexpr size_t kBatchBitBudget = 11000;
+    auto flushBatch = [&]() {
+        if (batch.empty()) return;
+        const PacketCodec::Packet pkt = cs.outbound.BuildRawBunchesPacket(batch);
+        const std::vector<uint8_t> wire =
+            PacketCodec::Encode(pkt, PacketCodec::kServerSendMaxPacketBytes);
+        conn->SendRaw(wire.data(), wire.size());
+        batch.clear();
+        batchBits = 0;
+    };
+    // Deliver the PlayerController channel (ch2) FIRST, in its own packet, before the
+    // rest of the flood. The client adopts ch2 (NetPlayerIndex==0) as its LOCAL
+    // PlayerController via HandleClientPlayer - and the team menu only opens when that
+    // adoption succeeds (ShowTeamSelect's LocalPlayer(Player)!=none gate). Burying the
+    // ch2 open in the middle of 138 other opens makes the adoption intermittent; giving
+    // it a clean, standalone packet up front makes it reliable.
     for (const ActorBunchRecord& r : records) {
+        if (r.chIndex == 2) {
+            PacketCodec::Bunch pcb;
+            pcb.bControl = r.bControl; pcb.bOpen = r.bOpen; pcb.bClose = r.bClose;
+            pcb.bReliable = r.bReliable; pcb.chIndex = r.chIndex; pcb.chType = r.chType;
+            pcb.chSequence = r.chSequence; pcb.payload = r.payload;
+            pcb.payloadBits = r.bunchDataBits;
+            const PacketCodec::Packet pkt = cs.outbound.BuildRawBunchPacket(pcb);
+            const std::vector<uint8_t> wire =
+                PacketCodec::Encode(pkt, PacketCodec::kServerSendMaxPacketBytes);
+            conn->SendRaw(wire.data(), wire.size());
+            break;
+        }
+    }
+
+    for (const ActorBunchRecord& r : records) {
+        if (r.chIndex == 2) continue;   // already sent first, standalone
         if (r.chIndex == 0) {
-            // A ch0 control bunch in the burst: ride the normal control path so our
-            // own rolling control ChSequence stays contiguous (the recorded seq is
-            // the official server's, not ours).
+            // A ch0 control bunch in the burst rides the normal control path; flush the
+            // pending actor batch first so ordering is preserved.
+            flushBatch();
             SendRawToClient(clientId, r.payload);
             continue;
         }
-        // An actor channel (ChIndex>=2): emit the recorded bunch verbatim - it opens
-        // the channel (bOpen, its own per-channel ChSequence). Encode at the server
-        // MaxPacket (matches how we frame all S2C bunches).
         PacketCodec::Bunch b;
         b.bControl = r.bControl;
         b.bOpen = r.bOpen;
@@ -673,11 +712,14 @@ void ConnectionManager::SendActorBootstrap(uint32_t clientId) {
         b.chSequence = r.chSequence;
         b.payload = r.payload;
         b.payloadBits = r.bunchDataBits;  // exact bit count (not byte-padded)
-        const PacketCodec::Packet pkt = cs.outbound.BuildRawBunchPacket(b);
-        const std::vector<uint8_t> wire =
-            PacketCodec::Encode(pkt, PacketCodec::kServerSendMaxPacketBytes);
-        conn->SendRaw(wire.data(), wire.size());
+        const size_t est = r.bunchDataBits + 64;  // payload + bunch-header allowance
+        if (batchBits + est > kBatchBitBudget) {
+            flushBatch();
+        }
+        batch.push_back(std::move(b));
+        batchBits += est;
     }
+    flushBatch();
 
     // ---- Open the team-select menu: ClientShowTeamSelect() on ch2 (the PC) -----
     // The live retail client reaches the world but sits in spectator/preload with no

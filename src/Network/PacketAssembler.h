@@ -78,6 +78,13 @@ public:
     // sequence is independent of the control channel.
     Packet BuildRawBunchPacket(const Bunch& bunch);
 
+    // Wrap MULTIPLE fully-specified bunches in ONE packet (next PacketId, queued acks
+    // drained onto it). The caller is responsible for keeping the combined encoded size
+    // within MaxPacket. Used to batch the bootstrap actor-channel opens so they go out
+    // as a few packets instead of one datagram each (a 139-packet burst overflows the
+    // client's receive buffer and drops the ch2 open -> PlayerController never binds).
+    Packet BuildRawBunchesPacket(const std::vector<Bunch>& bunches);
+
     // ---- state accessors (for tests / integration) ----
     uint32_t NextPacketId() const { return m_nextPacketId; }
     uint32_t NextControlChSequence() const { return m_nextControlChSequence; }
