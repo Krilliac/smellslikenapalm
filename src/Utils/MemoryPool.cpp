@@ -58,6 +58,14 @@ void* MemoryPool<BlockSize, BlocksPerChunk>::Allocate() {
         Logger::Debug("[MemoryPool::Allocate] Free list has available blocks, m_globalFree=%p", m_globalFree);
     }
     assert(m_globalFree && "Allocation failed: no free blocks");
+    // Hardening: assert() is compiled out in release builds. If the free list is still
+    // empty here (e.g. AddChunk could not grow the pool), bail out non-fatally instead of
+    // dereferencing a null block pointer below.
+    if (!m_globalFree) {
+        Logger::Error("[MemoryPool::Allocate] No free blocks available after AddChunk; returning nullptr");
+        Logger::Trace("[MemoryPool::Allocate] Exit: returning nullptr (allocation failed)");
+        return nullptr;
+    }
     // Pop one block
     void* block = m_globalFree;
     m_globalFree = *reinterpret_cast<void**>(block);

@@ -4,10 +4,19 @@
 // URLOptions.h for the semantics this mirrors from Engine/GameInfo.uc.
 
 #include "Network/URLOptions.h"
+#include "Utils/Logger.h"
 
 #include <cctype>
+#include <climits>
 
 namespace {
+
+// Defensive bounds for the attacker-controlled connect string. These are far
+// larger than any legitimate UE3 FURL (map path + a handful of Key=Value login
+// options is well under 1 KiB and a dozen options), so valid URLs parse
+// byte-identically; they exist only to cap memory/work on hostile input.
+constexpr size_t kMaxURLLength = 8192;   // reject absurdly long connect strings
+constexpr size_t kMaxOptions   = 256;    // cap '?'-delimited option count
 
 // Case-insensitive ASCII string equality, matching UnrealScript's '=='
 // behavior for option key comparisons.
@@ -41,8 +50,14 @@ int UScriptInt(const std::string& s) {
     }
     long long value = 0;
     bool anyDigit = false;
+    // Saturate accumulation: a long digit run (attacker-supplied) would overflow
+    // long long, which is signed-overflow UB. Stop growing well past the int
+    // range; in-range values (the only ones a valid URL carries) are unaffected.
+    constexpr long long kAccumCap = 100000000000LL; // 1e11, > INT_MAX, safe from ll overflow
     while (i < n && std::isdigit(static_cast<unsigned char>(s[i]))) {
-        value = value * 10 + (s[i] - '0');
+        if (value < kAccumCap) {
+            value = value * 10 + (s[i] - '0');
+        }
         anyDigit = true;
         ++i;
     }
@@ -52,6 +67,13 @@ int UScriptInt(const std::string& s) {
     if (negative) {
         value = -value;
     }
+    // Clamp out-of-range results instead of relying on implementation-defined
+    // narrowing. Values that fit in int are returned exactly (no behavior change).
+    if (value > INT_MAX) {
+        value = INT_MAX;
+    } else if (value < INT_MIN) {
+        value = INT_MIN;
+    }
     return static_cast<int>(value);
 }
 
@@ -59,6 +81,17 @@ int UScriptInt(const std::string& s) {
 
 URLOptions URLOptions::Parse(const std::string& url) {
     URLOptions out;
+
+    // Reject hostile, oversized connect strings before doing any per-character
+    // work. A valid FURL is well under this bound, so this never trips on a
+    // legitimate join; an over-length string yields an empty (no map, no
+    // options) result, which downstream login handling already treats as
+    // "no usable options".
+    if (url.size() > kMaxURLLength) {
+        Logger::Warn("[URLOptions::Parse] Rejecting oversized connect string (%zu bytes > %zu cap)",
+                     url.size(), kMaxURLLength);
+        return out;
+    }
 
     // Split off the map / URL portion: everything before the first '?'.
     const size_t firstQ = url.find('?');
@@ -78,6 +111,16 @@ URLOptions URLOptions::Parse(const std::string& url) {
 
         // Extract the raw pair; skip empty segments (e.g. "Map??Foo").
         if (end > start) {
+            // Cap the number of retained options. A flood of '?' separators
+            // (injected by an attacker) cannot grow the vector without bound;
+            // a valid login carries only a handful of options, so this is never
+            // reached on legitimate input. First-match-wins lookup semantics are
+            // preserved because we keep the earliest options.
+            if (out.m_options.size() >= kMaxOptions) {
+                Logger::Warn("[URLOptions::Parse] Option count hit cap (%zu); ignoring remaining options",
+                             kMaxOptions);
+                break;
+            }
             const std::string pair = url.substr(start, end - start);
 
             // GetKeyValue: split on the first '='. No '=' -> bare flag.

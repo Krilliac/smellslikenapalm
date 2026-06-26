@@ -1,5 +1,6 @@
 #include "Utils/StringUtils.h"
 #include <algorithm>
+#include <cmath>
 #include "Utils/Logger.h"
 
 namespace StringUtils {
@@ -24,10 +25,19 @@ std::vector<std::string> Split(const std::string& s, char delim, bool keepEmpty)
     std::vector<std::string> tokens;
     std::string token;
     std::istringstream iss(s);
+    // Defensive cap: bound token count so hostile (e.g. attacker-supplied
+    // URL/option) input with millions of delimiters cannot drive unbounded
+    // allocation. The cap is far above any legitimate config/URL token count,
+    // so valid inputs are unaffected.
+    static constexpr size_t kMaxTokens = 100000;
     while (std::getline(iss, token, delim)) {
         if (token.empty() && !keepEmpty) {
             Logger::Debug("[StringUtils::Split] Skipping empty token (keepEmpty=false)");
             continue;
+        }
+        if (tokens.size() >= kMaxTokens) {
+            Logger::Warn("[StringUtils::Split] Token limit %zu reached, truncating remaining input", kMaxTokens);
+            break;
         }
         tokens.push_back(token);
     }
@@ -147,6 +157,15 @@ std::optional<double> ToDouble(const std::string& s) {
         size_t idx = 0;
         double v = std::stod(s, &idx);
         if (idx == s.size()) {
+            // Reject non-finite results (inf/-inf/nan). std::stod accepts the
+            // literals "inf"/"nan", which are never valid finite config values
+            // and could poison downstream arithmetic. Valid finite values pass
+            // through unchanged.
+            if (!std::isfinite(v)) {
+                Logger::Warn("[StringUtils::ToDouble] Rejecting non-finite value parsed from '%s'", s.c_str());
+                Logger::Trace("[StringUtils::ToDouble] Exit: returning nullopt (non-finite)");
+                return std::nullopt;
+            }
             Logger::Debug("[StringUtils::ToDouble] Successfully parsed double: %.6f", v);
             Logger::Trace("[StringUtils::ToDouble] Exit: returning %.6f", v);
             return v;
