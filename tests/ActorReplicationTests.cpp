@@ -17,33 +17,33 @@
 using ActorRepl::NetGUIDRef;
 using ActorRepl::NewActorHeader;
 
-// A static (known-object) NetGUID round-trips through write/read.
-TEST(ActorReplication, StaticNetGUIDRoundTrips) {
-    for (uint32_t idx : {0u, 1u, 17u, 511u, 1022u}) {
+// A static object reference (class/archetype, flag bit 0, large index space) round-trips.
+TEST(ActorReplication, StaticObjectRefRoundTrips) {
+    for (uint32_t idx : {0u, 1u, 600u, 65535u, 0x1234567u}) {
         BitWriter w;
-        ActorRepl::WriteNetGUID(w, NetGUIDRef{/*isStatic=*/true, idx});
+        ActorRepl::WriteNetGUID(w, NetGUIDRef{/*isDynamic=*/false, idx});
         std::vector<uint8_t> bytes = w.GetBytes();
 
         BitReader r(bytes);
         NetGUIDRef got = ActorRepl::ReadNetGUID(r);
         EXPECT_FALSE(r.IsOverflowed());
-        EXPECT_TRUE(got.isStatic);
+        EXPECT_FALSE(got.isDynamic);
         EXPECT_EQ(got.index, idx) << "static idx " << idx;
     }
 }
 
-// A dynamic/export NetGUID (freshly-spawned actor) round-trips.
-TEST(ActorReplication, ExportNetGUIDRoundTrips) {
-    for (uint32_t idx : {0u, 5u, 1234u, 65535u, 0x1234567u}) {
+// A dynamic actor reference (flag bit 1, value = channel index, bound 1024) round-trips.
+TEST(ActorReplication, DynamicActorRefRoundTrips) {
+    for (uint32_t idx : {0u, 2u, 54u, 511u, 1023u}) {  // channel indices < 1024
         BitWriter w;
-        ActorRepl::WriteNetGUID(w, NetGUIDRef{/*isStatic=*/false, idx});
+        ActorRepl::WriteNetGUID(w, NetGUIDRef{/*isDynamic=*/true, idx});
         std::vector<uint8_t> bytes = w.GetBytes();
 
         BitReader r(bytes);
         NetGUIDRef got = ActorRepl::ReadNetGUID(r);
         EXPECT_FALSE(r.IsOverflowed());
-        EXPECT_FALSE(got.isStatic);
-        EXPECT_EQ(got.index, idx) << "export idx " << idx;
+        EXPECT_TRUE(got.isDynamic);
+        EXPECT_EQ(got.index, idx) << "dynamic chIndex " << idx;
     }
 }
 
@@ -51,8 +51,8 @@ TEST(ActorReplication, ExportNetGUIDRoundTrips) {
 // modelling the common case: an exported actor referencing a known (static) class.
 TEST(ActorReplication, NewActorHeaderRoundTrips) {
     NewActorHeader in;
-    in.actorGuid = NetGUIDRef{/*isStatic=*/false, 0xABCDEu};  // exported new actor
-    in.classGuid = NetGUIDRef{/*isStatic=*/true, 600u};       // class ref into PackageMap
+    in.classGuid = NetGUIDRef{/*isDynamic=*/false, 0xABCDEu};  // static class/archetype ref
+    in.actorGuid = NetGUIDRef{/*isDynamic=*/true, 42u};        // dynamic (channel index)
 
     BitWriter w;
     ActorRepl::WriteNewActorHeader(w, in);
@@ -61,29 +61,25 @@ TEST(ActorReplication, NewActorHeaderRoundTrips) {
     BitReader r(bytes);
     NewActorHeader out = ActorRepl::ReadNewActorHeader(r);
     EXPECT_FALSE(r.IsOverflowed());
-    EXPECT_EQ(out.actorGuid.isStatic, in.actorGuid.isStatic);
-    EXPECT_EQ(out.actorGuid.index, in.actorGuid.index);
-    EXPECT_EQ(out.classGuid.isStatic, in.classGuid.isStatic);
+    EXPECT_EQ(out.classGuid.isDynamic, in.classGuid.isDynamic);
     EXPECT_EQ(out.classGuid.index, in.classGuid.index);
+    EXPECT_EQ(out.actorGuid.isDynamic, in.actorGuid.isDynamic);
+    EXPECT_EQ(out.actorGuid.index, in.actorGuid.index);
 }
 
 // Capture anchor: the real ch2 PlayerController open (Session A f1484) begins
 // `60 c1 01 00 ...`. The first (flag) bit is the static/dynamic selector and must
-// decode as DYNAMIC/EXPORT (bit 0) for a freshly-spawned actor - the [H] result
-// that corrected the earlier "even NetGUID" misread.
-TEST(ActorReplication, CapturePlayerControllerOpenIsExport) {
+// decode as STATIC (bit 0) - the leading object ref is the CLASS/ARCHETYPE (a static
+// object), confirmed by the UE3 source (UnNetDrv.cpp: bit 0 = static).
+TEST(ActorReplication, CapturePlayerControllerOpenClassRefIsStatic) {
     // Real bytes from docs/RS2V_ActorReplication_7258.md §2.2 (ch2 PC open prefix).
     const std::vector<uint8_t> openPrefix = {
         0x60, 0xc1, 0x01, 0x00, 0x1b, 0xcc, 0xea, 0x3f, 0x49, 0x04, 0x60, 0xe0};
 
     BitReader r(openPrefix);
-    // Wire order is [class NetGUID][actor NetGUID]; both are on the export path here
-    // (flag bit 0). The first (class) ref must decode as export.
     NetGUIDRef cls = ActorRepl::ReadNetGUID(r);
-    EXPECT_FALSE(cls.isStatic) << "the class NetGUID at the open header must decode (export path)";
-    NetGUIDRef actor = ActorRepl::ReadNetGUID(r);
     EXPECT_FALSE(r.IsOverflowed());
-    (void)actor;
+    EXPECT_FALSE(cls.isDynamic) << "the leading object ref is the class/archetype (static)";
 }
 
 // A mixed replicated-property block (one of each type) round-trips: each property
@@ -96,7 +92,7 @@ TEST(ActorReplication, PropertyBlockRoundTrips) {
     ActorRepl::WritePropInt   (w, 10, maxHandle, -12345);
     ActorRepl::WritePropFloat (w, 12, maxHandle, 3.5f);
     ActorRepl::WritePropString(w, 20, maxHandle, "Krill");
-    ActorRepl::WritePropObject(w, 30, maxHandle, NetGUIDRef{/*isStatic=*/true, 600u});
+    ActorRepl::WritePropObject(w, 30, maxHandle, NetGUIDRef{/*isDynamic=*/false, 600u});
 
     const std::vector<uint8_t> bytes = w.GetBytes();
     const size_t nbits = w.NumBits();
@@ -109,7 +105,7 @@ TEST(ActorReplication, PropertyBlockRoundTrips) {
     EXPECT_EQ(r.SerializeInt(maxHandle), 20u);   EXPECT_EQ(r.ReadString(), "Krill");
     EXPECT_EQ(r.SerializeInt(maxHandle), 30u);
     NetGUIDRef g = ActorRepl::ReadNetGUID(r);
-    EXPECT_TRUE(g.isStatic);
+    EXPECT_FALSE(g.isDynamic);
     EXPECT_EQ(g.index, 600u);
 
     EXPECT_FALSE(r.IsOverflowed());
@@ -122,8 +118,8 @@ TEST(ActorReplication, PropertyBlockRoundTrips) {
 TEST(ActorReplication, OpeningActorBunchDecodes) {
     const uint32_t maxHandle = 80;
     NewActorHeader hdr;
-    hdr.actorGuid = NetGUIDRef{/*isStatic=*/false, 0x4242u}; // exported new actor
-    hdr.classGuid = NetGUIDRef{/*isStatic=*/true, 90u};      // PlayerController class ref
+    hdr.classGuid = NetGUIDRef{/*isDynamic=*/false, 90u};    // static PlayerController class ref
+    hdr.actorGuid = NetGUIDRef{/*isDynamic=*/true, 2u};      // dynamic (channel index)
 
     PacketCodec::Bunch b = ActorRepl::MakeOpeningActorBunch(
         /*chIndex=*/2, /*chSeq=*/1, hdr,
@@ -142,10 +138,10 @@ TEST(ActorReplication, OpeningActorBunchDecodes) {
 
     BitReader r(b.payload.data(), b.payload.size(), b.payloadBits);
     NewActorHeader out = ActorRepl::ReadNewActorHeader(r);
-    EXPECT_FALSE(out.actorGuid.isStatic);
-    EXPECT_EQ(out.actorGuid.index, 0x4242u);
-    EXPECT_TRUE(out.classGuid.isStatic);
+    EXPECT_FALSE(out.classGuid.isDynamic);
     EXPECT_EQ(out.classGuid.index, 90u);
+    EXPECT_TRUE(out.actorGuid.isDynamic);
+    EXPECT_EQ(out.actorGuid.index, 2u);
 
     EXPECT_EQ(r.SerializeInt(maxHandle), 6u);  EXPECT_EQ(r.ReadByte(), 2u);
     EXPECT_EQ(r.SerializeInt(maxHandle), 7u);  EXPECT_EQ(r.ReadByte(), 3u);

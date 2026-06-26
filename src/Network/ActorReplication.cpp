@@ -6,14 +6,14 @@
 namespace ActorRepl {
 
 void WriteNetGUID(BitWriter& w, const NetGUIDRef& ref) {
-    w.WriteBit(ref.isStatic);  // flag: 1=static(known), 0=dynamic/export
-    w.SerializeInt(ref.index, ref.isStatic ? kStaticGuidMax : kExportGuidMax);
+    w.WriteBit(ref.isDynamic);  // flag: 1=dynamic (channel index), 0=static (object index)
+    w.SerializeInt(ref.index, ref.isDynamic ? kDynamicChannelMax : kStaticObjectMax);
 }
 
 NetGUIDRef ReadNetGUID(BitReader& r) {
     NetGUIDRef ref;
-    ref.isStatic = r.ReadBit();
-    ref.index = r.SerializeInt(ref.isStatic ? kStaticGuidMax : kExportGuidMax);
+    ref.isDynamic = r.ReadBit();
+    ref.index = r.SerializeInt(ref.isDynamic ? kDynamicChannelMax : kStaticObjectMax);
     return ref;
 }
 

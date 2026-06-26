@@ -26,20 +26,27 @@
 
 namespace ActorRepl {
 
-// ---- NetGUID / object-reference codec (UPackageMap::SerializeObject) ----------
-// VNGame.exe net override @0x140696070. Every object reference / NetGUID on the
-// wire is a 1-bit selector followed by a ranged SerializeInt:
-//   flag bit == 1  -> STATIC / already-known object: SerializeInt(index, 1023)
-//   flag bit == 0  -> DYNAMIC / export (freshly-spawned actor or its class):
-//                     SerializeInt(index, 0x80000000)
-// (Confirmed against the ch2 PlayerController open `60 c1 01 00 ...`: byte0 bit0 = 0
-//  => the dynamic/export path, correct for a just-spawned actor.)
-constexpr uint32_t kStaticGuidMax = 1023;        // 0x3ff
-constexpr uint32_t kExportGuidMax = 0x80000000u; // dynamic/export
+// ---- Object-reference codec (UPackageMapLevel::SerializeObject) ---------------
+// UE3 7258 (UnNetDrv.cpp:97) - there is NO NetGUID system (that is UE4). An object
+// reference is a 1-bit selector followed by a ranged SerializeInt, where the value
+// is one of exactly two kinds:
+//   flag bit == 0  -> STATIC object (class / archetype / CDO / static actor):
+//                     SerializeInt(index, 0x80000000), index = package.ObjectBase +
+//                     Object->NetIndex (deterministic from our PackageMap export).
+//   flag bit == 1  -> DYNAMIC actor: SerializeInt(index, 2048), index = the actor's
+//                     OPEN ACTOR-CHANNEL INDEX. The actor IS its channel; there is no
+//                     persistent id - opening a channel is the "assignment".
+// (Verified against the ch2 PlayerController open `60 c1 01 00`: byte0 bit0 = 0 =>
+//  STATIC = the archetype ref. A reference to an unopened channel / bad class ref =>
+//  NMT_ActorChannelFailure and the client CLOSES the channel - our observed failure.)
+constexpr uint32_t kStaticObjectMax   = 0x80000000u; // MAX_OBJECT_INDEX (static index)
+constexpr uint32_t kDynamicChannelMax = 1024;        // RS2 MAX_CHANNELS (dynamic = ChIndex;
+                                                     // disasm-confirmed ~1023 max, use 1024)
 
 struct NetGUIDRef {
-    bool     isStatic = false;  // true => flag bit 1 (known object, max 1023)
-    uint32_t index = 0;         // the NetIndex
+    bool     isDynamic = false;  // true => flag bit 1, value is an actor channel index
+                                 // false => flag bit 0, value is a static object index
+    uint32_t index = 0;
 };
 
 // Serialize one object reference / NetGUID (selector bit + ranged int).
