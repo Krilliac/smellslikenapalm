@@ -100,6 +100,21 @@ private:
         uint32_t actorChType = 2;
         bool     teamSelected = false;
         bool     menuResent = false;   // re-sent ClientShowTeamSelect on client proof-of-life
+
+        // ---- Reliable retransmission (UE3 UNetConnection-style) -----------------
+        // UE3 reliability: a reliable bunch must be re-sent until the client acks the
+        // packet that carried it. Without this, one dropped reliable bunch in the
+        // bootstrap burst stalls that channel forever -> the client soft-locks (can't
+        // disconnect). We record each reliable bunch-set we send, clear it when the
+        // client acks any packet it rode in, and resend (verbatim, SAME per-channel
+        // ChSequence; NEW PacketId) on an ack-timeout.
+        struct SentReliable {
+            std::vector<uint32_t> packetIds;     // every packet this set has gone out in
+            uint64_t lastSendMs = 0;
+            int      resendCount = 0;
+            std::vector<PacketCodec::Bunch> bunches;  // the reliable bunches, verbatim
+        };
+        std::vector<SentReliable> pendingReliable;
     };
     std::unordered_map<uint32_t, ControlState> m_controlState;
     uint32_t m_nextClientId{1};
@@ -144,6 +159,15 @@ private:
     // (SerializeInt at the PlayerController maxHandle) and dispatch the client->server
     // RPC (e.g. SelectTeam). Logs the handle/name for visibility into client input.
     void DecodeInboundActorBunch(uint32_t clientId, const PacketCodec::Bunch& bunch);
+
+    // ---- Reliable retransmission ------------------------------------------------
+    // Build ONE packet from `bunches`, send it, and record any reliable bunches for
+    // retransmission until acked. The single choke-point for sending actor bunches.
+    void SendReliableBunches(uint32_t clientId, const std::vector<PacketCodec::Bunch>& bunches);
+    // The client acked `ackedPacketId`: drop any pending reliable set that rode in it.
+    void OnClientAck(uint32_t clientId, uint32_t ackedPacketId);
+    // Per-poll: resend reliable bunch-sets the client hasn't acked within the timeout.
+    void RetransmitTick();
 
     // Open the bootstrap ACTOR channels after the client confirms Join. Replays the
     // official server's f231 burst (ROGameReplicationInfo on ch2, TeamInfo, the

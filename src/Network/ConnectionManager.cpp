@@ -15,6 +15,7 @@
 #include <chrono>
 #include <fstream>
 #include <mutex>
+#include <algorithm>
 
 ConnectionManager::ConnectionManager(GameServer* server)
     : m_server(server)
@@ -119,6 +120,12 @@ void ConnectionManager::PumpNetwork() {
         packetCount++;
     }
     Logger::Debug("[ConnectionManager::PumpNetwork] Drained %d packets this pump cycle", packetCount);
+
+    // Resend any reliable bunches the client hasn't acked within the timeout. Runs every
+    // pump cycle (the poll loop is tight) so a dropped bootstrap open is recovered in
+    // ~250ms instead of stalling the channel forever (the soft-lock).
+    RetransmitTick();
+
     Logger::Trace("[ConnectionManager::PumpNetwork] Exit");
 }
 
@@ -665,10 +672,7 @@ void ConnectionManager::SendActorBootstrap(uint32_t clientId) {
     constexpr size_t kBatchBitBudget = 11000;
     auto flushBatch = [&]() {
         if (batch.empty()) return;
-        const PacketCodec::Packet pkt = cs.outbound.BuildRawBunchesPacket(batch);
-        const std::vector<uint8_t> wire =
-            PacketCodec::Encode(pkt, PacketCodec::kServerSendMaxPacketBytes);
-        conn->SendRaw(wire.data(), wire.size());
+        SendReliableBunches(clientId, batch);  // sent + recorded for retransmission
         batch.clear();
         batchBits = 0;
     };
@@ -685,10 +689,7 @@ void ConnectionManager::SendActorBootstrap(uint32_t clientId) {
             pcb.bReliable = r.bReliable; pcb.chIndex = r.chIndex; pcb.chType = r.chType;
             pcb.chSequence = r.chSequence; pcb.payload = r.payload;
             pcb.payloadBits = r.bunchDataBits;
-            const PacketCodec::Packet pkt = cs.outbound.BuildRawBunchPacket(pcb);
-            const std::vector<uint8_t> wire =
-                PacketCodec::Encode(pkt, PacketCodec::kServerSendMaxPacketBytes);
-            conn->SendRaw(wire.data(), wire.size());
+            SendReliableBunches(clientId, { pcb });  // ch2 standalone, recorded for retransmit
             break;
         }
     }
@@ -762,10 +763,72 @@ void ConnectionManager::SendActorBootstrap(uint32_t clientId) {
 // PlayerController (ROPlayerController) ClassNetCache maxHandle - see SendActorBootstrap.
 static constexpr uint32_t kRoPcMaxHandle = 531;
 
+static uint64_t NowMs() {
+    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+
+void ConnectionManager::SendReliableBunches(uint32_t clientId,
+                                            const std::vector<PacketCodec::Bunch>& bunches) {
+    auto conn = GetConnection(clientId);
+    if (!conn || bunches.empty()) return;
+    ControlState& cs = GetControlState(clientId);
+    const PacketCodec::Packet pkt = cs.outbound.BuildRawBunchesPacket(bunches);
+    const std::vector<uint8_t> wire =
+        PacketCodec::Encode(pkt, PacketCodec::kServerSendMaxPacketBytes);
+    conn->SendRaw(wire.data(), wire.size());
+    // Record the reliable bunches so we can retransmit until the client acks this packet.
+    std::vector<PacketCodec::Bunch> rel;
+    for (const auto& b : bunches) if (b.bReliable) rel.push_back(b);
+    if (!rel.empty()) {
+        ControlState::SentReliable sr;
+        sr.packetIds.push_back(pkt.packetId);
+        sr.lastSendMs = NowMs();
+        sr.resendCount = 0;
+        sr.bunches = std::move(rel);
+        cs.pendingReliable.push_back(std::move(sr));
+    }
+}
+
+void ConnectionManager::OnClientAck(uint32_t clientId, uint32_t ackedPacketId) {
+    auto it = m_controlState.find(clientId);
+    if (it == m_controlState.end()) return;
+    auto& pending = it->second.pendingReliable;
+    pending.erase(std::remove_if(pending.begin(), pending.end(),
+        [ackedPacketId](const ControlState::SentReliable& sr) {
+            for (uint32_t pid : sr.packetIds) if (pid == ackedPacketId) return true;
+            return false;
+        }), pending.end());
+}
+
+void ConnectionManager::RetransmitTick() {
+    const uint64_t now = NowMs();
+    constexpr uint64_t kRtoMs = 250;     // resend a reliable set un-acked for 250ms
+    constexpr int kMaxResends = 12;
+    for (auto& kv : m_controlState) {
+        ControlState& cs = kv.second;
+        if (cs.pendingReliable.empty()) continue;
+        auto conn = GetConnection(kv.first);
+        if (!conn) continue;
+        for (auto& sr : cs.pendingReliable) {
+            if (now - sr.lastSendMs < kRtoMs || sr.resendCount >= kMaxResends) continue;
+            // Resend the SAME reliable bunches (verbatim, same per-channel ChSequence) in a
+            // NEW packet (new PacketId). The client fills the gap or ignores the duplicate.
+            const PacketCodec::Packet pkt = cs.outbound.BuildRawBunchesPacket(sr.bunches);
+            const std::vector<uint8_t> wire =
+                PacketCodec::Encode(pkt, PacketCodec::kServerSendMaxPacketBytes);
+            conn->SendRaw(wire.data(), wire.size());
+            sr.packetIds.push_back(pkt.packetId);
+            sr.lastSendMs = now;
+            ++sr.resendCount;
+            Logger::Debug("[ConnectionManager::RetransmitTick] client %u: resent %zu reliable bunch(es) attempt %d (pkt %u)",
+                          kv.first, sr.bunches.size(), sr.resendCount, pkt.packetId);
+        }
+    }
+}
+
 void ConnectionManager::SendCh2Rpc(uint32_t clientId, const std::vector<uint8_t>& payload,
                                    uint32_t payloadBits, const char* name) {
-    auto conn = GetConnection(clientId);
-    if (!conn) return;
     ControlState& cs = GetControlState(clientId);
     PacketCodec::Bunch b;
     b.bControl   = false;
@@ -777,12 +840,9 @@ void ConnectionManager::SendCh2Rpc(uint32_t clientId, const std::vector<uint8_t>
     b.chSequence = ++cs.ch2OutReliable;   // next reliable on ch2
     b.payload    = payload;
     b.payloadBits = payloadBits;
-    const PacketCodec::Packet pkt = cs.outbound.BuildRawBunchPacket(b);
-    const std::vector<uint8_t> wire =
-        PacketCodec::Encode(pkt, PacketCodec::kServerSendMaxPacketBytes);
-    conn->SendRaw(wire.data(), wire.size());
     Logger::Info("[ConnectionManager::SendCh2Rpc] client %u: sent %s on ch2 seq %u (%u bits)",
                  clientId, name, b.chSequence, payloadBits);
+    SendReliableBunches(clientId, { b });   // recorded for retransmission until acked
 }
 
 // Names for the handful of ROPlayerController net-field handles we recognise on the
@@ -805,21 +865,10 @@ static const char* RoPcHandleName(uint32_t h) {
 
 void ConnectionManager::DecodeInboundActorBunch(uint32_t clientId,
                                                 const PacketCodec::Bunch& bunch) {
-    // Proof-of-life re-send: the very first inbound actor bunch means the client has
-    // bound its local PlayerController and is processing ch2. The initial
-    // ClientShowTeamSelect (sent right after the open burst) can race AHEAD of that
-    // bind and be dropped (menu never appears). Re-send it now that the client is
-    // demonstrably ready. Harmless if the menu is already up.
-    {
-        ControlState& cs = GetControlState(clientId);
-        if (!cs.menuResent && cs.ch2OutReliable > 0) {
-            cs.menuResent = true;
-            BitWriter fw;
-            fw.SerializeInt(206, kRoPcMaxHandle);   // ClientShowTeamSelect
-            SendCh2Rpc(clientId, fw.GetBytes(), static_cast<uint32_t>(fw.NumBits()),
-                       "ClientShowTeamSelect(resend)");
-        }
-    }
+    // (Removed the old "proof-of-life re-send" of ClientShowTeamSelect: it sent a NEW
+    // bunch at ch2 seq+1, manufacturing a sequence GAP if the original seq was dropped ->
+    // ch2 stall -> soft-lock. Reliable retransmission now redelivers the original
+    // ClientShowTeamSelect (same ChSequence) until the client acks it.)
 
     // Only reliable function/property bunches carry a handle worth dispatching; the
     // open/close framing and tiny keepalives don't.
@@ -962,9 +1011,11 @@ bool ConnectionManager::ParseIncomingControl(uint32_t clientId, const std::vecto
         cs.outbound.QueueAck(pkt.packetId);
     }
 
-    // (pkt.acks confirm OUR reliable bunches arrived; with the handshake's
-    // request/response pacing there is no retransmit window to advance yet, so
-    // they are currently informational.)
+    // pkt.acks confirm OUR reliable bunches arrived: clear any pending reliable
+    // bunch-set that rode in an acked packet so RetransmitTick stops resending it.
+    for (uint32_t ackedId : pkt.acks) {
+        OnClientAck(clientId, ackedId);
+    }
 
     // Feed control-channel bunches to the reassembler. Complete messages are
     // dispatched to the handshake, which may emit responses via SendRawToClient
