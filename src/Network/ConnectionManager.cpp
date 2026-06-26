@@ -787,6 +787,9 @@ void ConnectionManager::SendActorBootstrap(uint32_t clientId) {
         fw.SerializeInt(kClientShowTeamSelectHandle, kROPlayerControllerMaxHandle);
         SendCh2Rpc(clientId, fw.GetBytes(), static_cast<uint32_t>(fw.NumBits()),
                    "ClientShowTeamSelect");
+        // Establish the local PC->PRI link (handle 23 -> ch26) so ROPC.PlayerReplicationInfo
+        // is non-none before the role/unit-select UI ever opens. Unreliable, so send a few.
+        SendLocalPriLink(clientId, 5);
     }
 }
 
@@ -873,6 +876,34 @@ void ConnectionManager::SendCh2Rpc(uint32_t clientId, const std::vector<uint8_t>
     Logger::Info("[ConnectionManager::SendCh2Rpc] client %u: sent %s on ch2 seq %u (%u bits)",
                  clientId, name, b.chSequence, payloadBits);
     SendReliableBunches(clientId, { b });   // recorded for retransmission until acked
+}
+
+void ConnectionManager::SendLocalPriLink(uint32_t clientId, int repeats) {
+    // handle 23 (Controller.PlayerReplicationInfo) + dynamic object-ref to ch26 (local PRI):
+    //   SerializeInt(23,531) = 9 bits, selector bit 1 (dynamic), SerializeInt(26,1024).
+    // = the real server's exact 20-bit "176a00" bunch (decoded + confirmed by RE).
+    // Sent UNRELIABLE (bReliable=0, no chSequence/chType written by the encoder) exactly
+    // as the real server streams it (docs/re/pc_ch2_postjoin_timeline.md §C). Repeated for
+    // delivery since it is unreliable; the client latches ROPC.PlayerReplicationInfo on
+    // receipt, fixing the role-UI NULL deref (VNGame.exe+0xbbf712).
+    static const std::vector<uint8_t> kPriLink = { 0x17, 0x6a, 0x00 };
+    constexpr uint32_t kPriLinkBits = 20;
+    ControlState& cs = GetControlState(clientId);
+    for (int i = 0; i < repeats; ++i) {
+        PacketCodec::Bunch b;
+        b.bControl   = false;
+        b.bOpen      = false;
+        b.bClose     = false;
+        b.bReliable  = false;            // UNRELIABLE delta (chSeq=0, not retransmitted)
+        b.chIndex    = 2;
+        b.chType     = cs.actorChType;   // ignored on the wire for unreliable bunches
+        b.chSequence = 0;
+        b.payload    = kPriLink;
+        b.payloadBits = kPriLinkBits;
+        SendReliableBunches(clientId, { b });   // sends; not recorded (bReliable=false)
+    }
+    Logger::Info("[ConnectionManager::SendLocalPriLink] client %u: sent PC.PlayerReplicationInfo"
+                 "->ch26 link (handle 23) x%d (unreliable 176a00)", clientId, repeats);
 }
 
 // Names for the handful of ROPlayerController net-field handles we recognise on the
@@ -990,8 +1021,13 @@ void ConnectionManager::DecodeInboundActorBunch(uint32_t clientId,
         // populate the null object the role UI compares against), DO NOT send the advance -
         // it is a guaranteed client crash. The team is still recorded server-side above.
         // Re-enable by flipping this flag once role-state replication lands.
-        constexpr bool kEnableRoleSelectAdvance = false;
+        constexpr bool kEnableRoleSelectAdvance = true;
         if (kEnableRoleSelectAdvance) {
+            // Re-assert the local PC->PRI link (handle 23 -> ch26) right before opening the
+            // role scene: the unit-select scene's PostInitialize caches LocalPRI =
+            // ROPC.PlayerReplicationInfo, so that ref MUST be set when ChangedTeams runs.
+            // (RE: the null LocalPRI is the VNGame.exe+0xbbf712 crash.)
+            SendLocalPriLink(clientId, 3);
             constexpr uint32_t kChangedTeamsHandle           = 172;
             constexpr uint32_t kRoGameInfoTerritoriesClassIx = 69601;  // GRI.GameClass h33 (capture)
             BitWriter fw;

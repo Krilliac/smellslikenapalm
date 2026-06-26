@@ -155,6 +155,13 @@ private:
     void SendCh2Rpc(uint32_t clientId, const std::vector<uint8_t>& payload,
                     uint32_t payloadBits, const char* name);
 
+    // Replicate the local PlayerController's PlayerReplicationInfo (Controller handle 23)
+    // as an UNRELIABLE ch2 object-ref to the local PRI channel (ch26) - the exact bytes
+    // the real server streams ("176a00"). Without this link the client's
+    // ROPC.PlayerReplicationInfo is none and the role/unit-select UI derefs null
+    // (VNGame.exe+0xbbf712). Sent `repeats` times for unreliable delivery.
+    void SendLocalPriLink(uint32_t clientId, int repeats);
+
     // Decode one inbound actor-channel (ChIndex>=2) bunch: read the field handle
     // (SerializeInt at the PlayerController maxHandle) and dispatch the client->server
     // RPC (e.g. SelectTeam). Logs the handle/name for visibility into client input.
