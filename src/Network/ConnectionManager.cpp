@@ -1051,7 +1051,12 @@ void ConnectionManager::DecodeInboundActorBunch(uint32_t clientId,
         // populate the null object the role UI compares against), DO NOT send the advance -
         // it is a guaranteed client crash. The team is still recorded server-side above.
         // Re-enable by flipping this flag once role-state replication lands.
-        constexpr bool kEnableRoleSelectAdvance = true;
+        // Held again: the PC->PRI link (handle 23 -> ch26) is NOT being adopted by the
+        // client (LocalPRI still null -> +0xbbf712 crash once past the spectator gate),
+        // despite ch26 staying open. Root cause = an owning-PlayerController PRI mechanism
+        // we haven't cracked yet (under RE). Keep the advance + clear-spectator + link code
+        // ready; re-enable once the client actually adopts ROPC.PlayerReplicationInfo.
+        constexpr bool kEnableRoleSelectAdvance = false;
         if (kEnableRoleSelectAdvance) {
             // Clear the local PRI's spectator flags FIRST so ShowRoleSelectScene does not
             // early-return at uc:5932 (if PRI.bOnlySpectator return) - the "no crash but no
