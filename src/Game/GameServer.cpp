@@ -274,9 +274,15 @@ bool GameServer::Initialize() {
     m_projectileManager->Initialize();
     m_damageSystem->SetOnKill([this](const KillEvent& kill) {
         if (m_ticketSystem && !kill.isTeamKill) {
-            auto* tm = GetTeamManager();
-            uint32_t victimTeam = tm->GetPlayerTeam(kill.victimId);
-            m_ticketSystem->OnPlayerKilled(victimTeam);
+            // GUARD: TeamManager can be null/destroyed during shutdown; the kill
+            // callback may still fire from DamageSystem. Skip ticket accounting
+            // rather than dereference a null manager.
+            if (auto* tm = GetTeamManager()) {
+                uint32_t victimTeam = tm->GetPlayerTeam(kill.victimId);
+                m_ticketSystem->OnPlayerKilled(victimTeam);
+            } else {
+                Logger::Warn("[GameServer] Kill callback: TeamManager unavailable; skipping ticket update for victim %u", kill.victimId);
+            }
         }
         if (m_territoryMode) m_territoryMode->OnPlayerKilled(kill.killerId, kill.victimId);
         if (m_supremacyMode) m_supremacyMode->OnPlayerKilled(kill.killerId, kill.victimId);
@@ -451,6 +457,15 @@ void GameServer::Run() {
         if (tag == "CHAT_MESSAGE" && m_chatManager) {
             Packet pktCopy = qpkt.packet;
             std::string chatText = pktCopy.ReadString();
+            // GUARD: chat text is attacker-controlled. Cap its length before it
+            // propagates into chat history / broadcast buffers. Valid chat is
+            // short; this only rejects abusive/oversized payloads. Non-fatal.
+            constexpr size_t kMaxChatLen = 1024;
+            if (chatText.size() > kMaxChatLen) {
+                Logger::Warn("[GameServer::Run] Oversized chat from clientId=%u (%zu bytes); truncating to %zu",
+                             qpkt.clientId, chatText.size(), kMaxChatLen);
+                chatText.resize(kMaxChatLen);
+            }
             m_chatManager->ProcessChatCommand(qpkt.clientId, chatText);
         } else if (tag == "ROLE_SELECT") {
             HandleRoleSelection(qpkt.clientId, qpkt.packet.RawData());
@@ -640,7 +655,20 @@ std::shared_ptr<ConfigManager> GameServer::GetConfigManager() const { return m_c
 
 void GameServer::ChangeMap() {
     Logger::Trace("[GameServer::ChangeMap] Entry");
+    // GUARD: MapManager may be absent (init failed) or already torn down.
+    if (!m_mapManager) {
+        Logger::Error("[GameServer::ChangeMap] No MapManager available; cannot change map");
+        Logger::Trace("[GameServer::ChangeMap] Exit (no MapManager)");
+        return;
+    }
     std::string nextMap = m_mapManager->GetNextMap();
+    // GUARD: an empty next-map (no rotation configured / lookup miss) must not be
+    // fed to LoadMap. Keep the current map running instead of unloading to nothing.
+    if (nextMap.empty()) {
+        Logger::Warn("[GameServer::ChangeMap] Next map is empty (no rotation entry); staying on current map");
+        Logger::Trace("[GameServer::ChangeMap] Exit (empty next map)");
+        return;
+    }
     Logger::Info("[GameServer::ChangeMap] Changing to next map: '%s'", nextMap.c_str());
     if (m_mapManager->LoadMap(nextMap)) {
         Logger::Debug("[GameServer::ChangeMap] Map loaded successfully, transitioning GameMode");
@@ -723,13 +751,22 @@ void GameServer::HandleRoleSelection(uint32_t clientId, const std::vector<uint8_
         Logger::Info("Player %u selected role: %s", clientId, m_roleSystem->GetRoleName(role).c_str());
 
         // Apply role loadout to player
+        // GUARD: TeamManager/PlayerManager are dereferenced below; either can be
+        // null during shutdown or a partial init. The role was already assigned;
+        // just skip loadout application rather than crash.
         auto* tm = GetTeamManager();
+        auto* pm = GetPlayerManager();
+        if (!tm || !pm) {
+            Logger::Warn("[GameServer::HandleRoleSelection] TeamManager/PlayerManager unavailable; "
+                         "role assigned but loadout skipped for player %u", clientId);
+            Logger::Trace("[GameServer::HandleRoleSelection] Exit (manager unavailable)");
+            return;
+        }
         Faction faction = m_roleSystem->GetTeamFaction(tm->GetPlayerTeam(clientId));
         RoleLoadout loadout = m_roleSystem->GetRoleLoadout(role, faction);
         Logger::Debug("[GameServer::HandleRoleSelection] Applying loadout: primary='%s', secondary='%s'",
                      loadout.primaryWeapon.c_str(), loadout.secondaryWeapon.c_str());
 
-        auto* pm = GetPlayerManager();
         auto player = pm->GetPlayer(clientId);
         if (player) {
             player->ClearInventory();
@@ -839,7 +876,13 @@ void GameServer::HandleSquadAction(uint32_t clientId, const std::vector<uint8_t>
     switch (action) {
         case 0: {  // Create squad
             Logger::Debug("[GameServer::HandleSquadAction] Action: Create squad");
-            uint32_t teamId = GetTeamManager()->GetPlayerTeam(clientId);
+            // GUARD: TeamManager may be null during shutdown/partial init.
+            auto* tm = GetTeamManager();
+            if (!tm) {
+                Logger::Warn("[GameServer::HandleSquadAction] TeamManager unavailable; cannot create squad for player %u", clientId);
+                break;
+            }
+            uint32_t teamId = tm->GetPlayerTeam(clientId);
             uint32_t squadId = m_roleSystem->CreateSquad(teamId);
             if (squadId > 0) {
                 m_roleSystem->JoinSquad(clientId, squadId);
@@ -1006,9 +1049,11 @@ void GameServer::HandleWeaponFire(uint32_t clientId, const std::vector<uint8_t>&
         return;  // Miss — no damage
     }
 
-    // Calculate damage using weapon database
-    float distance = origin.Distance(m_playerManager->GetPlayer(victimId) ?
-                     m_playerManager->GetPlayer(victimId)->GetPosition() : origin);
+    // Calculate damage using weapon database.
+    // GUARD: m_playerManager can be null during shutdown; also avoid the
+    // double GetPlayer() lookup (and a possible null deref on the second call).
+    auto victimPlayer = m_playerManager ? m_playerManager->GetPlayer(victimId) : nullptr;
+    float distance = victimPlayer ? origin.Distance(victimPlayer->GetPosition()) : 0.0f;
 
     auto* weaponDef = m_weaponDatabase ? m_weaponDatabase->GetWeapon(weaponId) : nullptr;
     if (!weaponDef) {

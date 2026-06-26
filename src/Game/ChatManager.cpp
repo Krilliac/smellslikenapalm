@@ -111,6 +111,10 @@ void ChatManager::BroadcastChat(const std::string& message)
     auto connections = m_server->GetAllConnections();
     Logger::Debug("[ChatManager::BroadcastChat] Sending to %zu connections", connections.size());
     for (auto& conn : connections) {
+        if (!conn) {
+            Logger::Warn("[ChatManager::BroadcastChat] Skipping null connection in broadcast list");
+            continue;
+        }
         conn->SendChatMessage(message);
     }
     Logger::Trace("[ChatManager::BroadcastChat] Exit");
@@ -122,6 +126,10 @@ void ChatManager::BroadcastTeam(uint32_t teamId, const std::string& message)
     Logger::Info("Broadcasting team chat to team %u: %s", teamId, message.c_str());
     int sentCount = 0;
     for (auto& conn : m_server->GetAllConnections()) {
+        if (!conn) {
+            Logger::Warn("[ChatManager::BroadcastTeam] Skipping null connection in broadcast list");
+            continue;
+        }
         if (conn->GetClientId() % 2 == teamId) {
             conn->SendChatMessage(message);
             sentCount++;
@@ -238,6 +246,13 @@ void ChatManager::ProcessChatCommand(uint32_t clientId, const std::string& messa
         return;
     }
 
+    // Reject oversized command strings (attacker-controlled RPC input) to bound parsing work
+    if (message.size() > 256) {
+        Logger::Warn("[ChatManager::ProcessChatCommand] Command rejected: too long (%zu > 256) from client %u", message.size(), clientId);
+        Logger::Trace("[ChatManager::ProcessChatCommand] Exit (too long)");
+        return;
+    }
+
     // Parse command
     auto parts = Split(message.substr(1), ' ');
     std::string cmd = parts.empty() ? "" : parts[0];
@@ -248,7 +263,13 @@ void ChatManager::ProcessChatCommand(uint32_t clientId, const std::string& messa
     if (cmd == "me" && !parts.empty()) {
         std::string action = Join(parts, " ");
         Logger::Debug("[ChatManager::ProcessChatCommand] Processing /me action='%s'", action.c_str());
-        BroadcastChat("* " + std::to_string(m_server->GetClientConnection(clientId)->GetClientId()) + " " + action);
+        auto conn = m_server->GetClientConnection(clientId);
+        if (!conn) {
+            Logger::Warn("[ChatManager::ProcessChatCommand] /me from invalid client %u — ignoring", clientId);
+            Logger::Trace("[ChatManager::ProcessChatCommand] Exit (invalid client)");
+            return;
+        }
+        BroadcastChat("* " + std::to_string(conn->GetClientId()) + " " + action);
     }
     else if (cmd == "team" && !parts.empty()) {
         std::string teamMsg = Join(parts, " ");
@@ -258,7 +279,13 @@ void ChatManager::ProcessChatCommand(uint32_t clientId, const std::string& messa
     else {
         Logger::Debug("[ChatManager::ProcessChatCommand] Unknown built-in command '%s', passing to AdminManager", cmd.c_str());
         // Unknown or pass to admin/command manager
-        m_server->GetAdminManager()->HandleAdminCommand(clientId, cmd, parts);
+        AdminManager* admin = m_server->GetAdminManager();
+        if (!admin) {
+            Logger::Warn("[ChatManager::ProcessChatCommand] AdminManager unavailable — dropping command '%s' from client %u", cmd.c_str(), clientId);
+            Logger::Trace("[ChatManager::ProcessChatCommand] Exit (no admin manager)");
+            return;
+        }
+        admin->HandleAdminCommand(clientId, cmd, parts);
     }
     Logger::Trace("[ChatManager::ProcessChatCommand] Exit");
 }

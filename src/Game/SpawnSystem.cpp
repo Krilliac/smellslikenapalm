@@ -80,7 +80,12 @@ SpawnLocation* SpawnSystem::GetSpawnLocation(uint32_t id) {
 std::vector<const SpawnLocation*> SpawnSystem::GetAvailableSpawns(uint32_t playerId) const {
     Logger::Trace("[SpawnSystem::GetAvailableSpawns] Entry, playerId=%u", playerId);
     std::vector<const SpawnLocation*> result;
-    auto* tm = m_server->GetTeamManager();
+    auto* tm = m_server ? m_server->GetTeamManager() : nullptr;
+    if (!tm) {
+        Logger::Error("[SpawnSystem::GetAvailableSpawns] TeamManager unavailable, returning no spawns for player %u", playerId);
+        Logger::Trace("[SpawnSystem::GetAvailableSpawns] Exit, return 0 spawns (no TeamManager)");
+        return result;
+    }
     uint32_t playerTeam = tm->GetPlayerTeam(playerId);
     Logger::Debug("[SpawnSystem::GetAvailableSpawns] Player %u is on team %u, checking %zu spawn locations",
                   playerId, playerTeam, m_spawnLocations.size());
@@ -130,7 +135,12 @@ void SpawnSystem::UpdateSquadLeaderSpawns() {
     Logger::Trace("[SpawnSystem::UpdateSquadLeaderSpawns] Entry");
     // Remove stale squad leader spawns and update positions
     std::vector<uint32_t> toRemove;
-    auto* pm = m_server->GetPlayerManager();
+    auto* pm = m_server ? m_server->GetPlayerManager() : nullptr;
+    if (!pm) {
+        Logger::Error("[SpawnSystem::UpdateSquadLeaderSpawns] PlayerManager unavailable, aborting update");
+        Logger::Trace("[SpawnSystem::UpdateSquadLeaderSpawns] Exit (no PlayerManager)");
+        return;
+    }
     int updatedCount = 0;
     int deactivatedCount = 0;
 
@@ -161,7 +171,12 @@ void SpawnSystem::UpdateSquadLeaderSpawns() {
 bool SpawnSystem::CanSpawnOnSquadLeader(uint32_t playerId) const {
     Logger::Trace("[SpawnSystem::CanSpawnOnSquadLeader] Entry, playerId=%u", playerId);
     // Find player's squad leader and check if they can spawn on them
-    auto* pm = m_server->GetPlayerManager();
+    auto* pm = m_server ? m_server->GetPlayerManager() : nullptr;
+    if (!pm) {
+        Logger::Error("[SpawnSystem::CanSpawnOnSquadLeader] PlayerManager unavailable for player %u", playerId);
+        Logger::Trace("[SpawnSystem::CanSpawnOnSquadLeader] Exit, return false (no PlayerManager)");
+        return false;
+    }
     auto player = pm->GetPlayer(playerId);
     if (!player) {
         Logger::Debug("[SpawnSystem::CanSpawnOnSquadLeader] Player %u not found", playerId);
@@ -170,7 +185,12 @@ bool SpawnSystem::CanSpawnOnSquadLeader(uint32_t playerId) const {
     }
 
     // Check all squad leader spawns for the player's team
-    auto* tm = m_server->GetTeamManager();
+    auto* tm = m_server ? m_server->GetTeamManager() : nullptr;
+    if (!tm) {
+        Logger::Error("[SpawnSystem::CanSpawnOnSquadLeader] TeamManager unavailable for player %u", playerId);
+        Logger::Trace("[SpawnSystem::CanSpawnOnSquadLeader] Exit, return false (no TeamManager)");
+        return false;
+    }
     uint32_t playerTeam = tm->GetPlayerTeam(playerId);
     Logger::Debug("[SpawnSystem::CanSpawnOnSquadLeader] Checking squad leader spawns for player %u on team %u", playerId, playerTeam);
 
@@ -282,7 +302,12 @@ bool SpawnSystem::SpawnPlayer(uint32_t playerId, uint32_t spawnLocationId) {
         return false;
     }
 
-    auto* pm = m_server->GetPlayerManager();
+    auto* pm = m_server ? m_server->GetPlayerManager() : nullptr;
+    if (!pm) {
+        Logger::Error("[SpawnSystem::SpawnPlayer] PlayerManager unavailable, cannot spawn player %u", playerId);
+        Logger::Trace("[SpawnSystem::SpawnPlayer] Exit, return false (no PlayerManager)");
+        return false;
+    }
     auto player = pm->GetPlayer(playerId);
     if (!player) {
         Logger::Warn("[SpawnSystem::SpawnPlayer] Player %u not found", playerId);
@@ -370,11 +395,25 @@ void SpawnSystem::Update(float deltaSeconds) {
         if (wave.timer <= 0.0f) {
             Logger::Info("[SpawnSystem::Update] Spawn wave triggered for team %u", teamId);
             // Spawn all pending players
-            auto* pm = m_server->GetPlayerManager();
+            auto* pm = m_server ? m_server->GetPlayerManager() : nullptr;
+            auto* tm = m_server ? m_server->GetTeamManager() : nullptr;
+            if (!pm || !tm) {
+                Logger::Error("[SpawnSystem::Update] PlayerManager or TeamManager unavailable, skipping wave for team %u", teamId);
+                wave.timer = wave.interval;
+                continue;
+            }
             int spawnedCount = 0;
             for (auto& player : pm->GetDeadPlayers()) {
-                uint32_t pid = player->GetConnection()->GetClientId();
-                auto* tm = m_server->GetTeamManager();
+                if (!player) {
+                    Logger::Warn("[SpawnSystem::Update] Null player in dead-player list, skipping");
+                    continue;
+                }
+                auto conn = player->GetConnection();
+                if (!conn) {
+                    Logger::Warn("[SpawnSystem::Update] Dead player has no connection, skipping wave spawn");
+                    continue;
+                }
+                uint32_t pid = conn->GetClientId();
                 if (tm->GetPlayerTeam(pid) == teamId) {
                     Logger::Debug("[SpawnSystem::Update] Spawning dead player %u in wave for team %u", pid, teamId);
                     SpawnPlayerAtDefault(pid);
@@ -418,7 +457,12 @@ bool SpawnSystem::IsSquadLeaderInCombat(uint32_t leaderId) const {
     Logger::Trace("[SpawnSystem::IsSquadLeaderInCombat] Entry, leaderId=%u", leaderId);
     // A squad leader is "in combat" if they took damage recently
     // For now, approximate by checking health < max
-    auto* pm = m_server->GetPlayerManager();
+    auto* pm = m_server ? m_server->GetPlayerManager() : nullptr;
+    if (!pm) {
+        Logger::Error("[SpawnSystem::IsSquadLeaderInCombat] PlayerManager unavailable for leader %u, assuming in combat", leaderId);
+        Logger::Trace("[SpawnSystem::IsSquadLeaderInCombat] Exit, return true (no PlayerManager)");
+        return true;  // Err on the side of caution
+    }
     auto leader = pm->GetPlayer(leaderId);
     if (!leader) {
         Logger::Debug("[SpawnSystem::IsSquadLeaderInCombat] Leader %u not found, assuming in combat", leaderId);
