@@ -356,7 +356,10 @@ void ConnectionManager::RemoveStaleConnections() {
     Logger::Trace("[ConnectionManager::RemoveStaleConnections] Entry: %zu clients", m_clients.size());
     auto now = std::chrono::steady_clock::now();
     auto cfgMgr = m_server->GetConfigManager();
-    int timeoutSecs = cfgMgr ? cfgMgr->GetInt("Network.timeout_seconds", 30) : 30;
+    // 120s (was 30s): 30 was too aggressive - a player pausing in the menu, or a brief
+    // reliable-channel stall, would be dropped and surface as a client-side "connection
+    // timed out". Real RS2 servers are far more lenient. Override via Network.timeout_seconds.
+    int timeoutSecs = cfgMgr ? cfgMgr->GetInt("Network.timeout_seconds", 120) : 120;
     Logger::Debug("[ConnectionManager::RemoveStaleConnections] Timeout threshold: %d seconds", timeoutSecs);
 
     std::vector<ClientAddress> toRemove;
