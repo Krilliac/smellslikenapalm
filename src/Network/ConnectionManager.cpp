@@ -841,9 +841,42 @@ void ConnectionManager::DecodeInboundActorBunch(uint32_t clientId,
         if (teamId > 1) teamId &= 1;   // RS2 has two teams (0/1); the byte may carry
                                        // merged-bunch noise in the high bits.
         ControlState& cs = GetControlState(clientId);
-        Logger::Info("[ConnectionManager] client %u: SelectTeam(TeamID=%u) -> replying ChangedTeams",
+        Logger::Info("[ConnectionManager] client %u: SelectTeam(TeamID=%u) -> JoinTeam (clear spectator + Team) then ChangedTeams",
                      clientId, teamId);
         cs.teamSelected = true;
+
+        // --- The server-side JoinTeam result: transition the LOCAL player's PRI (ch26 =
+        // "Krill") from spectator to a participant on the chosen team. Our replayed PRI
+        // open carries bOnlySpectator=1/bWaitingPlayer=1/bIsSpectator=1, so role-select
+        // bounces back to team-select (ROPlayerController.uc:3482 sets bShowRoleSelection
+        // = !bOnlySpectator; ShowRoleSelect returns spectators to ShowTeamSelect). Clear
+        // those flags and bind PRI.Team, as ONE UNRELIABLE delta (bReliable=0, ChSeq=0) on
+        // ch26 - unreliable so it can't re-trigger the seq2 reliable-buffer hang. PRI
+        // handles at maxHandle 98 (docs/re/pri_channels_properties.md): bWaitingPlayer=31,
+        // bOnlySpectator=32, bIsSpectator=33, Team=35 (dynamic obj ref). team0->ch76,
+        // team1->ch56. Properties in ascending handle order.
+        if (auto conn = GetConnection(clientId)) {
+            const uint32_t teamChannel = (teamId == 0) ? 76u : 56u;
+            BitWriter pw;
+            pw.SerializeInt(31, 98); pw.WriteBit(false);   // bWaitingPlayer = 0
+            pw.SerializeInt(32, 98); pw.WriteBit(false);   // bOnlySpectator = 0
+            pw.SerializeInt(33, 98); pw.WriteBit(false);   // bIsSpectator   = 0
+            pw.SerializeInt(35, 98); pw.WriteBit(true);    // Team: selector 1 = dynamic
+            pw.SerializeInt(teamChannel, 1024);            //   -> TeamInfo open channel
+            PacketCodec::Bunch pb;
+            pb.bControl = false; pb.bOpen = false; pb.bClose = false;
+            pb.bReliable = false;            // UNRELIABLE delta
+            pb.chIndex = 26; pb.chType = 2; pb.chSequence = 0;
+            pb.payload = pw.GetBytes();
+            pb.payloadBits = static_cast<uint32_t>(pw.NumBits());
+            const PacketCodec::Packet pkt = cs.outbound.BuildRawBunchPacket(pb);
+            const std::vector<uint8_t> wire =
+                PacketCodec::Encode(pkt, PacketCodec::kServerSendMaxPacketBytes);
+            conn->SendRaw(wire.data(), wire.size());
+            Logger::Info("[ConnectionManager] client %u: PRI ch26 unreliable delta - clear spectator + Team->ch%u (%u bits)",
+                         clientId, teamChannel, pb.payloadBits);
+        }
+
         // ChangedTeams(byte TeamIndex, bool bShowRoleSelection, optional Class<GameInfo>
         // GameTypeClass, optional bool bTeamBalancing, optional bool bShowLobby) -
         // ROPlayerController.uc:3533, handle 172. This is what the real server calls after
