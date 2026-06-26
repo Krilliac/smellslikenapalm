@@ -1020,10 +1020,15 @@ void ConnectionManager::SendPawnSpawn(uint32_t clientId) {
 
     // ONE ORDERED PACKET (processed in order by the client):
     std::vector<PacketCodec::Bunch> pkt;
-    //  1) open the ROPawn channel (reliable, seq 1)
+    //  1) open the ROPawn channel (reliable, seq 1). NOTE: our PacketCodec encoder only writes
+    //     the bOpen/bClose flag bits when bControl is set, and a real actor OPEN decodes as
+    //     bControl=1 + bOpen=1 (verified against the canned GRI/ch54 open). So an encoded open
+    //     MUST set bControl=true too, or the client never sees it as an open and the channel is
+    //     never created (-> ClientRestart can't resolve the pawn -> AskForPawn spam).
     PacketCodec::Bunch open;
-    open.bOpen = true; open.bReliable = true; open.chIndex = kPawnCh; open.chType = 2;
-    open.chSequence = 1; open.payload = pawnOpen; open.payloadBits = kPawnOpenBits;
+    open.bControl = true; open.bOpen = true; open.bReliable = true;
+    open.chIndex = kPawnCh; open.chType = 2; open.chSequence = 1;
+    open.payload = pawnOpen; open.payloadBits = kPawnOpenBits;
     pkt.push_back(std::move(open));
     //  2) fix the pawn's back-refs (objref props, same encoding family as the PRI link):
     pkt.push_back(pawnDelta({0x34, 0x05, 0x00}, 20));  // h52 Controller -> ch2 (load-bearing)
