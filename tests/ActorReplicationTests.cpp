@@ -47,6 +47,46 @@ TEST(ActorReplication, DynamicActorRefRoundTrips) {
     }
 }
 
+// ChangedTeams (ROPlayerController handle 172) RPC body encodes to a client-decodable
+// bit layout. Mirrors src/Network/ConnectionManager.cpp's SelectTeam handler and the
+// retail client's param decode. Proves the bytes we send are well-formed WITHOUT a live
+// client. Param layout per UE3-src UnScript.cpp:2980-3010 (non-bool -> [Send][value];
+// bool -> bare value bit). GameTypeClass idx 69601 = ROGameInfoTerritories (capture h33).
+TEST(ActorReplication, ChangedTeamsRpcBodyRoundTrips) {
+    constexpr uint32_t kMaxHandle = 531;   // ROPlayerController ClassNetCache maxHandle
+    constexpr uint32_t kHandle    = 172;   // ChangedTeams
+    constexpr uint32_t kClassIx   = 69601; // ROGameInfoTerritories static class index
+    for (uint8_t teamId : {uint8_t{0}, uint8_t{1}}) {
+        // --- encode exactly as the server does ---
+        BitWriter fw;
+        fw.SerializeInt(kHandle, kMaxHandle);
+        if (teamId != 0) { fw.WriteBit(true); fw.WriteByte(teamId); }   // byte TeamIndex
+        else             { fw.WriteBit(false); }
+        fw.WriteBit(true);                                              // bShowRoleSelection
+        fw.WriteBit(true);                                             // GameTypeClass Send
+        ActorRepl::WriteNetGUID(fw, NetGUIDRef{/*isDynamic=*/false, kClassIx});
+        fw.WriteBit(false);                                            // bTeamBalancing
+        fw.WriteBit(false);                                            // bShowLobby
+
+        // --- decode mirroring the client ---
+        std::vector<uint8_t> bytes = fw.GetBytes();
+        BitReader r(bytes.data(), bytes.size(), fw.NumBits());
+        EXPECT_EQ(r.SerializeInt(kMaxHandle), kHandle);
+        const bool sendTeam = r.ReadBit();
+        EXPECT_EQ(sendTeam, teamId != 0) << "teamId " << int(teamId);
+        const uint8_t gotTeam = sendTeam ? r.ReadByte() : uint8_t{0};
+        EXPECT_EQ(gotTeam, teamId);
+        EXPECT_TRUE(r.ReadBit());                       // bShowRoleSelection == true
+        EXPECT_TRUE(r.ReadBit());                       // GameTypeClass present
+        const NetGUIDRef gc = ActorRepl::ReadNetGUID(r);
+        EXPECT_FALSE(gc.isDynamic);
+        EXPECT_EQ(gc.index, kClassIx);                  // resolves to ROGameInfoTerritories
+        EXPECT_FALSE(r.ReadBit());                      // bTeamBalancing == false
+        EXPECT_FALSE(r.ReadBit());                      // bShowLobby == false
+        EXPECT_FALSE(r.IsOverflowed());                 // consumed cleanly, no over-read
+    }
+}
+
 // FVector::SerializeCompressed round-trips at integer precision (components are
 // rounded to ints by the codec), including the zero vector and signed values.
 TEST(ActorReplication, CompressedVectorRoundTrips) {

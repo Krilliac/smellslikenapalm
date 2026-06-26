@@ -941,29 +941,61 @@ void ConnectionManager::DecodeInboundActorBunch(uint32_t clientId,
             }
         }
 
-        // --- CLIENT-SIDE ADVANCE DISABLED (it CRASHES the retail client). ---------------
-        // We used to reply with a PRI.Team delta + ChangedTeams (handle 172) to advance the
-        // client from team-select to role-select. Crash-dump analysis of VNGame.exe
-        // (AppData/Local/CrashDumps, EXCEPTION_ACCESS_VIOLATION reading 0x0 at
-        // VNGame.exe+0xbbf712, in the UE3 script ProcessEvent path) proved the cause:
-        // ChangedTeams runs ShowRoleSelectScene on the client, which dereferences game
-        // state we DON'T replicate (WorldInfo.GRI.Teams populated with real ROTeamInfo,
-        // ROMapInfo Northern/SouthernSquads roles, ROGameReplicationInfo cast) -> NULL
-        // deref -> client crash. Ironically, correctly encoding ChangedTeams (the UE3
-        // per-param "Send" bit fix) is what made the client actually DECODE+RUN it and
-        // crash; before, it was misaligned and silently ignored.
+        // --- ADVANCE TO ROLE-SELECT: ChangedTeams (handle 172) on ch2 -------------------
+        // ROPlayerController.uc:3533
+        //   reliable client simulated function ChangedTeams(byte TeamIndex,
+        //       bool bShowRoleSelection, optional Class<GameInfo> GameTypeClass,
+        //       optional bool bTeamBalancing, optional bool bShowLobby)
         //
-        // So: do NOT trigger the client-side role-select transition until the supporting
-        // state (GRI.Teams/ROTeamInfo with real data, ROMapInfo roles, PRI fields) is
-        // actually replicated. Sending ChangedTeams (or PRI.Team binding a half-populated
-        // ROTeamInfo) into the gap is a guaranteed client crash. The team menu stays up;
-        // the player can re-pick or disconnect cleanly. The team IS recorded server-side
-        // above (AddPlayerToTeam). Re-enable the advance only once role-select state is
-        // replicated (see docs/re/SAFE_STATE_REP_PLAN.md + the role->spawn TODO).
-        Logger::Info("[ConnectionManager] client %u: SelectTeam(TeamID=%u) recorded server-side; "
-                     "client-side role-select advance intentionally NOT sent (would crash the "
-                     "client against unreplicated role-select state - see crash-dump analysis)",
-                     clientId, teamId);
+        // The retail client's ChangedTeams() does the team->role transition itself:
+        //   * line 3618: PlayerReplicationInfo.Team = WorldInfo.GRI.Teams[TeamIndex]
+        //                -> it BINDS PRI.Team from GRI.Teams[] (already populated by our
+        //                   TeamInfo opens on ch21/56/76), so NO PRI.Team delta is needed.
+        //   * line 3627: ShowRoleSelectScene(GameTypeClass, TeamIndex, ...)
+        //                -> uses the GameTypeClass PARAM directly. If it is none, the
+        //                   client SKIPS InitSquadsForGametype (ROPlayerController.uc:5941),
+        //                   the squad/role tables stay empty, GetSelectedRoleInfoClass()
+        //                   returns none, and the role UI does RoleClass.default.X on a
+        //                   null class-default object -> EXCEPTION_ACCESS_VIOLATION (the
+        //                   VNGame.exe+0xbbf712 crash we saw). The fix is to SEND a real,
+        //                   client-resolvable GameTypeClass so squads build locally from
+        //                   the client's own loaded ROMapInfo (the map data is NOT
+        //                   replicated - confirmed: ROMI = ROMapInfo(WorldInfo.GetMapInfo)).
+        //
+        // GameTypeClass = ROGame.ROGameInfoTerritories, encoded as the SAME static
+        // PackageMap class index the real server already sent as GRI.GameClass (h33) in our
+        // verbatim ch54 GRI open: static index 69601 (selector 0). Reusing the exact captured
+        // index guarantees it resolves on the client (it already accepted this ref in GRI).
+        // See docs/re/CLIENT_CRASH_team_select.md + docs/re/open_bunch_structure.md:185.
+        //
+        // Param wire layout (UE3 UnScript.cpp:2980-3010, validated against UE3-src):
+        //   non-bool param -> [Send presence bit][value iff Send] ; bool -> bare value bit.
+        constexpr uint32_t kChangedTeamsHandle           = 172;
+        constexpr uint32_t kRoGameInfoTerritoriesClassIx = 69601;  // GRI.GameClass h33 (capture)
+        BitWriter fw;
+        fw.SerializeInt(kChangedTeamsHandle, kRoPcMaxHandle);      // handle (maxHandle 531)
+        // param 1: byte TeamIndex  -> Send only if != default(0)
+        if (teamId != 0) { fw.WriteBit(true); fw.WriteByte(teamId); }
+        else             { fw.WriteBit(false); }
+        // param 2: bool bShowRoleSelection = true  -> open the role-select scene
+        fw.WriteBit(true);
+        // param 3: Class<GameInfo> GameTypeClass = ROGameInfoTerritories  -> Send + objref
+        fw.WriteBit(true);
+        // Object-ref (UPackageMapLevel::SerializeObject), STATIC class path: selector bit 0
+        // then SerializeInt(index, MAX_OBJECT_INDEX=0x80000000). This is bit-identical to
+        // ActorRepl::WriteNetGUID(NetGUIDRef{false,idx}); inlined here to avoid a cross-TU
+        // link dependency on src/Network/ActorReplication.cpp, whose obj name collides with
+        // src/Protocol/ActorReplication.cpp in rs2v_core (see docs/hardening/HARDENING_LOG.md).
+        fw.WriteBit(false);                                            // selector = static
+        fw.SerializeInt(kRoGameInfoTerritoriesClassIx, 0x80000000u);   // static class index
+        // param 4: bool bTeamBalancing = false
+        fw.WriteBit(false);
+        // param 5: bool bShowLobby = false
+        fw.WriteBit(false);
+        SendCh2Rpc(clientId, fw.GetBytes(), static_cast<uint32_t>(fw.NumBits()), "ChangedTeams");
+        Logger::Info("[ConnectionManager] client %u: SelectTeam(TeamID=%u) -> sent ChangedTeams "
+                     "(role-select advance, GameTypeClass=ROGameInfoTerritories idx %u)",
+                     clientId, teamId, kRoGameInfoTerritoriesClassIx);
     }
 }
 
