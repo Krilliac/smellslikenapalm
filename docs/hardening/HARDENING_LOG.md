@@ -14,7 +14,7 @@ src/Network/BitWriter, BitReader, PacketCodec, ActorReplication, WireTrace.h.
 ## Subsystem queue
 - [x] Network inbound parse: HandshakeState, ControlReassembler, ControlChannel, ConnectionManager inbound path
 - [x] Protocol decoders (src/Protocol/*)
-- [ ] Security / AuthManager / input validation
+- [x] Security / AuthManager / input validation
 - [ ] Game state / SpawnSystem / GameMode / ReplicationManager
 - [ ] Config / ConfigManager
 - [ ] Utils (StringUtils, PathUtils, MemoryPool, etc.)
@@ -25,3 +25,4 @@ src/Network/BitWriter, BitReader, PacketCodec, ActorReplication, WireTrace.h.
 <!-- one line per completed iteration: date | subsystem | what was hardened | commit -->
 2026-06-26 | Network inbound parse | NMT-range + login-URL caps (HandshakeState); reassembly byte-cap 256KiB + seq-ahead/payloadBits guards (ControlReassembler); ValidBuffer/StringSane caps (ControlChannel); datagram clamp + checked find() + per-packet bunch cap 4096 (ConnectionManager inbound) | 2d7714d
 2026-06-26 | Protocol decoders | BytesRemaining guards + bool-return + reserve clamps (Actor/PropertyReplication); null-handler reject (ProtocolHandler); arg-count clamp (MessageEncoder); hex validation (ProtocolUtils); payload/field bounds (ProtocolDecoder) | 5dcbd39
+2026-06-26 | Security/Auth | anti-enumeration timing equalizer + no auto-insert (AuthManager); constant-time verify + param guards (PasswordHasher); bounded token/session maps + empty-token reject (TokenManager/EAC) | 18b81b0
