@@ -979,32 +979,48 @@ void ConnectionManager::DecodeInboundActorBunch(uint32_t clientId,
         //
         // Param wire layout (UE3 UnScript.cpp:2980-3010, validated against UE3-src):
         //   non-bool param -> [Send presence bit][value iff Send] ; bool -> bare value bit.
-        constexpr uint32_t kChangedTeamsHandle           = 172;
-        constexpr uint32_t kRoGameInfoTerritoriesClassIx = 69601;  // GRI.GameClass h33 (capture)
-        BitWriter fw;
-        fw.SerializeInt(kChangedTeamsHandle, kRoPcMaxHandle);      // handle (maxHandle 531)
-        // param 1: byte TeamIndex  -> Send only if != default(0)
-        if (teamId != 0) { fw.WriteBit(true); fw.WriteByte(teamId); }
-        else             { fw.WriteBit(false); }
-        // param 2: bool bShowRoleSelection = true  -> open the role-select scene
-        fw.WriteBit(true);
-        // param 3: Class<GameInfo> GameTypeClass = ROGameInfoTerritories  -> Send + objref
-        fw.WriteBit(true);
-        // Object-ref (UPackageMapLevel::SerializeObject), STATIC class path: selector bit 0
-        // then SerializeInt(index, MAX_OBJECT_INDEX=0x80000000). This is bit-identical to
-        // ActorRepl::WriteNetGUID(NetGUIDRef{false,idx}); inlined here to avoid a cross-TU
-        // link dependency on src/Network/ActorReplication.cpp, whose obj name collides with
-        // src/Protocol/ActorReplication.cpp in rs2v_core (see docs/hardening/HARDENING_LOG.md).
-        fw.WriteBit(false);                                            // selector = static
-        fw.SerializeInt(kRoGameInfoTerritoriesClassIx, 0x80000000u);   // static class index
-        // param 4: bool bTeamBalancing = false
-        fw.WriteBit(false);
-        // param 5: bool bShowLobby = false
-        fw.WriteBit(false);
-        SendCh2Rpc(clientId, fw.GetBytes(), static_cast<uint32_t>(fw.NumBits()), "ChangedTeams");
-        Logger::Info("[ConnectionManager] client %u: SelectTeam(TeamID=%u) -> sent ChangedTeams "
-                     "(role-select advance, GameTypeClass=ROGameInfoTerritories idx %u)",
-                     clientId, teamId, kRoGameInfoTerritoriesClassIx);
+        // ROLE-SELECT ADVANCE GATE (default OFF).
+        // Packet-recorder ground truth (packetlog/, session 1782498358588) + crash dump
+        // VNGame.exe.1152.dmp PROVED sending ChangedTeams crashes the retail client: the
+        // client processes it, opens the role/unit-select UI, and the role UI dereferences a
+        // NULL game-state object (VNGame.exe+0xbbf712: `mov rax,[rdx]; call [rax+0x2b8]` with
+        // rdx = a cached local-player ref at [r12+0xf0] == NULL) -> AV. Adding the resolvable
+        // GameTypeClass param did NOT fix it (the role UI reads GRI/role state directly, not
+        // our param). Until the role-select state layer is actually replicated (identify +
+        // populate the null object the role UI compares against), DO NOT send the advance -
+        // it is a guaranteed client crash. The team is still recorded server-side above.
+        // Re-enable by flipping this flag once role-state replication lands.
+        constexpr bool kEnableRoleSelectAdvance = false;
+        if (kEnableRoleSelectAdvance) {
+            constexpr uint32_t kChangedTeamsHandle           = 172;
+            constexpr uint32_t kRoGameInfoTerritoriesClassIx = 69601;  // GRI.GameClass h33 (capture)
+            BitWriter fw;
+            fw.SerializeInt(kChangedTeamsHandle, kRoPcMaxHandle);      // handle (maxHandle 531)
+            // param 1: byte TeamIndex  -> Send only if != default(0)
+            if (teamId != 0) { fw.WriteBit(true); fw.WriteByte(teamId); }
+            else             { fw.WriteBit(false); }
+            // param 2: bool bShowRoleSelection = true  -> open the role-select scene
+            fw.WriteBit(true);
+            // param 3: Class<GameInfo> GameTypeClass = ROGameInfoTerritories  -> Send + objref
+            fw.WriteBit(true);
+            // Object-ref (UPackageMapLevel::SerializeObject), STATIC class path: selector bit 0
+            // then SerializeInt(index, MAX_OBJECT_INDEX=0x80000000). Bit-identical to
+            // ActorRepl::WriteNetGUID(NetGUIDRef{false,idx}); inlined to avoid a cross-TU link
+            // dep on src/Network/ActorReplication.cpp (obj-name collision, see HARDENING_LOG).
+            fw.WriteBit(false);                                            // selector = static
+            fw.SerializeInt(kRoGameInfoTerritoriesClassIx, 0x80000000u);   // static class index
+            fw.WriteBit(false);                                            // param 4: bTeamBalancing
+            fw.WriteBit(false);                                            // param 5: bShowLobby
+            SendCh2Rpc(clientId, fw.GetBytes(), static_cast<uint32_t>(fw.NumBits()), "ChangedTeams");
+            Logger::Info("[ConnectionManager] client %u: SelectTeam(TeamID=%u) -> sent ChangedTeams "
+                         "(role-select advance, GameTypeClass idx %u)", clientId, teamId,
+                         kRoGameInfoTerritoriesClassIx);
+        } else {
+            Logger::Info("[ConnectionManager] client %u: SelectTeam(TeamID=%u) recorded server-side; "
+                         "role-select advance HELD (ChangedTeams crashes the client against "
+                         "unreplicated role-state - see packetlog + VNGame.exe+0xbbf712 crash)",
+                         clientId, teamId);
+        }
     }
 }
 
