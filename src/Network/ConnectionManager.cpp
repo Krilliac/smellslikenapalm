@@ -884,6 +884,34 @@ void ConnectionManager::SendCh2Rpc(uint32_t clientId, const std::vector<uint8_t>
     SendReliableBunches(clientId, { b });   // recorded for retransmission until acked
 }
 
+// Build the (unreliable) PC.PlayerReplicationInfo link bunch on ch2: handle 23 +
+// dynamic object-ref to ch26 (= "176a00"). Shared by SendLocalPriLink and the ordered
+// role-advance packet so the bytes are identical.
+static PacketCodec::Bunch BuildPriLinkBunch() {
+    BitWriter lw;
+    lw.SerializeInt(23, kRoPcMaxHandle);   // Controller.PlayerReplicationInfo
+    lw.WriteBit(true);                      // dynamic objref selector
+    lw.SerializeInt(26, 2048);              // local PRI channel index (UE3 MAX_CHANNELS)
+    PacketCodec::Bunch b;
+    b.bReliable = false; b.chIndex = 2; b.chType = 2; b.chSequence = 0;  // chType ignored (unreliable)
+    b.payload = lw.GetBytes(); b.payloadBits = static_cast<uint32_t>(lw.NumBits());
+    return b;
+}
+
+// Build the (unreliable) PRI spectator-clear bunch on ch26: bWaitingPlayer(31) /
+// bOnlySpectator(32) / bIsSpectator(33) = 0 (PRI maxHandle 98).
+static PacketCodec::Bunch BuildClearSpectatorBunch() {
+    constexpr uint32_t kPriMaxHandle = 98;
+    BitWriter pw;
+    pw.SerializeInt(31, kPriMaxHandle); pw.WriteBit(false);
+    pw.SerializeInt(32, kPriMaxHandle); pw.WriteBit(false);
+    pw.SerializeInt(33, kPriMaxHandle); pw.WriteBit(false);
+    PacketCodec::Bunch b;
+    b.bReliable = false; b.chIndex = 26; b.chType = 2; b.chSequence = 0;
+    b.payload = pw.GetBytes(); b.payloadBits = static_cast<uint32_t>(pw.NumBits());
+    return b;
+}
+
 void ConnectionManager::SendLocalPriLink(uint32_t clientId, int repeats) {
     // handle 23 (Controller.PlayerReplicationInfo) + dynamic object-ref to ch26 (local PRI):
     //   SerializeInt(23,531) = 9 bits, selector bit 1 (dynamic), SerializeInt(26,1024).
@@ -1100,10 +1128,25 @@ void ConnectionManager::DecodeInboundActorBunch(uint32_t clientId,
             fw.SerializeInt(kRoGameInfoTerritoriesClassIx, 0x80000000u);   // static class index
             fw.WriteBit(false);                                            // param 4: bTeamBalancing
             fw.WriteBit(false);                                            // param 5: bShowLobby
-            SendCh2Rpc(clientId, fw.GetBytes(), static_cast<uint32_t>(fw.NumBits()), "ChangedTeams");
-            Logger::Info("[ConnectionManager] client %u: SelectTeam(TeamID=%u) -> sent ChangedTeams "
-                         "(role-select advance, GameTypeClass idx %u)", clientId, teamId,
-                         kRoGameInfoTerritoriesClassIx);
+            // ORDERED SINGLE-PACKET ADVANCE: clear-spectator + PC->PRI link + ChangedTeams in
+            // ONE packet, in that order. Within a packet the client processes bunches in order,
+            // so bOnlySpectator=0 and the PRI link are applied BEFORE ShowRoleSelectScene runs -
+            // eliminating the intermittent first-click race (localhost can reorder/drop the
+            // separate unreliable bunches under the bootstrap burst). ChangedTeams is reliable
+            // (retransmitted until acked); the redundant clear/link sends above cover a drop of
+            // this packet (only ChangedTeams is retransmitted, but the separate sends already
+            // delivered the clear/link).
+            PacketCodec::Bunch ctBunch;
+            ctBunch.bReliable   = true;
+            ctBunch.chIndex     = 2;
+            ctBunch.chType      = cs.actorChType;
+            ctBunch.chSequence  = ++cs.ch2OutReliable;
+            ctBunch.payload     = fw.GetBytes();
+            ctBunch.payloadBits = static_cast<uint32_t>(fw.NumBits());
+            SendReliableBunches(clientId, { BuildClearSpectatorBunch(), BuildPriLinkBunch(), ctBunch });
+            Logger::Info("[ConnectionManager] client %u: SelectTeam(TeamID=%u) -> ordered "
+                         "[clear-spectator + PRI-link + ChangedTeams] advance packet sent "
+                         "(GameTypeClass idx %u)", clientId, teamId, kRoGameInfoTerritoriesClassIx);
         } else {
             Logger::Info("[ConnectionManager] client %u: SelectTeam(TeamID=%u) recorded server-side; "
                          "role-select advance HELD (ChangedTeams crashes the client against "
