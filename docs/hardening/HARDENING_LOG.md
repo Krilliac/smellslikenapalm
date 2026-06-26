@@ -34,3 +34,4 @@ src/Network/BitWriter, BitReader, PacketCodec, ActorReplication, WireTrace.h.
 2026-06-26 | Static analysis | cppcheck pass (11 findings, mostly non-bugs); fixed uninit Sha256::m_buf; AuthenticationTests 32/32 pass | 02ee824
 2026-06-26 | Netcode correctness review | FOUND+FIXED real client-breaking bugs: UE3 per-param Send presence bit (SelectTeam decode dropped team-0; ChangedTeams misaligned) + kMaxChannels 1023->1024. TODO: control-channel retransmit (edge-case) | 396bc58
 2026-06-26 | Property-encoding review | fixed 3 latent ActorRepl-helper bugs (enum-byte width, appRound, None self-check) before spawn wiring; live path verified correct | fc01168
+2026-06-26 | Player-lifecycle review | FIXED 4 real bugs: SelectTeam not persisted server-side (team->spawn BLOCKER), spectator force-respawn, stale TeamManager on disconnect, NVA->US mapping. TODO: wire Team/Player/GameTests | 0d65060
