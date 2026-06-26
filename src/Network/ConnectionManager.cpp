@@ -9,6 +9,8 @@
 #include "Protocol/ReverseEngineering/ProtocolDecoder.h"
 #include "Network/HandshakeState.h"
 #include "Network/ControlChannel.h"
+#include "Network/BitWriter.h"
+#include "Network/BitReader.h"
 #include "../../telemetry/TelemetryManager.h"
 #include <chrono>
 #include <fstream>
@@ -676,6 +678,118 @@ void ConnectionManager::SendActorBootstrap(uint32_t clientId) {
             PacketCodec::Encode(pkt, PacketCodec::kServerSendMaxPacketBytes);
         conn->SendRaw(wire.data(), wire.size());
     }
+
+    // ---- Open the team-select menu: ClientShowTeamSelect() on ch2 (the PC) -----
+    // The live retail client reaches the world but sits in spectator/preload with no
+    // team. ROGameInfo.uc:2631 shows the real server calls ROPC.ClientShowTeamSelect()
+    // on a fresh joiner to pop the team-select menu (the if-branch at 2621 is
+    // ChangedTeams() for players who already have a team). ClientShowTeamSelect is a
+    // `reliable client` function taking NO parameters, so the actor-channel bunch body
+    // is exactly one field handle: SerializeInt(handle, maxHandle), nothing after.
+    // ShowTeamSelect() is safe against our opens-only (empty) GRI: its server-only
+    // guard (WorldInfo.Game!=none) is false on the client, it opens the scene from the
+    // default TeamSelectSceneTemplate, and InitTeamSelect tolerates an empty
+    // GRI.Teams (None.NumPlayers == 0 in UnrealScript). See ROPlayerController.uc:5818.
+    //
+    // handle / maxHandle from the compiled .u packages via UELib, sorted by the real
+    // engine NetIndex (tools/netfields_from_u.ps1) - this is GROUND TRUTH, not the
+    // decompiled .uc declaration order (which is reordered and gave a wrong handle).
+    // Triple-confirmed: (1) NetIndex sort -> handle 206; (2) decoding the real-server
+    // capture's 20571 S2C ch2 bunches with this map yields ZERO Server-function
+    // mismatches; (3) SerializeInt(206,531) = bytes CE 00 = the exact `ce00` bunch the
+    // official server sends at capture frame f1637 (its own ClientShowTeamSelect).
+    constexpr uint32_t kROPlayerControllerMaxHandle = 531;
+    constexpr uint32_t kClientShowTeamSelectHandle  = 206;
+
+    const ActorBunchRecord* pcRec = nullptr;
+    for (const ActorBunchRecord& r : records) {
+        if (r.chIndex == 2) { pcRec = &r; break; }
+    }
+    if (pcRec) {
+        // Seed ch2's outbound reliable sequence at the open's ChSequence; SendCh2Rpc
+        // increments it for each function bunch (ClientShowTeamSelect = seq+1).
+        cs.ch2OutReliable = static_cast<uint32_t>(pcRec->chSequence);
+        cs.actorChType    = pcRec->chType;
+        BitWriter fw;
+        fw.SerializeInt(kClientShowTeamSelectHandle, kROPlayerControllerMaxHandle);
+        SendCh2Rpc(clientId, fw.GetBytes(), static_cast<uint32_t>(fw.NumBits()),
+                   "ClientShowTeamSelect");
+    }
+}
+
+// PlayerController (ROPlayerController) ClassNetCache maxHandle - see SendActorBootstrap.
+static constexpr uint32_t kRoPcMaxHandle = 531;
+
+void ConnectionManager::SendCh2Rpc(uint32_t clientId, const std::vector<uint8_t>& payload,
+                                   uint32_t payloadBits, const char* name) {
+    auto conn = GetConnection(clientId);
+    if (!conn) return;
+    ControlState& cs = GetControlState(clientId);
+    PacketCodec::Bunch b;
+    b.bControl   = false;
+    b.bOpen      = false;
+    b.bClose     = false;
+    b.bReliable  = true;
+    b.chIndex    = 2;
+    b.chType     = cs.actorChType;
+    b.chSequence = ++cs.ch2OutReliable;   // next reliable on ch2
+    b.payload    = payload;
+    b.payloadBits = payloadBits;
+    const PacketCodec::Packet pkt = cs.outbound.BuildRawBunchPacket(b);
+    const std::vector<uint8_t> wire =
+        PacketCodec::Encode(pkt, PacketCodec::kServerSendMaxPacketBytes);
+    conn->SendRaw(wire.data(), wire.size());
+    Logger::Info("[ConnectionManager::SendCh2Rpc] client %u: sent %s on ch2 seq %u (%u bits)",
+                 clientId, name, b.chSequence, payloadBits);
+}
+
+// Names for the handful of ROPlayerController net-field handles we recognise on the
+// wire (ground truth from tools/netfields_from_u.ps1). For logging/dispatch only.
+static const char* RoPcHandleName(uint32_t h) {
+    switch (h) {
+        case 170: return "SelectTeam";
+        case 172: return "ChangedTeams";
+        case 175: return "SelectRoleByClass";
+        case 206: return "ClientShowTeamSelect";
+        case 207: return "ClientShowRoleSelect";
+        case 210: return "ChangedRole";
+        case 82:  return "ServerChangeTeam";
+        case 80:  return "ServerSuicide";
+        case 65:  return "ServerMove";
+        case 27:  return "ServerRestartPlayer";
+        default:  return "?";
+    }
+}
+
+void ConnectionManager::DecodeInboundActorBunch(uint32_t clientId,
+                                                const PacketCodec::Bunch& bunch) {
+    // Only reliable function/property bunches carry a handle worth dispatching; the
+    // open/close framing and tiny keepalives don't.
+    if (!bunch.bReliable || bunch.bOpen || bunch.bClose || bunch.payloadBits == 0) {
+        return;
+    }
+    BitReader r(bunch.payload.data(), bunch.payload.size(), bunch.payloadBits);
+    const uint32_t handle = r.SerializeInt(kRoPcMaxHandle);
+    if (r.IsOverflowed()) return;
+    Logger::Info("[ConnectionManager::DecodeInboundActorBunch] client %u: ch%u inbound RPC handle %u (%s), %u bits",
+                 clientId, bunch.chIndex, handle, RoPcHandleName(handle), bunch.payloadBits);
+
+    // SelectTeam(byte TeamID) - the client clicked a team in the team-select menu.
+    // ROPlayerController.uc:3440 (reliable server). On the real server this assigns the
+    // team then calls ChangedTeams() to open role select. We advance the client to the
+    // role-select scene via ClientShowRoleSelect (handle 207, optional bool).
+    if (bunch.chIndex == 2 && handle == 170) {
+        const uint8_t teamId = r.ReadByte();
+        ControlState& cs = GetControlState(clientId);
+        Logger::Info("[ConnectionManager] client %u: SelectTeam(TeamID=%u) -> advancing to role select",
+                     clientId, teamId);
+        cs.teamSelected = true;
+        BitWriter fw;
+        fw.SerializeInt(207, kRoPcMaxHandle);   // ClientShowRoleSelect
+        fw.WriteBit(false);                      // optional bool bCacheOldRole = false
+        SendCh2Rpc(clientId, fw.GetBytes(), static_cast<uint32_t>(fw.NumBits()),
+                   "ClientShowRoleSelect");
+    }
 }
 
 void ConnectionManager::SendReplicationBootstrap(uint32_t clientId) {
@@ -746,7 +860,11 @@ bool ConnectionManager::ParseIncomingControl(uint32_t clientId, const std::vecto
     // dispatched to the handshake, which may emit responses via SendRawToClient
     // (draining the queued ack onto the response packet).
     for (const PacketCodec::Bunch& b : pkt.bunches) {
-        cs.reassembler->OnBunch(b);
+        if (b.chIndex == 0) {
+            cs.reassembler->OnBunch(b);          // control channel (handshake/NMT)
+        } else {
+            DecodeInboundActorBunch(clientId, b);  // ch>=2 actor-channel RPCs (SelectTeam, ...)
+        }
     }
 
     // If nothing we sent carried the ack, emit a standalone ack so the client

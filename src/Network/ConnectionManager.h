@@ -91,6 +91,14 @@ private:
     struct ControlState {
         PacketCodec::PacketAssembler outbound;
         std::unique_ptr<PacketCodec::ControlReassembler> reassembler;
+        // Per-channel state for the owning client's PlayerController (ch2). The actor
+        // bootstrap opens ch2 (seq 1) then sends ClientShowTeamSelect (seq 2); each
+        // further server->client reliable RPC on ch2 (ClientShowRoleSelect, ...)
+        // increments ch2OutReliable. actorChType is ch2's ChType (CHTYPE_Actor) reused
+        // for those bunches. teamSelected guards the SelectTeam->role-select advance.
+        uint32_t ch2OutReliable = 0;
+        uint32_t actorChType = 2;
+        bool     teamSelected = false;
     };
     std::unordered_map<uint32_t, ControlState> m_controlState;
     uint32_t m_nextClientId{1};
@@ -123,6 +131,18 @@ private:
     // data/replication_bootstrap.bin (a stream of [uint32 LE len][payload] records)
     // and sent in order via SendRawToClient. No-op (logged) if the file is absent.
     void SendReplicationBootstrap(uint32_t clientId);
+
+    // Send a reliable server->client function-call bunch on the PlayerController
+    // channel (ch2): payload = SerializeInt(handle, maxHandle) + any params, already
+    // packed into `payload`/`payloadBits` by the caller. Assigns the next ch2 reliable
+    // ChSequence. Used for ClientShowTeamSelect / ClientShowRoleSelect / ChangedTeams.
+    void SendCh2Rpc(uint32_t clientId, const std::vector<uint8_t>& payload,
+                    uint32_t payloadBits, const char* name);
+
+    // Decode one inbound actor-channel (ChIndex>=2) bunch: read the field handle
+    // (SerializeInt at the PlayerController maxHandle) and dispatch the client->server
+    // RPC (e.g. SelectTeam). Logs the handle/name for visibility into client input.
+    void DecodeInboundActorBunch(uint32_t clientId, const PacketCodec::Bunch& bunch);
 
     // Open the bootstrap ACTOR channels after the client confirms Join. Replays the
     // official server's f231 burst (ROGameReplicationInfo on ch2, TeamInfo, the
