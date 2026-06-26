@@ -100,6 +100,7 @@ private:
         uint32_t actorChType = 2;
         bool     teamSelected = false;
         bool     menuResent = false;   // re-sent ClientShowTeamSelect on client proof-of-life
+        bool     spawned = false;      // sent the pawn-spawn + possession once (SelectRoleByClass)
 
         // ---- Reliable retransmission (UE3 UNetConnection-style) -----------------
         // UE3 reliability: a reliable bunch must be re-sent until the client acks the
@@ -167,6 +168,13 @@ private:
     // ShowRoleSelectScene does not early-return at ROPlayerController.uc:5932
     // (if PlayerReplicationInfo.bOnlySpectator return). Sent `repeats` times.
     void SendClearSpectator(uint32_t clientId, int repeats);
+
+    // Spawn the local player's pawn + make the client possess it (the role->spawn step).
+    // Sends ONE ordered packet: open an ROPawn channel (verbatim 286147 open), fix its
+    // Controller(h52)->ch2 + PRI(h32)->ch26 back-refs, set PC.Pawn(h24)->the pawn channel,
+    // then ClientRestart(h85) to trigger possession. Expected result: the client switches
+    // from menu RPCs to ServerMove (handle 65). See docs/re/pawn_spawn_replication.md.
+    void SendPawnSpawn(uint32_t clientId);
 
     // Decode one inbound actor-channel (ChIndex>=2) bunch: read the field handle
     // (SerializeInt at the PlayerController maxHandle) and dispatch the client->server

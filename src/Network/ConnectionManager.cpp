@@ -979,6 +979,66 @@ void ConnectionManager::SendClearSpectator(uint32_t clientId, int repeats) {
                  "on ch26 (h31/32/33=0, %u bits) x%d", clientId, bits, repeats);
 }
 
+void ConnectionManager::SendPawnSpawn(uint32_t clientId) {
+    ControlState& cs = GetControlState(clientId);
+    constexpr uint32_t kPawnCh = 209;   // fresh channel above the bootstrap range (2..140, 481)
+
+    // Verbatim captured ROPawn open: classidx 286147, Location (1458,2644,297), 1137 bits.
+    // Replayed like our GRI/PRI opens. Its embedded Controller/PRI/InvManager refs point at the
+    // CAPTURE's channels (don't resolve here) -> fixed by the back-ref deltas below.
+    static const char* kPawnOpenHex =
+        "86bb08002b5ba9744a2c80604f0060d09442acea558320f3080902000098641a46004804204b0c204b14"
+        "204b1c204b24204b2c204b34f0483c204b44a0484c504854f0485c204b64a0486c50487418497c204b84a0"
+        "488c50489418499c204ba4a048ac5048b4204bbc203b05c0348c00704a805c1801e030a0b365a644fa232e"
+        "4525d225d1380001110080841cff01";
+    constexpr uint32_t kPawnOpenBits = 1137;
+    std::vector<uint8_t> pawnOpen;
+    {
+        auto nib = [](char c)->int {
+            if (c>='0'&&c<='9') return c-'0';
+            if (c>='a'&&c<='f') return c-'a'+10;
+            if (c>='A'&&c<='F') return c-'A'+10;
+            return 0;
+        };
+        for (const char* h = kPawnOpenHex; h[0] && h[1]; h += 2)
+            pawnOpen.push_back(static_cast<uint8_t>((nib(h[0]) << 4) | nib(h[1])));
+    }
+
+    auto pawnDelta = [&](std::vector<uint8_t> bytes, uint32_t bits) {
+        PacketCodec::Bunch b;
+        b.bReliable = false; b.chIndex = kPawnCh; b.chType = 2; b.chSequence = 0;  // unreliable
+        b.payload = std::move(bytes); b.payloadBits = bits;
+        return b;
+    };
+    auto ch2Bunch = [&](std::vector<uint8_t> bytes, uint32_t bits, bool reliable) {
+        PacketCodec::Bunch b;
+        b.bReliable = reliable; b.chIndex = 2; b.chType = cs.actorChType;
+        b.chSequence = reliable ? ++cs.ch2OutReliable : 0;
+        b.payload = std::move(bytes); b.payloadBits = bits;
+        return b;
+    };
+
+    // ONE ORDERED PACKET (processed in order by the client):
+    std::vector<PacketCodec::Bunch> pkt;
+    //  1) open the ROPawn channel (reliable, seq 1)
+    PacketCodec::Bunch open;
+    open.bOpen = true; open.bReliable = true; open.chIndex = kPawnCh; open.chType = 2;
+    open.chSequence = 1; open.payload = pawnOpen; open.payloadBits = kPawnOpenBits;
+    pkt.push_back(std::move(open));
+    //  2) fix the pawn's back-refs (objref props, same encoding family as the PRI link):
+    pkt.push_back(pawnDelta({0x34, 0x05, 0x00}, 20));  // h52 Controller -> ch2 (load-bearing)
+    pkt.push_back(pawnDelta({0x20, 0x35, 0x00}, 20));  // h32 PlayerReplicationInfo -> ch26
+    //  3) PC.Pawn (h24) on ch2 -> the pawn channel (unreliable, like the PRI link)
+    pkt.push_back(ch2Bunch({0x18, 0x8c, 0x06}, 22, /*reliable=*/false));
+    //  4) ClientRestart (h85) on ch2 (reliable) -> NewPawn = pawn channel: THE possession trigger
+    pkt.push_back(ch2Bunch({0x55, 0x1c, 0x0d}, 23, /*reliable=*/true));
+
+    SendReliableBunches(clientId, pkt);
+    Logger::Info("[ConnectionManager::SendPawnSpawn] client %u: opened ROPawn ch%u (286147) + "
+                 "Controller->ch2 + PRI->ch26 + PC.Pawn(h24) + ClientRestart(h85) - expecting "
+                 "the client to possess and switch to ServerMove(h65)", clientId, kPawnCh);
+}
+
 // Names for the handful of ROPlayerController net-field handles we recognise on the
 // wire (ground truth from tools/netfields_from_u.ps1). For logging/dispatch only.
 static const char* RoPcHandleName(uint32_t h) {
@@ -1153,6 +1213,22 @@ void ConnectionManager::DecodeInboundActorBunch(uint32_t clientId,
                          "unreplicated role-state - see packetlog + VNGame.exe+0xbbf712 crash)",
                          clientId, teamId);
         }
+    }
+
+    // SelectRoleByClass (handle 175) - the client picked a role / hit deploy.
+    // ROPlayerController.uc:3790; on a real server the bCloseMenu path calls RestartPlayer ->
+    // SpawnDefaultPawnFor -> Possess. We spawn the local player's pawn and make the client
+    // possess it. v1: spawn ONCE on the first handle-175 after team-select (refine to the
+    // bCloseMenu "deploy" bit once the WeaponSelectionInfo struct offset is pinned by testing).
+    if (bunch.chIndex == 2 && handle == 175) {
+        ControlState& cs = GetControlState(clientId);
+        if (cs.teamSelected && !cs.spawned) {
+            cs.spawned = true;
+            Logger::Info("[ConnectionManager] client %u: SelectRoleByClass -> spawning pawn + possession",
+                         clientId);
+            SendPawnSpawn(clientId);
+        }
+        return;
     }
 }
 
