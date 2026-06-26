@@ -65,6 +65,15 @@ void NetworkThread::SetTickRate(uint32_t ticksPerSecond) {
     m_ticksPerSecond = ticksPerSecond;
     if (ticksPerSecond > 0) {
         m_tickInterval = std::chrono::milliseconds(1000 / ticksPerSecond);
+        // HARDENING: integer division yields 0 ms for ticksPerSecond > 1000, which
+        // would turn RunLoop's sleep_until into a no-op and spin the thread at 100%
+        // CPU. Floor the interval at 1 ms so the loop always yields (additive; the
+        // normal 60 Hz path computes 16 ms and is unaffected).
+        if (m_tickInterval.count() < 1) {
+            m_tickInterval = std::chrono::milliseconds(1);
+            Logger::Warn("[NetworkThread::SetTickRate] ticksPerSecond=%u too high, flooring tick interval at 1 ms",
+                         ticksPerSecond);
+        }
         Logger::Debug("[NetworkThread::SetTickRate] ticksPerSecond > 0, computed m_tickInterval=%lld ms",
                       (long long)m_tickInterval.count());
     } else {
@@ -84,6 +93,14 @@ void NetworkThread::RunLoop() {
     Logger::Debug("[NetworkThread::RunLoop] First nextTick scheduled");
     while (m_running) {
         // 1. Poll and dispatch network I/O
+        // HARDENING: ConnectionManager is owned elsewhere and passed by raw pointer;
+        // guard against a null/torn-down manager so the loop can't deref-crash. If it
+        // is gone there is no work to do, so stop cleanly (additive; never hit while
+        // the manager is alive and serving valid traffic).
+        if (!m_connMgr) {
+            Logger::Error("[NetworkThread::RunLoop] ConnectionManager is null, stopping network loop");
+            break;
+        }
         Logger::Trace("[NetworkThread::RunLoop] Tick iteration: calling PumpNetwork");
         m_connMgr->PumpNetwork();
         Logger::Trace("[NetworkThread::RunLoop] PumpNetwork completed");
@@ -101,6 +118,20 @@ void NetworkThread::RunLoop() {
         Logger::Trace("[NetworkThread::RunLoop] Sleeping until next tick");
         std::this_thread::sleep_until(nextTick);
         nextTick += m_tickInterval;
+
+        // HARDENING: anti-busy-spin / clock-skew guard. If a slow PumpNetwork or tick
+        // callback (e.g. an inbound flood) pushes us many intervals behind, sleep_until
+        // would return immediately and the loop would spin at 100% CPU trying to "catch
+        // up" - a self-inflicted DoS. The same happens if the steady_clock jumps. When
+        // nextTick has fallen far behind now, resync it to one interval ahead so we
+        // resume normal pacing. Bounded resync threshold keeps normal ticks untouched.
+        const auto now = std::chrono::steady_clock::now();
+        const auto maxLag = m_tickInterval * 4;
+        if (maxLag.count() > 0 && now - nextTick > maxLag) {
+            Logger::Warn("[NetworkThread::RunLoop] Tick scheduler fell %lld ms behind, resyncing pace",
+                         (long long)std::chrono::duration_cast<std::chrono::milliseconds>(now - nextTick).count());
+            nextTick = now + m_tickInterval;
+        }
     }
     Logger::Info("NetworkThread loop exited");
     Logger::Debug("[NetworkThread::RunLoop] m_running became false, loop terminated");

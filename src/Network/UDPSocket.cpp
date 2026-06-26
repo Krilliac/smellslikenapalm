@@ -4,6 +4,8 @@
 #include "Utils/Logger.h"
 #include "Network/PlatformSocket.h"
 
+#include <climits>
+
 UDPSocket::UDPSocket() {
     Logger::Trace("[UDPSocket::UDPSocket] Entry: default constructor");
     Logger::Debug("[UDPSocket::UDPSocket] Created UDPSocket with m_sock=-1 (uninitialized)");
@@ -146,10 +148,35 @@ bool UDPSocket::SendTo(const std::string& remoteIp, uint16_t remotePort,
         Logger::Trace("[UDPSocket::SendTo] Exit: returning false (not open)");
         return false;
     }
+    // HARDENING: null buffer with a non-zero length would have sendto() read past
+    // unmapped memory. Reject before touching the socket. (len==0 + null is a
+    // legal empty datagram and is allowed.)
+    if (data == nullptr && len != 0) {
+        Logger::Warn("[UDPSocket::SendTo] Null data pointer with len=%zu; dropping send to %s:%u",
+                     len, remoteIp.c_str(), remotePort);
+        Logger::Trace("[UDPSocket::SendTo] Exit: returning false (null buffer)");
+        return false;
+    }
+    // HARDENING: len is size_t but sendto() takes an int below. A value > INT_MAX
+    // would truncate to a negative/garbage length. Reject oversized payloads
+    // rather than passing a corrupted length to the kernel.
+    if (len > static_cast<size_t>(INT_MAX)) {
+        Logger::Error("[UDPSocket::SendTo] Payload len=%zu exceeds INT_MAX; dropping send to %s:%u",
+                      len, remoteIp.c_str(), remotePort);
+        Logger::Trace("[UDPSocket::SendTo] Exit: returning false (len too large)");
+        return false;
+    }
     sockaddr_in dest{};
     dest.sin_family = AF_INET;
     dest.sin_port = htons(remotePort);
-    inet_pton(AF_INET, remoteIp.c_str(), &dest.sin_addr);
+    // HARDENING: validate the destination address parse. On failure inet_pton
+    // leaves sin_addr untouched (here zeroed => 0.0.0.0), which would silently
+    // misroute the datagram. Reject instead.
+    if (inet_pton(AF_INET, remoteIp.c_str(), &dest.sin_addr) != 1) {
+        Logger::Warn("[UDPSocket::SendTo] Invalid destination IP '%s'; dropping send", remoteIp.c_str());
+        Logger::Trace("[UDPSocket::SendTo] Exit: returning false (bad IP)");
+        return false;
+    }
 
     Logger::Debug("[UDPSocket::SendTo] Sending %zu bytes to %s:%u via fd=%d", len, remoteIp.c_str(), remotePort, m_sock);
     ssize_t sent = sendto(m_sock, reinterpret_cast<const char*>(data),
@@ -175,12 +202,29 @@ int UDPSocket::ReceiveFrom(std::string& outIp, uint16_t& outPort,
         Logger::Trace("[UDPSocket::ReceiveFrom] Exit: returning -1 (not open)");
         return -1;
     }
+    // HARDENING: never hand recvfrom() a null destination or a non-positive
+    // length. A negative bufferLen reinterpreted by the kernel as a size could
+    // allow a write past the (absent) buffer; a null buffer is an outright deref.
+    if (buffer == nullptr || bufferLen <= 0) {
+        Logger::Error("[UDPSocket::ReceiveFrom] Invalid buffer=%p / bufferLen=%d; refusing recvfrom",
+                      (void*)buffer, bufferLen);
+        Logger::Trace("[UDPSocket::ReceiveFrom] Exit: returning -1 (bad buffer args)");
+        return -1;
+    }
     sockaddr_in src{};
     socklen_t addrLen = sizeof(src);
     Logger::Debug("[UDPSocket::ReceiveFrom] Calling recvfrom on fd=%d, bufferLen=%d", m_sock, bufferLen);
     int len = recvfrom(m_sock, reinterpret_cast<char*>(buffer),
                        bufferLen, 0,
                        (sockaddr*)&src, &addrLen);
+    // HARDENING: defend downstream consumers against a return length that exceeds
+    // the buffer we supplied. UDP normally truncates to bufferLen, but a bogus
+    // oversized return would make callers read past the buffer. Clamp it.
+    if (len > bufferLen) {
+        Logger::Warn("[UDPSocket::ReceiveFrom] recvfrom returned len=%d > bufferLen=%d; clamping",
+                     len, bufferLen);
+        len = bufferLen;
+    }
     if (len > 0) {
         // inet_ntoa returns a non-reentrant static buffer; ReceiveFrom runs on the
         // network thread, so use inet_ntop into a local buffer instead.

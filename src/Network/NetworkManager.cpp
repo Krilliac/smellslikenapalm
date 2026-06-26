@@ -128,6 +128,14 @@ void NetworkManager::BroadcastPacket(const Packet& pkt) {
                   pkt.GetTag().c_str(), connections.size());
     for (size_t i = 0; i < connections.size(); ++i) {
         auto& conn = connections[i];
+        // HARDENING: GetAllConnections() snapshots shared_ptrs from the client map;
+        // skip any null entry rather than deref-crashing mid-broadcast (additive,
+        // does not change delivery to valid connections).
+        if (!conn) {
+            Logger::Warn("[NetworkManager::BroadcastPacket] Null connection at index %zu/%zu, skipping",
+                         i + 1, connections.size());
+            continue;
+        }
         Logger::Trace("[NetworkManager::BroadcastPacket] Sending to client %u [%zu/%zu]",
                       conn->GetClientId(), i + 1, connections.size());
         conn->SendPacket(pkt);
@@ -226,6 +234,15 @@ void NetworkManager::OnPacketReceived(uint32_t clientId, const Packet& pkt, cons
     TELEMETRY_INCREMENT_PACKETS_PROCESSED();
 
     // Enqueue into GameServer's receive queue
+    // HARDENING: this fires from the inbound dispatch path; guard against a null
+    // GameServer (e.g. during shutdown teardown) so a late packet can't deref-crash
+    // the network thread. Drop+log instead (additive; never reached on the valid path).
+    if (!m_server) {
+        Logger::Warn("[NetworkManager::OnPacketReceived] GameServer is null, dropping packet tag='%s' from client %u",
+                     pkt.GetTag().c_str(), clientId);
+        Logger::Trace("[NetworkManager::OnPacketReceived] Exit: no GameServer");
+        return;
+    }
     Logger::Debug("[NetworkManager::OnPacketReceived] Enqueueing packet for client %u into GameServer queue", clientId);
     m_server->EnqueuePacket({ clientId, pkt, meta });
     Logger::Info("[NetworkManager::OnPacketReceived] Packet tag='%s' from client %u enqueued for processing",
