@@ -1,5 +1,7 @@
 *Version 0.9.0-alpha · Last updated 2025-07-12*  
-*Stability: 🚧 Work-in-progress — APIs may change until v1.0.0*
+*Stability: work-in-progress — APIs may change until v1.0.0*
+
+> **Disabled:** C# scripting is currently disabled and does not build. The scripting host relies on a deprecated .NET COM hosting API (`ICorRuntimeHost`); the `ENABLE_SCRIPTING` CMake option defaults to `OFF` and the host must be reworked onto a supported hosting API before scripting can be used. The C#/Roslyn details below describe the **intended** design, not the current runtime. Native C++ handler plugins are unaffected by this. See `src/Scripting/` and the README's *Current status* section.
 
 > ⛔ **C# scripting is currently disabled and does not build.** The scripting host relies on a deprecated .NET COM hosting API (`ICorRuntimeHost`); the `ENABLE_SCRIPTING` CMake option defaults to `OFF` and the host must be reworked onto a supported hosting API before scripting can be used. The C#/Roslyn details below describe the **intended** design, not the current runtime. Native C++ handler plugins are unaffected by this. See `src/Scripting/` and the README's *Current Status* section.
 

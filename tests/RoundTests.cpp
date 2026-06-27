@@ -9,7 +9,7 @@
 // 5. Round count management.
 // 6. Edge cases: zero-length rounds, concurrent end calls.
 
-#include <gtest/gtest.h>
+#include "TestFramework.h"
 #include <chrono>
 #include <thread>
 #include "Game/GameMode.h"
@@ -31,7 +31,7 @@ static GameModeDefinition MakeRoundDef() {
 }
 
 // Fixture for RoundManager tests
-class RoundTests : public ::testing::Test {
+class RoundTests : public ::rs2v::Test {
 protected:
     void SetUp() override {
         rm = std::make_unique<RoundManager>();
@@ -130,7 +130,4 @@ TEST_F(RoundTests, ConcurrentEndCalls_NoCrash) {
     EXPECT_EQ(rm->GetRoundsCompleted(), 1);
 }
 
-int main(int argc, char** argv) {
-    ::testing::InitGoogleTest(&argc, argv);
-    return RUN_ALL_TESTS();
-}
+RS2V_TEST_MAIN()

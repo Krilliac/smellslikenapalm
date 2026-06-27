@@ -654,7 +654,10 @@ const std::vector<ActorBunchRecord>& GetActorBootstrapRecords() {
                               (static_cast<uint32_t>(all[off + 7]) << 8) |
                               (static_cast<uint32_t>(all[off + 8]) << 16) |
                               (static_cast<uint32_t>(all[off + 9]) << 24);
-            const size_t len = (r.bunchDataBits + 7) / 8;  // payload bytes
+            // Compute the payload byte count in size_t: doing (bunchDataBits + 7) in
+            // uint32 would wrap for bunchDataBits near UINT32_MAX, yielding a tiny len
+            // that passes the bounds check below and silently truncates the payload.
+            const size_t len = (static_cast<size_t>(r.bunchDataBits) + 7) / 8;  // payload bytes
             off += 10;
             if (off + len > all.size()) {
                 Logger::Warn("[ActorBootstrap] truncated record (bits=%u) - stopping", r.bunchDataBits);

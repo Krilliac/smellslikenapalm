@@ -17,6 +17,8 @@
 
 #pragma once
 
+#include <utility>
+
 namespace rs2v {
 
 // Install process-wide crash handlers:
@@ -25,5 +27,40 @@ namespace rs2v {
 //   * POSIX:   sigaction for SIGSEGV / SIGABRT / SIGFPE / SIGILL
 // Idempotent: calling more than once is harmless (only the first call installs).
 void InstallCrashHandler();
+
+// ---------------------------------------------------------------------------
+// Non-fatal exception handling
+// ---------------------------------------------------------------------------
+// The crash handler above turns an *uncaught* exception (one that reaches
+// std::terminate) into a fatal, diagnosed abort. The helpers below are the
+// complement: they let a caller CATCH an exception at a subsystem boundary, log
+// it with the same diagnostics, and KEEP RUNNING — for the many errors that are
+// recoverable (one bad packet, one bad command, a single misbehaving tick)
+// rather than reasons to take the whole server down.
+
+// Log the exception currently being handled (call from inside a catch block) as
+// a NON-FATAL event: a distinct banner, the type/message, the context label, and
+// a best-effort stack trace — then RETURN (no abort). Safe to call with no
+// exception in flight. noexcept: reporting must never itself throw.
+void ReportNonFatalException(const char* context) noexcept;
+
+// Total number of non-fatal exceptions reported so far (process-wide). Useful
+// for surfacing "the server recovered from N errors" in status/telemetry.
+unsigned long long NonFatalExceptionCount() noexcept;
+
+// Run `fn`, swallowing and reporting any exception as non-fatal. Returns true if
+// `fn` completed without throwing, false if an exception was caught + reported.
+// Use at boundaries where a failure should be logged but not propagate to
+// std::terminate (game tick, per-packet processing, command dispatch, etc.).
+template <typename Fn>
+bool Guard(const char* context, Fn&& fn) noexcept {
+    try {
+        std::forward<Fn>(fn)();
+        return true;
+    } catch (...) {
+        ReportNonFatalException(context);
+        return false;
+    }
+}
 
 }  // namespace rs2v

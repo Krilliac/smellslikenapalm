@@ -27,8 +27,8 @@ For detailed configuration, see [CONFIGURATION.md](CONFIGURATION.md). For diagno
 ### What are the build prerequisites?
 
 You need:
-- **C++17 compiler**: GCC 8+, Clang 7+, or MSVC 2019+
-- **CMake 3.15+**
+- **C++23 compiler**: GCC 12+, Clang 15+, or MSVC (VS 2022)
+- **CMake 3.20+**
 - **Threads support** (POSIX threads on Linux, Windows threads on Windows)
 
 Optional dependencies:
@@ -44,8 +44,8 @@ See [DEVELOPMENT.md](DEVELOPMENT.md) for platform-specific installation commands
 
 | Platform | Status | Compiler |
 |---|---|---|
-| **Linux** (Ubuntu 18.04+, CentOS 7+, Debian 10+) | Fully supported | GCC 8+, Clang 7+ |
-| **Windows** (Windows 10+) | Fully supported | MSVC 2019+, MinGW |
+| **Linux** (Ubuntu 22.04+, CentOS 9+, Debian 12+) | Fully supported | GCC 12+, Clang 15+ |
+| **Windows** (Windows 10+) | Fully supported | MSVC (VS 2022), MinGW |
 | **macOS** | Experimental | Clang (Xcode 11+) |
 
 Linux is the primary development and deployment platform. Windows is fully supported for both development and production. macOS support is experimental.
@@ -73,7 +73,7 @@ The binary is output to `build/rs2v_server` (Linux) or `build/Release/rs2v_serve
 | `ENABLE_TELEMETRY` | `ON` | Build with telemetry subsystem (Prometheus metrics, file reporters) |
 | `ENABLE_SCRIPTING` | `OFF` | Build with C# scripting support (requires .NET SDK). **Currently does not build** — disabled pending a rework (see below). |
 | `ENABLE_COMPRESSION` | `ON` | Build with packet compression (uses zlib if available) |
-| `BUILD_TESTS` | `OFF` | Build the Google Test suite |
+| `BUILD_TESTS` | `OFF` | Build the native test suite (no GoogleTest dependency) |
 
 Example with all options:
 ```bash

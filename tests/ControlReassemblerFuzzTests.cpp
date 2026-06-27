@@ -23,7 +23,7 @@
 // Build:  cmake --build build-tests --target ControlReassemblerFuzzTests --config Debug -- /m:1
 // Run:    build-tests/tests/Debug/ControlReassemblerFuzzTests.exe
 
-#include <gtest/gtest.h>
+#include "TestFramework.h"
 
 #include "Network/ControlReassembler.h"
 #include "Network/PacketCodec.h"
@@ -339,7 +339,4 @@ TEST(ControlReassemblerFuzz, ValidStreamStillRoundTripsAfterFuzz) {
     EXPECT_EQ(got[2], m3);
 }
 
-int main(int argc, char** argv) {
-    ::testing::InitGoogleTest(&argc, argv);
-    return RUN_ALL_TESTS();
-}
+RS2V_TEST_MAIN()

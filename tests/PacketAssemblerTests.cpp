@@ -16,7 +16,7 @@
 //     (verified against the official server; opening it stalled the real client);
 //   * the server must ack received PacketIds.
 
-#include <gtest/gtest.h>
+#include "TestFramework.h"
 
 #include "Network/PacketAssembler.h"
 #include "Network/PacketCodec.h"
@@ -221,7 +221,4 @@ TEST(PacketAssembler, AckOnlyPacketHasNoBunch) {
     EXPECT_EQ(packets[0].packetId, 1u);
 }
 
-int main(int argc, char** argv) {
-    ::testing::InitGoogleTest(&argc, argv);
-    return RUN_ALL_TESTS();
-}
+RS2V_TEST_MAIN()

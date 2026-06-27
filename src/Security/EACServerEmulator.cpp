@@ -3,6 +3,7 @@
 #include "Security/EACServerEmulator.h"
 #include "Security/EACPackets.h"
 #include "Utils/Logger.h"
+#include "Utils/CrashHandler.h"
 #include "../../telemetry/TelemetryManager.h"
 #include <cstring>
 #include <chrono>
@@ -81,7 +82,11 @@ void EACServerEmulator::RunLoop() {
         if (len > 0) {
             buf.resize(len);
             Logger::Trace("[EACServerEmulator::RunLoop] Received %d bytes from %s:%u", len, ip.c_str(), port);
-            HandlePacket(ip, port, buf);
+            // HARDENING: this is an anti-cheat probe endpoint fed untrusted UDP
+            // from the public internet. A malformed packet that throws must be
+            // recovered non-fatally, never propagate out of the thread function
+            // into std::terminate and kill the server.
+            rs2v::Guard("eac handle packet", [&] { HandlePacket(ip, port, buf); });
         }
 
         // Cleanup stale connections periodically
@@ -89,7 +94,7 @@ void EACServerEmulator::RunLoop() {
         auto now = std::chrono::steady_clock::now();
         if (now - lastCleanup > std::chrono::seconds(30)) {
             Logger::Debug("[EACServerEmulator::RunLoop] Triggering periodic stale connection cleanup");
-            CleanupStaleConnections();
+            rs2v::Guard("eac stale cleanup", [this] { CleanupStaleConnections(); });
             lastCleanup = now;
         }
 
@@ -194,15 +199,18 @@ void EACServerEmulator::HandleMemoryReply(uint32_t clientId, const uint8_t* data
     size_t payloadSize = dataSize - (1 + sizeof(reqId) + sizeof(reply));
     Logger::Debug("[EACServerEmulator::HandleMemoryReply] Payload size=%zu bytes", payloadSize);
 
-    // GUARD (out-of-bounds read): reply.length is fully wire-controlled (up to 4 GB) but the
-    // payload that actually follows the header is only payloadSize bytes. A consumer that trusts
-    // reply.length as the readable size (RequestMemoryRead forwards it verbatim to its callback)
-    // would read past the buffer. Clamp reply.length to the bytes we actually received before
-    // handing the reply to any callback.
+    // SECURITY (out-of-bounds read): reply.length is a fully wire-controlled field (up to 4 GB)
+    // claiming how many bytes the client read, but the payload that actually follows the header is
+    // only payloadSize bytes. The callback receives only the `payload` pointer and trusts
+    // reply.length to know how far to read (RequestMemoryRead forwards it verbatim to its
+    // callback) — a length larger than the bytes actually present would drive an out-of-bounds
+    // read inside the callback. A well-behaved client never sends length > payload, so reject the
+    // reply when the claimed length exceeds the real payload (fail closed).
     if (reply.length > payloadSize) {
-        Logger::Warn("[EACServerEmulator::HandleMemoryReply] reply.length=%u exceeds received payload=%zu for request %u; clamping",
-                     reply.length, payloadSize, reqId);
-        reply.length = static_cast<uint32_t>(payloadSize);
+        Logger::Warn("[EACServerEmulator::HandleMemoryReply] reply.length=%u exceeds actual payload=%zu for request %u (client %u) — dropping",
+                     reply.length, payloadSize, reqId, clientId);
+        Logger::Trace("[EACServerEmulator::HandleMemoryReply] Exit (length out of range)");
+        return;
     }
 
     // Find and execute callback

@@ -17,8 +17,8 @@
 // ConfigManager wiring) so they can be unit-tested in isolation; integrating
 // AuthManager into the live login flow is a separate follow-up.
 
-#include <gtest/gtest.h>
-#include <gmock/gmock.h>
+#include "TestFramework.h"
+#include "TestMock.h"
 #include <memory>
 #include <string>
 #include <vector>
@@ -30,22 +30,22 @@
 #include "Security/PasswordHasher.h"
 #include "Security/TokenManager.h"
 
-using ::testing::_;
-using ::testing::Return;
-using ::testing::InSequence;
-using ::testing::NiceMock;
+using ::rs2v::_;
+using ::rs2v::Return;
+using ::rs2v::InSequence;
+using ::rs2v::NiceMock;
 
 // A mock EACProxy exercising the virtual surface callers depend on.
 class MockEACProxy : public EACProxy {
 public:
     MOCK_METHOD(bool, ValidateSessionTicket,
-                (const std::string& steamId, const std::vector<uint8_t>& ticket), (override));
+                (const std::string&, const std::vector<uint8_t>&), (override));
     MOCK_METHOD(bool, Initialize, (), (override));
     MOCK_METHOD(void, Shutdown, (), (override));
-    MOCK_METHOD(bool, IsClientAuthenticated, (const std::string& steamId), (const, override));
+    MOCK_METHOD(bool, IsClientAuthenticated, (const std::string&), (const, override));
 };
 
-class AuthenticationTest : public ::testing::Test {
+class AuthenticationTest : public ::rs2v::Test {
 protected:
     void SetUp() override {
         eac = std::make_unique<EACProxy>();
@@ -327,7 +327,4 @@ TEST_F(AuthenticationTest, FullAuthenticationFlow_Success) {
     EXPECT_FALSE(auth->IsLockedOut(validSteamId));
 }
 
-int main(int argc, char** argv) {
-    ::testing::InitGoogleTest(&argc, argv);
-    return RUN_ALL_TESTS();
-}
+RS2V_TEST_MAIN()

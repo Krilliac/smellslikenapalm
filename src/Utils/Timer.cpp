@@ -1,5 +1,6 @@
 #include "Utils/Timer.h"
 #include "Utils/Logger.h"
+#include "Utils/CrashHandler.h"
 #include <thread>
 
 Timer::Timer()
@@ -27,7 +28,9 @@ void Timer::StartOnce(Duration interval, Callback cb) {
         std::this_thread::sleep_for(interval);
         if (m_running) {
             Logger::Debug("[Timer::StartOnce] Timer fired, invoking callback");
-            cb();
+            // Guard the user callback: it runs on this timer thread, so a throw
+            // would escape into std::terminate. Report non-fatally instead.
+            rs2v::Guard("timer callback (once)", cb);
         } else {
             Logger::Debug("[Timer::StartOnce] Timer was cancelled during sleep, skipping callback");
         }
@@ -53,7 +56,9 @@ void Timer::StartRepeating(Duration interval, Callback cb) {
                 break;
             }
             Logger::Debug("[Timer::StartRepeating] Timer tick, invoking callback");
-            cb();
+            // Guard the user callback: a throw on a repeating tick must not
+            // escape into std::terminate or silently kill future ticks.
+            rs2v::Guard("timer callback (repeating)", cb);
         }
         Logger::Debug("[Timer::StartRepeating] Repeating timer thread exiting");
     });

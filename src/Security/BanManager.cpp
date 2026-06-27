@@ -83,6 +83,11 @@ bool BanManager::SaveBans() const {
         return false;
     }
     Logger::Debug("[BanManager::SaveBans] Ban list file opened for writing");
+    // Self-documenting header so the machine-managed file stays readable. Loader
+    // skips '#'/blank lines, so this round-trips harmlessly.
+    file << "# RS2V ban list (managed by the server — edits may be overwritten)\n"
+            "# Format: SteamID|P|<unused>|reason            (permanent)\n"
+            "#         SteamID|T|<expiryUnixSeconds>|reason  (temporary)\n";
     size_t count = 0;
     for (const auto& kv : m_bans) {
         std::string serialized = SerializeEntry(kv.second);
@@ -123,7 +128,7 @@ void BanManager::AddBan(const std::string& steamId,
     entry.type    = type;
     entry.reason  = reason;
     if (type == BanType::Temporary) {
-        entry.expiresAt = std::chrono::steady_clock::now() + duration;
+        entry.expiresAt = std::chrono::system_clock::now() + duration;
         Logger::Debug("[BanManager::AddBan] Temporary ban for '%s' set to expire after %lld seconds",
                       steamId.c_str(), static_cast<long long>(duration.count()));
     } else {
@@ -179,7 +184,7 @@ bool BanManager::IsBanned(const std::string& steamId) const {
         Logger::Trace("[BanManager::IsBanned] Exit, returning true (permanent)");
         return true;
     }
-    bool stillBanned = std::chrono::steady_clock::now() < it->second.expiresAt;
+    bool stillBanned = std::chrono::system_clock::now() < it->second.expiresAt;
     Logger::Debug("[BanManager::IsBanned] SteamID '%s' has a temporary ban, stillBanned=%s",
                   steamId.c_str(), stillBanned ? "true" : "false");
     if (stillBanned) {
@@ -205,7 +210,7 @@ std::chrono::seconds BanManager::GetRemainingBan(const std::string& steamId) con
         Logger::Trace("[BanManager::GetRemainingBan] Exit, returning 0 seconds (permanent)");
         return std::chrono::seconds::zero();
     }
-    auto rem = std::chrono::duration_cast<std::chrono::seconds>(it->second.expiresAt - std::chrono::steady_clock::now());
+    auto rem = std::chrono::duration_cast<std::chrono::seconds>(it->second.expiresAt - std::chrono::system_clock::now());
     auto result = rem.count() > 0 ? rem : std::chrono::seconds(0);
     Logger::Debug("[BanManager::GetRemainingBan] SteamID '%s' has %lld seconds remaining on temporary ban",
                   steamId.c_str(), static_cast<long long>(result.count()));
@@ -215,7 +220,7 @@ std::chrono::seconds BanManager::GetRemainingBan(const std::string& steamId) con
 
 void BanManager::CleanupExpired() {
     Logger::Trace("[BanManager::CleanupExpired] Entry, total bans=%zu", m_bans.size());
-    auto now = std::chrono::steady_clock::now();
+    auto now = std::chrono::system_clock::now();
     bool changed = false;
     size_t removedCount = 0;
     for (auto it = m_bans.begin(); it != m_bans.end(); ) {
@@ -270,17 +275,12 @@ std::string BanManager::SerializeEntry(const BanEntry& entry) const {
         << (entry.type == BanType::Permanent ? "P" : "T") << "|";
     if (entry.type == BanType::Temporary) {
         // Persist the expiry as an ABSOLUTE system_clock (wall-clock) deadline. expiresAt is a
-        // steady_clock time_point whose epoch is unspecified and NOT stable across process
-        // restarts/reboots (typically time-since-boot), so writing its raw time_since_epoch made
-        // a reloaded temporary ban expire at an unrelated time. We convert to wall-clock here and
-        // back to a fresh steady_clock deadline on load (DeserializeEntry).
-        auto sysDeadline = std::chrono::system_clock::now() +
-            std::chrono::duration_cast<std::chrono::system_clock::duration>(
-                entry.expiresAt - std::chrono::steady_clock::now());
+        // system_clock time_point whose epoch is stable across process restarts/reboots, so the
+        // raw seconds-since-epoch round-trips correctly (see DeserializeEntry).
         auto expires = std::chrono::duration_cast<std::chrono::seconds>(
-            sysDeadline.time_since_epoch()).count();
+            entry.expiresAt.time_since_epoch()).count();
         oss << expires;
-        Logger::Debug("[BanManager::SerializeEntry] Temporary ban expiry serialized as %lld (system_clock seconds since epoch)",
+        Logger::Debug("[BanManager::SerializeEntry] Temporary ban expiry serialized as %lld seconds since epoch",
                       static_cast<long long>(expires));
     } else {
         Logger::Debug("[BanManager::SerializeEntry] Permanent ban - no expiry to serialize");
@@ -315,16 +315,17 @@ BanEntry BanManager::DeserializeEntry(const std::string& line) const {
                          token.c_str(), e.what());
             secs = 0;
         }
-        // The stored value is an ABSOLUTE system_clock (wall-clock) deadline. Convert the
-        // REMAINING wall-clock time into a fresh steady_clock deadline so IsBanned's steady_clock
-        // comparison stays correct across a restart (steady_clock's epoch changed). An expired
-        // ban yields a past deadline -> IsBanned returns false (the ban is simply gone).
-        auto sysDeadline = std::chrono::system_clock::time_point(std::chrono::seconds(secs));
-        auto remaining = sysDeadline - std::chrono::system_clock::now();
-        entry.expiresAt = std::chrono::steady_clock::now() +
-            std::chrono::duration_cast<std::chrono::steady_clock::duration>(remaining);
-        Logger::Debug("[BanManager::DeserializeEntry] Parsed temporary ban: %lld system_clock secs (%lld s remaining)",
-                      secs, static_cast<long long>(std::chrono::duration_cast<std::chrono::seconds>(remaining).count()));
+        // The stored value is an ABSOLUTE system_clock (wall-clock) deadline, which is
+        // restart-stable. Clamp to a sane range before constructing the time_point: a
+        // pathological value (negative, or near LLONG_MAX from a corrupted ban file) would
+        // overflow the duration->time_point conversion (UB) on construction. ~100 years of
+        // seconds is far beyond any real ban and safely inside the representable range. An
+        // already-past deadline simply makes IsBanned return false (the ban is gone).
+        constexpr long long kMaxBanSeconds = 100LL * 365 * 24 * 60 * 60;
+        if (secs < 0) secs = 0;
+        if (secs > kMaxBanSeconds) secs = kMaxBanSeconds;
+        entry.expiresAt = std::chrono::system_clock::time_point(std::chrono::seconds(secs));
+        Logger::Debug("[BanManager::DeserializeEntry] Parsed temporary ban expiry: %lld seconds since epoch", secs);
     } else {
         std::getline(iss, token, '|');
         Logger::Debug("[BanManager::DeserializeEntry] Permanent ban - skipped expiry field (token='%s')", token.c_str());

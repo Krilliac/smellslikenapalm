@@ -334,20 +334,27 @@ int main(int argc, char* argv[])
     Logger::Info("[main] Setting tick rate to %d ticks/sec", tickRate);
     gameClock.SetTickRate(tickRate);
 
+    // Let the `tickrate` command reach the GameClock without GameServer having to
+    // depend on it. Invoked from the console/remote command threads.
+    g_server->SetTickRateHook([&gameClock](int r) { gameClock.SetTickRate(static_cast<uint32_t>(r)); });
+
     Logger::Trace("[main] Registering tick callback for main game loop...");
     gameClock.RegisterTickCallback([&](GameClock::Duration /*delta*/) {
-        if (g_shutdownRequested) {
+        if (g_shutdownRequested || (g_server && g_server->IsShutdownRequested())) {
             Logger::Debug("[main::TickCallback] Shutdown requested, stopping game clock");
             gameClock.Stop();
             return;
         }
 
-        // Run one tick of the game server
-        g_server->Run();
+        // Run one tick of the game server. Guarded so a single bad tick (a
+        // recoverable exception from hostile input or a subsystem) is logged via
+        // the crash handler and the loop continues, instead of escaping the
+        // GameClock callback into std::terminate and killing the whole server.
+        rs2v::Guard("game tick", [] { g_server->Run(); });
 
         // Process EAC requests (no-op if threaded mode active)
         if (g_eacServer) {
-            g_eacServer->ProcessRequests();
+            rs2v::Guard("eac process", [] { g_eacServer->ProcessRequests(); });
         }
     });
 

@@ -1,8 +1,8 @@
 // tests/IntegrationTests.cpp
 // Comprehensive integration testing for smellslikenapalm server components
 
-#include <gtest/gtest.h>
-#include <gmock/gmock.h>
+#include "TestFramework.h"
+#include "TestMock.h"
 #include <memory>
 #include <string>
 #include <vector>
@@ -39,10 +39,10 @@
 #include "Utils/Logger.h"
 #include "Math/Vector3.h"
 
-using ::testing::_;
-using ::testing::Return;
-using ::testing::StrictMock;
-using ::testing::NiceMock;
+using ::rs2v::_;
+using ::rs2v::Return;
+using ::rs2v::StrictMock;
+using ::rs2v::NiceMock;
 
 // Constants for integration testing
 constexpr int TEST_SERVER_PORT = 7778;
@@ -205,7 +205,7 @@ private:
 };
 
 // Fixture
-class IntegrationTests : public ::testing::Test {
+class IntegrationTests : public ::rs2v::Test {
 protected:
     void SetUp() override {
         IntegrationConfigGenerator::CreateTestConfigs();
@@ -250,7 +250,4 @@ TEST_F(IntegrationTests, PacketFlow_Heartbeat) {
     SUCCEED();
 }
 
-int main(int argc, char** argv) {
-    ::testing::InitGoogleTest(&argc, argv);
-    return RUN_ALL_TESTS();
-}
+RS2V_TEST_MAIN()

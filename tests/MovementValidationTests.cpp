@@ -1,8 +1,8 @@
 // tests/MovementValidationTests.cpp
 // Unit tests for player movement validation and anti-cheat checks
 
-#include <gtest/gtest.h>
-#include <gmock/gmock.h>
+#include "TestFramework.h"
+#include "TestMock.h"
 #include <cmath>
 #include <vector>
 
@@ -13,7 +13,7 @@
 #include "Math/Vector3.h"
 #include "Utils/Logger.h"
 
-using ::testing::_; using ::testing::Return; using ::testing::StrictMock;
+using ::rs2v::_; using ::rs2v::Return; using ::rs2v::StrictMock;
 
 // Mock PlayerManager to validate movement constraints
 class MockPlayerManager : public PlayerManager {
@@ -47,7 +47,7 @@ public:
 };
 
 // Fixture
-class MovementValidationTest : public ::testing::Test {
+class MovementValidationTest : public ::rs2v::Test {
 protected:
     void SetUp() override {
         pm = std::make_unique<StrictMock<MockPlayerManager>>();
@@ -148,7 +148,4 @@ TEST_F(MovementValidationTest, Movement_Teleportation_Fails) {
     EXPECT_FALSE(gm->HandlePlayerMovement(id, newPos));
 }
 
-int main(int argc, char** argv){
-    ::testing::InitGoogleTest(&argc, argv);
-    return RUN_ALL_TESTS();
-}
+RS2V_TEST_MAIN()

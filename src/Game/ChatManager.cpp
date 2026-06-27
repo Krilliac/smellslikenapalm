@@ -6,12 +6,13 @@
 #include "Game/GameServer.h"
 #include <algorithm>
 #include <sstream>
-#include "Game/AdminManager.h"
+#include "Game/CommandManager.h"
+#include "Game/MapVoteManager.h"
 
 ChatManager::ChatManager(GameServer* server)
     : m_server(server)
 {
-    Logger::Trace("[ChatManager::ChatManager] Entry: server=%p", server);
+    Logger::Trace("[ChatManager::ChatManager] Entry: server=%p", static_cast<const void*>(server));
     Logger::Info("ChatManager initialized");
     Logger::Trace("[ChatManager::ChatManager] Exit");
 }
@@ -276,16 +277,59 @@ void ChatManager::ProcessChatCommand(uint32_t clientId, const std::string& messa
         Logger::Debug("[ChatManager::ProcessChatCommand] Processing /team message='%s'", teamMsg.c_str());
         HandleTeamChat(clientId, teamMsg);
     }
+    else if (cmd == "votemap") {
+        // Player-facing map vote. With an argument, cast a vote for that option;
+        // with no argument, (re)show the current options if a vote is active.
+        auto conn = m_server->GetClientConnection(clientId);
+        auto* vote = m_server->GetMapVoteManager();
+        if (!vote || !vote->IsVoteActive()) {
+            if (conn) conn->SendChatMessage("No map vote is currently active.");
+        } else if (parts.empty()) {
+            const auto& cands = vote->GetCandidates();
+            if (conn) {
+                conn->SendChatMessage("Map vote options (type /votemap <number>):");
+                for (size_t i = 0; i < cands.size(); ++i) {
+                    conn->SendChatMessage("  " + std::to_string(i + 1) + ") " + cands[i].displayName);
+                }
+            }
+        } else {
+            int choice = 0;
+            // A non-numeric arg falls through to choice=0 -> "Invalid vote
+            // option." reply below; log it (gated) so a stuck vote can be traced.
+            try { choice = std::stoi(parts[0]); }
+            catch (...) {
+                Logger::Debug("[ChatManager] /votemap got non-numeric option '%s' from client %u",
+                              parts[0].c_str(), clientId);
+                choice = 0;
+            }
+            // Options are presented 1-based to players; internal index is 0-based.
+            bool ok = m_server->CastMapVote(clientId, choice - 1);
+            if (conn) conn->SendChatMessage(ok ? "Vote recorded." : "Invalid vote option.");
+        }
+    }
     else {
-        Logger::Debug("[ChatManager::ProcessChatCommand] Unknown built-in command '%s', passing to AdminManager", cmd.c_str());
-        // Unknown or pass to admin/command manager
-        AdminManager* admin = m_server->GetAdminManager();
-        if (!admin) {
-            Logger::Warn("[ChatManager::ProcessChatCommand] AdminManager unavailable — dropping command '%s' from client %u", cmd.c_str(), clientId);
-            Logger::Trace("[ChatManager::ProcessChatCommand] Exit (no admin manager)");
+        // Everything else routes through the unified command system, which
+        // resolves the player's permission level and enforces it centrally.
+        Logger::Debug("[ChatManager::ProcessChatCommand] Dispatching '%s' via CommandManager", cmd.c_str());
+        CommandManager* cmdMgr = m_server->GetCommandManager();
+        auto conn = m_server->GetClientConnection(clientId);
+        if (!cmdMgr || !conn) {
+            Logger::Warn("[ChatManager::ProcessChatCommand] CommandManager/connection unavailable — dropping command '%s' from client %u", cmd.c_str(), clientId);
+            Logger::Trace("[ChatManager::ProcessChatCommand] Exit (no command manager)");
             return;
         }
-        admin->HandleAdminCommand(clientId, cmd, parts);
+        CommandContext ctx;
+        ctx.source   = CommandSource::InGame;
+        ctx.clientId = clientId;
+        ctx.invoker  = conn->GetSteamID();
+        ctx.server   = m_server;
+        ctx.level    = cmdMgr->ResolveLevelForClient(clientId);
+        std::weak_ptr<ClientConnection> weakConn = conn;
+        ctx.out = [weakConn](std::string_view line) {
+            if (auto c = weakConn.lock()) c->SendChatMessage(std::string(line));
+        };
+        ctx.args = parts;
+        cmdMgr->ExecuteParsed(ctx, cmd);
     }
     Logger::Trace("[ChatManager::ProcessChatCommand] Exit");
 }

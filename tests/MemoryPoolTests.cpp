@@ -9,8 +9,8 @@
 //  5.  Multithreaded access is lock-free and race-condition free.
 //  6.  Allocation / free latency stays <1µs for small blocks under load.
 
-#include <gtest/gtest.h>
-#include <gmock/gmock.h>
+#include "TestFramework.h"
+#include "TestMock.h"
 #include <vector>
 #include <thread>
 #include <atomic>
@@ -35,7 +35,7 @@ static_assert(std::is_trivially_destructible_v<MemoryPool>,
 /*                               test fixture                                 */
 /* -------------------------------------------------------------------------- */
 
-class MemoryPoolTest : public ::testing::Test
+class MemoryPoolTest : public ::rs2v::Test
 {
 protected:
     void SetUp() override
@@ -97,7 +97,7 @@ TEST_F(MemoryPoolTest, DoubleFree_ThrowsAssertInDebug)
     pool->Free(p);
     EXPECT_DEATH(pool->Free(p), "double free");
 #else
-    GTEST_SKIP() << "Double-free guard active only in debug builds.";
+    SKIP_TEST() << "Double-free guard active only in debug builds.";
 #endif
 }
 
@@ -112,7 +112,7 @@ TEST_F(MemoryPoolTest, CanaryDetectsOverflow)
     p[128] = 0xFF;                       // corrupt guard byte
     EXPECT_DEATH(pool->Free(p), "buffer overflow");
 #else
-    GTEST_SKIP() << "Guard bytes only in debug builds.";
+    SKIP_TEST() << "Guard bytes only in debug builds.";
 #endif
 }
 

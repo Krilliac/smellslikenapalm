@@ -1,8 +1,8 @@
 // tests/ConfigTests.cpp
 // Comprehensive configuration management and validation unit tests
 
-#include <gtest/gtest.h>
-#include <gmock/gmock.h>
+#include "TestFramework.h"
+#include "TestMock.h"
 #include <memory>
 #include <string>
 #include <fstream>
@@ -22,16 +22,16 @@
 #include "Utils/Logger.h"
 #include "Utils/FileUtils.h"
 
-using ::testing::_;
-using ::testing::Return;
-using ::testing::InSequence;
-using ::testing::StrictMock;
-using ::testing::NiceMock;
-using ::testing::Invoke;
-using ::testing::DoAll;
-using ::testing::SetArgReferee;
-using ::testing::AtLeast;
-using ::testing::Between;
+using ::rs2v::_;
+using ::rs2v::Return;
+using ::rs2v::InSequence;
+using ::rs2v::StrictMock;
+using ::rs2v::NiceMock;
+using ::rs2v::Invoke;
+using ::rs2v::DoAll;
+using ::rs2v::SetArgReferee;
+using ::rs2v::AtLeast;
+using ::rs2v::Between;
 
 // Constants for configuration testing
 constexpr const char* TEST_CONFIG_DIR = "test_configs";
@@ -197,7 +197,10 @@ MapDirectory=/opt/maps/
     }
 
     static void CreateUnicodeConfig() {
-        std::string content = u8R"(
+        // Source is UTF-8; a plain (narrow) raw string literal keeps the same
+        // bytes as a std::string. A u8"" literal is const char8_t[] in C++20+
+        // and no longer converts to std::string.
+        std::string content = R"(
 [Server]
 Name=テストサーバー
 Description=Server with unicode: café, naïve, résumé
@@ -231,7 +234,7 @@ private:
 };
 
 // Test fixture for configuration tests
-class ConfigTest : public ::testing::Test {
+class ConfigTest : public ::rs2v::Test {
 protected:
     void SetUp() override {
         // Create test directory and files
@@ -855,7 +858,4 @@ TEST_F(ConfigTest, EdgeCase_NullAndControlCharacters_Sanitized) {
 } // namespace
 
 // Test runner entry point
-int main(int argc, char** argv) {
-    ::testing::InitGoogleTest(&argc, argv);
-    return RUN_ALL_TESTS();
-}
+RS2V_TEST_MAIN()

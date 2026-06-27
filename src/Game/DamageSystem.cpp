@@ -14,7 +14,7 @@
 DamageSystem::DamageSystem(GameServer* server)
     : m_server(server)
 {
-    Logger::Trace("[DamageSystem::DamageSystem] Entry: server=%p", server);
+    Logger::Trace("[DamageSystem::DamageSystem] Entry: server=%p", static_cast<const void*>(server));
     Logger::Trace("[DamageSystem::DamageSystem] Exit");
 }
 
@@ -90,6 +90,14 @@ void DamageSystem::ApplyDamage(const DamageEvent& event) {
     if (!victim || !victim->IsAlive()) {
         Logger::Debug("[DamageSystem::ApplyDamage] Victim %u is null or dead, skipping damage", event.victimId);
         Logger::Trace("[DamageSystem::ApplyDamage] Exit (victim invalid)");
+        return;
+    }
+
+    // God mode (set by the admin `god` command) makes a player immune to all
+    // incoming damage. Honoured here so every damage path — bullets, explosions,
+    // fire DoT — respects it from one place.
+    if (victim->IsGodMode()) {
+        Logger::Debug("[DamageSystem::ApplyDamage] Victim %u is in god mode, ignoring damage", event.victimId);
         return;
     }
 
@@ -238,6 +246,13 @@ void DamageSystem::SetFriendlyFireDamageScale(float scale) {
     m_friendlyFireScale = scale;
     Logger::Debug("[DamageSystem::SetFriendlyFireDamageScale] Friendly fire damage scale set to %.2f", scale);
     Logger::Trace("[DamageSystem::SetFriendlyFireDamageScale] Exit");
+}
+
+void DamageSystem::SetGlobalDamageScale(float scale) {
+    Logger::Trace("[DamageSystem::SetGlobalDamageScale] Entry: scale=%.2f", scale);
+    m_globalDamageScale = (scale < 0.0f) ? 0.0f : scale;
+    Logger::Info("[DamageSystem::SetGlobalDamageScale] Global damage scale set to %.2f", m_globalDamageScale);
+    Logger::Trace("[DamageSystem::SetGlobalDamageScale] Exit");
 }
 
 float DamageSystem::CalculateFinalDamage(DamageEvent& event) const {

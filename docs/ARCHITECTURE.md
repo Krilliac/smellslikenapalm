@@ -1,6 +1,6 @@
 # ARCHITECTURE — System Overview
 
-A from-scratch C++17 server emulator for **Rising Storm 2: Vietnam** (Unreal
+A from-scratch C++23 server emulator for **Rising Storm 2: Vietnam** (Unreal
 Engine 3, `EngineVersion 7258`). The goal is to let the *retail* client connect,
 complete the UE3 control-channel handshake, bootstrap the world, and reach the
 team-select menu. This document is the map for a new engineer: what the

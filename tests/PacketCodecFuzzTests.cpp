@@ -28,15 +28,16 @@
 // rejects (empty / zero-terminator). If you want a stricter reject policy, that
 // is a production-code decision, not a decoder-safety bug.
 //
-// Framework: GoogleTest, one executable per test file with its own main()
-// (matches tests/CMakeLists.txt rs2v_add_test convention).
+// Framework: RS2V native test framework (tests/TestFramework.h), one executable
+// per test file with its own main() (matches tests/CMakeLists.txt rs2v_add_test
+// convention).
 //
 // Build + run (from repo root, reusing the existing VS2022 test build dir):
 //   cmake --build build-tests --target PacketCodecFuzzTests --config Debug
 //   build-tests/tests/Debug/PacketCodecFuzzTests.exe
 // (or:  ctest --test-dir build-tests -C Debug -R PacketCodecFuzzTests -V )
 
-#include <gtest/gtest.h>
+#include "TestFramework.h"
 
 #include "Network/PacketCodec.h"
 
@@ -285,8 +286,8 @@ void ExpectFieldsEqual(const Packet& a, const Packet& b) {
         }
         EXPECT_EQ(x.bReliable, y.bReliable) << "bunch " << i;
         EXPECT_EQ(x.chIndex, y.chIndex) << "bunch " << i;
-        if (x.bReliable) EXPECT_EQ(x.chSequence, y.chSequence) << "bunch " << i;
-        if (x.bReliable || x.bOpen) EXPECT_EQ(x.chType, y.chType) << "bunch " << i;
+        if (x.bReliable) { EXPECT_EQ(x.chSequence, y.chSequence) << "bunch " << i; }
+        if (x.bReliable || x.bOpen) { EXPECT_EQ(x.chType, y.chType) << "bunch " << i; }
         EXPECT_EQ(x.payloadBits, y.payloadBits) << "bunch " << i;
         EXPECT_EQ(x.payload, y.payload) << "bunch " << i;
     }
@@ -295,7 +296,7 @@ void ExpectFieldsEqual(const Packet& a, const Packet& b) {
 // A fixed deterministic seed so any failure is reproducible.
 constexpr uint32_t kSeed = 0xC0DEFACEu;
 
-class PacketCodecFuzz : public ::testing::Test {
+class PacketCodecFuzz : public ::rs2v::Test {
 protected:
     static void SetUpTestSuite() { g_wd.Start(); }
     static void TearDownTestSuite() { g_wd.Stop(); }
@@ -528,7 +529,4 @@ TEST_F(PacketCodecFuzz, DecodeReencodeDecodeStable) {
     }
 }
 
-int main(int argc, char** argv) {
-    ::testing::InitGoogleTest(&argc, argv);
-    return RUN_ALL_TESTS();
-}
+RS2V_TEST_MAIN()

@@ -7,7 +7,7 @@
 // against docs/RS2V_ControlChannel_WireSpec_7258.md. These are byte-exact ground
 // truth: if the codec decodes them wrong, a real client will reject our framing.
 
-#include <gtest/gtest.h>
+#include "TestFramework.h"
 
 #include "Network/PacketCodec.h"
 
@@ -196,7 +196,4 @@ TEST(PacketFraming, SyntheticAcksAndBunchesRoundTrip) {
     EXPECT_EQ(Encode(decoded), wire);
 }
 
-int main(int argc, char** argv) {
-    ::testing::InitGoogleTest(&argc, argv);
-    return RUN_ALL_TESTS();
-}
+RS2V_TEST_MAIN()

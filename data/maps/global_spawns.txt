@@ -1,0 +1,14 @@
+# RS2V global spawn-point templates
+# Used as a fallback when a map provides no per-map spawns.txt.
+# Format: x y z [teamId]   (teamId optional; 0 = neutral, 1 = US, 2 = NVA)
+#
+# These are generic, evenly-spread points; authored maps should ship their own
+# maps/<MapID>/spawns.txt for balanced, in-world placement.
+-500.0   0.0   0.0   1
+-450.0   0.0  50.0   1
+-400.0   0.0   0.0   1
+ 500.0   0.0   0.0   2
+ 450.0   0.0  50.0   2
+ 400.0   0.0   0.0   2
+   0.0 500.0   0.0   0
+   0.0-500.0   0.0   0

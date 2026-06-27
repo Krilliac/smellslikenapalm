@@ -13,8 +13,8 @@
 // 9. Multiplayer replication of weapon state.
 // 10. Security: input validation for fire requests.
 
-#include <gtest/gtest.h>
-#include <gmock/gmock.h>
+#include "TestFramework.h"
+#include "TestMock.h"
 #include <vector>
 #include <chrono>
 #include <thread>
@@ -27,10 +27,10 @@
 #include "Protocol/ReplicationManager.h"
 #include "Utils/Logger.h"
 
-using ::testing::_;
+using ::rs2v::_;
 
 // Fixture for WeaponManager tests
-class WeaponTests : public ::testing::Test {
+class WeaponTests : public ::rs2v::Test {
 protected:
     void SetUp() override {
         pm = std::make_unique<PlayerManager>();
@@ -185,7 +185,4 @@ TEST_F(WeaponTests, InvalidWeaponID_NoCrash) {
     EXPECT_EQ(wm->GetAmmo(9999), 0);
 }
 
-int main(int argc, char** argv) {
-    ::testing::InitGoogleTest(&argc, argv);
-    return RUN_ALL_TESTS();
-}
+RS2V_TEST_MAIN()

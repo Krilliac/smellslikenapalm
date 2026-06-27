@@ -16,7 +16,7 @@
 // bits), and the MaxPacket grows from the tiny StatelessConnect-handshake value
 // to the NMT value once the handshake completes - so this test does the same.
 
-#include <gtest/gtest.h>
+#include "TestFramework.h"
 
 #include "Network/HandshakeState.h"
 #include "Network/ControlChannel.h"
@@ -204,7 +204,4 @@ TEST(HandshakeIntegration, FullHandshakeReachesJoined) {
     EXPECT_TRUE(joined);
 }
 
-int main(int argc, char** argv) {
-    ::testing::InitGoogleTest(&argc, argv);
-    return RUN_ALL_TESTS();
-}
+RS2V_TEST_MAIN()

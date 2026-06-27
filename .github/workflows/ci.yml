@@ -120,7 +120,7 @@ jobs:
             --inline-suppr \
             --error-exitcode=1 \
             -I src/ -I include/ -I telemetry/ \
-            --std=c++17 \
+            --std=c++23 \
             src/ telemetry/
 
   docker:

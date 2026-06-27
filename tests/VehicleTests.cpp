@@ -10,8 +10,8 @@
 // 6. Performance under many vehicles.
 // 7. Edge cases: zero velocity, max speed, invalid inputs.
 
-#include <gtest/gtest.h>
-#include <gmock/gmock.h>
+#include "TestFramework.h"
+#include "TestMock.h"
 #include <vector>
 #include <thread>
 #include <atomic>
@@ -23,10 +23,10 @@
 #include "Protocol/ReplicationManager.h"
 #include "Utils/Logger.h"
 
-using ::testing::_;
+using ::rs2v::_;
 
 // Fixture for VehicleManager tests
-class VehicleTests : public ::testing::Test {
+class VehicleTests : public ::rs2v::Test {
 protected:
     void SetUp() override {
         phys = std::make_unique<PhysicsEngine>();
@@ -155,7 +155,4 @@ TEST_F(VehicleTests, InvalidVehicleID_NoCrash) {
     EXPECT_NO_THROW(vm->GetHealth(9999));
 }
 
-int main(int argc, char** argv) {
-    ::testing::InitGoogleTest(&argc, argv);
-    return RUN_ALL_TESTS();
-}
+RS2V_TEST_MAIN()

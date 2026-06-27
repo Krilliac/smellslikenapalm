@@ -84,13 +84,18 @@ bool ConfigManager::LoadConfiguration(const std::string& configFile) {
 
     while (std::getline(file, line)) {
         ++lineNumber;
-        // Strip trailing comments. A '#' only starts a comment when it is at the START of the
-        // line or is PRECEDED BY WHITESPACE - otherwise it is a literal character inside a value
-        // (e.g. rcon_password=Sup#rSecret!). The previous code erased from the FIRST '#' anywhere
-        // on the line, silently truncating any value that contained '#' - corrupting/weakening
-        // secrets, paths, and regexes. In-value '#' (no leading whitespace) is now preserved.
+        // Strip trailing comments. Both '#' and ';' begin a comment (the config
+        // files use ';' as a comment char, including inline after a value), but a
+        // comment char only STARTS a comment when it is at the START of the line or
+        // is PRECEDED BY WHITESPACE - otherwise it is a literal character inside a
+        // value (e.g. rcon_password=Sup#rSecret!). Erasing from the first '#'/';'
+        // anywhere on the line silently truncates any value containing one,
+        // corrupting/weakening secrets, paths, and regexes. In-value '#'/';' (no
+        // leading whitespace) is preserved, while full-line and whitespace-
+        // separated trailing comment banners are still dropped cleanly.
         for (size_t i = 0; i < line.size(); ++i) {
-            if (line[i] == '#' && (i == 0 || std::isspace(static_cast<unsigned char>(line[i - 1])))) {
+            if ((line[i] == '#' || line[i] == ';') &&
+                (i == 0 || std::isspace(static_cast<unsigned char>(line[i - 1])))) {
                 Logger::Trace("[ConfigManager::LoadConfiguration] Line %zu: stripping comment at position %zu", lineNumber, i);
                 line.erase(i);
                 break;
@@ -537,7 +542,23 @@ void ConfigManager::ApplyEACConfiguration() {
 
 void ConfigManager::InitializeConfigWatchers() {
     Logger::Trace("[ConfigManager::InitializeConfigWatchers] Entry");
-    Logger::Debug("[ConfigManager::InitializeConfigWatchers] Config watchers not implemented");
+
+    // Live configuration reloading is opt-out: enabled unless explicitly
+    // disabled via [Configuration] live_reload=false. The watcher polls the
+    // primary config file's modification time on a background thread and calls
+    // ReloadConfiguration() (which notifies registered listeners) on change.
+    if (!GetBool("Configuration.live_reload", true)) {
+        Logger::Info("[ConfigManager::InitializeConfigWatchers] Live config reload disabled via Configuration.live_reload");
+        Logger::Trace("[ConfigManager::InitializeConfigWatchers] Exit - disabled by config");
+        return;
+    }
+
+    if (!StartFileWatcher()) {
+        Logger::Warn("[ConfigManager::InitializeConfigWatchers] Failed to start config file watcher; live reload inactive");
+    } else {
+        Logger::Info("[ConfigManager::InitializeConfigWatchers] Config file watcher active for live reloading");
+    }
+
     Logger::Trace("[ConfigManager::InitializeConfigWatchers] Exit");
 }
 
@@ -715,6 +736,11 @@ void ConfigManager::FileWatcherThread() {
             }
         } catch (const std::exception& e) {
             Logger::Error("[ConfigManager::FileWatcherThread] Error checking file modification time: %s", e.what());
+        } catch (...) {
+            // A non-std throw (e.g. from a reload listener callback) must not
+            // escape this thread function into std::terminate. Log and keep
+            // watching.
+            Logger::Error("[ConfigManager::FileWatcherThread] Non-std exception while checking/reloading config");
         }
     }
 

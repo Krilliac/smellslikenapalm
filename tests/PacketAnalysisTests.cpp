@@ -9,8 +9,8 @@
 // 5. Performance of per-packet analysis under load.
 // 6. Edge cases: empty packets, corrupted headers, max-size packets.
 
-#include <gtest/gtest.h>
-#include <gmock/gmock.h>
+#include "TestFramework.h"
+#include "TestMock.h"
 #include <vector>
 #include <string>
 #include <chrono>
@@ -22,11 +22,11 @@
 #include "Network/PacketSerializer.h"
 #include "Utils/Logger.h"
 
-using ::testing::_;
-using ::testing::Return;
+using ::rs2v::_;
+using ::rs2v::Return;
 
 // Fixture for PacketAnalyzer
-class PacketAnalysisTest : public ::testing::Test {
+class PacketAnalysisTest : public ::rs2v::Test {
 protected:
     void SetUp() override {
         serializer = std::make_unique<PacketSerializer>();
@@ -147,7 +147,4 @@ TEST_F(PacketAnalysisTest, AnomalyDetection_RepeatedBytes_FlagsWarning) {
     EXPECT_GT(result.warnings.size(), 0u);
 }
 
-int main(int argc, char** argv) {
-    ::testing::InitGoogleTest(&argc, argv);
-    return RUN_ALL_TESTS();
-}
+RS2V_TEST_MAIN()

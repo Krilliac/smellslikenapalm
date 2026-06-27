@@ -1,8 +1,8 @@
 // tests/InputValidationTests.cpp
 // Unit tests for validating input handling and sanitization
 
-#include <gtest/gtest.h>
-#include <gmock/gmock.h>
+#include "TestFramework.h"
+#include "TestMock.h"
 #include <string>
 #include <vector>
 #include <filesystem>
@@ -19,7 +19,7 @@
 #include "Utils/StringUtils.h"
 #include "Utils/Logger.h"
 
-using ::testing::_; using ::testing::Return; using ::testing::StrictMock;
+using ::rs2v::_; using ::rs2v::Return; using ::rs2v::StrictMock;
 
 // Mocked dependencies
 class MockConfigManager : public ConfigManager {
@@ -46,7 +46,7 @@ public:
 };
 
 // Fixture
-class InputValidationTest : public ::testing::Test {
+class InputValidationTest : public ::rs2v::Test {
 protected:
     void SetUp() override {
         // no-op

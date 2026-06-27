@@ -3,10 +3,10 @@
 //
 // Tests cover packet serialization/deserialization, socket management,
 // rate limiting, error handling, and boundary conditions.
-// Uses GoogleTest and GoogleMock.
+// Uses the RS2V native test framework (TestFramework.h / TestMock.h).
 
-#include <gtest/gtest.h>
-#include <gmock/gmock.h>
+#include "TestFramework.h"
+#include "TestMock.h"
 #include <vector>
 #include <chrono>
 #include <thread>
@@ -19,10 +19,10 @@
 #include "Config/NetworkConfig.h"
 #include "Utils/Logger.h"
 
-using ::testing::_;
-using ::testing::Return;
-using ::testing::StrictMock;
-using ::testing::Invoke;
+using ::rs2v::_;
+using ::rs2v::Return;
+using ::rs2v::StrictMock;
+using ::rs2v::Invoke;
 
 // Mock NetworkConfig for rate limiting and timeouts
 class MockNetworkConfig : public NetworkConfig {
@@ -36,7 +36,7 @@ public:
 };
 
 // Fixture for PacketSerializer
-class PacketSerializerTest : public ::testing::Test {
+class PacketSerializerTest : public ::rs2v::Test {
 protected:
     PacketSerializer serializer;
 };
@@ -72,7 +72,7 @@ public:
     MOCK_METHOD(int, GetMaxPacketsPerTick, (), (const, override));
 };
 
-class NetworkManagerTest : public ::testing::Test {
+class NetworkManagerTest : public ::rs2v::Test {
 protected:
     void SetUp() override {
         config = std::make_shared<StrictMock<MockNetworkConfigForManager>>();
@@ -133,7 +133,7 @@ TEST_F(NetworkManagerTest, RateLimiting_DropsExcessPackets) {
 }
 
 // Fixture for Packet end-to-end
-class PacketIntegrationTest : public ::testing::Test {
+class PacketIntegrationTest : public ::rs2v::Test {
 protected:
     PacketIntegrationTest() : serializer() {}
 
@@ -173,7 +173,4 @@ TEST_F(NetworkManagerTest, Initialize_InvalidPort_Fails) {
     EXPECT_FALSE(badMgr.Initialize());
 }
 
-int main(int argc, char** argv) {
-    ::testing::InitGoogleTest(&argc, argv);
-    return RUN_ALL_TESTS();
-}
+RS2V_TEST_MAIN()

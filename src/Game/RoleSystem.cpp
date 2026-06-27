@@ -208,7 +208,18 @@ bool RoleSystem::LeaveSquad(uint32_t playerId) {
     auto sit = m_playerSquadMap.find(playerId);
     if (sit == m_playerSquadMap.end()) return false;
 
-    auto& squad = m_squads[sit->second];
+    // Look the squad up rather than using operator[]: a stale player->squad mapping
+    // (squad already disbanded) must NOT silently default-construct a phantom squad
+    // here. If the invariant "mapped squad exists" is broken, drop the dangling
+    // mapping and bail instead of fabricating an empty squad.
+    auto squadIt = m_squads.find(sit->second);
+    if (squadIt == m_squads.end()) {
+        Logger::Warn("RoleSystem: player %u mapped to non-existent squad %u — clearing stale mapping",
+                     playerId, sit->second);
+        m_playerSquadMap.erase(sit);
+        return false;
+    }
+    auto& squad = squadIt->second;
     auto& members = squad.memberIds;
     members.erase(std::remove(members.begin(), members.end(), playerId), members.end());
 

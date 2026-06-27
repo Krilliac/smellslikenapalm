@@ -5,7 +5,7 @@
 // channel; these round-trip it and anchor it to real-capture bytes.
 // Spec: docs/RS2V_ActorReplication_7258.md.
 
-#include <gtest/gtest.h>
+#include "TestFramework.h"
 
 #include "Network/ActorReplication.h"
 #include "Network/BitReader.h"
@@ -230,7 +230,4 @@ TEST(ActorReplication, OpeningActorBunchDecodes) {
     EXPECT_EQ(r.BitPos(), static_cast<size_t>(b.payloadBits));
 }
 
-int main(int argc, char** argv) {
-    ::testing::InitGoogleTest(&argc, argv);
-    return RUN_ALL_TESTS();
-}
+RS2V_TEST_MAIN()

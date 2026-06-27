@@ -6,6 +6,7 @@
 #include "Protocol/ReverseEngineering/ProtocolDecoder.h"
 #include "Protocol/UE3Protocol.h"
 #include "Utils/Logger.h"
+#include "Utils/CrashHandler.h"
 
 #include <fstream>
 #include <sstream>
@@ -15,6 +16,29 @@
 #include <algorithm>
 #include <filesystem>
 #include <numeric>
+
+namespace {
+// Explicit little-endian readers. The UE3 wire format is little-endian; reading
+// via these (rather than a host-endian memcpy into a wider int) makes the byte
+// order intentional and correct on a big-endian host too.
+inline uint16_t ReadLE16(const uint8_t* p) {
+    return static_cast<uint16_t>(p[0] | (p[1] << 8));
+}
+inline uint32_t ReadLE32(const uint8_t* p) {
+    return static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8) |
+           (static_cast<uint32_t>(p[2]) << 16) | (static_cast<uint32_t>(p[3]) << 24);
+}
+inline uint64_t ReadLE64(const uint8_t* p) {
+    return static_cast<uint64_t>(ReadLE32(p)) |
+           (static_cast<uint64_t>(ReadLE32(p + 4)) << 32);
+}
+inline float ReadLEFloat(const uint8_t* p) {
+    uint32_t bits = ReadLE32(p);
+    float f;
+    std::memcpy(&f, &bits, sizeof(f));
+    return f;
+}
+} // namespace
 
 // ---- Global singleton ----
 static std::unique_ptr<ProtocolDecoder> g_protocolDecoder;
@@ -50,55 +74,185 @@ void ProtocolDecoder::Initialize(const ProtocolDecoderConfig& config) {
             Logger::Warn("ProtocolDecoder: Could not create output dir '%s': %s",
                          m_config.outputDirectory.c_str(), ec.message().c_str());
         }
+
+        // Load per-class net-field handle tables as decoding PRIORS. These turn
+        // the bunch path from byte-guessing into named property decode.
+        if (m_config.decodeBunchProperties) {
+            size_t n = m_netFields.LoadDirectory(m_config.netfieldsDir);
+            m_propDecoder = std::make_unique<BunchPropertyDecoder>(m_config.maxChannels);
+            if (n == 0) {
+                Logger::Warn("ProtocolDecoder: no net-field tables in '%s' — bunch "
+                             "property decoding will be name-less", m_config.netfieldsDir.c_str());
+            }
+        }
+
+        // Merge cumulative per-tag stats from a prior run.
+        if (m_config.persistState) {
+            LoadPersistentState();
+        }
     }
 
     m_initialized = true;
-    Logger::Info("ProtocolDecoder initialized (enabled=%s, output=%s)",
+
+    // Start the async analysis worker (off the network hot path).
+    if (m_config.enabled && m_config.asyncAnalysis) {
+        m_workerRunning = true;
+        m_worker = std::thread(&ProtocolDecoder::WorkerLoop, this);
+    }
+
+    Logger::Info("ProtocolDecoder initialized (enabled=%s, async=%s, classes=%zu, output=%s)",
                  m_config.enabled ? "true" : "false",
+                 m_config.asyncAnalysis ? "true" : "false",
+                 m_netFields.ClassCount(),
                  m_config.outputDirectory.c_str());
 }
 
 void ProtocolDecoder::Shutdown() {
+    // Stop the worker FIRST (outside m_mutex) so no analysis runs during teardown.
+    if (m_workerRunning.exchange(false)) {
+        m_queueCv.notify_all();
+        if (m_worker.joinable()) m_worker.join();
+    }
+
     std::lock_guard<std::mutex> lock(m_mutex);
     if (!m_initialized) return;
 
-    // Final export before shutdown
+    // Final export + persist before shutdown (lock already held — no dance).
     if (m_config.exportJsonDefinitions && !m_decodedStructures.empty()) {
-        // Unlock temporarily for export
-        m_mutex.unlock();
-        ExportProtocolDefinitions();
-        m_mutex.lock();
+        ExportProtocolDefinitionsLocked("");
+    }
+    if (m_config.persistState) {
+        SavePersistentState();
     }
 
-    Logger::Info("ProtocolDecoder shutdown — analyzed %llu packets, decoded %llu structures",
+    Logger::Info("ProtocolDecoder shutdown — analyzed %llu packets, decoded %llu structures "
+                 "(%llu events dropped under load)",
                  (unsigned long long)m_stats.totalPacketsAnalyzed,
-                 (unsigned long long)m_stats.structuresDecoded);
+                 (unsigned long long)m_stats.structuresDecoded,
+                 (unsigned long long)m_droppedEvents);
 
     m_clientSessions.clear();
     m_decodedStructures.clear();
     m_bunchHistory.clear();
+    m_channelStats.clear();
     m_initialized = false;
+}
+
+// ---- Async pipeline: enqueue on the hot path, analyze on the worker ----
+
+void ProtocolDecoder::Enqueue(CaptureEvent&& ev) {
+    {
+        std::lock_guard<std::mutex> qlock(m_queueMutex);
+        // Bounded queue: under a flood we drop the OLDEST event and count it,
+        // so capture memory is capped and the socket thread never blocks.
+        if (m_queue.size() >= m_config.maxAnalysisQueue) {
+            m_queue.pop_front();
+            ++m_droppedEvents;
+        }
+        m_queue.push_back(std::move(ev));
+    }
+    m_queueCv.notify_one();
+}
+
+void ProtocolDecoder::WorkerLoop() {
+    while (true) {
+        std::deque<CaptureEvent> batch;
+        {
+            std::unique_lock<std::mutex> qlock(m_queueMutex);
+            m_queueCv.wait(qlock, [this]{ return !m_queue.empty() || !m_workerRunning; });
+            if (!m_workerRunning && m_queue.empty()) break;
+            batch.swap(m_queue);
+        }
+        std::lock_guard<std::mutex> lock(m_mutex);
+        // ProcessEvent decodes captured, attacker-influenced wire bytes. Guard
+        // per event so a decode that throws on one malformed capture is reported
+        // non-fatally and the worker keeps draining the queue, rather than
+        // escaping this thread function into std::terminate.
+        for (const auto& ev : batch) rs2v::Guard("protocol decode event", [&] { ProcessEvent(ev); });
+    }
+}
+
+void ProtocolDecoder::ProcessEvent(const CaptureEvent& ev) {
+    switch (ev.kind) {
+        case CaptureKind::Connected:    HandleConnected(ev.clientId, ev.ip); break;
+        case CaptureKind::Disconnected: HandleDisconnected(ev.clientId); break;
+        case CaptureKind::PacketRecv:   HandlePacket(ev.clientId, ev.data, ev.tag, true); break;
+        case CaptureKind::PacketSent:   HandlePacket(ev.clientId, ev.data, ev.tag, false); break;
+        case CaptureKind::RawUDP:       HandleRawUDP(ev.clientId, ev.data); break;
+    }
 }
 
 // ---- Client Session Management ----
 
 void ProtocolDecoder::OnClientConnected(uint32_t clientId, const std::string& ip) {
-    std::lock_guard<std::mutex> lock(m_mutex);
     if (!m_config.enabled) return;
+    if (m_config.asyncAnalysis) {
+        CaptureEvent ev; ev.kind = CaptureKind::Connected; ev.clientId = clientId; ev.ip = ip;
+        Enqueue(std::move(ev));
+    } else {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        HandleConnected(clientId, ip);
+    }
+}
 
+void ProtocolDecoder::OnClientDisconnected(uint32_t clientId) {
+    if (!m_config.enabled) return;
+    if (m_config.asyncAnalysis) {
+        CaptureEvent ev; ev.kind = CaptureKind::Disconnected; ev.clientId = clientId;
+        Enqueue(std::move(ev));
+    } else {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        HandleDisconnected(clientId);
+    }
+}
+
+void ProtocolDecoder::OnPacketReceived(uint32_t clientId, const std::vector<uint8_t>& rawData,
+                                       const std::string& tag) {
+    if (!m_config.enabled || rawData.empty()) return;
+    if (m_config.asyncAnalysis) {
+        CaptureEvent ev; ev.kind = CaptureKind::PacketRecv; ev.clientId = clientId;
+        ev.tag = tag; ev.data = rawData;
+        Enqueue(std::move(ev));
+    } else {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        HandlePacket(clientId, rawData, tag, true);
+    }
+}
+
+void ProtocolDecoder::OnPacketSent(uint32_t clientId, const std::vector<uint8_t>& rawData,
+                                    const std::string& tag) {
+    if (!m_config.enabled || rawData.empty()) return;
+    if (m_config.asyncAnalysis) {
+        CaptureEvent ev; ev.kind = CaptureKind::PacketSent; ev.clientId = clientId;
+        ev.tag = tag; ev.data = rawData;
+        Enqueue(std::move(ev));
+    } else {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        HandlePacket(clientId, rawData, tag, false);
+    }
+}
+
+void ProtocolDecoder::OnRawUDPReceived(uint32_t clientId, const uint8_t* data, size_t len) {
+    if (!m_config.enabled || !m_config.detectUE3Bunches || len < 8) return;
+    if (m_config.asyncAnalysis) {
+        CaptureEvent ev; ev.kind = CaptureKind::RawUDP; ev.clientId = clientId;
+        ev.data.assign(data, data + len);
+        Enqueue(std::move(ev));
+    } else {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        std::vector<uint8_t> copy(data, data + len);
+        HandleRawUDP(clientId, copy);
+    }
+}
+
+// ---- Analysis bodies (always invoked with m_mutex held) ----
+
+void ProtocolDecoder::HandleConnected(uint32_t clientId, const std::string& ip) {
     auto& session = m_clientSessions[clientId];
+    session = ClientAnalysisSession{};
     session.clientId = clientId;
     session.clientIP = ip;
     session.connectTime = std::chrono::steady_clock::now();
-    session.handshakeComplete = false;
-    session.handshakeStage = 0;
-    session.totalPacketsReceived = 0;
-    session.totalPacketsSent = 0;
-    session.totalBytesReceived = 0;
-    session.totalBytesSent = 0;
-    session.tagCounts.clear();
-    session.handshakePackets.clear();
-    session.recentPackets.clear();
 
     m_stats.activeClients = m_clientSessions.size();
 
@@ -106,10 +260,7 @@ void ProtocolDecoder::OnClientConnected(uint32_t clientId, const std::string& ip
                  clientId, ip.c_str());
 }
 
-void ProtocolDecoder::OnClientDisconnected(uint32_t clientId) {
-    std::lock_guard<std::mutex> lock(m_mutex);
-    if (!m_config.enabled) return;
-
+void ProtocolDecoder::HandleDisconnected(uint32_t clientId) {
     auto it = m_clientSessions.find(clientId);
     if (it != m_clientSessions.end()) {
         auto& session = it->second;
@@ -118,90 +269,45 @@ void ProtocolDecoder::OnClientDisconnected(uint32_t clientId) {
                      (unsigned long long)session.totalPacketsReceived,
                      (unsigned long long)session.totalPacketsSent);
 
-        // Export client capture data before removing
         if (m_config.exportJsonDefinitions) {
-            m_mutex.unlock();
-            ExportClientCapture(clientId);
-            m_mutex.lock();
+            ExportClientCaptureLocked(clientId, "");
         }
-
         m_clientSessions.erase(it);
     }
     m_stats.activeClients = m_clientSessions.size();
 }
 
-// ---- Packet Capture Hooks ----
-
-void ProtocolDecoder::OnPacketReceived(uint32_t clientId, const std::vector<uint8_t>& rawData,
-                                       const std::string& tag) {
-    std::lock_guard<std::mutex> lock(m_mutex);
-    if (!m_config.enabled || rawData.empty()) return;
-
+void ProtocolDecoder::HandlePacket(uint32_t clientId, const std::vector<uint8_t>& rawData,
+                                   const std::string& tag, bool inbound) {
     m_stats.totalPacketsAnalyzed++;
     m_stats.totalBytesAnalyzed += rawData.size();
 
     auto it = m_clientSessions.find(clientId);
     if (it != m_clientSessions.end()) {
         auto& session = it->second;
-        session.totalPacketsReceived++;
-        session.totalBytesReceived += rawData.size();
+        if (inbound) { session.totalPacketsReceived++; session.totalBytesReceived += rawData.size(); }
+        else         { session.totalPacketsSent++;     session.totalBytesSent += rawData.size(); }
         session.tagCounts[tag]++;
 
-        // Track recent packets
-        if (m_config.logRawPackets && session.recentPackets.size() < m_config.maxRawPacketsPerClient) {
+        // Rolling window of the MOST RECENT packets (deque: pop oldest when full).
+        if (m_config.logRawPackets) {
             session.recentPackets.push_back({
-                std::chrono::steady_clock::now(),
-                tag,
-                rawData,
-                true
-            });
+                std::chrono::steady_clock::now(), tag, rawData, inbound });
+            while (session.recentPackets.size() > m_config.maxRawPacketsPerClient)
+                session.recentPackets.pop_front();
         }
 
-        // Handshake detection for early packets
-        if (!session.handshakeComplete && session.totalPacketsReceived <= 10) {
+        if (inbound && !session.handshakeComplete && session.totalPacketsReceived <= 10) {
             AnalyzeHandshake(clientId, rawData);
         }
     }
 
-    // Core payload analysis
-    AnalyzePacketPayload(tag, rawData, true);
-
-    // Auto-export check
+    AnalyzePacketPayload(tag, rawData, inbound);
     MaybeAutoExport();
 }
 
-void ProtocolDecoder::OnPacketSent(uint32_t clientId, const std::vector<uint8_t>& rawData,
-                                    const std::string& tag) {
-    std::lock_guard<std::mutex> lock(m_mutex);
-    if (!m_config.enabled || rawData.empty()) return;
-
-    m_stats.totalPacketsAnalyzed++;
-    m_stats.totalBytesAnalyzed += rawData.size();
-
-    auto it = m_clientSessions.find(clientId);
-    if (it != m_clientSessions.end()) {
-        auto& session = it->second;
-        session.totalPacketsSent++;
-        session.totalBytesSent += rawData.size();
-
-        if (m_config.logRawPackets && session.recentPackets.size() < m_config.maxRawPacketsPerClient) {
-            session.recentPackets.push_back({
-                std::chrono::steady_clock::now(),
-                tag,
-                rawData,
-                false
-            });
-        }
-    }
-
-    AnalyzePacketPayload(tag, rawData, false);
-}
-
-void ProtocolDecoder::OnRawUDPReceived(uint32_t clientId, const uint8_t* data, size_t len) {
-    std::lock_guard<std::mutex> lock(m_mutex);
-    if (!m_config.enabled || !m_config.detectUE3Bunches || len < 8) return;
-
-    AnalyzeUE3Bunch(data, len);
+void ProtocolDecoder::HandleRawUDP(uint32_t /*clientId*/, const std::vector<uint8_t>& data) {
+    AnalyzeUE3Bunch(data.data(), data.size());
 }
 
 // ---- Core Analysis Methods ----
@@ -236,15 +342,9 @@ void ProtocolDecoder::AnalyzePacketPayload(const std::string& tag, const std::ve
     structure.avgPayloadSize = structure.avgPayloadSize
         + (static_cast<double>(data.size()) - structure.avgPayloadSize) / structure.totalSamples;
 
-    // Detect field types from payload
+    // Field-type detection: buffers early samples, then infers the layout from
+    // the modal payload size (and refines) once enough evidence is in.
     DetectFieldTypes(structure, data);
-
-    // After enough samples, refine the detection
-    if (structure.totalSamples == m_config.minSamplesForConfidence) {
-        RefineFieldDetection(structure);
-        Logger::Info("ProtocolDecoder: Structure for '%s' refined after %llu samples (%zu fields detected)",
-                     tag.c_str(), (unsigned long long)structure.totalSamples, structure.fields.size());
-    }
 }
 
 void ProtocolDecoder::AnalyzeUE3Bunch(const uint8_t* data, size_t len) {
@@ -289,115 +389,244 @@ void ProtocolDecoder::AnalyzeUE3Bunch(const uint8_t* data, size_t len) {
             Logger::Debug("ProtocolDecoder: UE3 bunch OPEN on channel %u, seq=%u, payload=%zu",
                           header.ChannelIndex, header.ChSequence, payloadLen);
         }
+
+        // Decode the bit-packed property stream against the known class tables.
+        if (m_config.decodeBunchProperties && m_propDecoder &&
+            !m_bunchHistory.empty() && m_bunchHistory.back().payloadLength > 0) {
+            const auto& rp = m_bunchHistory.back().rawPayload;
+            DecodeBunchProperties(header, rp.data(), rp.size());
+        }
+    }
+}
+
+// Static class export index -> class name (names match the loaded
+// netfields_u_<Class> tables). The four menu actors are bit-exact against the
+// capture (docs/re/open_bunch_structure.md §1); the Pawn/Weapon ranges are from
+// the MASTER_replication_reference §0 static-index table (used for channel
+// identification only — those tables are lean, so values aren't decoded).
+static std::string ResolveActorClassIndex(uint32_t idx) {
+    switch (idx) {
+        case 57520: return "ROPlayerController";       // [H]
+        case 86701: return "ROPlayerReplicationInfo";  // [H]
+        case 90245: return "ROTeamInfo";               // [H]
+        case 70887: return "ROGameReplicationInfo";    // [H]
+        case 82735: case 75939: case 286097:           // ROWeapon/Inventory
+            return "ROWeapon";
+        default: break;
+    }
+    // ROPawn subclasses cluster in this export-index range (respawn clusters).
+    if (idx >= 285994 && idx <= 286464) return "ROPawn";
+    return std::string();
+}
+
+// Decode the bit-packed property record stream inside an actor-channel bunch.
+// For an OPEN bunch we parse the SerializeNewActor header to identify the actor's
+// class EXACTLY (by its static export index) and to find where the property block
+// begins; the channel is then bound to that class. Non-open bunches reuse the
+// bound class. A best-fit scan remains only as a fallback for bunches seen before
+// their open. This recovers real UE3 property NAMES + VALUES via the handle
+// tables instead of guessing a byte layout.
+void ProtocolDecoder::DecodeBunchProperties(const UE3BunchHeader& header,
+                                            const uint8_t* payload, size_t payloadLen) {
+    if (!payload || payloadLen == 0) return;
+
+    auto& chan = m_channelStats[header.ChannelIndex];
+    const size_t validBits = payloadLen * 8;
+
+    auto applyDecode = [&](const BunchDecodeResult& res) {
+        chan.bunchesDecoded++;
+        for (const auto& p : res.properties) {
+            if (!p.valueDecoded) continue;
+            auto& agg = chan.properties[p.name];
+            agg.count++;
+            agg.handle = p.handle;
+            agg.lastValue = p.valueSummary;
+        }
+    };
+
+    // OPEN bunch: identify the class exactly and skip its SerializeNewActor header.
+    size_t startBit = 0;
+    if (header.Open) {
+        auto hdr = m_propDecoder->ParseOpenHeader(payload, payloadLen, validBits,
+                                                  &ResolveActorClassIndex);
+        if (hdr.ok && !hdr.className.empty()) {
+            chan.className = hdr.className;
+            chan.bestFitScore = 1.0;        // exact identification, not a guess
+            startBit = hdr.headerBits;
+            Logger::Debug("ProtocolDecoder: ch%u open -> class %s (idx=%u), property "
+                          "block at bit %zu", header.ChannelIndex,
+                          hdr.className.c_str(), hdr.classIndex, hdr.headerBits);
+        }
+    }
+
+    // Decode with the bound class (exact when identified via the open header).
+    if (!chan.className.empty()) {
+        if (const NetFieldTable* t = m_netFields.GetClass(chan.className)) {
+            applyDecode(m_propDecoder->Decode(*t, payload, payloadLen, validBits, startBit));
+            return;
+        }
+    }
+
+    // Fallback: a non-open bunch on a channel whose open we never saw. Try the
+    // value-typed classes and keep the best fit (no header to skip here).
+    const NetFieldTable* bestTable = nullptr;
+    BunchDecodeResult bestRes;
+    double bestScore = 0.0;
+    for (const NetFieldTable* t : m_netFields.AllClasses()) {
+        if (!t->HasValueTypes()) continue;
+        BunchDecodeResult res = m_propDecoder->Decode(*t, payload, payloadLen);
+        double score = res.FitScore();
+        if (score > bestScore && res.properties.size() >= 2) {
+            bestScore = score;
+            bestTable = t;
+            bestRes = std::move(res);
+        }
+    }
+    if (bestTable && bestScore >= 0.6) {
+        chan.className = bestTable->ClassName();
+        chan.bestFitScore = bestScore;
+        applyDecode(bestRes);
+    }
+}
+
+// Byte width implied by a classified field at `offset`. Returns 0 for a blob
+// (caller treats as "consume the rest"). Shared by layout inference.
+static size_t FieldSizeFor(DetectedFieldType& type, const std::vector<uint8_t>& data,
+                           size_t offset, size_t remaining,
+                           size_t& outMinLen, size_t& outMaxLen) {
+    switch (type) {
+        case DetectedFieldType::String: {
+            if (remaining >= 4) {
+                uint32_t strLen = ReadLE32(&data[offset]);
+                if (strLen < 10000 && offset + 4 + strLen <= data.size()) {
+                    outMinLen = outMaxLen = strLen;
+                    return 4 + strLen;
+                }
+                type = DetectedFieldType::UInt32;
+                return 4;
+            }
+            type = DetectedFieldType::Unknown;
+            return remaining;
+        }
+        case DetectedFieldType::Vector3:  return 12;
+        case DetectedFieldType::Float32:  return 4;
+        case DetectedFieldType::UInt32:
+        case DetectedFieldType::EntityId: return 4;
+        case DetectedFieldType::UInt16:
+        case DetectedFieldType::Enum16:   return 2;
+        case DetectedFieldType::UInt8:
+        case DetectedFieldType::Boolean:
+        case DetectedFieldType::Enum8:    return 1;
+        case DetectedFieldType::UInt64:
+        case DetectedFieldType::Timestamp:return 8;
+        default:
+            type = DetectedFieldType::BlobData;
+            return remaining;
     }
 }
 
 void ProtocolDecoder::DetectFieldTypes(DecodedPacketStructure& structure, const std::vector<uint8_t>& data) {
     if (data.empty()) return;
 
-    // On first sample, do initial field layout detection
-    if (structure.totalSamples <= 1) {
-        structure.fields.clear();
-        size_t offset = 0;
-        size_t fieldIndex = 0;
-        while (offset < data.size()) {
-            size_t remaining = data.size() - offset;
-            DetectedField field;
-            field.offset = offset;
-            field.sampleCount = 1;
+    if (!structure.layoutFinalized) {
+        // Buffer the earliest samples; defer layout until we can pick the MODAL
+        // payload size, so an atypical first packet can't lock a bad layout.
+        if (structure.sampleBuffer.size() < m_config.maxSampleBuffer)
+            structure.sampleBuffer.push_back(data);
 
-            DetectedFieldType fieldType = ClassifyFieldAt(data, offset, remaining);
-            field.type = fieldType;
-
-            switch (fieldType) {
-                case DetectedFieldType::String: {
-                    if (remaining >= 4) {
-                        uint32_t strLen = 0;
-                        std::memcpy(&strLen, &data[offset], 4);
-                        if (strLen < 10000 && offset + 4 + strLen <= data.size()) {
-                            field.size = 4 + strLen;
-                            field.minLength = strLen;
-                            field.maxLength = strLen;
-                        } else {
-                            field.type = DetectedFieldType::UInt32;
-                            field.size = 4;
-                        }
-                    } else {
-                        field.type = DetectedFieldType::Unknown;
-                        field.size = remaining;
-                    }
-                    break;
-                }
-                case DetectedFieldType::Vector3:
-                    field.size = 12;
-                    break;
-                case DetectedFieldType::Float32:
-                    field.size = 4;
-                    break;
-                case DetectedFieldType::UInt32:
-                case DetectedFieldType::EntityId:
-                    field.size = 4;
-                    break;
-                case DetectedFieldType::UInt16:
-                case DetectedFieldType::Enum16:
-                    field.size = 2;
-                    break;
-                case DetectedFieldType::UInt8:
-                case DetectedFieldType::Boolean:
-                case DetectedFieldType::Enum8:
-                    field.size = 1;
-                    break;
-                case DetectedFieldType::UInt64:
-                case DetectedFieldType::Timestamp:
-                    field.size = 8;
-                    break;
-                default:
-                    // Consume remaining bytes as blob
-                    field.size = remaining;
-                    field.type = DetectedFieldType::BlobData;
-                    break;
-            }
-
-            field.suggestedName = GenerateFieldName(field.type, fieldIndex);
-            field.confidence = 0.3f; // low initial confidence
-
-            // Defensive: a classified field must (a) advance the cursor by at
-            // least one byte — otherwise the loop could spin forever on crafted
-            // input — and (b) never claim more bytes than remain in the buffer,
-            // which would let subsequent-sample stats read past the payload.
-            // Valid inputs always satisfy both, so this cannot change behavior.
-            if (field.size > remaining) {
-                field.size = remaining;
-            }
-            if (field.size == 0) {
-                Logger::Warn("ProtocolDecoder: zero-width field at offset %zu in '%s' — "
-                             "stopping field scan", offset, structure.packetTag.c_str());
-                break;
-            }
-
-            if (m_config.trackFieldStatistics && field.type != DetectedFieldType::BlobData) {
-                UpdateFieldStatistics(field, data, offset);
-            }
-
-            structure.fields.push_back(field);
-            offset += field.size;
-            fieldIndex++;
+        // Gate inference on the CURRENT-RUN buffered sample count, NOT cumulative
+        // totalSamples: persistence seeds totalSamples across runs, so keying off
+        // it would fire inference on the first packet after a restart (one-sample
+        // buffer) and lock an atypical layout. Cap by maxSampleBuffer in case
+        // minSamplesForConfidence exceeds it.
+        size_t need = std::min(m_config.minSamplesForConfidence, m_config.maxSampleBuffer);
+        if (need == 0) need = 1;
+        if (structure.sampleBuffer.size() >= need) {
+            InferLayoutFromSamples(structure);
         }
-    } else {
-        // Update statistics for existing fields with new sample
-        if (m_config.trackFieldStatistics) {
-            size_t offset = 0;
-            for (auto& field : structure.fields) {
-                if (offset + field.size <= data.size()) {
-                    field.sampleCount++;
+        return;
+    }
+
+    // Layout finalized: fold this sample's values into the per-field statistics
+    // (only when it matches the inferred layout width).
+    if (m_config.trackFieldStatistics) {
+        size_t offset = 0;
+        for (auto& field : structure.fields) {
+            if (offset + field.size <= data.size()) {
+                field.sampleCount++;
+                if (field.type != DetectedFieldType::BlobData)
                     UpdateFieldStatistics(field, data, offset);
-                    offset += field.size;
-                } else {
-                    break;
-                }
+                offset += field.size;
+            } else {
+                break;
             }
         }
     }
+}
+
+void ProtocolDecoder::InferLayoutFromSamples(DecodedPacketStructure& structure) {
+    if (structure.sampleBuffer.empty()) return;
+
+    // Choose the MODAL payload size and a representative sample of it.
+    std::map<size_t, int> sizeCounts;
+    for (const auto& s : structure.sampleBuffer) sizeCounts[s.size()]++;
+    size_t modalSize = 0; int bestCount = -1;
+    for (const auto& [sz, c] : sizeCounts) if (c > bestCount) { bestCount = c; modalSize = sz; }
+
+    const std::vector<uint8_t>* rep = nullptr;
+    for (const auto& s : structure.sampleBuffer)
+        if (s.size() == modalSize) { rep = &s; break; }
+    if (!rep) return;
+
+    // Build the field layout from the representative sample.
+    structure.fields.clear();
+    size_t offset = 0, fieldIndex = 0;
+    while (offset < rep->size()) {
+        size_t remaining = rep->size() - offset;
+        DetectedField field;
+        field.offset = offset;
+        field.type = ClassifyFieldAt(*rep, offset, remaining);
+        field.size = FieldSizeFor(field.type, *rep, offset, remaining,
+                                  field.minLength, field.maxLength);
+        field.suggestedName = GenerateFieldName(field.type, fieldIndex);
+        field.confidence = 0.3f;
+        if (field.size > remaining) field.size = remaining;
+        if (field.size == 0) {
+            Logger::Warn("ProtocolDecoder: zero-width field at offset %zu in '%s' — "
+                         "stopping field scan", offset, structure.packetTag.c_str());
+            break;
+        }
+        structure.fields.push_back(std::move(field));
+        offset += structure.fields.back().size;
+        fieldIndex++;
+    }
+
+    // Replay every buffered modal-size sample through the statistics so the
+    // inferred layout starts with real distributions, not just one packet.
+    for (const auto& s : structure.sampleBuffer) {
+        if (s.size() != modalSize) continue;
+        size_t off = 0;
+        for (auto& field : structure.fields) {
+            if (off + field.size <= s.size()) {
+                field.sampleCount++;
+                if (m_config.trackFieldStatistics && field.type != DetectedFieldType::BlobData)
+                    UpdateFieldStatistics(field, s, off);
+                off += field.size;
+            } else {
+                break;
+            }
+        }
+    }
+
+    structure.layoutFinalized = true;
+    structure.sampleBuffer.clear();
+    structure.sampleBuffer.shrink_to_fit();
+    RefineFieldDetection(structure);
+
+    Logger::Info("ProtocolDecoder: Structure for '%s' layout inferred from modal size %zu "
+                 "(%zu fields, %zu samples buffered)",
+                 structure.packetTag.c_str(), modalSize, structure.fields.size(),
+                 (size_t)structure.totalSamples);
 }
 
 void ProtocolDecoder::RefineFieldDetection(DecodedPacketStructure& structure) {
@@ -489,8 +718,7 @@ void ProtocolDecoder::UpdateFieldStatistics(DetectedField& field, const std::vec
 
         case DetectedFieldType::UInt16:
         case DetectedFieldType::Enum16: {
-            uint16_t v = 0;
-            std::memcpy(&v, &data[offset], 2);
+            uint16_t v = ReadLE16(&data[offset]);
             value = v;
             field.observedValues[v]++;
             break;
@@ -498,8 +726,7 @@ void ProtocolDecoder::UpdateFieldStatistics(DetectedField& field, const std::vec
 
         case DetectedFieldType::UInt32:
         case DetectedFieldType::EntityId: {
-            uint32_t v = 0;
-            std::memcpy(&v, &data[offset], 4);
+            uint32_t v = ReadLE32(&data[offset]);
             value = v;
             if (field.observedValues.size() < 1000) { // cap map size
                 field.observedValues[v]++;
@@ -508,24 +735,20 @@ void ProtocolDecoder::UpdateFieldStatistics(DetectedField& field, const std::vec
         }
 
         case DetectedFieldType::Float32: {
-            float v = 0;
-            std::memcpy(&v, &data[offset], 4);
-            value = v;
+            value = ReadLEFloat(&data[offset]);
             break;
         }
 
         case DetectedFieldType::UInt64:
         case DetectedFieldType::Timestamp: {
-            uint64_t v = 0;
-            std::memcpy(&v, &data[offset], 8);
+            uint64_t v = ReadLE64(&data[offset]);
             value = static_cast<double>(v);
             break;
         }
 
         case DetectedFieldType::String: {
             if (offset + 4 <= data.size()) {
-                uint32_t strLen = 0;
-                std::memcpy(&strLen, &data[offset], 4);
+                uint32_t strLen = ReadLE32(&data[offset]);
                 field.minLength = std::min(field.minLength, static_cast<size_t>(strLen));
                 field.maxLength = std::max(field.maxLength, static_cast<size_t>(strLen));
             }
@@ -536,50 +759,67 @@ void ProtocolDecoder::UpdateFieldStatistics(DetectedField& field, const std::vec
             return;
     }
 
-    // Running statistics (Welford's algorithm)
+    // Running mean + variance (Welford). m2 is the running sum of squared deltas;
+    // variance is the population variance m2/n (NOT m2 itself — the previous code
+    // stored m2 in the 'variance' field, mislabelling it).
     double n = static_cast<double>(field.sampleCount);
     if (field.sampleCount == 1) {
         field.minValue = value;
         field.maxValue = value;
         field.avgValue = value;
-        field.variance = 0;
+        field.m2 = 0.0;
+        field.variance = 0.0;
     } else {
         field.minValue = std::min(field.minValue, value);
         field.maxValue = std::max(field.maxValue, value);
         double oldAvg = field.avgValue;
         field.avgValue += (value - oldAvg) / n;
-        field.variance += (value - oldAvg) * (value - field.avgValue);
+        field.m2 += (value - oldAvg) * (value - field.avgValue);
+        field.variance = field.m2 / n;
     }
 }
 
 // ---- Heuristic Field Detection ----
 
+// A float we'd plausibly see as game data: finite, and either exactly zero or in
+// a sane magnitude band. Crucially this REJECTS denormals/near-zero noise, which
+// is what small little-endian integers look like when misread as float — so an
+// int blob no longer masquerades as a float/Vector3 and desyncs the layout.
+static bool PlausibleFloat(float v) {
+    if (std::isnan(v) || std::isinf(v)) return false;
+    if (v == 0.0f) return true;
+    float a = std::fabs(v);
+    return a >= 1e-3f && a <= 1e9f;
+}
+
 DetectedFieldType ProtocolDecoder::ClassifyFieldAt(const std::vector<uint8_t>& data, size_t offset, size_t remaining) {
-    // Try most specific patterns first
+    // Most structurally specific patterns first. Ordering matters: a wrong guess
+    // consumes the wrong number of bytes and desyncs every following field.
 
-    // Vector3 (12 bytes: 3x float32)
-    if (remaining >= 12 && LooksLikeVector3(data, offset)) {
-        return DetectedFieldType::Vector3;
-    }
-
-    // Timestamp (8 bytes: large uint64 that looks like epoch millis)
-    if (remaining >= 8 && LooksLikeTimestamp(data, offset)) {
-        return DetectedFieldType::Timestamp;
-    }
-
-    // String (4-byte length prefix + printable ASCII)
+    // String: 4-byte length prefix pointing at in-buffer printable bytes.
     if (remaining >= 4 && LooksLikeString(data, offset)) {
         return DetectedFieldType::String;
     }
 
-    // Float32 (4 bytes in reasonable float range)
+    // Vector3 (12 bytes: 3x float32) — stricter than before (see LooksLikeVector3).
+    if (remaining >= 12 && LooksLikeVector3(data, offset)) {
+        return DetectedFieldType::Vector3;
+    }
+
+    // Float32 (4 bytes, plausible non-zero game float).
     if (remaining >= 4 && LooksLikeFloat(data, offset)) {
         return DetectedFieldType::Float32;
     }
 
-    // EntityId / UInt32 (4 bytes, reasonable ID range)
+    // EntityId / UInt32 (4 bytes, reasonable ID range).
     if (remaining >= 4 && LooksLikeEntityId(data, offset)) {
         return DetectedFieldType::EntityId;
+    }
+
+    // Timestamp is the WEAKEST signal for this (UE3) protocol, which uses no
+    // epoch-ms field; keep it last so it never steals a float/id/uint match.
+    if (remaining >= 8 && LooksLikeTimestamp(data, offset)) {
+        return DetectedFieldType::Timestamp;
     }
 
     // UInt32 fallback for 4+ bytes
@@ -608,8 +848,7 @@ DetectedFieldType ProtocolDecoder::ClassifyFieldAt(const std::vector<uint8_t>& d
 bool ProtocolDecoder::LooksLikeString(const std::vector<uint8_t>& data, size_t offset) {
     if (offset + 4 > data.size()) return false;
 
-    uint32_t strLen = 0;
-    std::memcpy(&strLen, &data[offset], 4);
+    uint32_t strLen = ReadLE32(&data[offset]);
 
     // Reasonable string length check
     if (strLen == 0 || strLen > 2048) return false;
@@ -631,55 +870,56 @@ bool ProtocolDecoder::LooksLikeString(const std::vector<uint8_t>& data, size_t o
 bool ProtocolDecoder::LooksLikeFloat(const std::vector<uint8_t>& data, size_t offset) {
     if (offset + 4 > data.size()) return false;
 
-    float v = 0;
-    std::memcpy(&v, &data[offset], 4);
+    float v = ReadLEFloat(&data[offset]);
 
-    // Check for reasonable game float values (positions, rotations, velocities)
-    if (std::isnan(v) || std::isinf(v)) return false;
-    if (v == 0.0f) return false; // Could be uint32 zero
-
-    // Game world coordinates and rotations typically in range
+    // Plausible game float, excluding exact zero (ambiguous with a uint32 0) and
+    // denormal noise (a small LE integer misread as float). Range covers game
+    // positions/rotations/velocities.
+    if (v == 0.0f) return false;
+    if (!PlausibleFloat(v)) return false;
     return (v > -100000.0f && v < 100000.0f);
 }
 
 bool ProtocolDecoder::LooksLikeVector3(const std::vector<uint8_t>& data, size_t offset) {
     if (offset + 12 > data.size()) return false;
 
-    float x, y, z;
-    std::memcpy(&x, &data[offset], 4);
-    std::memcpy(&y, &data[offset + 4], 4);
-    std::memcpy(&z, &data[offset + 8], 4);
+    float x = ReadLEFloat(&data[offset]);
+    float y = ReadLEFloat(&data[offset + 4]);
+    float z = ReadLEFloat(&data[offset + 8]);
 
-    // All three must be valid floats in game world range
-    if (std::isnan(x) || std::isnan(y) || std::isnan(z)) return false;
-    if (std::isinf(x) || std::isinf(y) || std::isinf(z)) return false;
+    // Every component must be a PLAUSIBLE float (rejects denormal noise — i.e. a
+    // run of small integers that would otherwise pass the old range-only test and
+    // get mis-claimed as a 12-byte vector, desyncing the rest of the packet).
+    if (!PlausibleFloat(x) || !PlausibleFloat(y) || !PlausibleFloat(z)) return false;
 
     bool xValid = (x > -100000.0f && x < 100000.0f);
     bool yValid = (y > -100000.0f && y < 100000.0f);
     bool zValid = (z > -100000.0f && z < 100000.0f);
+    if (!(xValid && yValid && zValid)) return false;
 
-    // At least 2 of 3 should be non-zero for it to be a vector
-    int nonZero = (x != 0.0f ? 1 : 0) + (y != 0.0f ? 1 : 0) + (z != 0.0f ? 1 : 0);
-
-    return xValid && yValid && zValid && nonZero >= 2;
+    // Need real spatial scale: at least two non-zero components AND at least one
+    // with magnitude >= 1 (a true coordinate), not three sub-unit values.
+    int nonZero = (x != 0.0f) + (y != 0.0f) + (z != 0.0f);
+    bool hasScale = std::fabs(x) >= 1.0f || std::fabs(y) >= 1.0f || std::fabs(z) >= 1.0f;
+    return nonZero >= 2 && hasScale;
 }
 
 bool ProtocolDecoder::LooksLikeTimestamp(const std::vector<uint8_t>& data, size_t offset) {
     if (offset + 8 > data.size()) return false;
 
-    uint64_t v = 0;
-    std::memcpy(&v, &data[offset], 8);
+    uint64_t v = ReadLE64(&data[offset]);
 
-    // Check if it looks like epoch milliseconds (roughly 2020-2030 range)
-    // 2020-01-01 = 1577836800000 ms, 2030-01-01 = 1893456000000 ms
+    // Epoch-millis window (≈2020-2033). Such values occupy ~41 bits, so the top
+    // two bytes are zero; requiring that rejects most random 8-byte windows. This
+    // is a deliberately weak/rare signal — UE3/RS2V does not field epoch time.
+    if ((v >> 48) != 0) return false;
     return (v > 1577836800000ULL && v < 2000000000000ULL);
 }
 
 bool ProtocolDecoder::LooksLikeEntityId(const std::vector<uint8_t>& data, size_t offset) {
     if (offset + 4 > data.size()) return false;
 
-    uint32_t v = 0;
-    std::memcpy(&v, &data[offset], 4);
+    uint32_t v = ReadLE32(&data[offset]);
 
     // Entity IDs are typically small-ish positive integers
     return (v > 0 && v < 100000);
@@ -762,7 +1002,10 @@ std::vector<uint32_t> ProtocolDecoder::GetActiveClients() const {
 
 bool ProtocolDecoder::ExportProtocolDefinitions(const std::string& outputPath) const {
     std::lock_guard<std::mutex> lock(m_mutex);
+    return ExportProtocolDefinitionsLocked(outputPath);
+}
 
+bool ProtocolDecoder::ExportProtocolDefinitionsLocked(const std::string& outputPath) const {
     std::string path = outputPath.empty()
         ? (m_config.outputDirectory + "/protocol_definitions.json")
         : outputPath;
@@ -799,7 +1042,10 @@ bool ProtocolDecoder::ExportProtocolDefinitions(const std::string& outputPath) c
 
 bool ProtocolDecoder::ExportClientCapture(uint32_t clientId, const std::string& outputPath) const {
     std::lock_guard<std::mutex> lock(m_mutex);
+    return ExportClientCaptureLocked(clientId, outputPath);
+}
 
+bool ProtocolDecoder::ExportClientCaptureLocked(uint32_t clientId, const std::string& outputPath) const {
     auto it = m_clientSessions.find(clientId);
     if (it == m_clientSessions.end()) return false;
     const auto& session = it->second;
@@ -813,7 +1059,7 @@ bool ProtocolDecoder::ExportClientCapture(uint32_t clientId, const std::string& 
 
     file << "{\n";
     file << "  \"clientId\": " << session.clientId << ",\n";
-    file << "  \"clientIP\": \"" << session.clientIP << "\",\n";
+    file << "  \"clientIP\": \"" << JsonEscape(session.clientIP) << "\",\n";
     file << "  \"totalPacketsReceived\": " << session.totalPacketsReceived << ",\n";
     file << "  \"totalPacketsSent\": " << session.totalPacketsSent << ",\n";
     file << "  \"totalBytesReceived\": " << session.totalBytesReceived << ",\n";
@@ -827,7 +1073,7 @@ bool ProtocolDecoder::ExportClientCapture(uint32_t clientId, const std::string& 
     for (const auto& [tag, count] : session.tagCounts) {
         if (!firstTag) file << ",\n";
         firstTag = false;
-        file << "    \"" << tag << "\": " << count;
+        file << "    \"" << JsonEscape(tag) << "\": " << count;
     }
     file << "\n  },\n";
 
@@ -849,7 +1095,7 @@ bool ProtocolDecoder::ExportClientCapture(uint32_t clientId, const std::string& 
     file << "  \"recentPackets\": [\n";
     for (size_t i = 0; i < session.recentPackets.size(); ++i) {
         const auto& rp = session.recentPackets[i];
-        file << "    {\"tag\": \"" << rp.tag << "\", \"size\": " << rp.data.size()
+        file << "    {\"tag\": \"" << JsonEscape(rp.tag) << "\", \"size\": " << rp.data.size()
              << ", \"direction\": \"" << (rp.inbound ? "recv" : "send") << "\", \"hex\": \"";
         // First 32 bytes only
         for (size_t j = 0; j < std::min(rp.data.size(), (size_t)32); ++j) {
@@ -945,6 +1191,22 @@ std::string ProtocolDecoder::GenerateProtocolReport() const {
         }
     }
 
+    // Decoded bit-packed bunch properties (the real RE payoff: named UE3
+    // properties recovered from actor-channel bunches via the handle tables).
+    if (!m_channelStats.empty()) {
+        report << "\n--- Decoded Channel Properties (bit-packed) ---\n\n";
+        for (const auto& [ch, cs] : m_channelStats) {
+            report << "Channel " << (unsigned)ch << " -> class "
+                   << (cs.className.empty() ? "(unidentified)" : cs.className)
+                   << " (fit=" << std::setprecision(2) << cs.bestFitScore
+                   << ", bunches=" << cs.bunchesDecoded << ")\n";
+            for (const auto& [name, agg] : cs.properties) {
+                report << "    [" << agg.handle << "] " << name
+                       << " x" << agg.count << " last=" << agg.lastValue << "\n";
+            }
+        }
+    }
+
     return report.str();
 }
 
@@ -1017,9 +1279,88 @@ std::string ProtocolDecoder::GenerateFieldName(DetectedFieldType type, size_t fi
     return prefix + "_" + std::to_string(fieldIndex);
 }
 
+std::string ProtocolDecoder::JsonEscape(const std::string& s) {
+    std::string out;
+    out.reserve(s.size() + 8);
+    for (unsigned char c : s) {
+        switch (c) {
+            case '"':  out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\b': out += "\\b";  break;
+            case '\f': out += "\\f";  break;
+            case '\n': out += "\\n";  break;
+            case '\r': out += "\\r";  break;
+            case '\t': out += "\\t";  break;
+            default:
+                if (c < 0x20) {
+                    static const char* hex = "0123456789abcdef";
+                    out += "\\u00";
+                    out += hex[(c >> 4) & 0xF];
+                    out += hex[c & 0xF];
+                } else {
+                    out += static_cast<char>(c);
+                }
+        }
+    }
+    return out;
+}
+
+std::map<uint8_t, ChannelPropertyStats> ProtocolDecoder::GetChannelPropertyStats() const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    return m_channelStats;
+}
+
+// Cumulative cross-run persistence. A compact, line-based sidecar (NOT JSON) so
+// it can be parsed back robustly without a hand-rolled JSON reader. Only the
+// stable high-level per-tag signal is merged (sample counts, sizes, directions);
+// per-run field layouts are re-inferred each run and intentionally not persisted.
+void ProtocolDecoder::LoadPersistentState() {
+    const std::string path = m_config.outputDirectory + "/protocol_state.tsv";
+    std::ifstream f(path);
+    if (!f.is_open()) return;
+
+    std::string line;
+    size_t loaded = 0;
+    while (std::getline(f, line)) {
+        if (line.empty() || line[0] == '#') continue;
+        std::istringstream is(line);
+        std::string tag;
+        uint64_t samples = 0, c2s = 0, s2c = 0;
+        size_t minSz = 0, maxSz = 0;
+        double avgSz = 0.0;
+        if (!(is >> tag >> samples >> minSz >> maxSz >> avgSz >> c2s >> s2c)) continue;
+
+        auto& s = m_decodedStructures[tag];
+        s.packetTag = tag;
+        s.totalSamples += samples;
+        s.minPayloadSize = std::min(s.minPayloadSize, minSz);
+        s.maxPayloadSize = std::max(s.maxPayloadSize, maxSz);
+        s.avgPayloadSize = avgSz;   // seed; refined as new samples arrive
+        s.clientToServerCount += c2s;
+        s.serverToClientCount += s2c;
+        ++loaded;
+    }
+    if (loaded)
+        Logger::Info("ProtocolDecoder: merged %zu prior packet-type records from '%s'",
+                     loaded, path.c_str());
+}
+
+void ProtocolDecoder::SavePersistentState() const {
+    const std::string path = m_config.outputDirectory + "/protocol_state.tsv";
+    std::ofstream f(path, std::ios::trunc);
+    if (!f.is_open()) return;
+    f << "# tag\tsamples\tminSize\tmaxSize\tavgSize\tc2s\ts2c\n";
+    for (const auto& [tag, s] : m_decodedStructures) {
+        size_t minSz = (s.minPayloadSize == SIZE_MAX) ? 0 : s.minPayloadSize;
+        f << tag << '\t' << s.totalSamples << '\t' << minSz << '\t'
+          << s.maxPayloadSize << '\t' << s.avgPayloadSize << '\t'
+          << s.clientToServerCount << '\t' << s.serverToClientCount << '\n';
+    }
+}
+
 std::string ProtocolDecoder::StructureToJson(const DecodedPacketStructure& structure) const {
     std::ostringstream json;
-    json << "\"" << structure.packetTag << "\": {\n";
+    json << "\"" << JsonEscape(structure.packetTag) << "\": {\n";
     json << "      \"totalSamples\": " << structure.totalSamples << ",\n";
     json << "      \"confidence\": " << std::fixed << std::setprecision(3) << structure.structureConfidence << ",\n";
     json << "      \"minPayloadSize\": " << structure.minPayloadSize << ",\n";
@@ -1032,7 +1373,7 @@ std::string ProtocolDecoder::StructureToJson(const DecodedPacketStructure& struc
     for (size_t i = 0; i < structure.fields.size(); ++i) {
         const auto& f = structure.fields[i];
         json << "        {\n";
-        json << "          \"name\": \"" << f.suggestedName << "\",\n";
+        json << "          \"name\": \"" << JsonEscape(f.suggestedName) << "\",\n";
         json << "          \"offset\": " << f.offset << ",\n";
         json << "          \"size\": " << f.size << ",\n";
         json << "          \"type\": \"" << FieldTypeToString(f.type) << "\",\n";
@@ -1081,19 +1422,8 @@ void ProtocolDecoder::MaybeAutoExport() {
     auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - m_lastExportTime);
     if (elapsed.count() >= m_config.exportIntervalSeconds) {
         m_lastExportTime = now;
-        // Export outside lock — but we're already locked, so just write directly
-        std::string path = m_config.outputDirectory + "/protocol_definitions.json";
-        std::ofstream file(path);
-        if (file.is_open()) {
-            file << "{\n  \"autoExport\": true,\n  \"structures\": {\n";
-            bool first = true;
-            for (const auto& [tag, s] : m_decodedStructures) {
-                if (!first) file << ",\n";
-                first = false;
-                file << "    " << StructureToJson(s);
-            }
-            file << "\n  }\n}\n";
-            file.close();
-        }
+        // Already under m_mutex (called from the worker) — use the locked paths.
+        ExportProtocolDefinitionsLocked("");
+        if (m_config.persistState) SavePersistentState();
     }
 }

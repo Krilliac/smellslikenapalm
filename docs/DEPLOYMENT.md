@@ -3,7 +3,7 @@
 This guide covers **production deployment**, **security hardening**, **monitoring setup**, and **operational maintenance** for the RS2V Custom Server.  
 For development workflow and API details, see **DEVELOPMENT.md** and **API.md**.
 
-> ⚠️ **Status:** This is a forward-looking guide. The server is still an in-development **emulator** — the live UE3 handshake is not finished and a stock client cannot fully connect yet (see the README's *Current Status* section). Treat the procedures below as the intended production-deployment workflow, not a description of a battle-tested production service.
+> ⚠️ **Status:** This is a forward-looking guide. The server is still an in-development **emulator** — the live UE3 handshake is not finished and a stock client cannot fully connect yet (see the README's *Current status* section). Treat the procedures below as the intended production-deployment workflow, not a description of a battle-tested production service.
 
 ## 1 · Overview
 
@@ -40,12 +40,12 @@ The RS2V server is intended to support **bare-metal**, **containerized**, or **c
 
 | OS | Version | Status | Notes |
 |----|---------|--------|-------|
-| **Ubuntu** | 20.04, 22.04 LTS | ✅ Recommended | Primary development platform |
-| **CentOS/RHEL** | 8, 9 | ✅ Supported | Enterprise environments |
-| **Rocky Linux** | 8, 9 | ✅ Supported | CentOS alternative |
-| **Debian** | 11, 12 | ✅ Supported | Minimal installations |
-| **Windows Server** | 2019, 2022 | 🔄 Beta | Limited testing |
-| **macOS** | 12+ | 🔧 Development only | Not recommended for production |
+| **Ubuntu** | 22.04 LTS | Recommended | Primary development platform |
+| **CentOS/RHEL** | 9 | Supported | Enterprise environments |
+| **Rocky Linux** | 9 | Supported | CentOS alternative |
+| **Debian** | 12 | Supported | Minimal installations |
+| **Windows Server** | 2022 | Beta | Limited testing |
+| **macOS** | 12+ | Development only | Not recommended for production |
 
 ## 3 · Installation Methods
 

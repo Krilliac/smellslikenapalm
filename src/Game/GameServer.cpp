@@ -5,6 +5,9 @@
 #include "Network/NetworkManager.h"
 #include "Game/AdminManager.h"
 #include "Game/ChatManager.h"
+#include "Game/CommandManager.h"
+#include "Network/ConsoleInput.h"
+#include "Network/RemoteAdminServer.h"
 #include "Game/GameMode.h"
 #include "Config/ConfigManager.h"
 #include "Config/GameConfig.h"
@@ -16,6 +19,10 @@
 #include "Game/PlayerManager.h"
 #include "Game/TeamManager.h"
 #include "Game/MapManager.h"
+#include "Game/MapVoteManager.h"
+#include "Game/WorkshopManager.h"
+#include "Game/ModManager.h"
+#include "Game/MutatorManager.h"
 #include "Game/RoleSystem.h"
 #include "Game/TicketSystem.h"
 #include "Game/ObjectiveSystem.h"
@@ -28,17 +35,22 @@
 #include "Game/TerritoryMode.h"
 #include "Game/SupremacyMode.h"
 #include "Game/SkirmishMode.h"
+#include "Game/GameState.h"
+#include "Game/RoundManager.h"
 #include "Game/ConnectionLoginBridge.h"
 #include "Protocol/ProtocolHandler.h"
 #include "Protocol/ReplicationManager.h"
 #include "Network/ClientConnection.h"
 #include "Utils/PathUtils.h"
 #include "Utils/HandlerLibraryManager.h"
+#include "Utils/CrashHandler.h"
 #include "Protocol/ReverseEngineering/ProtocolDecoder.h"
 #include <chrono>
 #include <thread>
 #include <cstdlib>
 #include <cstring>
+#include <algorithm>
+#include <cctype>
 #include <filesystem>
 
 using namespace GeneratedHandlers;
@@ -101,7 +113,11 @@ void GameServer::StartAutoRegen(int intervalSeconds) {
             }
             if (m_regenRunning) {
                 Logger::Debug("[GameServer::StartAutoRegen] Triggering periodic handler regeneration");
-                Cmd_RegenHandlers();
+                // Detached thread: an uncaught exception here would reach
+                // std::terminate with no one to join/observe it. Guard so a
+                // failed regeneration is reported non-fatally and the periodic
+                // thread keeps running.
+                rs2v::Guard("auto handler regen", [this] { Cmd_RegenHandlers(); });
             }
         }
         Logger::Info("Auto handler regeneration thread stopped");
@@ -226,11 +242,34 @@ bool GameServer::Initialize() {
     m_teamManager   = std::make_unique<TeamManager>(this);
     m_mapManager    = std::make_unique<MapManager>(this, m_mapConfig);
 
+    // Map voting
+    m_mapVoteManager = std::make_unique<MapVoteManager>(m_mapConfig);
+    m_mapVoteManager->SetEnabled(m_serverConfig->IsMapVoteEnabled());
+    m_mapVoteManager->SetOptionCount(m_serverConfig->GetMapVoteOptions());
+    m_mapVoteManager->SetVoteDurationSeconds(m_serverConfig->GetMapVoteDuration());
+
+    // Steam Workshop items (custom maps / mods / assets)
+    m_workshopManager = std::make_unique<WorkshopManager>(m_serverConfig);
+    m_workshopManager->Initialize();
+    m_workshopManager->DownloadMissing();   // dry-run unless Workshop.download_enabled
+    m_workshopManager->LogSummary();
+
+    // Mods + cosmetic assets (sourced from Workshop manifest + local mods dir)
+    m_modManager = std::make_unique<ModManager>(m_serverConfig);
+    m_modManager->Initialize(m_workshopManager.get());
+    m_modManager->LogSummary();
+
     m_adminManager  = std::make_unique<AdminManager>(this, m_serverConfig);
     m_adminManager->Initialize();
 
     m_chatManager   = std::make_unique<ChatManager>(this);
     m_chatManager->Initialize();
+
+    // Unified command system — single source of truth for admin/dev/mod/player/
+    // console/config/automation commands. All transports (chat, console, SOAP)
+    // dispatch through this one registry.
+    m_commandManager = std::make_unique<CommandManager>(this);
+    m_commandManager->Initialize();
 
     // Initialize RS2V game systems
     Logger::Debug("[GameServer::Initialize] Initializing RS2V game systems");
@@ -258,6 +297,10 @@ bool GameServer::Initialize() {
         if (m_territoryMode) m_territoryMode->OnObjectiveCaptured(objId, capTeam);
         if (m_supremacyMode) m_supremacyMode->OnObjectiveCaptured(objId, capTeam);
         if (m_skirmishMode) m_skirmishMode->OnObjectiveCaptured(objId, capTeam);
+        // Central round/state layer (opt-in): mirror ownership into GameState
+        // and let RoundManager evaluate early round-end win conditions.
+        if (m_gameState)    m_gameState->CaptureObjective(objId, capTeam);
+        if (m_roundManager) m_roundManager->OnObjectiveCaptured(objId, capTeam);
     });
 
     m_commanderAbilities = std::make_unique<CommanderAbilities>(this);
@@ -269,6 +312,16 @@ bool GameServer::Initialize() {
     m_damageSystem = std::make_unique<DamageSystem>(this);
     m_damageSystem->Initialize();
     m_damageSystem->SetFriendlyFireEnabled(m_gameConfig->IsFriendlyFire());
+
+    // Gameplay mutators — created after DamageSystem since several mutators
+    // adjust damage/friendly-fire settings in their OnInit.
+    m_mutatorManager = std::make_unique<MutatorManager>(this);
+    if (m_serverConfig->IsMutatorsEnabled()) {
+        m_mutatorManager->LoadFromConfig(m_serverConfig->GetEnabledMutators());
+    } else {
+        Logger::Debug("[GameServer::Initialize] Mutators disabled by config");
+    }
+    m_mutatorManager->LogSummary();
 
     m_projectileManager = std::make_unique<ProjectileManager>(this);
     m_projectileManager->Initialize();
@@ -287,6 +340,7 @@ bool GameServer::Initialize() {
         if (m_territoryMode) m_territoryMode->OnPlayerKilled(kill.killerId, kill.victimId);
         if (m_supremacyMode) m_supremacyMode->OnPlayerKilled(kill.killerId, kill.victimId);
         if (m_skirmishMode) m_skirmishMode->OnPlayerKilled(kill.killerId, kill.victimId);
+        if (m_mutatorManager) m_mutatorManager->DispatchPlayerKilled(kill.killerId, kill.victimId);
     });
 
     m_helicopterPhysics = std::make_unique<HelicopterPhysics>(this);
@@ -361,6 +415,31 @@ bool GameServer::Initialize() {
         Logger::Warn("[GameServer::Initialize] Failed to load map: %s — continuing without map", mapName.c_str());
     } else if (!mapName.empty()) {
         Logger::Debug("[GameServer::Initialize] Map '%s' loaded successfully", mapName.c_str());
+        // Register the loaded map's objectives with the (already-ticking)
+        // ObjectiveSystem so capture zones become live.
+        PopulateObjectivesFromMap();
+    }
+
+    // Optional central round/state layer. Off by default: the per-mode classes
+    // (TerritoryMode/SupremacyMode/SkirmishMode) already drive rounds, so this
+    // is opt-in to avoid two independent phase drivers. When enabled, GameState
+    // holds the authoritative phase/score/objective state and RoundManager
+    // cycles Preparation -> Active -> PostRound over it.
+    if (m_configManager && m_configManager->GetBool("Game.use_round_manager", false)) {
+        Logger::Info("[GameServer::Initialize] Central round manager ENABLED (Game.use_round_manager)");
+        m_gameState = std::make_unique<GameState>(this);
+        m_gameState->Initialize();   // pulls objective ids from the loaded map
+
+        m_roundManager = std::make_unique<RoundManager>(this);
+        m_roundManager->Initialize(); // binds to GameState via GetGameState()
+        m_roundManager->SetOnRoundStart([this]() {
+            Logger::Info("[GameServer] Round started (RoundManager)");
+        });
+        m_roundManager->SetOnRoundEnd([this]() {
+            Logger::Info("[GameServer] Round ended (RoundManager)");
+        });
+    } else {
+        Logger::Debug("[GameServer::Initialize] Central round manager disabled (default); per-mode drivers active");
     }
 
     const auto& gmDef = m_gameConfig->GetGameModeDefinition(m_gameConfig->GetGameSettings().gameMode);
@@ -376,10 +455,18 @@ bool GameServer::Initialize() {
     {
         ProtocolDecoderConfig decoderCfg;
         decoderCfg.enabled = m_configManager->GetBool("ReverseEngineering.enabled", true);
-        decoderCfg.logRawPackets = m_configManager->GetBool("ReverseEngineering.log_raw_packets", true);
-        decoderCfg.exportJsonDefinitions = m_configManager->GetBool("ReverseEngineering.export_json", true);
+        // SAFE-BY-DEFAULT: retaining raw attacker payloads and writing JSON on a
+        // shipped server is a memory/disk-fill + info-leak risk, so these default
+        // OFF; an operator opts in for an active RE session.
+        decoderCfg.logRawPackets = m_configManager->GetBool("ReverseEngineering.log_raw_packets", false);
+        decoderCfg.exportJsonDefinitions = m_configManager->GetBool("ReverseEngineering.export_json", false);
         decoderCfg.detectUE3Bunches = m_configManager->GetBool("ReverseEngineering.detect_ue3_bunches", true);
+        decoderCfg.decodeBunchProperties = m_configManager->GetBool("ReverseEngineering.decode_bunch_properties", true);
+        decoderCfg.asyncAnalysis = m_configManager->GetBool("ReverseEngineering.async_analysis", true);
+        decoderCfg.persistState = m_configManager->GetBool("ReverseEngineering.persist_state", true);
         decoderCfg.outputDirectory = m_configManager->GetString("ReverseEngineering.output_dir", "protocol_analysis");
+        decoderCfg.netfieldsDir = m_configManager->GetString("ReverseEngineering.netfields_dir", "data/re/netfields");
+        decoderCfg.maxChannels = static_cast<uint32_t>(m_configManager->GetInt("ReverseEngineering.max_channels", 1024));
         decoderCfg.exportIntervalSeconds = m_configManager->GetInt("ReverseEngineering.export_interval", 300);
         GetProtocolDecoder().Initialize(decoderCfg);
 
@@ -413,6 +500,41 @@ bool GameServer::Initialize() {
     // when present, otherwise falls back to the statically-compiled registry.
     // Fully guarded — never crashes when neither is available.
     DynamicReloadGeneratedHandlers();
+
+    // Record the configured tick rate so `status`/`tickrate` report truthfully
+    // even before main() installs the GameClock hook.
+    if (m_serverConfig) m_currentTickRate = m_serverConfig->GetTickRate();
+
+    // Local console (stdin) command transport. Enabled by default; a headless
+    // launch with no TTY simply sees EOF and the reader thread exits cleanly.
+    {
+        bool consoleEnabled = m_configManager ? m_configManager->GetBool("Console.enabled", true) : true;
+        if (consoleEnabled) {
+            m_consoleInput = std::make_unique<ConsoleInput>(this);
+            m_consoleInput->Start();
+        } else {
+            Logger::Info("[GameServer::Initialize] Console command input disabled by config");
+        }
+    }
+
+    // Remote SOAP command transport (for tooling / AI automation). Off unless a
+    // port AND password are configured — never expose remote control by default.
+    {
+        RemoteAdminConfig rc;
+        rc.port     = m_configManager ? static_cast<uint16_t>(m_configManager->GetInt("RemoteAdmin.soap_port", 0)) : 0;
+        rc.password = m_configManager ? m_configManager->GetString("RemoteAdmin.password", "") : "";
+        rc.defaultLevel = m_configManager ? m_configManager->GetInt("RemoteAdmin.level", static_cast<int>(CommandLevel::Admin)) : static_cast<int>(CommandLevel::Admin);
+        if (rc.port != 0 && !rc.password.empty()) {
+            m_remoteAdminServer = std::make_unique<RemoteAdminServer>(this, rc);
+            if (!m_remoteAdminServer->Start()) {
+                Logger::Warn("[GameServer::Initialize] Remote SOAP admin server failed to start on port %u", rc.port);
+                m_remoteAdminServer.reset();
+            }
+        } else {
+            Logger::Info("[GameServer::Initialize] Remote SOAP admin server disabled "
+                         "(set RemoteAdmin.soap_port and RemoteAdmin.password to enable)");
+        }
+    }
 
     m_running = true;
     Logger::Info("GameServer initialized successfully");
@@ -452,6 +574,10 @@ void GameServer::Run() {
             continue;
         }
 
+        // Per-packet guard: packet payloads are attacker-controlled. A handler
+        // that throws on a crafted packet is logged non-fatally and we advance to
+        // the next packet, rather than letting one bad packet abort the whole tick.
+        rs2v::Guard("packet dispatch", [&] {
         std::string tag = qpkt.packet.GetTag();
         Logger::Debug("[GameServer::Run] Processing packet tag='%s' from clientId=%u", tag.c_str(), qpkt.clientId);
 
@@ -465,7 +591,7 @@ void GameServer::Run() {
         if (tag != "CHAT_MESSAGE" && !conn->IsHandshakeComplete()) {
             Logger::Warn("[GameServer::Run] Rejecting pre-auth gameplay packet tag='%s' from clientId=%u "
                          "(handshake not complete)", tag.c_str(), qpkt.clientId);
-            continue;
+            return;  // inside rs2v::Guard lambda: return skips this packet (was 'continue' in the raw loop)
         }
 
         if (tag == "CHAT_MESSAGE" && m_chatManager) {
@@ -499,9 +625,10 @@ void GameServer::Run() {
         } else {
             Logger::Debug("[GameServer::Run] Unhandled packet tag '%s' and no GameMode available", tag.c_str());
         }
+        });  // rs2v::Guard (per-packet dispatch)
     }
 
-    float dt = m_tickDeltaSeconds;
+    float dt = m_tickDeltaSeconds * m_timeScale;
 
     // Tick core subsystems with game logic timing
     {
@@ -533,6 +660,11 @@ void GameServer::Run() {
         if (m_supremacyMode) m_supremacyMode->Update(dt);
         if (m_skirmishMode) m_skirmishMode->Update(dt);
 
+        // Central round cycle (opt-in). RoundManager drives GameState's phases
+        // directly, so GameState::Update() is intentionally not ticked here to
+        // avoid a second, conflicting phase driver.
+        if (m_roundManager) m_roundManager->Update();
+
         // Update performance metrics with timing data
         auto frameEnd = std::chrono::high_resolution_clock::now();
         double frameMs = std::chrono::duration<double, std::milli>(frameEnd - frameStart).count();
@@ -556,6 +688,17 @@ void GameServer::Shutdown() {
     m_running = false;
     StopAutoRegen();
 
+    // Stop command transports first so no late command runs against subsystems
+    // that are about to be torn down.
+    if (m_remoteAdminServer) {
+        m_remoteAdminServer->Stop();
+        m_remoteAdminServer.reset();
+    }
+    if (m_consoleInput) {
+        m_consoleInput->Stop();
+        m_consoleInput.reset();
+    }
+
     // Shutdown login bridge / replication first (they reference the game
     // subsystems below). The bridge owns and shuts down its SecurityManager.
     Logger::Debug("[GameServer::Shutdown] Destroying login bridge and replication");
@@ -565,6 +708,14 @@ void GameServer::Shutdown() {
 
     // Shutdown RS2V systems
     Logger::Debug("[GameServer::Shutdown] Destroying RS2V game systems");
+    // Mutators first: OnShutdown may reset DamageSystem state, so do it while
+    // DamageSystem is still alive.
+    if (m_mutatorManager) {
+        m_mutatorManager->Shutdown();
+        m_mutatorManager.reset();
+    }
+    m_roundManager.reset();
+    m_gameState.reset();
     m_skirmishMode.reset();
     m_supremacyMode.reset();
     m_territoryMode.reset();
@@ -585,12 +736,19 @@ void GameServer::Shutdown() {
     } else {
         Logger::Debug("[GameServer::Shutdown] No active GameMode to end");
     }
+    if (m_commandManager) {
+        m_commandManager->Shutdown();
+        m_commandManager.reset();
+    }
     m_chatManager.reset();
     if (m_adminManager) {
         Logger::Debug("[GameServer::Shutdown] Shutting down AdminManager");
         m_adminManager->Shutdown();
         m_adminManager.reset();
     }
+    m_modManager.reset();
+    m_workshopManager.reset();
+    m_mapVoteManager.reset();
     m_mapManager.reset();
     m_teamManager.reset();
     m_playerManager.reset();
@@ -648,9 +806,15 @@ std::vector<std::shared_ptr<ClientConnection>> GameServer::GetAllConnections() c
 PlayerManager*      GameServer::GetPlayerManager()      const { return m_playerManager.get();      }
 TeamManager*        GameServer::GetTeamManager()        const { return m_teamManager.get();        }
 MapManager*         GameServer::GetMapManager()         const { return m_mapManager.get();         }
+MapVoteManager*     GameServer::GetMapVoteManager()     const { return m_mapVoteManager.get();     }
+WorkshopManager*    GameServer::GetWorkshopManager()    const { return m_workshopManager.get();    }
+ModManager*         GameServer::GetModManager()         const { return m_modManager.get();         }
+MutatorManager*     GameServer::GetMutatorManager()     const { return m_mutatorManager.get();     }
 NetworkManager*     GameServer::GetNetworkManager()     const { return m_networkManager.get();     }
 AdminManager*       GameServer::GetAdminManager()       const { return m_adminManager.get();       }
 SecurityManager*    GameServer::GetSecurityManager()    const { return m_loginBridge ? m_loginBridge->GetSecurityManager() : nullptr; }
+ChatManager*        GameServer::GetChatManager()        const { return m_chatManager.get();        }
+CommandManager*     GameServer::GetCommandManager()     const { return m_commandManager.get();     }
 RoleSystem*         GameServer::GetRoleSystem()         const { return m_roleSystem.get();         }
 TicketSystem*       GameServer::GetTicketSystem()       const { return m_ticketSystem.get();       }
 ObjectiveSystem*    GameServer::GetObjectiveSystem()    const { return m_objectiveSystem.get();    }
@@ -663,10 +827,107 @@ HelicopterPhysics*  GameServer::GetHelicopterPhysics()  const { return m_helicop
 TerritoryMode*      GameServer::GetTerritoryMode()      const { return m_territoryMode.get();      }
 SupremacyMode*      GameServer::GetSupremacyMode()      const { return m_supremacyMode.get();      }
 SkirmishMode*       GameServer::GetSkirmishMode()       const { return m_skirmishMode.get();       }
+GameState*          GameServer::GetGameState()          const { return m_gameState.get();          }
+RoundManager*       GameServer::GetRoundManager()       const { return m_roundManager.get();       }
 
 std::shared_ptr<GameConfig>    GameServer::GetGameConfig()    const { return m_gameConfig;    }
 std::shared_ptr<ServerConfig>  GameServer::GetServerConfig()  const { return m_serverConfig;  }
 std::shared_ptr<ConfigManager> GameServer::GetConfigManager() const { return m_configManager; }
+
+// --- Ban administration: forward to the single authoritative store behind the
+// login bridge (SecurityManager/BanManager). The bridge keeps the Security
+// headers out of this TU (they clash with the Network ClientAddress). ---
+
+bool GameServer::BanSteamId(const std::string& steamId, int durationMinutes, const std::string& reason) {
+    return m_loginBridge ? m_loginBridge->BanSteamId(steamId, durationMinutes, reason) : false;
+}
+
+bool GameServer::UnbanSteamId(const std::string& steamId) {
+    return m_loginBridge ? m_loginBridge->UnbanSteamId(steamId) : false;
+}
+
+bool GameServer::IsSteamIdBanned(const std::string& steamId) const {
+    return m_loginBridge ? m_loginBridge->IsSteamIdBanned(steamId) : false;
+}
+
+std::vector<BanRecord> GameServer::GetActiveBans() const {
+    return m_loginBridge ? m_loginBridge->GetActiveBans() : std::vector<BanRecord>{};
+}
+
+// --- Runtime controls driven by the command system ---
+
+void GameServer::RequestShutdown() {
+    Logger::Info("[GameServer::RequestShutdown] Graceful shutdown requested via command");
+    m_shutdownRequested.store(true);
+}
+
+void GameServer::SetTickRateHook(std::function<void(int)> hook) {
+    m_tickRateHook = std::move(hook);
+}
+
+bool GameServer::SetTickRate(int rate) {
+    if (rate < 1 || rate > 256) {
+        Logger::Warn("[GameServer::SetTickRate] Rejected out-of-range tick rate %d", rate);
+        return false;
+    }
+    m_currentTickRate = rate;
+    m_tickDeltaSeconds = 1.0f / static_cast<float>(rate);
+    if (m_tickRateHook) m_tickRateHook(rate);
+    if (m_configManager) m_configManager->SetInt("Network.tick_rate", rate);
+    Logger::Info("[GameServer::SetTickRate] Tick rate set to %d Hz", rate);
+    return true;
+}
+
+void GameServer::SetTimeScale(float scale) {
+    if (scale < 0.05f) scale = 0.05f;
+    if (scale > 8.0f)  scale = 8.0f;
+    m_timeScale = scale;
+    Logger::Info("[GameServer::SetTimeScale] Time scale set to %.2f", scale);
+}
+
+void GameServer::PopulateObjectivesFromMap() {
+    Logger::Trace("[GameServer::PopulateObjectivesFromMap] Entry");
+    if (!m_objectiveSystem || !m_mapManager) {
+        Logger::Debug("[GameServer::PopulateObjectivesFromMap] ObjectiveSystem or MapManager unavailable; skipping");
+        return;
+    }
+
+    // Start from a clean slate so map changes don't accumulate stale zones.
+    m_objectiveSystem->Clear();
+
+    // Register in territory order so any caller-supplied ids are preserved and
+    // the linear ordering (below) lines up with insertion.
+    std::vector<CaptureZone> zones = m_mapManager->GetObjectiveZones();
+    if (zones.empty()) {
+        Logger::Info("[GameServer::PopulateObjectivesFromMap] Map provides no objectives");
+        return;
+    }
+    std::sort(zones.begin(), zones.end(),
+              [](const CaptureZone& a, const CaptureZone& b) { return a.territoryOrder < b.territoryOrder; });
+
+    std::vector<uint32_t> orderedIds;
+    orderedIds.reserve(zones.size());
+    for (const auto& z : zones) {
+        orderedIds.push_back(m_objectiveSystem->AddObjective(z));
+    }
+
+    // Only impose linear territory locking when the active mode is Territory;
+    // other modes keep every objective simultaneously capturable.
+    std::string mode = m_gameConfig ? m_gameConfig->GetGameSettings().gameMode : std::string();
+    std::string modeLower;
+    modeLower.reserve(mode.size());
+    for (char c : mode) modeLower.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+
+    if (modeLower.find("territory") != std::string::npos) {
+        m_objectiveSystem->SetTerritoryOrder(orderedIds);
+        Logger::Info("[GameServer::PopulateObjectivesFromMap] Registered %zu objectives with Territory ordering",
+                     orderedIds.size());
+    } else {
+        Logger::Info("[GameServer::PopulateObjectivesFromMap] Registered %zu objectives (all active)",
+                     orderedIds.size());
+    }
+    Logger::Trace("[GameServer::PopulateObjectivesFromMap] Exit");
+}
 
 void GameServer::ChangeMap() {
     Logger::Trace("[GameServer::ChangeMap] Entry");
@@ -676,7 +937,22 @@ void GameServer::ChangeMap() {
         Logger::Trace("[GameServer::ChangeMap] Exit (no MapManager)");
         return;
     }
-    std::string nextMap = m_mapManager->GetNextMap();
+    // If an end-of-round vote concluded, honor its winner; otherwise fall back
+    // to simple rotation order.
+    std::string nextMap;
+    if (m_mapVoteManager && m_mapVoteManager->IsVoteActive()) {
+        m_pendingVoteWinner = m_mapVoteManager->ResolveWinner();
+        if (!m_pendingVoteWinner.empty()) {
+            Logger::Info("[GameServer::ChangeMap] Using map vote winner: '%s'", m_pendingVoteWinner.c_str());
+        }
+    }
+    if (!m_pendingVoteWinner.empty()) {
+        nextMap = m_pendingVoteWinner;
+        m_pendingVoteWinner.clear();
+    } else {
+        nextMap = m_mapManager->GetNextMap();
+    }
+
     // GUARD: an empty next-map (no rotation configured / lookup miss) must not be
     // fed to LoadMap. Keep the current map running instead of unloading to nothing.
     if (nextMap.empty()) {
@@ -687,6 +963,9 @@ void GameServer::ChangeMap() {
     Logger::Info("[GameServer::ChangeMap] Changing to next map: '%s'", nextMap.c_str());
     if (m_mapManager->LoadMap(nextMap)) {
         Logger::Debug("[GameServer::ChangeMap] Map loaded successfully, transitioning GameMode");
+        // Re-register the new map's objectives with the ObjectiveSystem.
+        PopulateObjectivesFromMap();
+        if (m_mutatorManager) m_mutatorManager->DispatchRoundEnd();
         if (m_gameMode) {
             Logger::Debug("[GameServer::ChangeMap] Ending current GameMode");
             m_gameMode->OnEnd();
@@ -696,6 +975,7 @@ void GameServer::ChangeMap() {
             Logger::Debug("[GameServer::ChangeMap] Creating new GameMode instance");
             m_gameMode = std::make_unique<GameMode>(this, *gmDef);
             m_gameMode->OnStart();
+            if (m_mutatorManager) m_mutatorManager->DispatchRoundStart();
         } else {
             Logger::Warn("[GameServer::ChangeMap] No valid game mode definition found after map change");
         }
@@ -703,6 +983,39 @@ void GameServer::ChangeMap() {
         Logger::Error("[GameServer::ChangeMap] Failed to change to map: %s", nextMap.c_str());
     }
     Logger::Trace("[GameServer::ChangeMap] Exit");
+}
+
+bool GameServer::StartMapVote()
+{
+    if (!m_mapVoteManager) {
+        Logger::Warn("[GameServer::StartMapVote] No MapVoteManager available");
+        return false;
+    }
+    if (!m_mapVoteManager->IsEnabled()) {
+        Logger::Debug("[GameServer::StartMapVote] Map voting disabled by config");
+        return false;
+    }
+    std::string current = m_mapManager ? m_mapManager->GetCurrentMapName() : "";
+    const auto& candidates = m_mapVoteManager->StartVote(current);
+    if (candidates.empty()) {
+        Logger::Warn("[GameServer::StartMapVote] No candidates; vote not started");
+        return false;
+    }
+
+    // Announce options to players.
+    std::string msg = "Map vote started! Type votemap <number>:";
+    BroadcastChatMessage(msg);
+    for (size_t i = 0; i < candidates.size(); ++i) {
+        BroadcastChatMessage("  " + std::to_string(i + 1) + ") " + candidates[i].displayName);
+    }
+    Logger::Info("[GameServer::StartMapVote] Vote started with %zu options", candidates.size());
+    return true;
+}
+
+bool GameServer::CastMapVote(uint32_t clientId, int optionIndex)
+{
+    if (!m_mapVoteManager) return false;
+    return m_mapVoteManager->CastVote(clientId, optionIndex);
 }
 
 // Packet queue implementation

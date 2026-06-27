@@ -87,7 +87,21 @@ bool MessageDecoder::DecodeAction(const Packet& pkt, uint32_t& outClientId,
     uint32_t argCount = copy.ReadUInt();
     Logger::Debug("[MessageDecoder::DecodeAction] read clientId=%u, action='%s', argCount=%u",
                   outClientId, outAction.c_str(), argCount);
+    // SECURITY: argCount is a fully attacker-controlled uint32. The per-string reads
+    // below are bounds-safe (ReadString returns "" past the end), but the LOOP itself
+    // is bounded only by argCount — a hostile value like 0xFFFFFFFF would push billions
+    // of empty strings into outArgs, exhausting memory (DoS) before any read fails.
+    // Each argument is a length-prefixed string costing >= 4 bytes on the wire, so a
+    // legitimate argCount can never exceed remaining/4. Reject anything larger.
+    const size_t maxArgs = copy.BytesRemaining() / 4;
+    if (argCount > maxArgs) {
+        Logger::Warn("MessageDecoder: argCount %u exceeds max %zu for client %u — rejecting action",
+                     argCount, maxArgs, outClientId);
+        Logger::Trace("[MessageDecoder::DecodeAction] exit — returning false (argCount out of range)");
+        return false;
+    }
     outArgs.clear();
+    outArgs.reserve(argCount);
     for (uint32_t i = 0; i < argCount; ++i) {
         std::string arg = copy.ReadString();
         Logger::Trace("[MessageDecoder::DecodeAction] read arg[%u]='%s'", i, arg.c_str());

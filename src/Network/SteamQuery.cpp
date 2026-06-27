@@ -94,7 +94,12 @@ bool SteamQuery::ParseInfoResponse(const std::vector<uint8_t>& buf, SteamServerI
         while (offset < buf.size() && buf[offset] != '\0') {
             out.push_back(buf[offset++]);
         }
-        offset++;
+        // Only step over the NUL terminator if one is actually present. A response
+        // from a malicious/MITM'd server may omit it; advancing unconditionally would
+        // push offset past buf.size() and could underflow later "remaining" maths.
+        if (offset < buf.size()) {
+            ++offset;
+        }
     };
     // Skip protocol byte
     // offset already at first char of name

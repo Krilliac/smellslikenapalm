@@ -32,11 +32,26 @@ void ObjectiveSystem::Shutdown() {
 
 uint32_t ObjectiveSystem::AddObjective(const CaptureZone& zone) {
     CaptureZone z = zone;
-    z.id = m_nextObjectiveId++;
+    // Preserve a caller-supplied id (e.g. one loaded from map data) so the
+    // ObjectiveSystem, MapManager and GameState all agree on objective ids.
+    // Fall back to an auto-assigned id when none was provided (id == 0).
+    if (z.id == 0) {
+        z.id = m_nextObjectiveId++;
+    } else if (z.id >= m_nextObjectiveId) {
+        m_nextObjectiveId = z.id + 1;
+    }
     m_objectives[z.id] = z;
     Logger::Info("Objective added: '%s' (id=%u) at (%.1f, %.1f, %.1f) radius=%.1f",
                  z.name.c_str(), z.id, z.position.x, z.position.y, z.position.z, z.captureRadius);
     return z.id;
+}
+
+void ObjectiveSystem::Clear() {
+    m_objectives.clear();
+    m_territoryOrder.clear();
+    m_currentTerritoryIndex = 0;
+    m_nextObjectiveId = 1;
+    Logger::Debug("ObjectiveSystem cleared");
 }
 
 void ObjectiveSystem::RemoveObjective(uint32_t objectiveId) {
@@ -223,10 +238,15 @@ void ObjectiveSystem::ProcessCapture(CaptureZone& zone, float deltaSeconds) {
         if (zone.captureProgress >= 1.0f) {
             zone.captureProgress = 1.0f;
 
-            // Determine which team captured it
-            auto* tm = m_server->GetTeamManager();
+            // Determine which team captured it. attackerIds is guaranteed non-empty
+            // here (attackers > 0), but GetTeamManager() may be null during teardown;
+            // guard the dereference rather than trust it blindly.
+            auto* tm = m_server ? m_server->GetTeamManager() : nullptr;
+            if (!tm) {
+                Logger::Warn("[ObjectiveSystem::ProcessCapture] No TeamManager available; skipping capture resolution");
+                return;
+            }
             uint32_t capturingTeam = tm->GetPlayerTeam(zone.attackerIds.front());
-            uint32_t previousTeam = zone.controllingTeam;
             OnObjectiveCaptured(zone, capturingTeam);
         }
     }

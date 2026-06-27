@@ -374,6 +374,80 @@ int ServerConfig::GetEACListenPort() const {
     return result;
 }
 
+// Steam Workshop
+std::string ServerConfig::GetWorkshopItemsFile() const {
+    Logger::Trace("[ServerConfig::GetWorkshopItemsFile] Entry");
+    auto result = m_mgr->GetString("Workshop.items_file", "config/workshop_items.txt");
+    Logger::Trace("[ServerConfig::GetWorkshopItemsFile] Exit - returning '%s'", result.c_str());
+    return result;
+}
+bool ServerConfig::IsWorkshopDownloadEnabled() const {
+    Logger::Trace("[ServerConfig::IsWorkshopDownloadEnabled] Entry");
+    bool result = m_mgr->GetBool("Workshop.download_enabled", false);
+    Logger::Trace("[ServerConfig::IsWorkshopDownloadEnabled] Exit - returning %s", result ? "true" : "false");
+    return result;
+}
+int ServerConfig::GetWorkshopAppId() const {
+    Logger::Trace("[ServerConfig::GetWorkshopAppId] Entry");
+    int result = m_mgr->GetInt("Workshop.app_id", 418460); // Rising Storm 2: Vietnam
+    Logger::Trace("[ServerConfig::GetWorkshopAppId] Exit - returning %d", result);
+    return result;
+}
+std::string ServerConfig::GetSteamCmdPath() const {
+    Logger::Trace("[ServerConfig::GetSteamCmdPath] Entry");
+    auto result = m_mgr->GetString("Workshop.steamcmd_path", "steamcmd");
+    Logger::Trace("[ServerConfig::GetSteamCmdPath] Exit - returning '%s'", result.c_str());
+    return result;
+}
+std::string ServerConfig::GetWorkshopInstallDir() const {
+    Logger::Trace("[ServerConfig::GetWorkshopInstallDir] Entry");
+    auto result = m_mgr->GetString("Workshop.install_dir", "");
+    Logger::Trace("[ServerConfig::GetWorkshopInstallDir] Exit - returning '%s'", result.c_str());
+    return result;
+}
+
+// Map voting
+bool ServerConfig::IsMapVoteEnabled() const {
+    Logger::Trace("[ServerConfig::IsMapVoteEnabled] Entry");
+    bool result = m_mgr->GetBool("MapVote.enabled", true);
+    Logger::Trace("[ServerConfig::IsMapVoteEnabled] Exit - returning %s", result ? "true" : "false");
+    return result;
+}
+int ServerConfig::GetMapVoteOptions() const {
+    Logger::Trace("[ServerConfig::GetMapVoteOptions] Entry");
+    int result = m_mgr->GetInt("MapVote.options", 4);
+    Logger::Trace("[ServerConfig::GetMapVoteOptions] Exit - returning %d", result);
+    return result;
+}
+int ServerConfig::GetMapVoteDuration() const {
+    Logger::Trace("[ServerConfig::GetMapVoteDuration] Entry");
+    int result = m_mgr->GetInt("MapVote.duration_s", 30);
+    Logger::Trace("[ServerConfig::GetMapVoteDuration] Exit - returning %d", result);
+    return result;
+}
+
+// Mods
+std::string ServerConfig::GetModsDir() const {
+    Logger::Trace("[ServerConfig::GetModsDir] Entry");
+    auto result = m_mgr->GetString("DataPaths.mods_path", "data/mods/");
+    Logger::Trace("[ServerConfig::GetModsDir] Exit - returning '%s'", result.c_str());
+    return result;
+}
+
+// Mutators
+bool ServerConfig::IsMutatorsEnabled() const {
+    Logger::Trace("[ServerConfig::IsMutatorsEnabled] Entry");
+    bool result = m_mgr->GetBool("Mutators.enabled", false);
+    Logger::Trace("[ServerConfig::IsMutatorsEnabled] Exit - returning %s", result ? "true" : "false");
+    return result;
+}
+std::string ServerConfig::GetEnabledMutators() const {
+    Logger::Trace("[ServerConfig::GetEnabledMutators] Entry");
+    auto result = m_mgr->GetString("Mutators.enabled_list", "");
+    Logger::Trace("[ServerConfig::GetEnabledMutators] Exit - returning '%s'", result.c_str());
+    return result;
+}
+
 // Access underlying ConfigManager
 std::shared_ptr<ConfigManager> ServerConfig::GetManager() const {
     Logger::Trace("[ServerConfig::GetManager] Entry");

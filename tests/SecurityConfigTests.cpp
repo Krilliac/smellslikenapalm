@@ -9,7 +9,7 @@
 // 5. Live reload of security settings.
 // 6. Edge cases: missing section, invalid values, zero/negative durations.
 
-#include <gtest/gtest.h>
+#include "TestFramework.h"
 #include <filesystem>
 #include <fstream>
 #include "Config/ConfigManager.h"
@@ -26,7 +26,7 @@ void WriteFile(const std::string &name, const std::string &text) {
     out << text;
 }
 
-struct SecurityConfigTest : public ::testing::Test {
+struct SecurityConfigTest : public ::rs2v::Test {
     void SetUp() override {
         std::filesystem::remove_all(kTmpDir);
     }
