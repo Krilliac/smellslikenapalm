@@ -1090,11 +1090,26 @@ void GameServer::HandleWeaponFire(uint32_t clientId, const std::vector<uint8_t>&
         return;  // Miss — no damage
     }
 
-    // Calculate damage using weapon database.
-    // GUARD: m_playerManager can be null during shutdown; also avoid the
-    // double GetPlayer() lookup (and a possible null deref on the second call).
+    // GUARD: the attacker must be a live participant. This legacy path trusts an
+    // attacker-supplied victimId, so a dead/spectating/never-spawned client could
+    // otherwise claim kills. Mirrors the HandleVehicleAction ownership guard (af0d970).
+    auto attackerPlayer = m_playerManager ? m_playerManager->GetPlayer(clientId) : nullptr;
+    if (!attackerPlayer || !attackerPlayer->IsAlive()) {
+        Logger::Warn("[GameServer::HandleWeaponFire] Rejecting fire from clientId=%u: attacker not alive/unknown", clientId);
+        Logger::Trace("[GameServer::HandleWeaponFire] Exit (attacker invalid)");
+        return;
+    }
+
+    // GUARD: the victim must resolve to a real, live player. An attacker-supplied victimId
+    // that doesn't exist or is already dead is a spoofed/garbage hit - drop it. (Also avoids
+    // the former double GetPlayer() lookup / possible null deref.)
     auto victimPlayer = m_playerManager ? m_playerManager->GetPlayer(victimId) : nullptr;
-    float distance = victimPlayer ? origin.Distance(victimPlayer->GetPosition()) : 0.0f;
+    if (!victimPlayer || !victimPlayer->IsAlive()) {
+        Logger::Warn("[GameServer::HandleWeaponFire] Rejecting fire from clientId=%u: victim %u invalid/dead", clientId, victimId);
+        Logger::Trace("[GameServer::HandleWeaponFire] Exit (victim invalid)");
+        return;
+    }
+    float distance = origin.Distance(victimPlayer->GetPosition());
 
     auto* weaponDef = m_weaponDatabase ? m_weaponDatabase->GetWeapon(weaponId) : nullptr;
     if (!weaponDef) {
