@@ -5,6 +5,7 @@
 #include "Utils/PacketAnalysis.h"
 #include "Game/GameServer.h"
 #include "Game/TeamManager.h"
+#include "Game/TicketSystem.h"
 #include "Config/ServerConfig.h"
 #include "Network/ClientConnection.h"
 #include <chrono>
@@ -100,7 +101,23 @@ void PlayerManager::Update()
         // joined a team and died.
         if (pl->GetState() == PlayerState::Dead && pl->GetTeam() != 0 &&
             pl->CanRespawn(m_respawnDelaySec)) {
-            OnPlayerSpawn(id);
+            // Block respawn once the team has exhausted its reinforcement tickets,
+            // mirroring ROGameInfo.PlayerShouldRespawn (returns false when
+            // Team.ReinforcementsRemaining <= 0 for ticket-based modes). The per-death
+            // cost is already debited via TicketSystem::OnPlayerKilled, so we ONLY gate
+            // here - adding a per-spawn decrement would double-count the death. A team
+            // with no ticket pool (GetInitialTickets == 0, e.g. an unlimited/Supremacy
+            // config) is never gated, preserving the prior unlimited-respawn behavior.
+            auto* ts = m_server->GetTicketSystem();
+            const uint32_t team = pl->GetTeam();
+            const bool outOfReinforcements =
+                ts && ts->GetInitialTickets(team) > 0 && !ts->HasTickets(team);
+            if (outOfReinforcements) {
+                Logger::Debug("PlayerManager: Player %u ready to respawn but team %u is out "
+                              "of reinforcements; staying down", id, team);
+            } else {
+                OnPlayerSpawn(id);
+            }
         }
         pl->Update(deltaSeconds);
     }
