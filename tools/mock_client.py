@@ -479,14 +479,28 @@ def spawn(host, port):
     ack_only = sum(1 for d in after if d.get("ok") and not d.get("bunches") and d.get("acks"))
     bunch_pkts = sum(1 for d in after if d.get("bunches"))
 
+    # Possession RPCs on ch2 (server->client): ClientRestart (h85) is the RPC that makes the client
+    # accept the pawn + leave the menu; PC.Pawn (h24) points the controller at the pawn channel.
+    # Their first payload byte is SerializeInt(handle, 531)'s low byte, which equals the handle for
+    # handle < 128 (85 -> 0x55, 24 -> 0x18). Requiring ClientRestart makes this gate verify the full
+    # possession SEQUENCE (open + possess), not just that a channel opened.
+    ch2_nmts = {b2["nmt"] for d in after for b2 in d.get("bunches", []) if b2["chIndex"] == 2 and b2["nmt"] is not None}
+    has_client_restart = 0x55 in ch2_nmts   # ClientRestart(h85) - the possession trigger
+    has_pc_pawn        = 0x18 in ch2_nmts    # PlayerController.Pawn(h24) -> pawn channel
+
     print()
     print(f"     pawn channel opens (>ch{BOOTSTRAP_CH_MAX}) after role-select: {pawn_opens}")
+    print(f"     possession RPCs on ch2: ClientRestart(h85)={'yes' if has_client_restart else 'NO'}, "
+          f"PC.Pawn(h24)={'yes' if has_pc_pawn else 'NO'}")
     print(f"     server data packets: {bunch_pkts}; standalone ack-only datagrams: {ack_only}")
-    ok = bool(pawn_opens)
+    ok = bool(pawn_opens) and has_client_restart
     if ok:
-        print(f"\n=== spawn: PASS - server opened pawn channel(s) {pawn_opens} in response to SelectRoleByClass ===")
+        print(f"\n=== spawn: PASS - server opened pawn channel(s) {pawn_opens} + sent ClientRestart possession RPC ===")
     else:
-        print("\n=== spawn: FAIL - no pawn channel opened after SelectRoleByClass (check team->role advance) ===")
+        miss = []
+        if not pawn_opens: miss.append("no pawn channel opened")
+        if not has_client_restart: miss.append("no ClientRestart(h85) possession RPC")
+        print(f"\n=== spawn: FAIL - {'; '.join(miss)} (check team->role advance / pawn-spawn) ===")
     sock.close()
     return 0 if ok else 1
 
