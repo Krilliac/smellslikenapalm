@@ -9,6 +9,8 @@
 #include <thread>
 #include <mutex>
 #include <queue>
+#include <unordered_map>
+#include <cstdint>
 #include "Network/Packet.h"
 
 class NetworkManager;
@@ -156,6 +158,11 @@ private:
     // Game tick timing
     float m_lastTickTime = 0.0f;
     float m_tickDeltaSeconds = 1.0f / 60.0f;  // 60Hz default
+
+    // Per-client last weapon-fire timestamp (ms, steady_clock) for the server-side rate-of-fire
+    // gate in HandleWeaponFire. Partial of the "no server-side firing authority" finding; full
+    // per-player Weapon-instance ammo/reload wiring is a follow-up.
+    std::unordered_map<uint32_t, uint64_t> m_lastWeaponFireMs;
 
     // Packet handlers for RS2V systems
     void HandleRoleSelection(uint32_t clientId, const std::vector<uint8_t>& data);

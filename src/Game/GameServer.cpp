@@ -1127,6 +1127,29 @@ void GameServer::HandleWeaponFire(uint32_t clientId, const std::vector<uint8_t>&
     if (!weaponDef) {
         Logger::Warn("[GameServer::HandleWeaponFire] Weapon '%s' not found in database, using default damage", weaponId.c_str());
     }
+
+    // GUARD (server-side rate-of-fire): the weapon's fireRate (RPM) bounds how often a client can
+    // register a damaging shot. Reject hits arriving faster than the weapon physically fires (with
+    // a 20% jitter tolerance). The source is fully server-authoritative over firing (ROWeapon
+    // GetFireInterval + ConsumeAmmo); this is a PARTIAL of that finding - the full per-player
+    // Weapon-instance ammo/magazine/reload wiring is a tracked follow-up. Without it a client could
+    // claim hits at any cadence (the Weapon class is orphaned from this path).
+    if (weaponDef && weaponDef->stats.fireRate > 0.0f) {
+        const uint64_t nowMs = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
+        const double minIntervalMs = 60000.0 / weaponDef->stats.fireRate;  // RPM -> ms per shot
+        auto it = m_lastWeaponFireMs.find(clientId);
+        if (it != m_lastWeaponFireMs.end() &&
+            static_cast<double>(nowMs - it->second) < minIntervalMs * 0.8) {
+            Logger::Warn("[GameServer::HandleWeaponFire] Rejecting too-fast shot from clientId=%u ('%s' %.0f RPM -> >=%.0fms/shot, got %llums)",
+                         clientId, weaponId.c_str(), weaponDef->stats.fireRate, minIntervalMs,
+                         static_cast<unsigned long long>(nowMs - it->second));
+            Logger::Trace("[GameServer::HandleWeaponFire] Exit (rate-of-fire violation)");
+            return;
+        }
+        m_lastWeaponFireMs[clientId] = nowMs;
+    }
+
     float baseDmg = weaponDef ? m_weaponDatabase->CalculateDamage(
         weaponId, distance, hitZone == HitZone::Head,
         hitZone == HitZone::LeftArm || hitZone == HitZone::RightArm ||
