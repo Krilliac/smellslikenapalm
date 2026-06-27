@@ -6,13 +6,13 @@
 #include "Game/GameServer.h"
 #include <algorithm>
 #include <sstream>
-#include "Game/AdminManager.h"
+#include "Game/CommandManager.h"
 #include "Game/MapVoteManager.h"
 
 ChatManager::ChatManager(GameServer* server)
     : m_server(server)
 {
-    Logger::Trace("[ChatManager::ChatManager] Entry: server=%p", server);
+    Logger::Trace("[ChatManager::ChatManager] Entry: server=%p", static_cast<const void*>(server));
     Logger::Info("ChatManager initialized");
     Logger::Trace("[ChatManager::ChatManager] Exit");
 }
@@ -301,15 +301,28 @@ void ChatManager::ProcessChatCommand(uint32_t clientId, const std::string& messa
         }
     }
     else {
-        Logger::Debug("[ChatManager::ProcessChatCommand] Unknown built-in command '%s', passing to AdminManager", cmd.c_str());
-        // Unknown or pass to admin/command manager
-        AdminManager* admin = m_server->GetAdminManager();
-        if (!admin) {
-            Logger::Warn("[ChatManager::ProcessChatCommand] AdminManager unavailable — dropping command '%s' from client %u", cmd.c_str(), clientId);
-            Logger::Trace("[ChatManager::ProcessChatCommand] Exit (no admin manager)");
+        // Everything else routes through the unified command system, which
+        // resolves the player's permission level and enforces it centrally.
+        Logger::Debug("[ChatManager::ProcessChatCommand] Dispatching '%s' via CommandManager", cmd.c_str());
+        CommandManager* cmdMgr = m_server->GetCommandManager();
+        auto conn = m_server->GetClientConnection(clientId);
+        if (!cmdMgr || !conn) {
+            Logger::Warn("[ChatManager::ProcessChatCommand] CommandManager/connection unavailable — dropping command '%s' from client %u", cmd.c_str(), clientId);
+            Logger::Trace("[ChatManager::ProcessChatCommand] Exit (no command manager)");
             return;
         }
-        admin->HandleAdminCommand(clientId, cmd, parts);
+        CommandContext ctx;
+        ctx.source   = CommandSource::InGame;
+        ctx.clientId = clientId;
+        ctx.invoker  = conn->GetSteamID();
+        ctx.server   = m_server;
+        ctx.level    = cmdMgr->ResolveLevelForClient(clientId);
+        std::weak_ptr<ClientConnection> weakConn = conn;
+        ctx.out = [weakConn](std::string_view line) {
+            if (auto c = weakConn.lock()) c->SendChatMessage(std::string(line));
+        };
+        ctx.args = parts;
+        cmdMgr->ExecuteParsed(ctx, cmd);
     }
     Logger::Trace("[ChatManager::ProcessChatCommand] Exit");
 }

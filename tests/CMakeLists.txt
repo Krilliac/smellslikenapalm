@@ -74,6 +74,7 @@ rs2v_add_test(NetworkUtilsTests)       # Network/NetworkUtils: IPv4 validate/nor
 rs2v_add_test(BoundsTests)             # Game/Bounds: AABB contains/center/size
 rs2v_add_test(RandomGeneratorTests)    # Utils/RandomGenerator: seed determinism, range bounds
 rs2v_add_test(CompressionHandlerTests) # Protocol/CompressionHandler: NONE + zlib round-trips
+rs2v_add_test(CommandManagerTests)     # Game/CommandManager + Network/RemoteAdminServer: tokenise/alias/permission-gate/help-visibility + defensive SOAP XML parse
 
 # Scripting is OFF by default (deprecated .NET COM hosting). The scripting test
 # is gated on ENABLE_SCRIPTING, but it ALSO references Scripting/ScriptEngine.h

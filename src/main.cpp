@@ -334,9 +334,13 @@ int main(int argc, char* argv[])
     Logger::Info("[main] Setting tick rate to %d ticks/sec", tickRate);
     gameClock.SetTickRate(tickRate);
 
+    // Let the `tickrate` command reach the GameClock without GameServer having to
+    // depend on it. Invoked from the console/remote command threads.
+    g_server->SetTickRateHook([&gameClock](int r) { gameClock.SetTickRate(static_cast<uint32_t>(r)); });
+
     Logger::Trace("[main] Registering tick callback for main game loop...");
     gameClock.RegisterTickCallback([&](GameClock::Duration /*delta*/) {
-        if (g_shutdownRequested) {
+        if (g_shutdownRequested || (g_server && g_server->IsShutdownRequested())) {
             Logger::Debug("[main::TickCallback] Shutdown requested, stopping game clock");
             gameClock.Stop();
             return;
