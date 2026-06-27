@@ -72,6 +72,7 @@ public:
     // Objective management
     uint32_t AddObjective(const CaptureZone& zone);
     void RemoveObjective(uint32_t objectiveId);
+    void Clear();   // Remove all objectives and reset territory ordering
     CaptureZone* GetObjective(uint32_t id);
     const CaptureZone* GetObjective(uint32_t id) const;
     std::vector<const CaptureZone*> GetAllObjectives() const;

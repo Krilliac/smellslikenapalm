@@ -32,6 +32,9 @@
 #include "Game/TerritoryMode.h"
 #include "Game/SupremacyMode.h"
 #include "Game/SkirmishMode.h"
+#include "Game/GameState.h"
+#include "Game/RoundManager.h"
+#include "Game/MapManager.h"
 #include "Game/ConnectionLoginBridge.h"
 #include "Protocol/ProtocolHandler.h"
 #include "Protocol/ReplicationManager.h"
@@ -43,6 +46,8 @@
 #include <thread>
 #include <cstdlib>
 #include <cstring>
+#include <algorithm>
+#include <cctype>
 #include <filesystem>
 
 using namespace GeneratedHandlers;
@@ -279,6 +284,10 @@ bool GameServer::Initialize() {
         if (m_territoryMode) m_territoryMode->OnObjectiveCaptured(objId, capTeam);
         if (m_supremacyMode) m_supremacyMode->OnObjectiveCaptured(objId, capTeam);
         if (m_skirmishMode) m_skirmishMode->OnObjectiveCaptured(objId, capTeam);
+        // Central round/state layer (opt-in): mirror ownership into GameState
+        // and let RoundManager evaluate early round-end win conditions.
+        if (m_gameState)    m_gameState->CaptureObjective(objId, capTeam);
+        if (m_roundManager) m_roundManager->OnObjectiveCaptured(objId, capTeam);
     });
 
     m_commanderAbilities = std::make_unique<CommanderAbilities>(this);
@@ -393,6 +402,31 @@ bool GameServer::Initialize() {
         Logger::Warn("[GameServer::Initialize] Failed to load map: %s — continuing without map", mapName.c_str());
     } else if (!mapName.empty()) {
         Logger::Debug("[GameServer::Initialize] Map '%s' loaded successfully", mapName.c_str());
+        // Register the loaded map's objectives with the (already-ticking)
+        // ObjectiveSystem so capture zones become live.
+        PopulateObjectivesFromMap();
+    }
+
+    // Optional central round/state layer. Off by default: the per-mode classes
+    // (TerritoryMode/SupremacyMode/SkirmishMode) already drive rounds, so this
+    // is opt-in to avoid two independent phase drivers. When enabled, GameState
+    // holds the authoritative phase/score/objective state and RoundManager
+    // cycles Preparation -> Active -> PostRound over it.
+    if (m_configManager && m_configManager->GetBool("Game.use_round_manager", false)) {
+        Logger::Info("[GameServer::Initialize] Central round manager ENABLED (Game.use_round_manager)");
+        m_gameState = std::make_unique<GameState>(this);
+        m_gameState->Initialize();   // pulls objective ids from the loaded map
+
+        m_roundManager = std::make_unique<RoundManager>(this);
+        m_roundManager->Initialize(); // binds to GameState via GetGameState()
+        m_roundManager->SetOnRoundStart([this]() {
+            Logger::Info("[GameServer] Round started (RoundManager)");
+        });
+        m_roundManager->SetOnRoundEnd([this]() {
+            Logger::Info("[GameServer] Round ended (RoundManager)");
+        });
+    } else {
+        Logger::Debug("[GameServer::Initialize] Central round manager disabled (default); per-mode drivers active");
     }
 
     const auto& gmDef = m_gameConfig->GetGameModeDefinition(m_gameConfig->GetGameSettings().gameMode);
@@ -559,6 +593,11 @@ void GameServer::Run() {
         if (m_supremacyMode) m_supremacyMode->Update(dt);
         if (m_skirmishMode) m_skirmishMode->Update(dt);
 
+        // Central round cycle (opt-in). RoundManager drives GameState's phases
+        // directly, so GameState::Update() is intentionally not ticked here to
+        // avoid a second, conflicting phase driver.
+        if (m_roundManager) m_roundManager->Update();
+
         // Update performance metrics with timing data
         auto frameEnd = std::chrono::high_resolution_clock::now();
         double frameMs = std::chrono::duration<double, std::milli>(frameEnd - frameStart).count();
@@ -597,6 +636,8 @@ void GameServer::Shutdown() {
         m_mutatorManager->Shutdown();
         m_mutatorManager.reset();
     }
+    m_roundManager.reset();
+    m_gameState.reset();
     m_skirmishMode.reset();
     m_supremacyMode.reset();
     m_territoryMode.reset();
@@ -701,10 +742,56 @@ HelicopterPhysics*  GameServer::GetHelicopterPhysics()  const { return m_helicop
 TerritoryMode*      GameServer::GetTerritoryMode()      const { return m_territoryMode.get();      }
 SupremacyMode*      GameServer::GetSupremacyMode()      const { return m_supremacyMode.get();      }
 SkirmishMode*       GameServer::GetSkirmishMode()       const { return m_skirmishMode.get();       }
+GameState*          GameServer::GetGameState()          const { return m_gameState.get();          }
+RoundManager*       GameServer::GetRoundManager()       const { return m_roundManager.get();       }
 
 std::shared_ptr<GameConfig>    GameServer::GetGameConfig()    const { return m_gameConfig;    }
 std::shared_ptr<ServerConfig>  GameServer::GetServerConfig()  const { return m_serverConfig;  }
 std::shared_ptr<ConfigManager> GameServer::GetConfigManager() const { return m_configManager; }
+
+void GameServer::PopulateObjectivesFromMap() {
+    Logger::Trace("[GameServer::PopulateObjectivesFromMap] Entry");
+    if (!m_objectiveSystem || !m_mapManager) {
+        Logger::Debug("[GameServer::PopulateObjectivesFromMap] ObjectiveSystem or MapManager unavailable; skipping");
+        return;
+    }
+
+    // Start from a clean slate so map changes don't accumulate stale zones.
+    m_objectiveSystem->Clear();
+
+    // Register in territory order so any caller-supplied ids are preserved and
+    // the linear ordering (below) lines up with insertion.
+    std::vector<CaptureZone> zones = m_mapManager->GetObjectiveZones();
+    if (zones.empty()) {
+        Logger::Info("[GameServer::PopulateObjectivesFromMap] Map provides no objectives");
+        return;
+    }
+    std::sort(zones.begin(), zones.end(),
+              [](const CaptureZone& a, const CaptureZone& b) { return a.territoryOrder < b.territoryOrder; });
+
+    std::vector<uint32_t> orderedIds;
+    orderedIds.reserve(zones.size());
+    for (const auto& z : zones) {
+        orderedIds.push_back(m_objectiveSystem->AddObjective(z));
+    }
+
+    // Only impose linear territory locking when the active mode is Territory;
+    // other modes keep every objective simultaneously capturable.
+    std::string mode = m_gameConfig ? m_gameConfig->GetGameSettings().gameMode : std::string();
+    std::string modeLower;
+    modeLower.reserve(mode.size());
+    for (char c : mode) modeLower.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+
+    if (modeLower.find("territory") != std::string::npos) {
+        m_objectiveSystem->SetTerritoryOrder(orderedIds);
+        Logger::Info("[GameServer::PopulateObjectivesFromMap] Registered %zu objectives with Territory ordering",
+                     orderedIds.size());
+    } else {
+        Logger::Info("[GameServer::PopulateObjectivesFromMap] Registered %zu objectives (all active)",
+                     orderedIds.size());
+    }
+    Logger::Trace("[GameServer::PopulateObjectivesFromMap] Exit");
+}
 
 void GameServer::ChangeMap() {
     Logger::Trace("[GameServer::ChangeMap] Entry");
@@ -740,6 +827,8 @@ void GameServer::ChangeMap() {
     Logger::Info("[GameServer::ChangeMap] Changing to next map: '%s'", nextMap.c_str());
     if (m_mapManager->LoadMap(nextMap)) {
         Logger::Debug("[GameServer::ChangeMap] Map loaded successfully, transitioning GameMode");
+        // Re-register the new map's objectives with the ObjectiveSystem.
+        PopulateObjectivesFromMap();
         if (m_mutatorManager) m_mutatorManager->DispatchRoundEnd();
         if (m_gameMode) {
             Logger::Debug("[GameServer::ChangeMap] Ending current GameMode");

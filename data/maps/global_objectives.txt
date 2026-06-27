@@ -1,0 +1,16 @@
+# RS2V global objective / capture-zone templates
+# Used as a fallback when a map provides no per-map objectives.txt.
+# Format: name x y z [radius] [order] [tunnel 0/1] [tunnelX tunnelY tunnelZ]
+#   name     - short capture-zone label (no spaces)
+#   x y z    - world position of the zone centre
+#   radius   - capture radius in metres (optional, default 30)
+#   order    - linear capture order for Territory mode (optional, default = line order)
+#   tunnel   - 1 if a VC/NVA tunnel spawn sits at this objective (optional)
+#   tunnelX/Y/Z - tunnel spawn position (optional; defaults to the zone centre)
+#
+# These are generic, evenly-spread points; authored maps should ship their own
+# maps/<MapID>/objectives.txt for balanced, in-world placement.
+Alpha    -300.0  0.0  0.0  35  0
+Bravo    -100.0  0.0  0.0  35  1
+Charlie   100.0  0.0  0.0  35  2  1   110.0  0.0  0.0
+Delta     300.0  0.0  0.0  35  3

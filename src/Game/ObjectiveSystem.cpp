@@ -32,11 +32,26 @@ void ObjectiveSystem::Shutdown() {
 
 uint32_t ObjectiveSystem::AddObjective(const CaptureZone& zone) {
     CaptureZone z = zone;
-    z.id = m_nextObjectiveId++;
+    // Preserve a caller-supplied id (e.g. one loaded from map data) so the
+    // ObjectiveSystem, MapManager and GameState all agree on objective ids.
+    // Fall back to an auto-assigned id when none was provided (id == 0).
+    if (z.id == 0) {
+        z.id = m_nextObjectiveId++;
+    } else if (z.id >= m_nextObjectiveId) {
+        m_nextObjectiveId = z.id + 1;
+    }
     m_objectives[z.id] = z;
     Logger::Info("Objective added: '%s' (id=%u) at (%.1f, %.1f, %.1f) radius=%.1f",
                  z.name.c_str(), z.id, z.position.x, z.position.y, z.position.z, z.captureRadius);
     return z.id;
+}
+
+void ObjectiveSystem::Clear() {
+    m_objectives.clear();
+    m_territoryOrder.clear();
+    m_currentTerritoryIndex = 0;
+    m_nextObjectiveId = 1;
+    Logger::Debug("ObjectiveSystem cleared");
 }
 
 void ObjectiveSystem::RemoveObjective(uint32_t objectiveId) {

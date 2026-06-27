@@ -21,6 +21,12 @@ RoundManager::~RoundManager() = default;
 
 void RoundManager::Initialize()
 {
+    // Bind to the server's authoritative GameState so phase/round transitions
+    // and win-condition checks operate on real state instead of a null pointer.
+    m_gameState = m_server ? m_server->GetGameState() : nullptr;
+    if (!m_gameState) {
+        Logger::Warn("RoundManager: no GameState available; phase transitions will not update central state");
+    }
     Logger::Info("RoundManager initialized");
     m_roundNumber = 0;
     StartPreparation();
