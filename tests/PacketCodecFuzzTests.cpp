@@ -286,8 +286,8 @@ void ExpectFieldsEqual(const Packet& a, const Packet& b) {
         }
         EXPECT_EQ(x.bReliable, y.bReliable) << "bunch " << i;
         EXPECT_EQ(x.chIndex, y.chIndex) << "bunch " << i;
-        if (x.bReliable) EXPECT_EQ(x.chSequence, y.chSequence) << "bunch " << i;
-        if (x.bReliable || x.bOpen) EXPECT_EQ(x.chType, y.chType) << "bunch " << i;
+        if (x.bReliable) { EXPECT_EQ(x.chSequence, y.chSequence) << "bunch " << i; }
+        if (x.bReliable || x.bOpen) { EXPECT_EQ(x.chType, y.chType) << "bunch " << i; }
         EXPECT_EQ(x.payloadBits, y.payloadBits) << "bunch " << i;
         EXPECT_EQ(x.payload, y.payload) << "bunch " << i;
     }

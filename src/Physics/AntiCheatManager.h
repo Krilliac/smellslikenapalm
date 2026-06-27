@@ -1,6 +1,7 @@
 #pragma once
 
 #include <memory>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -32,7 +33,10 @@ private:
     // Whitelist of allowed packet tags
     std::vector<std::string>     m_allowedTags;
 
-    // Per-client violation counts
+    // Per-client violation counts. Guarded by m_violationsMutex: OnReceive/OnSend
+    // run on network threads while Update() runs on the main loop, so concurrent
+    // access to this map is a data race without synchronization.
+    mutable std::mutex                m_violationsMutex;
     std::unordered_map<uint32_t, int> m_violations;
 
     // Thresholds
@@ -40,5 +44,7 @@ private:
 
     // Helpers
     void InspectPacket(uint32_t clientId, const Packet& pkt, bool incoming);
-    void BanIfNeeded(uint32_t clientId);
+    // `violations` is the already-read count for clientId, passed in so this never
+    // re-locks m_violationsMutex (avoids recursive-lock deadlock from InspectPacket).
+    void BanIfNeeded(uint32_t clientId, int violations);
 };

@@ -20,6 +20,7 @@
 #include <string>
 
 #include "Network/Packet.h"
+#include "Protocol/MessageDecoder.h"
 
 namespace {
 
@@ -67,6 +68,34 @@ TEST(NetworkPacketSafety, WellFormedValuesStillDecode) {
     EXPECT_EQ(WithPayload({0x00, 0x00, 0x00, 0x00}).ReadString(), "");   // valid empty string
     EXPECT_EQ(WithPayload({0x04, 0x00, 0x00, 0x00}).ReadUInt(), 4u);
     EXPECT_EQ(WithPayload({1, 2, 3, 4}).ReadBytes(4).size(), 4u);
+}
+
+// MessageDecoder::DecodeAction reads an attacker-controlled argument count and then
+// loops that many times reading a string per iteration. The per-string reads are
+// bounds-safe (return ""), but an unbounded loop count (e.g. 0xFFFFFFFF) would push
+// billions of empty strings into the output vector, exhausting memory (DoS) before any
+// read fails. The decoder must reject an argCount that cannot fit in the remaining
+// payload (each arg costs >= 4 bytes on the wire) rather than attempt the loop.
+TEST(NetworkPacketSafety, DecodeActionRejectsHostileArgCount) {
+    uint32_t clientId = 0;
+    std::string action;
+    std::vector<std::string> args;
+
+    // argCount = 0xFFFFFFFF with no argument bytes following.
+    Packet huge("PLAYER_ACTION");
+    huge.WriteUInt(7);              // clientId
+    huge.WriteString("kick");      // action
+    huge.WriteUInt(0xFFFFFFFFu);   // argCount — hostile
+    EXPECT_FALSE(MessageDecoder::DecodeAction(huge, clientId, action, args));
+    EXPECT_TRUE(args.empty());
+
+    // A large-but-not-max count with only a few payload bytes left is also rejected.
+    Packet many("PLAYER_ACTION");
+    many.WriteUInt(7);
+    many.WriteString("kick");
+    many.WriteUInt(1000000u);      // claims 1e6 args; nowhere near that many bytes follow
+    EXPECT_FALSE(MessageDecoder::DecodeAction(many, clientId, action, args));
+    EXPECT_TRUE(args.empty());
 }
 
 RS2V_TEST_MAIN()

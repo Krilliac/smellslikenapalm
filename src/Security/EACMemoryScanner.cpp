@@ -224,7 +224,11 @@ bool EACMemoryScanner::MatchPattern(const uint8_t* data, size_t dataLen,
     for (size_t i = 0; i + patLen <= dataLen; ++i) {
         bool found = true;
         for (size_t j = 0; j < patLen; ++j) {
-            if (mask[j] == 'x' && data[i + j] != pattern[j]) {
+            // The mask is supplied independently of the pattern; a mask shorter than
+            // the pattern would read mask[j] out of bounds (std::string::operator[]
+            // past size() is UB). Treat a missing mask byte as a wildcard ('?'),
+            // i.e. skip the compare rather than over-read.
+            if (j < mask.size() && mask[j] == 'x' && data[i + j] != pattern[j]) {
                 found = false;
                 break;
             }

@@ -307,6 +307,13 @@ BanEntry BanManager::DeserializeEntry(const std::string& line) const {
                          token.c_str(), e.what());
             secs = 0;
         }
+        // Clamp to a sane range before constructing the time_point. A pathological
+        // value (negative, or near LLONG_MAX from a corrupted ban file) would overflow
+        // the duration->time_point conversion (UB) on construction. ~100 years of
+        // seconds is far beyond any real ban and safely inside the representable range.
+        constexpr long long kMaxBanSeconds = 100LL * 365 * 24 * 60 * 60;
+        if (secs < 0) secs = 0;
+        if (secs > kMaxBanSeconds) secs = kMaxBanSeconds;
         entry.expiresAt = std::chrono::steady_clock::time_point(std::chrono::seconds(secs));
         Logger::Debug("[BanManager::DeserializeEntry] Parsed temporary ban expiry: %lld seconds since epoch", secs);
     } else {
