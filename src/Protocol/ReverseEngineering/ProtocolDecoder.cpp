@@ -529,8 +529,14 @@ void ProtocolDecoder::DetectFieldTypes(DecodedPacketStructure& structure, const 
         if (structure.sampleBuffer.size() < m_config.maxSampleBuffer)
             structure.sampleBuffer.push_back(data);
 
-        if (structure.totalSamples >= m_config.minSamplesForConfidence ||
-            structure.sampleBuffer.size() >= m_config.maxSampleBuffer) {
+        // Gate inference on the CURRENT-RUN buffered sample count, NOT cumulative
+        // totalSamples: persistence seeds totalSamples across runs, so keying off
+        // it would fire inference on the first packet after a restart (one-sample
+        // buffer) and lock an atypical layout. Cap by maxSampleBuffer in case
+        // minSamplesForConfidence exceeds it.
+        size_t need = std::min(m_config.minSamplesForConfidence, m_config.maxSampleBuffer);
+        if (need == 0) need = 1;
+        if (structure.sampleBuffer.size() >= need) {
             InferLayoutFromSamples(structure);
         }
         return;

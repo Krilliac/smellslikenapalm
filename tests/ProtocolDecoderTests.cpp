@@ -372,6 +372,52 @@ static void TestPRIValueDecode(const std::string& dir) {
     CHECK_EQ(res.bitsConsumed, bw.NumBits());
 }
 
+// Regression (Codex review P2): persistence seeds totalSamples across runs, so
+// layout inference must gate on the CURRENT-RUN buffered sample count, not the
+// cumulative total — otherwise the first packet after a restart locks the layout
+// from one (possibly atypical) sample. Simulated via the real persist/reload path.
+static void TestPersistenceLayoutGate() {
+    std::printf("TestPersistenceLayoutGate\n");
+    ProtocolDecoderConfig cfg = MakeTestConfig(/*async=*/false);
+    cfg.persistState = true;
+    cfg.minSamplesForConfidence = 8;
+    cfg.outputDirectory = "build/re_persist_test";
+
+    // Run 1: feed 8 packets so the tag finalizes, then shut down (writes state).
+    {
+        ProtocolDecoder a;
+        a.Initialize(cfg);
+        a.OnClientConnected(1, "127.0.0.1");
+        for (int i = 0; i < 8; ++i) {
+            auto p = MakeSamplePayload(static_cast<uint8_t>(i));
+            a.OnPacketReceived(1, p, "SEED");
+        }
+        CHECK(a.GetStructure("SEED").value().layoutFinalized);
+        a.Shutdown();   // persists SEED with a high totalSamples
+    }
+
+    // Run 2: a fresh decoder loads the seeded totalSamples. The first packet must
+    // NOT finalize the layout (only one current-run sample buffered).
+    {
+        ProtocolDecoder b;
+        b.Initialize(cfg);
+        CHECK(b.GetStructure("SEED").has_value());      // merged from disk
+        b.OnClientConnected(2, "127.0.0.1");
+        auto p0 = MakeSamplePayload(0);
+        b.OnPacketReceived(2, p0, "SEED");
+        auto s1 = b.GetStructure("SEED");
+        CHECK(s1.has_value());
+        CHECK(!s1->layoutFinalized);    // the bug would make this true after 1 pkt
+        // After enough current-run samples it should finalize normally.
+        for (int i = 1; i < 8; ++i) {
+            auto p = MakeSamplePayload(static_cast<uint8_t>(i));
+            b.OnPacketReceived(2, p, "SEED");
+        }
+        CHECK(b.GetStructure("SEED").value().layoutFinalized);
+        b.Shutdown();
+    }
+}
+
 int main() {
     std::printf("=== ProtocolDecoder / NetFieldTable self-tests ===\n");
     const std::string dir = NetfieldsDir();
@@ -387,6 +433,7 @@ int main() {
     TestPRIValueDecode(dir);
     TestDecoderSyncLayout();
     TestDecoderAsyncDrain();
+    TestPersistenceLayoutGate();
 
     std::printf("\n%d checks, %d failures\n", g_checks, g_failures);
     if (g_failures == 0) std::printf("ALL PASSED\n");
