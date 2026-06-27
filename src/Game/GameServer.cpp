@@ -114,7 +114,11 @@ void GameServer::StartAutoRegen(int intervalSeconds) {
             }
             if (m_regenRunning) {
                 Logger::Debug("[GameServer::StartAutoRegen] Triggering periodic handler regeneration");
-                Cmd_RegenHandlers();
+                // Detached thread: an uncaught exception here would reach
+                // std::terminate with no one to join/observe it. Guard so a
+                // failed regeneration is reported non-fatally and the periodic
+                // thread keeps running.
+                rs2v::Guard("auto handler regen", [this] { Cmd_RegenHandlers(); });
             }
         }
         Logger::Info("Auto handler regeneration thread stopped");

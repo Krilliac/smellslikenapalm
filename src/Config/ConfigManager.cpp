@@ -727,6 +727,11 @@ void ConfigManager::FileWatcherThread() {
             }
         } catch (const std::exception& e) {
             Logger::Error("[ConfigManager::FileWatcherThread] Error checking file modification time: %s", e.what());
+        } catch (...) {
+            // A non-std throw (e.g. from a reload listener callback) must not
+            // escape this thread function into std::terminate. Log and keep
+            // watching.
+            Logger::Error("[ConfigManager::FileWatcherThread] Non-std exception while checking/reloading config");
         }
     }
 

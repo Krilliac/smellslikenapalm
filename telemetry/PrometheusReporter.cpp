@@ -143,7 +143,7 @@ void PrometheusMetricsReporter::Shutdown() {
     StopHTTPServer();
 
     Logger::Info("PrometheusMetricsReporter shutdown complete. Served %llu HTTP requests total.",
-                m_httpRequests.load());
+                (unsigned long long)m_httpRequests.load());
     Logger::Debug("[PrometheusMetricsReporter::Shutdown] Final stats: reportsGenerated=%llu, reportsFailed=%llu",
                  (unsigned long long)m_reportsGenerated.load(), (unsigned long long)m_reportsFailed.load());
     Logger::Trace("[PrometheusMetricsReporter::Shutdown] Exit");
@@ -411,6 +411,13 @@ void PrometheusMetricsReporter::HTTPServerLoop() {
                 Logger::Error("[PrometheusMetricsReporter::HTTPServerLoop] Exception in server loop: %s", ex.what());
                 ReportError("Exception in HTTP server loop: " + std::string(ex.what()));
             }
+        } catch (...) {
+            // A non-std throw must not escape this thread function into
+            // std::terminate. Record it and keep accepting connections.
+            if (m_serverRunning.load()) {
+                Logger::Error("[PrometheusMetricsReporter::HTTPServerLoop] Non-std exception in server loop");
+                ReportError("Non-std exception in HTTP server loop");
+            }
         }
     }
 
@@ -512,6 +519,11 @@ void PrometheusMetricsReporter::HandleClientConnection(SocketHandle clientSocket
     } catch (const std::exception& ex) {
         Logger::Error("Error handling Prometheus HTTP client: %s", ex.what());
         Logger::Error("[PrometheusMetricsReporter::HandleClientConnection] Exception details on socket %d: %s", (int)clientSocket, ex.what());
+    } catch (...) {
+        // Runs on a detached thread: a non-std throw here would reach
+        // std::terminate with no one to observe it. Swallow + log, then still
+        // close the socket below.
+        Logger::Error("[PrometheusMetricsReporter::HandleClientConnection] Non-std exception on socket %d", (int)clientSocket);
     }
 
     Logger::Trace("[PrometheusMetricsReporter::HandleClientConnection] Closing client socket %d", (int)clientSocket);

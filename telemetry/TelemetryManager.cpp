@@ -335,6 +335,11 @@ void TelemetryManager::SamplingLoop() {
         } catch (const std::exception& ex) {
             Logger::Error("[TelemetryManager::SamplingLoop] Exception during iteration %llu: %s", (unsigned long long)iterationCount, ex.what());
             ReportError("Sampling loop error: " + std::string(ex.what()));
+        } catch (...) {
+            // A non-std exception must not escape this thread function into
+            // std::terminate. Record it and keep sampling.
+            Logger::Error("[TelemetryManager::SamplingLoop] Non-std exception during iteration %llu", (unsigned long long)iterationCount);
+            ReportError("Sampling loop error: non-std exception");
         }
 
         // Calculate sleep time to maintain consistent interval

@@ -104,4 +104,31 @@ malformed packet now logs a `NON-FATAL EXCEPTION` banner and the server keeps
 running; only genuinely unrecoverable faults (signals, uncaught exceptions that
 escape all guards) remain fatal.
 
+## 2026-06-27 — Guard every thread entry point, not just the game tick
+**Context:** The non-fatal `rs2v::Guard` recovery (entry above) was wired into the
+main game tick, per-packet dispatch, command dispatch, and the console/remote
+worker threads — but several other thread entry points still ran their work
+unguarded. An uncaught exception on a worker thread does not unwind into `main`;
+it calls `std::terminate` and kills the whole server. The unguarded loops
+included the two that process untrusted network bytes: `NetworkThread::RunLoop`
+(`PumpNetwork` + tick callback) and `EACServerEmulator::RunLoop` (`HandlePacket`),
+plus the `Timer` callback threads, the detached auto-handler-regen thread,
+`ProtocolDecoder::WorkerLoop`, and `TelemetryManager::SamplingLoop` (which caught
+`std::exception` but not a non-`std::` throw).
+**Decision:** Wrap the per-iteration body of each remaining thread entry point in
+`rs2v::Guard` (or, for `SamplingLoop`, add the missing `catch (...)` arm that
+mirrors its existing handler). A throw from one bad packet/tick/callback is now
+reported as a `NON-FATAL EXCEPTION` and the loop keeps serving, identical to the
+game tick. Separately, catch blocks in three parsers that silently swallowed the
+error (`CommandHandlers::ParseFloat`, `MapManager` lighting/ambient parse,
+`ChatManager` `/votemap`) now log the offending input (gated at Debug/Warn).
+**Rules out:** A thread entry point invoking subsystem work without a top-level
+guard; relying on a single `catch (const std::exception&)` on a thread loop
+(a non-`std::` throw would still terminate); catch blocks that discard the error
+text on a parse failure.
+**Consequences:** No single thread can take the process down via a recoverable
+exception — the only fatal paths left are signals and throws that escape *all*
+guards. The recovered-exception count (`NonFatalExceptionCount`) now also covers
+these threads.
+
 <!-- Append new decisions above this line, newest first. -->
