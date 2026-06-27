@@ -8,10 +8,10 @@ If you are looking for runtime configuration or API details, see **API.md** and 
 
 | Layer | Key Directories | Primary Languages |
 |-------|-----------------|-------------------|
-| Core engine | `Server/` | C++17 |
-| Telemetry | `telemetry/` | C++17 |
-| Scripting  | `plugins/` | C# 10 (.NET 7) & C++ |
-| Tests      | `tests/`   | C++17 (Google-Test) |
+| Core engine | `src/` | C++23 |
+| Telemetry | `telemetry/` | C++23 |
+| Scripting  | `src/Scripting/` | C# (.NET) & C++ — **disabled** (does not build) |
+| Tests      | `tests/`   | C++23 (native framework, no GoogleTest) |
 
 The repository uses **CMake** as its single build system and **GitHub Actions** as CI.
 
@@ -21,8 +21,8 @@ The repository uses **CMake** as its single build system and **GitHub Actions** 
 
 | Tool | Minimum Version | Install Hint |
 |------|-----------------|--------------|
-| **CMake** | 3.15 | `brew install cmake` / `apt install cmake` |
-| **Compiler** | GCC 8 / Clang 7 / MSVC 2019 | Set `CXX=clang++` if you have multiple |
+| **CMake** | 3.20 | `brew install cmake` / `apt install cmake` |
+| **Compiler (C++23)** | GCC 12 / Clang 15 / MSVC VS 2022 | Set `CXX=clang++` if you have multiple |
 | **Conan** (optional) | 2.0 | Dependency cache |
 | **.NET SDK** | 7.0 | Required for C# scripting |
 | **Python** | 3.9 | Build scripts |
@@ -46,16 +46,20 @@ The binary is `build/bin/rs2v_server`.
 | `-DENABLE_TELEMETRY` | `ON`  | Build telemetry subsystem |
 | `-DENABLE_SCRIPTING` | `OFF` | Embed the C# scripting host. **Currently does not build** (deprecated .NET COM host) — disabled pending a rework. |
 | `-DENABLE_COMPRESSION` | `ON` | Build packet compression (zlib if available, otherwise a built-in stub) |
-| `-DBUILD_TESTS`      | `OFF` | Compile Google-Test suites |
+| `-DBUILD_TESTS`      | `OFF` | Compile the native test suite (no GoogleTest dependency) |
 
 Add `-G "Visual Studio 17 2022"` on Windows.
 
 ## 3 · Coding Standards
 
+The full, enforceable standard is [`CODING_STANDARDS.md`](CODING_STANDARDS.md) —
+read it before writing code. The table below is a quick summary; where the two
+differ, `CODING_STANDARDS.md` wins.
+
 | Rule | Short Form |
 |------|------------|
-| **Language level** | C++17 (`-std=c++17`) |
-| **Naming** | `PascalCase` for classes, `snake_case` for functions & variables, `kCamel` for constants |
+| **Language level** | C++23 (`-std=c++23`) |
+| **Naming** | `PascalCase` classes/methods, `camelCase` locals, `m_` prefix members, `UPPER_SNAKE` macros/constants |
 | **Headers** | `.h` for interfaces, `.inl` for header-only impl |
 | **Namespaces** | Top-level subsystem: `Network`, `Telemetry`, `Physics`, etc. |
 | **Includes** | Use forward declarations where possible, include order: STL → third-party → project |

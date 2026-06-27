@@ -39,7 +39,7 @@ ActorReplication) were already in place.
 
 ## 2. Fuzz + static-analysis validation
 
-**Fuzzing — 41 tests, ~1.3M inputs, 0 crashes** (`0a2f390`). GoogleTest suites with a
+**Fuzzing — 41 tests, ~1.3M inputs, 0 crashes** (`0a2f390`). Native-framework suites with a
 per-loop watchdog (a hang fails hard) and a fixed seed (failures reproduce exactly),
 hammering the attacker-facing decoders with random / mutated / boundary / lying-length
 input, and asserting valid input still round-trips byte- and field-exactly:

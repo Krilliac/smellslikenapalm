@@ -7,16 +7,16 @@ and adversarially-mutated wire input **without** crashing, reading/writing out o
 bounds, hanging (infinite loop), or allocating without bound — and that valid
 input still round-trips.
 
-All suites are written in the existing **GoogleTest** framework using the
-repo's one-executable-per-file convention (each file has its own `main()` that
-runs `InitGoogleTest` + `RUN_ALL_TESTS`, links `rs2v_core`, and is registered via
-`rs2v_add_test(...)` in `tests/CMakeLists.txt`). They build with the same test
-target machinery as the pre-existing ~11 suites — no new framework, no production
-source changes.
+All suites are written in the repo's **native test framework**
+(`tests/TestFramework.h`, `TEST`/`EXPECT_*`/`ASSERT_*`) using the
+one-executable-per-file convention (each file emits its own entry point via
+`RS2V_TEST_MAIN()`, links `rs2v_core`, and is registered via `rs2v_add_test(...)`
+in `tests/CMakeLists.txt`). There is **no GoogleTest dependency** — the suite
+builds and runs offline with no network fetch.
 
 Each suite embeds a **watchdog** (background thread / `std::async` with a
 wall-clock budget) that turns a genuine hang into a hard, visible failure
-(`std::abort` or a gtest timeout assertion) rather than wedging CI forever, and
+(`std::abort` or a timeout assertion) rather than wedging CI forever, and
 uses a **fixed deterministic seed** so any failure reproduces exactly.
 
 ## Test files

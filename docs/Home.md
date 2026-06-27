@@ -2,7 +2,7 @@
 
 Welcome to the **RS2V Custom Server** documentation. This page serves as the central index for all project documentation, organized by topic and audience.
 
-RS2V Custom Server is a modular, extensible dedicated-server **emulator** for Rising Storm 2: Vietnam (an Unreal Engine 3 game, `EngineVersion 7258`), built in C++17. It is organized around a production-style architecture with telemetry, security, and networking subsystems.
+RS2V Custom Server is a clean-room dedicated-server **emulator** for Rising Storm 2: Vietnam (an Unreal Engine 3 game, `EngineVersion 7258`), built in C++23. It is organized around a production-style architecture with telemetry, security, and networking subsystems.
 
 > **Status:** This project is under active development. The main server target builds on MSVC and MinGW, but the UE3 control-channel handshake is still being implemented and **a stock client cannot fully connect yet**. C# scripting is currently **disabled** (it does not build), and telemetry/security are partially stubbed. The public API, file layout, and naming conventions are not yet frozen and may change without notice. See the README's *Current Status* section and [TODO.md](../TODO.md) for the current roadmap.
 
@@ -65,8 +65,8 @@ These documents cover building from source, the internal architecture, the API s
 
 | Requirement | Minimum | Recommended |
 |---|---|---|
-| C++ Compiler | GCC 8, Clang 7, or MSVC 2019 | GCC 12+, Clang 15+ |
-| CMake | 3.15 | 3.25+ |
+| C++ Compiler (C++23) | GCC 12, Clang 15, or MSVC VS 2022 | GCC 13+, Clang 18+ |
+| CMake | 3.20 | 3.25+ |
 | OpenSSL | 1.1.0 (optional) | 3.0+ |
 | zlib | 1.2.11 (optional) | 1.3+ |
 | .NET SDK | 7.0 (for scripting) | 8.0+ |
@@ -99,7 +99,7 @@ cmake --build . --parallel
 | `ENABLE_TELEMETRY` | `ON` | Build with the telemetry subsystem (Prometheus metrics, file reporters, alerting) |
 | `ENABLE_SCRIPTING` | `OFF` | Build with C# scripting support. **Currently does not build** — the host uses a deprecated .NET COM hosting API and is disabled pending a rework. |
 | `ENABLE_COMPRESSION` | `ON` | Build with packet compression (uses zlib if available, otherwise built-in stub) |
-| `BUILD_TESTS` | `OFF` | Build the Google Test suite |
+| `BUILD_TESTS` | `OFF` | Build the native test suite (no GoogleTest dependency) |
 
 ### Run the Server
 
@@ -174,7 +174,7 @@ smellslikenapalm/
 │       ├── enabled/            # Active scripts (loaded at startup)
 │       └── disabled/           # Inactive scripts (available for activation)
 ├── docs/                       # Documentation (you are here)
-├── tests/                      # Test suites (Google Test)
+├── tests/                      # Native test suite (no GoogleTest) + fuzz tier
 ├── .github/                    # GitHub configuration
 │   ├── ISSUE_TEMPLATE/         # Bug report & feature request templates
 │   └── workflows/              # CI/CD (Codacy)
