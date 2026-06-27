@@ -76,19 +76,12 @@ float WeaponDatabase::CalculateDamage(const std::string& weaponId, float distanc
     float falloff = CalculateDamageFalloff(*def, distance);
     float dmg = baseDmg * falloff;
 
-    // RS2V damage model: energy transfer based on deceleration
-    // At very close range, bullets may over-penetrate (less damage)
-    // Peak damage occurs at medium range (~20-50m)
-    if (def->ballistics.ammoType != AmmoType::Shotgun_12ga &&
-        def->ballistics.ammoType != AmmoType::Flame) {
-        float overpenFactor = 1.0f;
-        if (distance < 5.0f) {
-            overpenFactor = 0.85f + 0.03f * distance;  // 85-100% at 0-5m
-        } else if (distance < 50.0f) {
-            overpenFactor = 1.0f;  // Peak energy transfer
-        }
-        dmg *= overpenFactor;
-    }
+    // NO close-range "over-penetration" reduction. The source (ROBullet.CalculateBulletDamageRS2:
+    // UsedDamage = Damage * |Velocity|^2 / Speed^2) makes damage MAXIMAL at the muzzle (PowerLeft
+    // = 1.0) and only ever decreasing as the round slows with distance - point-blank is the most
+    // lethal. The former overpenFactor cut point-blank damage to 85% (ramping to 100% at 5m),
+    // inverting close-range lethality vs the source; removed. NOTE: CalculateDamageFalloff is
+    // still a piecewise-linear approximation of the source's velocity^2 falloff (separate follow-up).
 
     // Hit-zone scaling is intentionally NOT applied here. The damage-APPLICATION
     // layer (DamageSystem::CalculateFinalDamage, using the event's full HitZone) is
