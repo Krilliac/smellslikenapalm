@@ -205,6 +205,17 @@ PacketAnalysisResult PacketAnalyzer::AnalyzePacket(
         Logger::Debug("[PacketAnalyzer::AnalyzePacket] PATTERN_DETECTION flag set and enabled, analyzing patterns");
         std::string key = context + "_" + std::to_string(data.size());
         auto now = std::chrono::steady_clock::now();
+        // GUARD (memory-exhaustion DoS): pattern detection runs on the ALWAYS-ON receive path.
+        // Bound the pattern map so a wide spread of distinct (context,size) keys can't grow it
+        // without limit. Reset history BEFORE inserting a new key (so we never clear the map
+        // while holding a reference into it). Pattern detection is a short-window heuristic, so
+        // dropping old history is harmless.
+        constexpr size_t kMaxPatterns = 4096;
+        if (m_impl->patterns.size() >= kMaxPatterns &&
+            m_impl->patterns.find(key) == m_impl->patterns.end()) {
+            Logger::Warn("PacketAnalyzer: pattern map hit %zu entries; clearing to bound memory", kMaxPatterns);
+            m_impl->patterns.clear();
+        }
         auto& pat = m_impl->patterns[key];
         if (++pat.frequency == 1) {
             pat.patternType = context;
@@ -212,7 +223,15 @@ PacketAnalysisResult PacketAnalyzer::AnalyzePacket(
             Logger::Debug("[PacketAnalyzer::AnalyzePacket] New pattern detected: key='%s'", key.c_str());
         }
         pat.lastSeen = now;
-        pat.clientIds.push_back(clientId);
+        // GUARD (memory-exhaustion DoS): clientIds was appended on EVERY analyzed packet and is
+        // never read back - on the always-on path it grew unbounded until OOM. Keep only DISTINCT
+        // client ids and cap the count (the field's only meaning is "which clients show this
+        // pattern"), so a steady packet flood can no longer exhaust memory here.
+        constexpr size_t kMaxClientIdsPerPattern = 256;  // ~max concurrent clients
+        if (pat.clientIds.size() < kMaxClientIdsPerPattern &&
+            std::find(pat.clientIds.begin(), pat.clientIds.end(), clientId) == pat.clientIds.end()) {
+            pat.clientIds.push_back(clientId);
+        }
         Logger::Trace("[PacketAnalyzer::AnalyzePacket] Pattern key='%s', frequency=%u", key.c_str(), pat.frequency);
         if (pat.frequency > 100 &&
             std::chrono::duration_cast<std::chrono::seconds>(now - pat.firstSeen).count() < 10) {
