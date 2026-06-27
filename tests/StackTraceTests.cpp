@@ -102,7 +102,7 @@ TEST(StackTraceTests, FunctionNameAppearsWhenSymbolsAvailable) {
     rs2v::StackTrace trace = DistinctlyNamedCaptureFunction();
 
     if (!HasAppSymbols(trace)) {
-        GTEST_SKIP() << "Application symbol resolution unavailable in this "
+        SKIP_TEST() << "Application symbol resolution unavailable in this "
                         "build/environment (no PDB / stripped binary; system-DLL "
                         "exports don't count); skipping name assertion.";
     }

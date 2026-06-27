@@ -97,7 +97,7 @@ TEST_F(MemoryPoolTest, DoubleFree_ThrowsAssertInDebug)
     pool->Free(p);
     EXPECT_DEATH(pool->Free(p), "double free");
 #else
-    GTEST_SKIP() << "Double-free guard active only in debug builds.";
+    SKIP_TEST() << "Double-free guard active only in debug builds.";
 #endif
 }
 
@@ -112,7 +112,7 @@ TEST_F(MemoryPoolTest, CanaryDetectsOverflow)
     p[128] = 0xFF;                       // corrupt guard byte
     EXPECT_DEATH(pool->Free(p), "buffer overflow");
 #else
-    GTEST_SKIP() << "Guard bytes only in debug builds.";
+    SKIP_TEST() << "Guard bytes only in debug builds.";
 #endif
 }
 

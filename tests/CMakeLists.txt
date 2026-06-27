@@ -61,6 +61,20 @@ rs2v_add_test(BitReaderFuzzTests)        # fuzz + malformed-input hardening for 
 rs2v_add_test(PacketCodecFuzzTests)      # fuzz/hostile-input: random+mutated+boundary bytes into Decode/Encode (no crash/OOB/hang), valid round-trip
 rs2v_add_test(NetworkPacketSafetyTests)  # malformed-input bounds checks for legacy Packet readers (ReadString/DecodeString/ReadUInt/ReadFloat/ReadBytes)
 
+# -----------------------------------------------------------------------------
+# Unit coverage for self-contained subsystem APIs (added with the native test
+# framework). Each targets the REAL src/ API surface and asserts published
+# vectors / round-trips / invariants.
+# -----------------------------------------------------------------------------
+rs2v_add_test(StringUtilsTests)        # Utils/StringUtils: trim/split/join/case/parse
+rs2v_add_test(MathUtilsTests)          # Utils/MathUtils: clamp/lerp/remap/angles/gcd/quadratic
+rs2v_add_test(CryptoUtilsTests)        # Utils/CryptoUtils: SHA-256/HMAC/Base64 vectors + RNG
+rs2v_add_test(ProtocolUtilsTests)      # Protocol/ProtocolUtils: hex/base64/checksum/tag<->type
+rs2v_add_test(NetworkUtilsTests)       # Network/NetworkUtils: IPv4 validate/normalize, ports
+rs2v_add_test(BoundsTests)             # Game/Bounds: AABB contains/center/size
+rs2v_add_test(RandomGeneratorTests)    # Utils/RandomGenerator: seed determinism, range bounds
+rs2v_add_test(CompressionHandlerTests) # Protocol/CompressionHandler: NONE + zlib round-trips
+
 # Scripting is OFF by default (deprecated .NET COM hosting). The scripting test
 # is gated on ENABLE_SCRIPTING, but it ALSO references Scripting/ScriptEngine.h
 # which does not exist (src has CSharpEngine / ScriptManager), so it stays off.

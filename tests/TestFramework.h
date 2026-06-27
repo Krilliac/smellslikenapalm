@@ -1,34 +1,34 @@
 // tests/TestFramework.h
 //
-// RS2V native test framework — a self-contained, dependency-free replacement
-// for the subset of GoogleTest the RS2V test suite uses.
+// RS2V native test framework — a self-contained, dependency-free unit test
+// system for the RS2V server. No external libraries, no network.
 //
 // WHY THIS EXISTS
-//   GoogleTest is pulled in via CMake FetchContent, which clones
-//   github.com/google/googletest at configure time. In sandboxed / offline /
-//   CI-restricted environments that clone fails (no outbound network), so the
-//   whole test suite is un-buildable. This header reimplements the macros the
-//   suite actually relies on, with no external dependency and no network, so
-//   `-DBUILD_TESTS=ON` works anywhere a C++17 compiler is present.
+//   The suite was originally written against GoogleTest, which CMake pulled in
+//   via FetchContent (a configure-time clone of github.com/google/googletest).
+//   In sandboxed / offline / CI-restricted environments that clone fails, so
+//   the whole suite was un-buildable. This framework replaces it outright: it
+//   builds and runs anywhere a C++17 compiler is present.
 //
-// DROP-IN COMPATIBILITY
-//   The goal is that test sources need only swap their include line; the test
-//   bodies are unchanged. We provide gtest-identical spellings:
-//     * TEST(suite,name) / TEST_F(fixture,name)
-//     * EXPECT_* / ASSERT_* (EQ/NE/TRUE/FALSE/LT/LE/GT/GE/NEAR/FLOAT_EQ/
-//       DOUBLE_EQ/STREQ/STRNE/THROW/NO_THROW/ANY_THROW)
-//     * SUCCEED/FAIL/ADD_FAILURE/GTEST_SKIP, all streamable with `<< "msg"`
-//     * a ::testing::Test base with virtual SetUp()/TearDown()
-//     * ::testing::InitGoogleTest(&argc, argv)  (no-op)
-//     * RUN_ALL_TESTS()  -> 0 on success, 1 on any failure
+// PUBLIC API
+//     * TEST(suite, name) / TEST_F(fixture, name) — define test cases.
+//     * rs2v::Test — fixture base class with virtual SetUp()/TearDown().
+//     * EXPECT_* / ASSERT_* — EQ/NE/TRUE/FALSE/LT/LE/GT/GE/NEAR/FLOAT_EQ/
+//       DOUBLE_EQ/STREQ/STRNE/THROW/NO_THROW/ANY_THROW.
+//     * SUCCEED / FAIL / ADD_FAILURE / SKIP_TEST — all streamable with `<< msg`.
+//     * RS2V_TEST_MAIN() — emits the program entry point. Supports
+//       `--filter=<substr>` (run matching "Suite.Name") and `--list`.
 //
-//   EXPECT_* records a non-fatal failure and continues; ASSERT_* records a
-//   fatal failure and returns from the current test (exactly like gtest, by
-//   textually inserting `return`). Because of that, ASSERT_* may only appear in
-//   functions returning void (same constraint gtest imposes).
+//   EXPECT_* records a non-fatal failure and continues; ASSERT_* records a fatal
+//   failure and returns from the current test (by textually inserting `return`,
+//   so ASSERT_* may only appear in functions returning void).
 //
 //   Mock support (MOCK_METHOD / EXPECT_CALL / ...) lives in TestMock.h, which
 //   includes this header.
+//
+//   For ease of migration a few well-known GoogleTest spellings remain as thin
+//   aliases (e.g. GTEST_SKIP -> SKIP_TEST); the implementation underneath is
+//   entirely native.
 
 #ifndef RS2V_TEST_FRAMEWORK_H
 #define RS2V_TEST_FRAMEWORK_H
@@ -546,10 +546,10 @@ using Test = ::native::Test;
 // blocker": it makes the macro a single statement that safely consumes a
 // trailing `<< "msg"` and never captures a following `else`.
 // ---------------------------------------------------------------------------
-#define GTEST_AMBIGUOUS_ELSE_BLOCKER_ switch (0) case 0: default:
+#define RS2V_AMBIGUOUS_ELSE_BLOCKER_ switch (0) case 0: default:
 
 #define RS2V_TEST_ASSERT_(assertion_result, kind)                                   \
-    GTEST_AMBIGUOUS_ELSE_BLOCKER_                                                    \
+    RS2V_AMBIGUOUS_ELSE_BLOCKER_                                                     \
     if (const ::native::AssertionResult rs2v_ar_ = (assertion_result)) {            \
         ;                                                                           \
     } else                                                                          \
@@ -560,7 +560,7 @@ using Test = ::native::Test;
 // `return` exits the current (void) test function.
 #define RS2V_EXPECT_(ar) RS2V_TEST_ASSERT_((ar), ::native::FailureKind::kNonFatal)
 #define RS2V_ASSERT_(ar)                                                             \
-    GTEST_AMBIGUOUS_ELSE_BLOCKER_                                                    \
+    RS2V_AMBIGUOUS_ELSE_BLOCKER_                                                     \
     if (const ::native::AssertionResult rs2v_ar_ = (ar)) {                          \
         ;                                                                           \
     } else                                                                          \
@@ -659,11 +659,12 @@ AssertionResult CheckAnyThrow(Fn&& fn, const char* stmt) {
 #define FAIL()                                                                       \
     return ::native::AssertHelper(::native::FailureKind::kFatal, __FILE__, __LINE__,  \
                                   "Failed") = ::native::Message()
-#define GTEST_SKIP()                                                                 \
+// SKIP_TEST() marks the current test skipped and returns. GTEST_SKIP is kept as
+// a one-line alias only because it is such a widely-recognized spelling.
+#define SKIP_TEST()                                                                  \
     return ::native::AssertHelper(::native::FailureKind::kSkip, __FILE__, __LINE__,   \
                                   "Skipped") = ::native::Message()
-#define GTEST_SUCCEED() SUCCEED()
-#define GTEST_FAIL()    FAIL()
+#define GTEST_SKIP() SKIP_TEST()
 
 // ---------------------------------------------------------------------------
 // Test definition macros.
