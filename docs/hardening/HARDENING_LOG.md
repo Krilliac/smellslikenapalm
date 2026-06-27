@@ -41,3 +41,17 @@ src/Network/BitWriter, BitReader, PacketCodec, ActorReplication, WireTrace.h.
 2026-06-26 | Pkt-dispatch security review (fleet) | 3-agent review+verify (wf_fff418dc-46f): 6/15 confirmed attacker-reachable. FIXED the HIGH one: wire-driven OOB read up to 4GB in legacy Packet readers (DecodeString/ReadUInt/ReadFloat/ReadBytes lacked bounds checks) -> additive guards mirroring ReadUInt16/32/64 + NetworkPacketSafetyTests (5). 16/16 green, mock react PASS. | 067ecf6
 2026-06-26 | OPEN findings (from wf_fff418dc-46f) for later ticks: (1) no auth/connection-state gate on string-tag dispatch — pre-login client can drive gameplay handlers (GameServer::Run ~448-488; needs IsLoggedIn gate, behavioral so verify carefully); (2) legacy FromBuffer path reachable by any non-UE3 datagram (ConnectionManager.cpp:1039-1043) — the reachability bridge; (3) HandleVehicleAction trusts attacker heliId (no pilotId/seat check, GameServer.cpp:937-1002, griefing); (4) HandleWeaponFire trusts attacker victimId (GameServer.cpp:1040-1078, no attacker-alive/range/LOS check); (5) AdminManager BanPlayer std::stoi(args[1]) unguarded throw (admin-only, not wire-reachable) + privileged subops don't re-check IsAdmin (currently only HandleAdminCommand-reachable, safe today). | (open)
 2026-06-26 | Vehicle-action ownership (finding #3) | FIXED: HandleVehicleAction Start/Stop engine (cases 3/4) trusted attacker heliId -> any client could start/stop any heli's engine (griefing). Added requesterPilotsHeli() ownership gate mirroring the case-2 control path. Additive. 16/16 green, mock react PASS. | af0d970
+
+## Game-logic validation pass (vs decompiled RS2 UnrealScript at D:\RE-Tools\rs2-source)
+Fleet wf_19008ffa-b00 (4 dims x review+verify, 24 agents): **15/20 confirmed-real** discrepancies where our C++ game
+logic diverges from the source in a way that produces wrong gameplay. Applying highest-confidence additive/correctness
+fixes one per tick. Full result: tasks/w9luafrwc.output. Confirmed-real backlog (✔=fixed):
+- ✔ Objective capture froze whenever ANY defender was present (ObjectiveSystem) - source advances the dominant force
+- [ ] HIGH Hitzone scaling applied TWICE (headshot ~100x, limbs compounded) - Weapon/WeaponDatabase + DamageSystem
+- [ ] HIGH Limb damage flat *0.4/0.5 vs source per-zone ZoneHealth cap (hand/foot=10, forearm/calf=20, thigh=35)
+- [ ] HIGH Respawn never consumes reinforcement tickets / not blocked when depleted (PlayerManager/SpawnSystem)
+- [ ] HIGH Auto-respawn ignores ready-to-deploy state (force-deploys dead players) (PlayerManager)
+- [ ] HIGH Supremacy win model: two 250 pools drain-to-0 vs source single signed TotalMapScore +/-TargetScore(50)
+- [ ] (more in tasks/w9luafrwc.output - linked-objective HQ graph, etc.)
+
+2026-06-26 | Capture contest logic (game-logic finding) | FIXED: ObjectiveSystem::ProcessCapture froze ALL capture progress whenever both teams had a capper in the zone (one defender stalls any attacking force). Source ROGameInfoTerritories.CaptureTimer compares TeamCapValue[0] vs [1] - the greater force keeps capturing ('>'=attackers advance, '<'=defenders regain, '=='=standoff). Rewrote contested branch to advance/regain by net force (diminishing returns), only a true tie stalls. Additive (capper-count approximation; squad/leader bonus inputs not tracked at this layer). Build green, mock react PASS. | (this commit)

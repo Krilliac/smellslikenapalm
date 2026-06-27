@@ -177,10 +177,38 @@ void ObjectiveSystem::ProcessCapture(CaptureZone& zone, float deltaSeconds) {
     }
 
     if (attackers > 0 && defenders > 0) {
-        // Contested: no capture progress, slow decay
-        zone.state = CaptureState::Contested;
-        zone.captureProgress -= zone.contestDecaySpeed * deltaSeconds;
-        if (zone.captureProgress < 0.0f) zone.captureProgress = 0.0f;
+        // Contested: per ROGameInfoTerritories.CaptureTimer, capture does NOT
+        // freeze whenever a defender is present - the team with the greater cap
+        // value keeps making progress; only a true tie stalls the point. (Source
+        // compares TeamCapValue[0] vs [1]: '>' advances the attackers, '<' lets the
+        // defenders regain, '==' is a standoff.) We approximate each side's cap
+        // value with the capper counts in the zone, since the per-squad/leader
+        // bonus inputs the source uses aren't tracked at this layer.
+        if (attackers > defenders) {
+            // Attackers dominate -> advance, scaled by net force (diminishing returns).
+            zone.state = CaptureState::Capturing;
+            size_t net = attackers - defenders;
+            float speedMultiplier = 1.0f + 0.5f * (std::min(net, (size_t)5) - 1);
+            zone.captureProgress += zone.captureSpeed * speedMultiplier * deltaSeconds;
+            if (zone.captureProgress >= 1.0f) {
+                zone.captureProgress = 1.0f;
+                auto* tm = m_server->GetTeamManager();
+                uint32_t capturingTeam = tm->GetPlayerTeam(zone.attackerIds.front());
+                OnObjectiveCaptured(zone, capturingTeam);
+            }
+        } else if (defenders > attackers) {
+            // Defenders dominate -> regain: decay attacker progress back toward held.
+            zone.state = CaptureState::Contested;
+            size_t net = defenders - attackers;
+            float regainMultiplier = 1.0f + 0.5f * (std::min(net, (size_t)5) - 1);
+            zone.captureProgress -= zone.contestDecaySpeed * regainMultiplier * deltaSeconds;
+            if (zone.captureProgress < 0.0f) zone.captureProgress = 0.0f;
+        } else {
+            // True tie -> standoff, slow decay (the original contested behavior).
+            zone.state = CaptureState::Contested;
+            zone.captureProgress -= zone.contestDecaySpeed * deltaSeconds;
+            if (zone.captureProgress < 0.0f) zone.captureProgress = 0.0f;
+        }
         return;
     }
 
