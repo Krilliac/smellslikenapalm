@@ -784,19 +784,30 @@ void GameServer::HandleRoleSelection(uint32_t clientId, const std::vector<uint8_
 
         auto player = pm->GetPlayer(clientId);
         if (player) {
-            player->ClearInventory();
-            player->AddItem(loadout.primaryWeapon, loadout.primaryAmmo);
-            if (!loadout.secondaryWeapon.empty()) {
-                player->AddItem(loadout.secondaryWeapon, loadout.secondaryAmmo);
+            // Source ROPlayerController.SelectRoleByClass does NOT swap a LIVE pawn's loadout in
+            // place mid-round - the new role is deferred to the next spawn (MyDesiredRoleInfo) or
+            // forces a respawn (Pawn.Suicide). So only apply the loadout + deploy-ready flag when
+            // the player is NOT currently alive. A living player's role is still RECORDED
+            // (AssignRole above) and takes effect when they next deploy/respawn; this stops the
+            // exploit where an alive player hot-swaps to a fresh kit for free.
+            if (!player->IsAlive()) {
+                player->ClearInventory();
+                player->AddItem(loadout.primaryWeapon, loadout.primaryAmmo);
+                if (!loadout.secondaryWeapon.empty()) {
+                    player->AddItem(loadout.secondaryWeapon, loadout.secondaryAmmo);
+                }
+                for (const auto& eq : loadout.equipment) {
+                    player->AddItem(eq, 1);
+                }
+                // Selecting a role IS the deploy action - mark ready so the respawn loop spawns
+                // them (the ready-gate in PlayerManager::Update). Mirrors the netcode
+                // SelectRoleByClass path in ConnectionManager::DecodeInboundActorBunch.
+                player->SetReadyToSpawn(true);
+                Logger::Debug("[GameServer::HandleRoleSelection] Loadout applied to player %u", clientId);
+            } else {
+                Logger::Info("[GameServer::HandleRoleSelection] Player %u changed role while alive; "
+                             "role recorded but loadout deferred to next spawn (no in-place swap)", clientId);
             }
-            for (const auto& eq : loadout.equipment) {
-                player->AddItem(eq, 1);
-            }
-            // Selecting a role IS the deploy action - mark the player ready so the respawn
-            // loop will spawn them (the ready-gate in PlayerManager::Update). Mirrors the
-            // netcode SelectRoleByClass path in ConnectionManager::DecodeInboundActorBunch.
-            player->SetReadyToSpawn(true);
-            Logger::Debug("[GameServer::HandleRoleSelection] Loadout applied to player %u", clientId);
         } else {
             Logger::Warn("[GameServer::HandleRoleSelection] Player %u not found in PlayerManager", clientId);
         }
