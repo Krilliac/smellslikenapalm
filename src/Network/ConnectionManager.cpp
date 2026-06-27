@@ -708,9 +708,14 @@ void ConnectionManager::SendActorBootstrap(uint32_t clientId) {
     // menu-critical actors live instead. Set RS2V_LIVE_REPL=0 to fall back to the
     // canned replay for A/B comparison.
     {
+        // Default = canned replay. UE3-source + client-log evidence: the canned
+        // bootstrap DOES trigger local-PC adoption (client logs "<PC> setplayer
+        // <LocalPlayer>") and reaches team interaction, while the minimal live open
+        // does not yet adopt (see project-replication-frontier). Opt into the live
+        // path with RS2V_LIVE_REPL=1 for continued development.
         const char* lr = std::getenv("RS2V_LIVE_REPL");
-        const bool useCanned = lr && (lr[0] == '0' || lr[0] == 'n' || lr[0] == 'N');
-        if (!useCanned) {
+        const bool useLive = lr && (lr[0] == '1' || lr[0] == 'y' || lr[0] == 'Y');
+        if (useLive) {
             SendLiveActorBootstrap(clientId);
             return;
         }
