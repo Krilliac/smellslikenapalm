@@ -210,10 +210,15 @@ void ObjectiveSystem::ProcessCapture(CaptureZone& zone, float deltaSeconds) {
         if (zone.captureProgress >= 1.0f) {
             zone.captureProgress = 1.0f;
 
-            // Determine which team captured it
-            auto* tm = m_server->GetTeamManager();
+            // Determine which team captured it. attackerIds is guaranteed non-empty
+            // here (attackers > 0), but GetTeamManager() may be null during teardown;
+            // guard the dereference rather than trust it blindly.
+            auto* tm = m_server ? m_server->GetTeamManager() : nullptr;
+            if (!tm) {
+                Logger::Warn("[ObjectiveSystem::ProcessCapture] No TeamManager available; skipping capture resolution");
+                return;
+            }
             uint32_t capturingTeam = tm->GetPlayerTeam(zone.attackerIds.front());
-            uint32_t previousTeam = zone.controllingTeam;
             OnObjectiveCaptured(zone, capturingTeam);
         }
     }

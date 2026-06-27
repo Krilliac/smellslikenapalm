@@ -63,6 +63,7 @@ void AntiCheatManager::Update() {
     Logger::Trace("[AntiCheatManager::Update] Entry - tracked clients=%zu", m_violations.size());
     // Periodically decay violations
     int decayedCount = 0;
+    std::lock_guard<std::mutex> lock(m_violationsMutex);
     for (auto& kv : m_violations) {
         int oldVal = kv.second;
         kv.second = std::max(0, kv.second - 1);
@@ -84,15 +85,21 @@ void AntiCheatManager::InspectPacket(uint32_t clientId, const Packet& pkt, bool 
     Logger::Debug("[AntiCheatManager::InspectPacket] Client %u packet tag '%s' (direction=%s): allowed=%s",
                   clientId, tag.c_str(), incoming ? "incoming" : "outgoing", allowed ? "true" : "false");
     if (!allowed) {
-        int& v = m_violations[clientId];
-        v++;
+        int v;
+        {
+            std::lock_guard<std::mutex> lock(m_violationsMutex);
+            v = ++m_violations[clientId];
+        }
         TELEMETRY_INCREMENT_SECURITY_VIOLATION();
         Logger::Warn("AntiCheat: client %u sent disallowed packet '%s' (violation %d)",
                      clientId, tag.c_str(), v);
         Logger::Debug("[AntiCheatManager::InspectPacket] Client %u violation count incremented to %d (maxViolations=%d)",
                       clientId, v, m_maxViolations);
         Logger::Debug("[AntiCheatManager::InspectPacket] Checking if client %u needs to be banned", clientId);
-        BanIfNeeded(clientId);
+        // Pass the count by value: the ban action below calls into GameServer and
+        // must not run under m_violationsMutex (avoids holding the lock across an
+        // unbounded call and avoids re-locking inside BanIfNeeded).
+        BanIfNeeded(clientId, v);
     } else {
         Logger::Debug("[AntiCheatManager::InspectPacket] Client %u packet tag '%s' is in allowed list, no violation recorded",
                       clientId, tag.c_str());
@@ -103,25 +110,30 @@ void AntiCheatManager::InspectPacket(uint32_t clientId, const Packet& pkt, bool 
     Logger::Trace("[AntiCheatManager::InspectPacket] Exit");
 }
 
-void AntiCheatManager::BanIfNeeded(uint32_t clientId) {
+void AntiCheatManager::BanIfNeeded(uint32_t clientId, int violations) {
     Logger::Trace("[AntiCheatManager::BanIfNeeded] Entry - clientId=%u, violations=%d, maxViolations=%d",
-                  clientId, m_violations[clientId], m_maxViolations);
-    if (m_violations[clientId] >= m_maxViolations) {
+                  clientId, violations, m_maxViolations);
+    if (violations >= m_maxViolations) {
         Logger::Error("AntiCheat: client %u exceeded max violations, banning", clientId);
         Logger::Debug("[AntiCheatManager::BanIfNeeded] Client %u violations=%d >= maxViolations=%d, proceeding with ban",
-                      clientId, m_violations[clientId], m_maxViolations);
+                      clientId, violations, m_maxViolations);
         TELEMETRY_INCREMENT_BAN();
-        auto conn = m_server->GetClientConnection(clientId);
-        if (conn) {
+        auto conn = m_server ? m_server->GetClientConnection(clientId) : nullptr;
+        // Both the connection AND the AdminManager must exist before we can ban:
+        // GetAdminManager() can return null during early bring-up / shutdown, and
+        // dereferencing it unconditionally would crash on this hot packet path.
+        AdminManager* admin = m_server ? m_server->GetAdminManager() : nullptr;
+        if (conn && admin) {
             Logger::Debug("[AntiCheatManager::BanIfNeeded] Client %u connection found, retrieving SteamID for ban", clientId);
-            m_server->GetAdminManager()->BanPlayer(0 /*system*/, conn->GetSteamID(), 60);
+            admin->BanPlayer(0 /*system*/, conn->GetSteamID(), 60);
             Logger::Info("[AntiCheatManager::BanIfNeeded] Client %u banned for 60 minutes via AdminManager (system-initiated ban)", clientId);
         } else {
-            Logger::Error("[AntiCheatManager::BanIfNeeded] Client %u connection not found, unable to execute ban", clientId);
+            Logger::Error("[AntiCheatManager::BanIfNeeded] Client %u cannot be banned (conn=%p, admin=%p)",
+                          clientId, static_cast<void*>(conn.get()), static_cast<void*>(admin));
         }
     } else {
         Logger::Debug("[AntiCheatManager::BanIfNeeded] Client %u violations=%d < maxViolations=%d, no ban needed",
-                      clientId, m_violations[clientId], m_maxViolations);
+                      clientId, violations, m_maxViolations);
     }
     Logger::Trace("[AntiCheatManager::BanIfNeeded] Exit");
 }

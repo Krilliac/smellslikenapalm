@@ -214,7 +214,16 @@ void TimeSync::WriteInt64(std::vector<uint8_t>& buf, int64_t v)
 int64_t TimeSync::ReadInt64(const std::vector<uint8_t>& buf, size_t& off)
 {
     Logger::Trace("[TimeSync::ReadInt64] Entry — buf size=%zu, offset=%zu", buf.size(), off);
-    int64_t v;
+    int64_t v = 0;
+    // Bounds-check before the memcpy: this is a reusable wire-read primitive and must
+    // never read past the buffer even if a caller's prior length check is wrong or
+    // absent. The subtraction is overflow-safe because we first verify off <= size().
+    if (off > buf.size() || buf.size() - off < 8) {
+        Logger::Warn("[TimeSync::ReadInt64] Short read: need 8 bytes at offset %zu, have %zu — returning 0",
+                     off, buf.size());
+        off = buf.size();
+        return 0;
+    }
     std::memcpy(&v, buf.data()+off, 8);
     off += 8;
     Logger::Trace("[TimeSync::ReadInt64] Exit — read value=%lld, new offset=%zu",
