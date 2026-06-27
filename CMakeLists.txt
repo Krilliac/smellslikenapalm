@@ -100,7 +100,13 @@ endif()
 # dir on PATH, so a dynamically-linked exe fails at launch with a missing-DLL
 # error (STATUS_ENTRYPOINT_NOT_FOUND / 0xc0000139). Static linking makes the
 # tool self-contained and runnable from any environment.
-if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+#
+# This is a MinGW/Windows-only need. On Linux a full `-static` link FAILS when
+# OpenSSL is found, because the system ships libssl/libcrypto as shared-only
+# objects ("attempted static link of dynamic object libssl.so"). Gate to MINGW so
+# Linux gcc links the tool normally (dynamic libssl is fine there); MSVC never
+# entered this block.
+if(MINGW)
     target_link_options(PacketHandlerCodeGen PRIVATE -static -static-libgcc -static-libstdc++)
 endif()
 

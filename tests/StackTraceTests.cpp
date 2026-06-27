@@ -25,12 +25,23 @@
 
 namespace {
 
-// Returns true if at least one frame in the trace resolved to a function name.
-// Used to gate the "function name appears in output" assertion so the suite
-// stays green on a stripped/symbol-less build where only raw addresses resolve.
-bool HasAnyResolvedSymbol(const rs2v::StackTrace& trace) {
-    for (const auto& f : trace.GetFrames()) {
-        if (!f.functionName.empty()) {
+// Returns true if the APPLICATION's own symbols resolved — i.e. at least one
+// frame in the same module as the capture site (frame 0 is our own code) carries
+// a function name. Used to gate the "function name appears in output" assertion.
+//
+// Gating on ANY resolved name is wrong: on Windows the system DLLs
+// (kernel32/ntdll) always resolve their EXPORTED names even in a Release build
+// with no application PDB, and on POSIX libc frames resolve via dladdr — so an
+// "any frame resolved" gate is true even when the app's own frames are
+// unsymbolized, making the strong assertion run against an "<unknown>" app frame
+// and fail. Scoping to the capture site's module keeps a symbol-less runner on
+// the skip path (green) while still asserting in a symbol-resolving build.
+bool HasAppSymbols(const rs2v::StackTrace& trace) {
+    const auto& frames = trace.GetFrames();
+    if (frames.empty()) return false;
+    const std::string& appModule = frames.front().moduleName;
+    for (const auto& f : frames) {
+        if (!f.functionName.empty() && f.moduleName == appModule) {
             return true;
         }
     }
@@ -90,9 +101,10 @@ TEST(StackTraceTests, AtLeastOneFrameHasNonZeroAddress) {
 TEST(StackTraceTests, FunctionNameAppearsWhenSymbolsAvailable) {
     rs2v::StackTrace trace = DistinctlyNamedCaptureFunction();
 
-    if (!HasAnyResolvedSymbol(trace)) {
-        GTEST_SKIP() << "Symbol resolution unavailable in this build/environment "
-                        "(no PDB / stripped binary); skipping name assertion.";
+    if (!HasAppSymbols(trace)) {
+        GTEST_SKIP() << "Application symbol resolution unavailable in this "
+                        "build/environment (no PDB / stripped binary; system-DLL "
+                        "exports don't count); skipping name assertion.";
     }
 
     // In a symbol-resolving build, the enclosing function should show up
