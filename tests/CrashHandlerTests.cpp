@@ -13,6 +13,7 @@
 
 #include <stdexcept>
 #include <string>
+#include <thread>
 
 TEST(CrashHandler, GuardReturnsTrueWhenCallableSucceeds) {
     bool ran = false;
@@ -49,6 +50,26 @@ TEST(CrashHandler, GuardReturnValuePropagatesAcrossManyCalls) {
     // i = 1, 3 succeed; i = 0, 2, 4 throw.
     EXPECT_EQ(successes, 2);
     EXPECT_EQ(rs2v::NonFatalExceptionCount(), before + 3);
+}
+
+// Regression test for the wiring added across the server's thread entry points
+// (NetworkThread / EACServerEmulator run loops, Timer callbacks, the auto-regen
+// thread, the protocol-decode worker). Each of those guards a callable that runs
+// on a worker thread; an uncaught exception there would call std::terminate and
+// kill the whole process. This proves Guard stays terminate-safe when the throw
+// originates off the main thread — if it did not, the std::terminate would abort
+// the test binary and this test would never report PASS.
+TEST(CrashHandler, GuardSwallowsExceptionThrownOnWorkerThread) {
+    unsigned long long before = rs2v::NonFatalExceptionCount();
+    bool ok = true;
+    std::thread worker([&] {
+        ok = rs2v::Guard("worker-thread-throw", [] {
+            throw std::runtime_error("thrown on a worker thread");
+        });
+    });
+    worker.join();
+    EXPECT_FALSE(ok);
+    EXPECT_EQ(rs2v::NonFatalExceptionCount(), before + 1);
 }
 
 RS2V_TEST_MAIN()

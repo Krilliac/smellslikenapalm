@@ -309,7 +309,13 @@ void MapManager::LoadLighting(const std::string& mapName)
         try {
             size_t idx = colon + 1;
             return std::stof(json.substr(idx), nullptr);
-        } catch (...) { return fallback; }
+        } catch (...) {
+            // Malformed numeric value in the map lighting file. Surface it so a
+            // mapper can fix the data instead of silently getting the default.
+            Logger::Warn("[MapManager] lighting key '%s' has a non-numeric value; using default %.2f",
+                         key.c_str(), fallback);
+            return fallback;
+        }
     };
 
     std::string tod = findString("time_of_day");
@@ -328,7 +334,12 @@ void MapManager::LoadLighting(const std::string& mapName)
             int comp = 0;
             while (std::getline(iss, tok, ',') && comp < 3) {
                 try { m_lighting.ambientColor[comp++] = std::stoi(StringUtils::Trim(tok)); }
-                catch (...) { /* leave default */ }
+                catch (...) {
+                    // Bad component in the ambient_color array; keep the default
+                    // for this channel but tell the mapper which token was wrong.
+                    Logger::Warn("[MapManager] ambient_color component %d ('%s') is not an integer; keeping default",
+                                 comp, StringUtils::Trim(tok).c_str());
+                }
             }
         }
     }

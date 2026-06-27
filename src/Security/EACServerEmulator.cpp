@@ -3,6 +3,7 @@
 #include "Security/EACServerEmulator.h"
 #include "Security/EACPackets.h"
 #include "Utils/Logger.h"
+#include "Utils/CrashHandler.h"
 #include "../../telemetry/TelemetryManager.h"
 #include <cstring>
 #include <chrono>
@@ -81,7 +82,11 @@ void EACServerEmulator::RunLoop() {
         if (len > 0) {
             buf.resize(len);
             Logger::Trace("[EACServerEmulator::RunLoop] Received %d bytes from %s:%u", len, ip.c_str(), port);
-            HandlePacket(ip, port, buf);
+            // HARDENING: this is an anti-cheat probe endpoint fed untrusted UDP
+            // from the public internet. A malformed packet that throws must be
+            // recovered non-fatally, never propagate out of the thread function
+            // into std::terminate and kill the server.
+            rs2v::Guard("eac handle packet", [&] { HandlePacket(ip, port, buf); });
         }
 
         // Cleanup stale connections periodically
@@ -89,7 +94,7 @@ void EACServerEmulator::RunLoop() {
         auto now = std::chrono::steady_clock::now();
         if (now - lastCleanup > std::chrono::seconds(30)) {
             Logger::Debug("[EACServerEmulator::RunLoop] Triggering periodic stale connection cleanup");
-            CleanupStaleConnections();
+            rs2v::Guard("eac stale cleanup", [this] { CleanupStaleConnections(); });
             lastCleanup = now;
         }
 

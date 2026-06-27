@@ -294,7 +294,14 @@ void ChatManager::ProcessChatCommand(uint32_t clientId, const std::string& messa
             }
         } else {
             int choice = 0;
-            try { choice = std::stoi(parts[0]); } catch (...) { choice = 0; }
+            // A non-numeric arg falls through to choice=0 -> "Invalid vote
+            // option." reply below; log it (gated) so a stuck vote can be traced.
+            try { choice = std::stoi(parts[0]); }
+            catch (...) {
+                Logger::Debug("[ChatManager] /votemap got non-numeric option '%s' from client %u",
+                              parts[0].c_str(), clientId);
+                choice = 0;
+            }
             // Options are presented 1-based to players; internal index is 0-based.
             bool ok = m_server->CastMapVote(clientId, choice - 1);
             if (conn) conn->SendChatMessage(ok ? "Vote recorded." : "Invalid vote option.");

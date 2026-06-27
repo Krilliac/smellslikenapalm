@@ -2,6 +2,7 @@
 
 #include "Network/NetworkThread.h"
 #include "Utils/Logger.h"
+#include "Utils/CrashHandler.h"
 
 NetworkThread::NetworkThread(ConnectionManager* connMgr, TickCallback tickCb)
     : m_connMgr(connMgr)
@@ -101,14 +102,21 @@ void NetworkThread::RunLoop() {
             Logger::Error("[NetworkThread::RunLoop] ConnectionManager is null, stopping network loop");
             break;
         }
+        // HARDENING: this loop processes untrusted, attacker-controlled traffic.
+        // A single hostile packet that provokes a throw (parse error, failed
+        // invariant) must NOT escape the thread function — an uncaught exception
+        // in a std::thread calls std::terminate and takes the whole server down.
+        // Guard each iteration so one bad packet is reported non-fatally and the
+        // loop keeps serving every other client (mirrors the main game tick in
+        // main.cpp and ConsoleInput/RemoteAdminServer).
         Logger::Trace("[NetworkThread::RunLoop] Tick iteration: calling PumpNetwork");
-        m_connMgr->PumpNetwork();
+        rs2v::Guard("network pump", [this] { m_connMgr->PumpNetwork(); });
         Logger::Trace("[NetworkThread::RunLoop] PumpNetwork completed");
 
         // 2. Invoke game-server tick callback (processing of packets)
         if (m_tickCallback) {
             Logger::Trace("[NetworkThread::RunLoop] Invoking tick callback");
-            m_tickCallback();
+            rs2v::Guard("network tick callback", [this] { m_tickCallback(); });
             Logger::Trace("[NetworkThread::RunLoop] Tick callback completed");
         } else {
             Logger::Debug("[NetworkThread::RunLoop] No tick callback set, skipping");

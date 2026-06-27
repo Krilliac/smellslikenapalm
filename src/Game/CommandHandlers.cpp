@@ -54,7 +54,13 @@ uint32_t ResolveTarget(GameServer* server, const std::string& token)
 bool ParseFloat(const std::string& s, float& out)
 {
     try { size_t pos = 0; out = std::stof(s, &pos); return pos == s.size(); }
-    catch (...) { return false; }
+    catch (...) {
+        // Don't lose the failure silently: the caller turns this into an
+        // "invalid argument" reply, but record the offending token for anyone
+        // debugging a rejected command. Gated at Debug so it never floods.
+        Logger::Debug("[CommandHandlers::ParseFloat] Not a float: '%s'", s.c_str());
+        return false;
+    }
 }
 
 } // namespace

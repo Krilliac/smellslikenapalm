@@ -6,6 +6,7 @@
 #include "Protocol/ReverseEngineering/ProtocolDecoder.h"
 #include "Protocol/UE3Protocol.h"
 #include "Utils/Logger.h"
+#include "Utils/CrashHandler.h"
 
 #include <fstream>
 #include <sstream>
@@ -163,7 +164,11 @@ void ProtocolDecoder::WorkerLoop() {
             batch.swap(m_queue);
         }
         std::lock_guard<std::mutex> lock(m_mutex);
-        for (const auto& ev : batch) ProcessEvent(ev);
+        // ProcessEvent decodes captured, attacker-influenced wire bytes. Guard
+        // per event so a decode that throws on one malformed capture is reported
+        // non-fatally and the worker keeps draining the queue, rather than
+        // escaping this thread function into std::terminate.
+        for (const auto& ev : batch) rs2v::Guard("protocol decode event", [&] { ProcessEvent(ev); });
     }
 }
 
