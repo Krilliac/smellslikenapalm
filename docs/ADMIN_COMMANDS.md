@@ -254,9 +254,26 @@ Aliases are shown in parentheses.
 - The **level** column is the numeric tier from §2 (0-5).
 - A bare SteamID with no level is treated as **Admin (3)** for backward
   compatibility with the legacy flat list.
-- The list is loaded at startup. Bans are stored separately in
-  `config/ban_list.txt` and are also loaded at startup (so bans survive
-  restarts).
+- The list is loaded at startup.
+
+### Bans
+
+There is a **single** authoritative ban store, owned by the security layer
+(`BanManager`, behind the login bridge) — the same store that enforces bans at
+connect time. The `ban`/`unban`/`banlist` commands and anti-cheat all go through
+it; `AdminManager` no longer keeps a separate ban list (a previous shadow list
+drifted from and was clobbered by the security layer's).
+
+Bans persist in `config/ban_list.txt`, pipe-delimited:
+
+```
+SteamID64|P|<unused>|reason             # permanent
+SteamID64|T|<expiryUnixSeconds>|reason  # temporary (UTC seconds since epoch)
+```
+
+The file is machine-managed (rewritten on ban/unban/cleanup), so hand edits are
+best made with the server stopped. Temporary-ban expiry is wall-clock, so bans
+survive restarts.
 
 ---
 
@@ -265,8 +282,9 @@ Aliases are shown in parentheses.
 The command system is designed to be driven by tooling and AI as well as humans:
 
 - **`query`** returns a stable `key=value` snapshot (`name=`, `map=`, `players=`,
-  `maxplayers=`, `tickrate=`, `timescale=`) — easy to parse without scraping
-  prose.
+  `maxplayers=`, `tickrate=`, `timescale=`, `nonfatal_exceptions=`) — easy to
+  parse without scraping prose. `nonfatal_exceptions` is the count of recovered
+  (non-fatal) exceptions, useful for health monitoring.
 - **`ping`** / **`echo`** give cheap liveness and round-trip checks.
 - Remote SOAP responses always include a machine-readable `<ok>` boolean plus the
   full `<output>`. Remote requests run with `machine = true`, so handlers prefer

@@ -1,11 +1,13 @@
 // src/Game/AdminManager.h – admin/ban data store and privileged player operations
 //
-// AdminManager owns the persistent authorization data (the admin list with
-// per-SteamID permission levels, and the ban list) and the privileged player
-// operations that mutate connection state (kick/ban/unban). It is NOT the
-// command parser — command parsing, permission gating and dispatch live in
-// CommandManager, which calls the operations here. Keeping the data/ops here
-// and the dispatch there avoids two parallel command paths.
+// AdminManager owns the persistent ADMIN-LIST authorization data (per-SteamID
+// permission levels) and the privileged player operations that mutate connection
+// state (kick/ban/unban). It is NOT the command parser — parsing, permission
+// gating and dispatch live in CommandManager. It is also NOT the ban store: the
+// single authoritative ban list lives in the security layer (BanManager, behind
+// the login bridge); AdminManager's ban operations delegate to GameServer, which
+// forwards to that one store. This avoids the previous shadow ban list that
+// drifted from — and was clobbered by — the security layer's own list.
 
 #pragma once
 
@@ -13,8 +15,9 @@
 #include <vector>
 #include <map>
 #include <utility>
-#include <chrono>
 #include <memory>
+
+#include "Game/BanRecord.h"
 
 class GameServer;
 class ServerConfig;
@@ -33,21 +36,21 @@ public:
     // level from admin_list.txt (0 = unlisted/plain player).
     bool IsAdmin(const std::string& steamId) const;
     int  GetPermissionLevel(const std::string& steamId) const;
-    bool IsBanned(const std::string& steamId) const;
+    bool IsBanned(const std::string& steamId) const;          // delegates to ban store
 
     // Snapshots for the `admins` / `banlist` commands.
     std::vector<std::pair<std::string, int>> GetAdminList() const;
-    std::vector<std::pair<std::string, std::chrono::system_clock::time_point>> GetActiveBans() const;
+    std::vector<BanRecord> GetActiveBans() const;             // delegates to ban store
 
     void LoadAdminList();
-    void LoadBanList();
-    void SaveBanList() const;
 
     // --- Privileged player operations (called by CommandManager / AntiCheat) ---
     // adminClientId is the issuing in-game client, or INVALID/0 for
-    // console/remote/system callers (connection lookups are null-safe).
+    // console/remote/system callers (connection lookups are null-safe). Ban/Unban
+    // record into the single authoritative ban store via GameServer.
     bool KickPlayer(uint32_t adminClientId, const std::string& targetSteamId);
-    bool BanPlayer(uint32_t adminClientId, const std::string& targetSteamId, int durationMinutes);
+    bool BanPlayer(uint32_t adminClientId, const std::string& targetSteamId, int durationMinutes,
+                   const std::string& reason = "");
     bool Unban(const std::string& targetSteamId);
 
 private:
@@ -58,6 +61,4 @@ private:
     // the SteamID -> level map for GetPermissionLevel.
     std::vector<std::string> m_admins;
     std::map<std::string, int> m_adminLevels;
-
-    std::map<std::string, std::chrono::system_clock::time_point> m_bans;
 };

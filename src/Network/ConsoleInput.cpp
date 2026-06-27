@@ -6,6 +6,7 @@
 #include "Game/CommandManager.h"
 #include "Utils/Logger.h"
 #include "Utils/StringUtils.h"
+#include "Utils/CrashHandler.h"
 
 #include <iostream>
 #include <string>
@@ -89,7 +90,9 @@ void ConsoleInput::ReadLoop()
         ctx.invoker = "console";
         ctx.server  = m_server;
         ctx.out     = [](std::string_view s) { std::cout << s << "\n"; };
-        cmdMgr->Execute(ctx, line);
+        // Guarded so a throwing command can't take down the reader thread (an
+        // uncaught exception in a std::thread calls std::terminate).
+        rs2v::Guard("console command", [&] { cmdMgr->Execute(ctx, line); });
         std::cout.flush();
     }
     m_running.store(false);

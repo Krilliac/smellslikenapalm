@@ -24,6 +24,7 @@
 #include "Math/Vector3.h"
 #include "Utils/Logger.h"
 #include "Utils/StringUtils.h"
+#include "Utils/CrashHandler.h"
 
 #include <algorithm>
 #include <chrono>
@@ -88,6 +89,7 @@ void CommandManager::RegisterBuiltins()
             ctx.Reply("maxplayers=" + std::to_string(sc ? sc->GetMaxPlayers() : 0));
             ctx.Reply("tickrate=" + std::to_string(s ? s->GetTickRate() : 0));
             ctx.Reply("timescale=" + std::to_string(s ? s->GetTimeScale() : 1.0f));
+            ctx.Reply("nonfatal_exceptions=" + std::to_string(rs2v::NonFatalExceptionCount()));
             return true;
         }});
 
@@ -249,7 +251,12 @@ void CommandManager::RegisterBuiltins()
             } else {
                 ctx.Reply("Invalid duration: " + ctx.args[1]); return false;
             }
-            bool ok = admin->BanPlayer(ctx.clientId, steamId, minutes);
+            std::string reason;
+            if (ctx.args.size() > 2) {
+                std::vector<std::string> rest(ctx.args.begin() + 2, ctx.args.end());
+                reason = StringUtils::Join(rest, " ");
+            }
+            bool ok = admin->BanPlayer(ctx.clientId, steamId, minutes, reason);
             ctx.Reply(ok ? ("Banned " + steamId + " for " + std::to_string(minutes) + " min")
                          : ("Ban failed for " + steamId));
             return ok;
@@ -273,10 +280,12 @@ void CommandManager::RegisterBuiltins()
             if (!admin) { ctx.Reply("AdminManager unavailable."); return false; }
             auto bans = admin->GetActiveBans();
             ctx.Reply("Active bans (" + std::to_string(bans.size()) + "):");
-            const auto now = std::chrono::system_clock::now();
-            for (const auto& [steamId, expiry] : bans) {
-                auto mins = std::chrono::duration_cast<std::chrono::minutes>(expiry - now).count();
-                ctx.Reply("  " + steamId + "  expires in ~" + std::to_string(mins) + " min");
+            for (const auto& b : bans) {
+                std::string when = b.permanent
+                    ? "permanent"
+                    : ("expires in ~" + std::to_string(b.remainingSeconds / 60) + " min");
+                std::string why = b.reason.empty() ? "" : ("  \"" + b.reason + "\"");
+                ctx.Reply("  " + b.steamId + "  " + when + why);
             }
             return true;
         }});

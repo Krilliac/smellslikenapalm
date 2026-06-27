@@ -11,6 +11,7 @@
 #include <queue>
 #include <functional>
 #include "Network/Packet.h"
+#include "Game/BanRecord.h"
 
 class NetworkManager;
 class AdminManager;
@@ -75,6 +76,15 @@ public:
     virtual void Shutdown();
 
     void BroadcastChatMessage(const std::string& msg);
+
+    // --- Ban administration (single authoritative store, owned by the security
+    // layer behind the login bridge). AdminManager and the command system go
+    // through here so there is exactly one ban store. durationMinutes <= 0 is a
+    // permanent ban. No-ops returning false/empty before the bridge exists. ---
+    bool BanSteamId(const std::string& steamId, int durationMinutes, const std::string& reason);
+    bool UnbanSteamId(const std::string& steamId);
+    bool IsSteamIdBanned(const std::string& steamId) const;
+    std::vector<BanRecord> GetActiveBans() const;
 
     uint32_t FindClientBySteamID(const std::string& steamId) const;
     std::shared_ptr<ClientConnection> GetClientConnection(uint32_t clientId) const;

@@ -7,6 +7,7 @@
 #include "Game/CommandManager.h"
 #include "Utils/Logger.h"
 #include "Utils/StringUtils.h"
+#include "Utils/CrashHandler.h"
 
 #include <chrono>
 #include <thread>
@@ -81,11 +82,10 @@ void RemoteAdminServer::AcceptLoop()
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
             continue;
         }
-        try {
-            HandleConnection(*client);
-        } catch (const std::exception& e) {
-            Logger::Error("[RemoteAdminServer] Connection handler threw: %s", e.what());
-        }
+        // Guarded so a malformed remote request that throws is diagnosed and the
+        // accept loop survives (an uncaught exception here would terminate the
+        // worker thread, and remote input is untrusted).
+        rs2v::Guard("remote admin request", [&] { HandleConnection(*client); });
         client->Close();
     }
 }

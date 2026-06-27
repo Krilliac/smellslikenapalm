@@ -11,6 +11,7 @@
 #include "Network/ClientConnection.h"
 #include "Utils/Logger.h"
 #include "Utils/StringUtils.h"
+#include "Utils/CrashHandler.h"
 
 #include <algorithm>
 #include <sstream>
@@ -154,12 +155,12 @@ bool CommandManager::ExecuteParsed(CommandContext& ctx, std::string_view name)
         return false;
     }
 
+    // A handler must never take the server down over hostile/garbled input. Run
+    // it under the non-fatal guard so any exception is diagnosed via the crash
+    // handler and the server keeps running; the user gets a generic failure.
     bool ok = false;
-    try {
-        ok = cmd->handler(ctx);
-    } catch (const std::exception& e) {
-        // A handler must never take the server down over hostile/garbled input.
-        Logger::Error("[CommandManager] Handler for '%s' threw: %s", cmd->name.c_str(), e.what());
+    bool completed = rs2v::Guard("command handler", [&] { ok = cmd->handler(ctx); });
+    if (!completed) {
         ctx.Reply("Command failed: internal error.");
         return false;
     }

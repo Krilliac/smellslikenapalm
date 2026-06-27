@@ -218,6 +218,11 @@ bool SecurityManager::IsBanned(const std::string& steamId) const {
     return result;
 }
 
+std::vector<BanEntry> SecurityManager::GetAllBans() const {
+    Logger::Trace("[SecurityManager::GetAllBans] Entry");
+    return m_banManager.GetAllBans();
+}
+
 void SecurityManager::HandleEACReport(const EnhancedEACReport& report) {
     Logger::Trace("[SecurityManager::HandleEACReport] Entry, clientId=%u, result=%d, details='%s'",
                   report.clientId, int(report.result), report.details.c_str());

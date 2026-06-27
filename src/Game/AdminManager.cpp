@@ -7,7 +7,6 @@
 #include "Network/ClientConnection.h"
 #include "Game/GameServer.h"
 #include <algorithm>
-#include <chrono>
 #include <fstream>
 #include <sstream>
 
@@ -31,11 +30,10 @@ AdminManager::~AdminManager()
 void AdminManager::Initialize()
 {
     Logger::Trace("[AdminManager::Initialize] Entry");
-    Logger::Info("AdminManager: Loading admin and ban lists");
+    Logger::Info("AdminManager: Loading admin list");
     LoadAdminList();
-    // Persisted bans must be loaded at startup or IsBanned() silently lets
-    // previously-banned SteamIDs reconnect across restarts.
-    LoadBanList();
+    // Bans are owned and loaded by the security layer (BanManager); AdminManager
+    // no longer keeps a parallel ban list.
     Logger::Trace("[AdminManager::Initialize] Exit");
 }
 
@@ -138,18 +136,26 @@ bool AdminManager::KickPlayer(uint32_t adminClientId, const std::string& targetS
     return true;
 }
 
-bool AdminManager::BanPlayer(uint32_t adminClientId, const std::string& targetSteamId, int durationMinutes)
+bool AdminManager::BanPlayer(uint32_t adminClientId, const std::string& targetSteamId, int durationMinutes,
+                             const std::string& reason)
 {
-    Logger::Trace("[AdminManager::BanPlayer] Entry: adminClientId=%u, targetSteamId='%s', durationMinutes=%d", adminClientId, targetSteamId.c_str(), durationMinutes);
+    Logger::Trace("[AdminManager::BanPlayer] Entry: adminClientId=%u, targetSteamId='%s', durationMinutes=%d, reason='%s'",
+                  adminClientId, targetSteamId.c_str(), durationMinutes, reason.c_str());
+
+    // Record the ban in the single authoritative store (security layer).
+    bool recorded = m_server->BanSteamId(targetSteamId, durationMinutes, reason);
+    if (!recorded) {
+        Logger::Warn("[AdminManager::BanPlayer] Ban store unavailable; ban not recorded for '%s'", targetSteamId.c_str());
+        if (auto c = m_server->GetClientConnection(adminClientId)) c->SendChatMessage("Ban store unavailable.");
+        return false;
+    }
+
+    // Disconnect the target if currently connected so the ban takes effect now.
     uint32_t targetId = m_server->FindClientBySteamID(targetSteamId);
     if (targetId != INVALID_CLIENT_ID)
     {
         if (auto c = m_server->GetClientConnection(targetId)) c->MarkDisconnected();
     }
-
-    const auto expires = std::chrono::system_clock::now() + std::chrono::minutes(durationMinutes);
-    m_bans[targetSteamId] = expires;
-    SaveBanList();
 
     m_server->BroadcastChatMessage("Player " + targetSteamId + " banned for " + std::to_string(durationMinutes) + " minutes by admin.");
     Logger::Info("[AdminManager::BanPlayer] Player '%s' banned for %d minutes by admin (client %u)", targetSteamId.c_str(), durationMinutes, adminClientId);
@@ -159,78 +165,17 @@ bool AdminManager::BanPlayer(uint32_t adminClientId, const std::string& targetSt
 bool AdminManager::Unban(const std::string& targetSteamId)
 {
     Logger::Trace("[AdminManager::Unban] Entry: targetSteamId='%s'", targetSteamId.c_str());
-    auto it = m_bans.find(targetSteamId);
-    if (it == m_bans.end())
-    {
-        Logger::Debug("[AdminManager::Unban] No ban entry for '%s'", targetSteamId.c_str());
-        return false;
-    }
-    m_bans.erase(it);
-    SaveBanList();
-    Logger::Info("[AdminManager::Unban] Ban removed for '%s'", targetSteamId.c_str());
-    return true;
-}
-
-void AdminManager::SaveBanList() const
-{
-    Logger::Trace("[AdminManager::SaveBanList] Entry");
-    const std::string path = "config/ban_list.txt";
-    std::ofstream file(path, std::ios::trunc);
-    if (!file.is_open())
-    {
-        Logger::Error("AdminManager: Unable to write ban list to %s", path.c_str());
-        return;
-    }
-
-    for (const auto& [steamId, expiry] : m_bans)
-    {
-        auto timeT = std::chrono::system_clock::to_time_t(expiry);
-        file << steamId << " " << timeT << "\n";
-    }
-    file.close();
-    Logger::Info("AdminManager: Ban list saved (%zu entries)", m_bans.size());
-}
-
-void AdminManager::LoadBanList()
-{
-    Logger::Trace("[AdminManager::LoadBanList] Entry");
-    const std::string path = "config/ban_list.txt";
-    m_bans.clear();
-
-    std::ifstream file(path);
-    if (!file.is_open())
-    {
-        Logger::Warn("AdminManager: Ban list not found at %s", path.c_str());
-        return;
-    }
-
-    std::string steamId;
-    std::time_t expiryTime;
-    while (file >> steamId >> expiryTime)
-    {
-        m_bans[steamId] = std::chrono::system_clock::from_time_t(expiryTime);
-    }
-    file.close();
-    Logger::Info("AdminManager: Loaded %zu ban entries", m_bans.size());
+    bool removed = m_server->UnbanSteamId(targetSteamId);
+    Logger::Info("[AdminManager::Unban] Unban for '%s': %s", targetSteamId.c_str(), removed ? "removed" : "no active ban");
+    return removed;
 }
 
 bool AdminManager::IsBanned(const std::string& steamId) const
 {
-    auto it = m_bans.find(steamId);
-    if (it == m_bans.end())
-        return false;
-    if (std::chrono::system_clock::now() > it->second)
-        return false; // expired
-    return true;
+    return m_server->IsSteamIdBanned(steamId);
 }
 
-std::vector<std::pair<std::string, std::chrono::system_clock::time_point>> AdminManager::GetActiveBans() const
+std::vector<BanRecord> AdminManager::GetActiveBans() const
 {
-    std::vector<std::pair<std::string, std::chrono::system_clock::time_point>> out;
-    const auto now = std::chrono::system_clock::now();
-    for (const auto& [steamId, expiry] : m_bans)
-    {
-        if (now <= expiry) out.emplace_back(steamId, expiry);
-    }
-    return out;
+    return m_server->GetActiveBans();
 }

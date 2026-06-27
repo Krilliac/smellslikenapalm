@@ -15,7 +15,11 @@ enum class BanType {
 struct BanEntry {
     std::string     steamId;
     BanType         type;
-    std::chrono::steady_clock::time_point expiresAt;  // ignored if permanent
+    // Wall-clock expiry (system_clock). MUST be system_clock, not steady_clock:
+    // the expiry is serialised as seconds-since-epoch and must round-trip across
+    // restarts. steady_clock's epoch is per-process, so persisting it made
+    // temporary bans meaningless after a restart. Ignored if permanent.
+    std::chrono::system_clock::time_point expiresAt;
     std::string     reason;
 };
 

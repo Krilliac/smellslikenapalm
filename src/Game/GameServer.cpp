@@ -44,6 +44,7 @@
 #include "Network/ClientConnection.h"
 #include "Utils/PathUtils.h"
 #include "Utils/HandlerLibraryManager.h"
+#include "Utils/CrashHandler.h"
 #include "Protocol/ReverseEngineering/ProtocolDecoder.h"
 #include <chrono>
 #include <thread>
@@ -570,6 +571,10 @@ void GameServer::Run() {
             continue;
         }
 
+        // Per-packet guard: packet payloads are attacker-controlled. A handler
+        // that throws on a crafted packet is logged non-fatally and we advance to
+        // the next packet, rather than letting one bad packet abort the whole tick.
+        rs2v::Guard("packet dispatch", [&] {
         std::string tag = qpkt.packet.GetTag();
         Logger::Debug("[GameServer::Run] Processing packet tag='%s' from clientId=%u", tag.c_str(), qpkt.clientId);
         if (tag == "CHAT_MESSAGE" && m_chatManager) {
@@ -603,6 +608,7 @@ void GameServer::Run() {
         } else {
             Logger::Debug("[GameServer::Run] Unhandled packet tag '%s' and no GameMode available", tag.c_str());
         }
+        });  // rs2v::Guard (per-packet dispatch)
     }
 
     float dt = m_tickDeltaSeconds * m_timeScale;
@@ -809,6 +815,26 @@ RoundManager*       GameServer::GetRoundManager()       const { return m_roundMa
 std::shared_ptr<GameConfig>    GameServer::GetGameConfig()    const { return m_gameConfig;    }
 std::shared_ptr<ServerConfig>  GameServer::GetServerConfig()  const { return m_serverConfig;  }
 std::shared_ptr<ConfigManager> GameServer::GetConfigManager() const { return m_configManager; }
+
+// --- Ban administration: forward to the single authoritative store behind the
+// login bridge (SecurityManager/BanManager). The bridge keeps the Security
+// headers out of this TU (they clash with the Network ClientAddress). ---
+
+bool GameServer::BanSteamId(const std::string& steamId, int durationMinutes, const std::string& reason) {
+    return m_loginBridge ? m_loginBridge->BanSteamId(steamId, durationMinutes, reason) : false;
+}
+
+bool GameServer::UnbanSteamId(const std::string& steamId) {
+    return m_loginBridge ? m_loginBridge->UnbanSteamId(steamId) : false;
+}
+
+bool GameServer::IsSteamIdBanned(const std::string& steamId) const {
+    return m_loginBridge ? m_loginBridge->IsSteamIdBanned(steamId) : false;
+}
+
+std::vector<BanRecord> GameServer::GetActiveBans() const {
+    return m_loginBridge ? m_loginBridge->GetActiveBans() : std::vector<BanRecord>{};
+}
 
 // --- Runtime controls driven by the command system ---
 

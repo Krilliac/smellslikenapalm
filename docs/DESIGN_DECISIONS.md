@@ -72,4 +72,36 @@ endpoint is off unless a port *and* password are set and binds all interfaces
 `DamageSystem` via a `Player` flag. The legacy `[Admin] rcon_*` keys remain inert
 (no Source-RCON implementation); the remote transport uses `[RemoteAdmin]`.
 
+## 2026-06-27 — Single authoritative ban store; non-fatal exception recovery
+**Context:** Two ban stores pointed at the same `config/ban_list.txt` in
+incompatible formats: `AdminManager` (`steamId epochSeconds`, used by the command
+system + anti-cheat) and `SecurityManager::m_banManager` (`steamId|T/P|expiry|reason`,
+the store that actually enforces bans at connect time). `AdminManager`'s
+`IsBanned` had no callers, so its list was a shadow that never enforced anything
+yet wrote the shared file — which `BanManager`'s destructor then truncated on
+shutdown. The shipped sample file was in a *third* format neither could parse, and
+`BanManager` serialised `steady_clock` epochs (per-process), so temporary bans
+were meaningless after a restart. Separately, a recoverable exception escaping a
+subsystem boundary (e.g. one bad packet, one bad command) reached
+`std::terminate` and killed the whole server.
+**Decision:** (1) Make `SecurityManager`/`BanManager` the single ban owner.
+`AdminManager` ban ops delegate via `GameServer` → `ConnectionLoginBridge`
+(which keeps the Security headers — and their `ClientAddress` clash — out of the
+Game TUs) and surface bans as a neutral `BanRecord`. `AdminManager` drops its
+shadow map and file I/O. `BanManager` switches to `system_clock` so temporary
+bans persist correctly. (2) Add `rs2v::ReportNonFatalException` / `rs2v::Guard`
+to the crash handler — the complement of the existing `std::set_terminate` path:
+catch at a boundary, log with the same diagnostics, and continue. Guards wrap the
+game tick, per-packet dispatch, command dispatch, and the console/remote worker
+threads; `query` reports the recovered-exception count.
+**Rules out:** A second ban list anywhere; AdminManager owning ban persistence;
+persisting `steady_clock` time points; letting a recoverable per-boundary
+exception propagate to `std::terminate`.
+**Consequences:** One ban file, one format (pipe-delimited, wall-clock expiry),
+machine-managed. Reaching the security layer from Game code goes through the
+bridge's neutral forwarders, never a raw `SecurityManager*`. A throwing handler or
+malformed packet now logs a `NON-FATAL EXCEPTION` banner and the server keeps
+running; only genuinely unrecoverable faults (signals, uncaught exceptions that
+escape all guards) remain fatal.
+
 <!-- Append new decisions above this line, newest first. -->
