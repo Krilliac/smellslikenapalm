@@ -90,12 +90,15 @@ float WeaponDatabase::CalculateDamage(const std::string& weaponId, float distanc
         dmg *= overpenFactor;
     }
 
-    // Hit zone multipliers
-    if (isHeadshot) {
-        dmg *= def->ballistics.headshotMultiplier;
-    } else if (isLimb) {
-        dmg *= def->ballistics.limbMultiplier;
-    }
+    // Hit-zone scaling is intentionally NOT applied here. The damage-APPLICATION
+    // layer (DamageSystem::CalculateFinalDamage, using the event's full HitZone) is
+    // the single point that scales by hit zone - mirroring the source, where the
+    // weapon yields a base damage and ROPawn.TakeDamage applies the per-zone effect
+    // exactly once. Applying headshot/limb multipliers here too double-counted the
+    // zone (headshots ~10x*10x = ~100x; limbs ~0.4x*0.4x). isHeadshot/isLimb stay in
+    // the signature for callers and logging.
+    (void)isHeadshot;
+    (void)isLimb;
 
     return dmg;
 }
