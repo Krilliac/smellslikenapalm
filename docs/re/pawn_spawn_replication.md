@@ -231,3 +231,35 @@ index — confirm via ch2 handle 24).
    via the cooked ROGame linker export table → exact ROPawn subclass + weapon/ammo class names.
 3. **Decode one full pawn open** property-by-property (typed) to get the exact initial-property set +
    role-flag bytes the client expects, for the generator.
+
+---
+
+## 10. Implementation status (server-side built + autonomously validated)
+
+`ConnectionManager::SendPawnSpawn` implements the §6 flow. On the first inbound
+`SelectRoleByClass` (ch2 handle 175) after a `SelectTeam` (handle 170), the server, in two
+decoupled reliable packets:
+
+1. **opens the pawn channel `kPawnCh = 209`** with the verbatim ROPawn open (`bControl=1,bOpen=1`,
+   class 286147, 1137 bits) + the back-refs **h52 `Controller` → ch2** and **h32
+   `PlayerReplicationInfo` → ch26**;
+2. sends the possession RPCs on ch2: **h24 `Pawn` → ch209** and **h85 `ClientRestart`**.
+
+**The S2C ack-storm** (a standalone ack-only datagram per received packet) was congesting Windows
+loopback and dropping these reliable bunches; `FlushPendingAcks()` now **coalesces acks** to ≤1
+datagram per client per pump (acks also piggyback on data), which fixed the drop.
+
+**Autonomous validation — `python tools/mock_client.py spawn`** drives the full path as a UE3
+client (handshake → Join → `SelectTeam(170)` → `SelectRoleByClass(175)`) and asserts the server
+opens a channel above the bootstrap range. **RESULT: PASS** — server opens **ch209** (1137-bit open)
++ h52/h32 back-refs + ch2 h24/h85, with **0 standalone ack-only datagrams** (ack-storm fix holds;
+e.g. `ack5` piggybacks on the pawn open). The reliable open/possession retransmit because the mock
+doesn't ACK — expected, and proves reliable retransmission works.
+
+`react` (handshake/bootstrap) and `spawn` (menu→pawn) are the **two netcode regression gates** — run
+both (`python tools/mock_client.py react` and `... spawn`) after any netcode/GameServer change.
+
+**Remaining unknown (pending a real-client test):** whether the retail client *accepts* the pawn
+open and switches to the §7 ServerMove stream (true possession). The send path is proven correct to
+the bit and the ack-storm is gone, so the next real-client connect is the test. Client verbose
+logging (ROEngine.ini `Suppress=-DevNet`) + `-FORCELOGFLUSH` are enabled to capture it.
