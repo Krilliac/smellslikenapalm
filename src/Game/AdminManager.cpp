@@ -127,7 +127,27 @@ bool AdminManager::HandleAdminCommand(uint32_t clientId, const std::string& comm
     }
     else if (command == "ban" && args.size() >= 2)
     {
-        int duration = std::stoi(args[1]);
+        // GUARD: args[1] is operator-supplied text. std::stoi throws (std::invalid_argument
+        // on non-numeric, std::out_of_range on oversized) - a mistyped duration like
+        // "ban player forever" would otherwise crash the whole server. Parse safely and
+        // reject anything that isn't a clean integer (incl. trailing junk like "10abc").
+        int duration = 0;
+        bool parsed = false;
+        try {
+            size_t consumed = 0;
+            duration = std::stoi(args[1], &consumed);
+            parsed = (consumed == args[1].size());
+        } catch (...) {
+            parsed = false;
+        }
+        if (!parsed) {
+            Logger::Warn("[AdminManager::HandleAdminCommand] Invalid ban duration '%s' from admin %s; expected an integer number of minutes",
+                         args[1].c_str(), steamId.c_str());
+            conn->SendChatMessage("Invalid ban duration. Usage: ban <player> <minutes>");
+            Logger::Trace("[AdminManager::HandleAdminCommand] Exit: return false (bad ban duration)");
+            return false;
+        }
+        if (duration < 0) duration = 0;  // clamp negative durations to 0
         Logger::Debug("[AdminManager::HandleAdminCommand] Dispatching BanPlayer for target='%s', duration=%d min", args[0].c_str(), duration);
         bool result = BanPlayer(clientId, args[0], duration);
         Logger::Trace("[AdminManager::HandleAdminCommand] Exit: return %d (ban)", result);
