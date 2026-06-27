@@ -606,7 +606,10 @@ SpecialKey=Value with spaces
     }
 
     static void CreateUnicodeINI() {
-        std::string content = u8R"(
+        // Source is UTF-8; a plain (narrow) raw string literal keeps the same
+        // bytes as a std::string. A u8"" literal is const char8_t[] in C++20+
+        // and no longer converts to std::string.
+        std::string content = R"(
 [国际化]
 服务器名称=测试服务器
 端口=7777

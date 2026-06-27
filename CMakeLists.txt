@@ -1,7 +1,11 @@
-cmake_minimum_required(VERSION 3.15)
+# CMake 3.20 is the first version that recognises CMAKE_CXX_STANDARD 23.
+cmake_minimum_required(VERSION 3.20)
 project(RS2VServer VERSION 1.0.0 LANGUAGES CXX)
 
-set(CMAKE_CXX_STANDARD 17)
+# C++23 is the mandated baseline (was C++17). Toolchains: GCC 12+, Clang 15+,
+# MSVC VS 2022. Rationale + required idioms: docs/CODING_STANDARDS.md and
+# docs/DESIGN_DECISIONS.md (2026-06-27 entry).
+set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)

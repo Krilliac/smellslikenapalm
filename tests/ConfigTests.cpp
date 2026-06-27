@@ -197,7 +197,10 @@ MapDirectory=/opt/maps/
     }
 
     static void CreateUnicodeConfig() {
-        std::string content = u8R"(
+        // Source is UTF-8; a plain (narrow) raw string literal keeps the same
+        // bytes as a std::string. A u8"" literal is const char8_t[] in C++20+
+        // and no longer converts to std::string.
+        std::string content = R"(
 [Server]
 Name=テストサーバー
 Description=Server with unicode: café, naïve, résumé
