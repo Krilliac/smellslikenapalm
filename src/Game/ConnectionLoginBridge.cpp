@@ -97,6 +97,12 @@ void ConnectionLoginBridge::OnClientLoggedIn(const ClientLoggedInEvent& ev)
     // (conn->GetPlayerName()/GetTeamId()). This is the wiring that was missing.
     conn->SetPlayerName(inName);
     conn->SetTeamId(pickedTeam == 255 ? 0u : (uint32_t)pickedTeam);
+    // Stamp the authenticated Steam64 so admin/ban lookups (keyed on Steam64) can match.
+    // Only when a real id was resolved (non-zero); RS2's minimal Hello often omits it, in
+    // which case GetSteamID keeps falling back to the clientId string (no behavior change).
+    if (ev.steamId != 0) {
+        conn->SetSteamID(std::to_string(ev.steamId));
+    }
 
     // *** WIRE UP the dead PlayerManager::OnPlayerConnect ***
     // (src/Game/PlayerManager.cpp:33 — previously had no caller). This is the

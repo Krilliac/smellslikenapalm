@@ -52,10 +52,23 @@ uint16_t ClientConnection::GetPort() const {
 
 std::string ClientConnection::GetSteamID() const {
     Logger::Trace("[ClientConnection::GetSteamID] Entry: clientId=%u", m_clientId);
+    // Prefer the authenticated Steam64 (stamped at login). Fall back to the clientId string
+    // only when no real Steam id was resolved, so admin/ban lists keyed on Steam64 can match
+    // for clients that present one, without breaking clients that don't.
+    if (!m_steamId.empty()) {
+        Logger::Trace("[ClientConnection::GetSteamID] Exit: returning authenticated SteamID '%s'", m_steamId.c_str());
+        return m_steamId;
+    }
     std::string steamId = std::to_string(m_clientId);
-    Logger::Debug("[ClientConnection::GetSteamID] Generated SteamID '%s' from clientId=%u", steamId.c_str(), m_clientId);
+    Logger::Debug("[ClientConnection::GetSteamID] No authenticated SteamID; falling back to clientId-derived '%s'", steamId.c_str());
     Logger::Trace("[ClientConnection::GetSteamID] Exit: returning '%s'", steamId.c_str());
     return steamId;
+}
+
+void ClientConnection::SetSteamID(const std::string& steamId) {
+    Logger::Trace("[ClientConnection::SetSteamID] Entry: clientId=%u, steamId='%s'", m_clientId, steamId.c_str());
+    m_steamId = steamId;
+    Logger::Debug("[ClientConnection::SetSteamID] client %u authenticated SteamID set to '%s'", m_clientId, steamId.c_str());
 }
 
 bool ClientConnection::SendPacket(const Packet& pkt) {
