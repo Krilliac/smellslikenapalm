@@ -5,6 +5,7 @@
 #include "Game/GameServer.h"
 #include "Game/PlayerManager.h"
 #include "Game/TeamManager.h"
+#include "Game/ObjectiveSystem.h"
 #include "Utils/Logger.h"
 #include <algorithm>
 
@@ -273,9 +274,38 @@ void TerritoryMode::DetermineWinner() {
 }
 
 bool TerritoryMode::AreAttackersContesting() const {
-    // Check if any attacker is inside an active objective zone
-    // This would query the ObjectiveSystem
-    return false;  // Placeholder — integrated via ObjectiveSystem
+    // Attackers are contesting if any player on the attacking team is currently
+    // inside an active objective's capture zone. Query the ObjectiveSystem,
+    // which refreshes per-zone player presence each tick. Note that a zone's
+    // attackerIds/defenderIds are relative to that zone's controlling team, not
+    // to the Territory attacking team, so check zone membership by team here.
+    if (!m_server) return false;
+
+    auto* objSys = m_server->GetObjectiveSystem();
+    auto* teamMgr = m_server->GetTeamManager();
+    if (!objSys || !teamMgr) return false;
+
+    auto attackingTeamPresent = [&](const CaptureZone* zone) {
+        if (!zone) return false;
+        for (uint32_t pid : zone->attackerIds) {
+            if (teamMgr->GetPlayerTeam(pid) == m_attackingTeam) return true;
+        }
+        for (uint32_t pid : zone->defenderIds) {
+            if (teamMgr->GetPlayerTeam(pid) == m_attackingTeam) return true;
+        }
+        return false;
+    };
+
+    if (const CaptureZone* current = objSys->GetCurrentTerritoryObjective()) {
+        return attackingTeamPresent(current);
+    }
+
+    // No designated territory objective (e.g. linear order not set): fall back
+    // to checking every active objective zone.
+    for (const CaptureZone* zone : objSys->GetActiveObjectives()) {
+        if (attackingTeamPresent(zone)) return true;
+    }
+    return false;
 }
 
 void TerritoryMode::SetupObjectives() {

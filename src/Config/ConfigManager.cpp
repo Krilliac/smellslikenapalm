@@ -533,7 +533,23 @@ void ConfigManager::ApplyEACConfiguration() {
 
 void ConfigManager::InitializeConfigWatchers() {
     Logger::Trace("[ConfigManager::InitializeConfigWatchers] Entry");
-    Logger::Debug("[ConfigManager::InitializeConfigWatchers] Config watchers not implemented");
+
+    // Live configuration reloading is opt-out: enabled unless explicitly
+    // disabled via [Configuration] live_reload=false. The watcher polls the
+    // primary config file's modification time on a background thread and calls
+    // ReloadConfiguration() (which notifies registered listeners) on change.
+    if (!GetBool("Configuration.live_reload", true)) {
+        Logger::Info("[ConfigManager::InitializeConfigWatchers] Live config reload disabled via Configuration.live_reload");
+        Logger::Trace("[ConfigManager::InitializeConfigWatchers] Exit - disabled by config");
+        return;
+    }
+
+    if (!StartFileWatcher()) {
+        Logger::Warn("[ConfigManager::InitializeConfigWatchers] Failed to start config file watcher; live reload inactive");
+    } else {
+        Logger::Info("[ConfigManager::InitializeConfigWatchers] Config file watcher active for live reloading");
+    }
+
     Logger::Trace("[ConfigManager::InitializeConfigWatchers] Exit");
 }
 
