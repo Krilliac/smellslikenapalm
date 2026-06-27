@@ -383,12 +383,12 @@ public:
 };
 
 // ---------------------------------------------------------------------------
-// The runner. Executes every registered test, capturing failures, and prints a
-// gtest-flavored report. Returns 0 if all tests pass (or are skipped), 1 if any
-// fail.
+// The runner. Executes every registered test (optionally filtered by a
+// substring of "Suite.Name"), capturing failures, and prints a concise report.
+// Returns 0 if all selected tests pass (or are skipped), 1 if any fail.
 // ---------------------------------------------------------------------------
-inline int RunAllTests() {
-    const auto& tests = Registry::Instance().tests();
+inline int RunRegisteredTests(const std::string& filter) {
+    const auto& all = Registry::Instance().tests();
     const char* kGreen = "\033[0;32m";
     const char* kRed = "\033[0;31m";
     const char* kYellow = "\033[0;33m";
@@ -398,6 +398,15 @@ inline int RunAllTests() {
     kGreen = kRed = kYellow = kReset = "";
 #endif
 
+    // Select tests matching the filter (empty filter = run everything).
+    std::vector<const TestInfo*> tests;
+    for (const auto& info : all) {
+        std::string full = std::string(info.suite) + "." + info.name;
+        if (filter.empty() || full.find(filter) != std::string::npos) {
+            tests.push_back(&info);
+        }
+    }
+
     std::cout << kGreen << "[==========]" << kReset << " Running " << tests.size()
               << " test" << (tests.size() == 1 ? "" : "s") << ".\n";
 
@@ -406,7 +415,8 @@ inline int RunAllTests() {
     int skipped = 0;
     std::vector<std::string> failed_names;
 
-    for (const auto& info : tests) {
+    for (const auto* infop : tests) {
+        const TestInfo& info = *infop;
         std::string full = std::string(info.suite) + "." + info.name;
         std::cout << kGreen << "[ RUN      ]" << kReset << " " << full << std::endl;
 
@@ -488,19 +498,46 @@ inline int RunAllTests() {
     return failed > 0 ? 1 : 0;
 }
 
+// Convenience: run everything.
+inline int RunAllTests() { return RunRegisteredTests(std::string()); }
+
+// Parse a minimal command line: `--filter=<substr>` (alias `--gtest_filter=`,
+// kept only so old invocations keep working) selects tests by a substring of
+// "Suite.Name"; `--list` prints the registered tests and exits.
+inline int RunAllTests(int argc, char** argv) {
+    std::string filter;
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i] ? argv[i] : "";
+        const char* kF = "--filter=";
+        const char* kG = "--gtest_filter=";
+        if (arg.rfind(kF, 0) == 0) {
+            filter = arg.substr(std::strlen(kF));
+        } else if (arg.rfind(kG, 0) == 0) {
+            filter = arg.substr(std::strlen(kG));
+        } else if (arg == "--list" || arg == "--list_tests") {
+            for (const auto& info : Registry::Instance().tests()) {
+                std::cout << info.suite << "." << info.name << "\n";
+            }
+            return 0;
+        }
+    }
+    return RunRegisteredTests(filter);
+}
+
 }  // namespace native
 
 // ---------------------------------------------------------------------------
-// ::testing compatibility shims so existing sources compile unchanged.
+// Public native test API. `rs2v::Test` is the fixture base; test sources derive
+// their fixtures from it. RS2V_TEST_MAIN() emits a standard entry point.
 // ---------------------------------------------------------------------------
-namespace testing {
+namespace rs2v {
 using Test = ::native::Test;
-inline void InitGoogleTest(int* /*argc*/, char** /*argv*/) {}
-inline void InitGoogleTest(int* /*argc*/, wchar_t** /*argv*/) {}
-inline void InitGoogleTest() {}
-}  // namespace testing
+}  // namespace rs2v
 
-#define RUN_ALL_TESTS() ::native::RunAllTests()
+#define RS2V_TEST_MAIN()                                   \
+    int main(int argc, char** argv) {                      \
+        return ::native::RunAllTests(argc, argv);          \
+    }
 
 // ---------------------------------------------------------------------------
 // Core assertion plumbing.

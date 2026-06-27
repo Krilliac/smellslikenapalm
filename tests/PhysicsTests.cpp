@@ -23,10 +23,10 @@
 #include "Math/Vector3.h"
 #include "Utils/Logger.h"
 
-using ::testing::_;
+using ::rs2v::_;
 
 // Fixture for PhysicsEngine tests
-class PhysicsEngineTest : public ::testing::Test {
+class PhysicsEngineTest : public ::rs2v::Test {
 protected:
     void SetUp() override {
         phys = std::make_unique<PhysicsEngine>();
@@ -142,7 +142,4 @@ TEST(FastRaycastTest, Raycast_NoBodies_ReturnsNoHit) {
     EXPECT_FALSE(res.hit);
 }
 
-int main(int argc, char** argv) {
-    ::testing::InitGoogleTest(&argc, argv);
-    return RUN_ALL_TESTS();
-}
+RS2V_TEST_MAIN()

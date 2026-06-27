@@ -69,7 +69,4 @@ TEST(NetworkPacketSafety, WellFormedValuesStillDecode) {
     EXPECT_EQ(WithPayload({1, 2, 3, 4}).ReadBytes(4).size(), 4u);
 }
 
-int main(int argc, char** argv) {
-    ::testing::InitGoogleTest(&argc, argv);
-    return RUN_ALL_TESTS();
-}
+RS2V_TEST_MAIN()

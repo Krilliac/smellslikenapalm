@@ -296,7 +296,7 @@ void ExpectFieldsEqual(const Packet& a, const Packet& b) {
 // A fixed deterministic seed so any failure is reproducible.
 constexpr uint32_t kSeed = 0xC0DEFACEu;
 
-class PacketCodecFuzz : public ::testing::Test {
+class PacketCodecFuzz : public ::rs2v::Test {
 protected:
     static void SetUpTestSuite() { g_wd.Start(); }
     static void TearDownTestSuite() { g_wd.Stop(); }
@@ -529,7 +529,4 @@ TEST_F(PacketCodecFuzz, DecodeReencodeDecodeStable) {
     }
 }
 
-int main(int argc, char** argv) {
-    ::testing::InitGoogleTest(&argc, argv);
-    return RUN_ALL_TESTS();
-}
+RS2V_TEST_MAIN()

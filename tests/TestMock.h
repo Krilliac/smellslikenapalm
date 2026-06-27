@@ -267,9 +267,10 @@ private:
 }  // namespace native
 
 // ---------------------------------------------------------------------------
-// ::testing compatibility surface.
+// Public native mocking surface (rs2v namespace). Matchers, actions, and mock
+// wrappers used by test sources.
 // ---------------------------------------------------------------------------
-namespace testing {
+namespace rs2v {
 inline constexpr ::native::mock::Wildcard _{};
 
 template <typename V>
@@ -295,7 +296,41 @@ class InSequence {
 public:
     InSequence() = default;
 };
-}  // namespace testing
+
+// -- Limited support for richer actions/cardinalities -----------------------
+// These exist so the legacy/excluded test sources (which were written against
+// the full GoogleMock action language) name native symbols rather than foreign
+// ones. They cover the common cases; exotic combinations are best-effort.
+template <typename Fn>
+Fn Invoke(Fn fn) { return fn; }                 // WillOnce(Invoke(f)) -> calls f
+
+// DoAll(a, b, ..., last) performs all actions and returns the last one's value.
+template <typename A>
+A DoAll(A last) { return last; }
+template <typename First, typename... Rest>
+auto DoAll(First, Rest... rest) { return DoAll(rest...); }
+
+// SetArgReferee<N>(v): assign v into the N-th (reference) argument. Implemented
+// as an action callable that writes through the indexed argument.
+template <std::size_t N, typename V>
+auto SetArgReferee(V v) {
+    return [v](auto&&... args) {
+        auto tup = std::forward_as_tuple(args...);
+        std::get<N>(tup) = v;
+    };
+}
+
+// Cardinality helpers, consumed by ExpectationBuilder::Times(...).
+struct Cardinality {
+    int min_calls;
+    int max_calls;
+    operator int() const { return min_calls; }  // back-compat with int Times()
+};
+inline Cardinality AtLeast(int n) { return {n, (1 << 30)}; }
+inline Cardinality AtMost(int n) { return {0, n}; }
+inline Cardinality Between(int lo, int hi) { return {lo, hi}; }
+inline Cardinality Exactly(int n) { return {n, n}; }
+}  // namespace rs2v
 
 // ---------------------------------------------------------------------------
 // Preprocessor helpers to expand MOCK_METHOD's (arg-types) and (specs) lists.
@@ -362,7 +397,7 @@ public:
 
 // ---------------------------------------------------------------------------
 // MOCK_METHOD — generates the storage, the overriding method, and the
-// gmock_<name> accessor used by EXPECT_CALL / ON_CALL.
+// rs2v_mock_<name> accessor used by EXPECT_CALL / ON_CALL.
 //
 // `args` and `specs` arrive parenthesized, e.g.
 //   MOCK_METHOD(bool, Validate, (const std::string&, int), (override))
@@ -373,13 +408,13 @@ public:
         return rs2v_mm_##name.Invoke(RS2V_ARGS args);                                \
     }                                                                                \
     template <typename... RS2VMs>                                                     \
-    auto gmock_##name(RS2VMs... rs2v_ms) const {                                     \
+    auto rs2v_mock_##name(RS2VMs... rs2v_ms) const {                                 \
         return rs2v_mm_##name.AddExpectation(std::move(rs2v_ms)...);                 \
     }
 
-// EXPECT_CALL(obj, Method(m...))  ->  obj.gmock_Method(m...)
+// EXPECT_CALL(obj, Method(m...))  ->  obj.rs2v_mock_Method(m...)
 // ON_CALL(obj, Method(m...)).WillByDefault(...) uses the same accessor.
-#define EXPECT_CALL(obj, call) (obj).gmock_##call
-#define ON_CALL(obj, call) (obj).gmock_##call
+#define EXPECT_CALL(obj, call) (obj).rs2v_mock_##call
+#define ON_CALL(obj, call) (obj).rs2v_mock_##call
 
 #endif  // RS2V_TEST_MOCK_H

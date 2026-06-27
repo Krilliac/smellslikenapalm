@@ -23,12 +23,12 @@
 #include "Time/TimeUtils.h"
 #include "Math/Vector3.h"
 
-using ::testing::_;
-using ::testing::Return;
-using ::testing::Invoke;
+using ::rs2v::_;
+using ::rs2v::Return;
+using ::rs2v::Invoke;
 
 // Fixture for StringUtils tests
-class StringUtilsTest : public ::testing::Test {
+class StringUtilsTest : public ::rs2v::Test {
 protected:
     StringUtils su;
 };
@@ -57,7 +57,7 @@ TEST_F(StringUtilsTest, StartsEndsWith) {
 }
 
 // Fixture for FileUtils tests
-class FileUtilsTest : public ::testing::Test {
+class FileUtilsTest : public ::rs2v::Test {
 protected:
     FileUtils fu;
     std::string testDir = "test_utils_files";
@@ -91,7 +91,7 @@ TEST_F(FileUtilsTest, WriteStringToFileAndListFiles) {
 }
 
 // Fixture for PathUtils tests
-class PathUtilsTest : public ::testing::Test {
+class PathUtilsTest : public ::rs2v::Test {
 protected:
     PathUtils pu;
 };
@@ -107,7 +107,7 @@ TEST_F(PathUtilsTest, JoinPaths_Correct) {
 }
 
 // Logger tests: formatting and level filtering
-class LoggerTest : public ::testing::Test {
+class LoggerTest : public ::rs2v::Test {
 protected:
     // Redirect logs to memory if Logger supports it, else basic call
 };
@@ -134,7 +134,7 @@ TEST(TimeUtilsTest, WaitUntil_Timeout) {
 }
 
 // Vector3 tests
-class Vector3Test : public ::testing::Test {
+class Vector3Test : public ::rs2v::Test {
 protected:
     Math::Vector3 v{3,4,0};
 };

@@ -26,16 +26,16 @@
 #include "Utils/Logger.h"
 #include "Utils/PerformanceProfiler.h"
 
-using ::testing::_;
-using ::testing::Return;
-using ::testing::InSequence;
-using ::testing::StrictMock;
-using ::testing::NiceMock;
-using ::testing::Invoke;
-using ::testing::DoAll;
-using ::testing::SetArgReferee;
-using ::testing::AtLeast;
-using ::testing::Between;
+using ::rs2v::_;
+using ::rs2v::Return;
+using ::rs2v::InSequence;
+using ::rs2v::StrictMock;
+using ::rs2v::NiceMock;
+using ::rs2v::Invoke;
+using ::rs2v::DoAll;
+using ::rs2v::SetArgReferee;
+using ::rs2v::AtLeast;
+using ::rs2v::Between;
 
 // Constants for client simulation
 constexpr int DEFAULT_CLIENT_COUNT = 10;
@@ -605,7 +605,7 @@ private:
 };
 
 // Test fixture for client simulation tests
-class ClientSimulatorTest : public ::testing::Test {
+class ClientSimulatorTest : public ::rs2v::Test {
 protected:
     void SetUp() override {
         // Initialize mocks
@@ -1117,7 +1117,4 @@ TEST_F(ClientSimulatorTest, ErrorHandling_SimulationNotStarted_SafeFailure) {
 } // namespace
 
 // Test runner entry point
-int main(int argc, char** argv) {
-    ::testing::InitGoogleTest(&argc, argv);
-    return RUN_ALL_TESTS();
-}
+RS2V_TEST_MAIN()

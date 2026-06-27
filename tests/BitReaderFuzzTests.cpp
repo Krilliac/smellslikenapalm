@@ -47,7 +47,7 @@ namespace {
 // Watchdog: run `fn` on a worker thread; FAIL (not hang) if it exceeds `ms`.
 // Catches an accidental infinite loop in any decoder path. Returns true if the
 // call completed in time. The worker is detached on timeout (we cannot safely
-// kill it); the process will be failed by the gtest assertion regardless.
+// kill it); the process will be failed by the native test assertion regardless.
 // ---------------------------------------------------------------------------
 bool RunWithWatchdog(const std::function<void()>& fn, int ms = 2000) {
     auto fut = std::async(std::launch::async, fn);
@@ -505,7 +505,4 @@ TEST(BitReaderRandomFuzz, BoundaryBuffers) {
     }
 }
 
-int main(int argc, char** argv) {
-    ::testing::InitGoogleTest(&argc, argv);
-    return RUN_ALL_TESTS();
-}
+RS2V_TEST_MAIN()

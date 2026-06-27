@@ -111,7 +111,4 @@ TEST(Vector3Test, Edge_ZeroVectorNormalization) {
     EXPECT_EQ(u, Vector3(0,0,0));
 }
 
-int main(int argc, char** argv) {
-    ::testing::InitGoogleTest(&argc, argv);
-    return RUN_ALL_TESTS();
-}
+RS2V_TEST_MAIN()

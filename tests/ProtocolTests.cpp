@@ -17,10 +17,10 @@
 #include "Network/PacketSerializer.h"
 #include "Utils/Logger.h"
 
-using ::testing::_;
+using ::rs2v::_;
 
 // Fixture for ProtocolUtils enum conversions
-class ProtocolUtilsTest : public ::testing::Test {
+class ProtocolUtilsTest : public ::rs2v::Test {
 protected:
     std::vector<PacketType> allTypes;
 
@@ -52,7 +52,7 @@ TEST_F(ProtocolUtilsTest, TagToName_InvalidTag_ReturnsUnknown) {
 }
 
 // Fixture for PacketSerializer tests
-class PacketSerializerTest : public ::testing::Test {
+class PacketSerializerTest : public ::rs2v::Test {
 protected:
     PacketSerializer serializer;
 };
@@ -107,7 +107,4 @@ TEST_F(PacketSerializerTest, RoundTrip_AllPacketTypes) {
     }
 }
 
-int main(int argc, char** argv) {
-    ::testing::InitGoogleTest(&argc, argv);
-    return RUN_ALL_TESTS();
-}
+RS2V_TEST_MAIN()

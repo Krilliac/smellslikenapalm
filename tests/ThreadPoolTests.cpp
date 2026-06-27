@@ -38,7 +38,7 @@ static void WaitAll(std::vector<std::future<T>>& futs) {
 }
 
 // Fixture
-class ThreadPoolTest : public ::testing::Test {
+class ThreadPoolTest : public ::rs2v::Test {
 protected:
     void SetUp() override {
         pool = std::make_unique<ThreadPool>(4);
@@ -148,7 +148,4 @@ TEST_F(ThreadPoolTest, ConcurrentShutdown_NoRace) {
     SUCCEED();  // no crash
 }
 
-int main(int argc, char** argv) {
-    ::testing::InitGoogleTest(&argc, argv);
-    return RUN_ALL_TESTS();
-}
+RS2V_TEST_MAIN()

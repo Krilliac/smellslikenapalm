@@ -19,10 +19,10 @@
 #include "Math/Vector3.h"
 #include "Utils/Logger.h"
 
-using ::testing::_;
+using ::rs2v::_;
 
 // Fixture
-class PlayerManagerTest : public ::testing::Test {
+class PlayerManagerTest : public ::rs2v::Test {
 protected:
     void SetUp() override {
         pm = std::make_unique<PlayerManager>();
@@ -148,7 +148,4 @@ TEST_F(PlayerManagerTest, Performance_ManyPlayers_OperationsFast) {
     EXPECT_LT(ms, 50.0);  // add+remove 10k players <50ms
 }
 
-int main(int argc, char** argv) {
-    ::testing::InitGoogleTest(&argc, argv);
-    return RUN_ALL_TESTS();
-}
+RS2V_TEST_MAIN()

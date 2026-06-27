@@ -20,7 +20,7 @@
 #include "Math/Vector3.h"
 #include "Utils/Logger.h"
 
-using ::testing::_;
+using ::rs2v::_;
 
 // Mock actor with simple properties
 struct MockActor {
@@ -38,7 +38,7 @@ struct MockActor {
 };
 
 // Test fixture
-class ReplicationTest : public ::testing::Test {
+class ReplicationTest : public ::rs2v::Test {
 protected:
     void SetUp() override {
         mgr = std::make_unique<ReplicationManager>();
@@ -162,7 +162,4 @@ TEST_F(ReplicationTest, AllPropertiesChanged_DeltaEqualsFull) {
     EXPECT_EQ(delta.actorCount(), actors.size());
 }
 
-int main(int argc, char** argv) {
-    ::testing::InitGoogleTest(&argc, argv);
-    return RUN_ALL_TESTS();
-}
+RS2V_TEST_MAIN()

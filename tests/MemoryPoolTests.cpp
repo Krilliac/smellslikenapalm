@@ -35,7 +35,7 @@ static_assert(std::is_trivially_destructible_v<MemoryPool>,
 /*                               test fixture                                 */
 /* -------------------------------------------------------------------------- */
 
-class MemoryPoolTest : public ::testing::Test
+class MemoryPoolTest : public ::rs2v::Test
 {
 protected:
     void SetUp() override

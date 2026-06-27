@@ -21,7 +21,7 @@
 #include "Network/PacketSerializer.h"
 #include "Utils/Logger.h"
 
-using ::testing::_;
+using ::rs2v::_;
 
 // Mock handler to record invocation order
 static std::vector<std::string> invokedHandlers;
@@ -29,7 +29,7 @@ extern "C" void Handle_CHAT_MESSAGE(const PacketAnalysisResult& r) { invokedHand
 extern "C" void Handle_PLAYER_MOVE (const PacketAnalysisResult& r) { invokedHandlers.push_back("PLAYER_MOVE"); }
 extern "C" void Handle_HEARTBEAT   (const PacketAnalysisResult& r) { invokedHandlers.push_back("HEARTBEAT"); }
 
-class PacketFlowTest : public ::testing::Test {
+class PacketFlowTest : public ::rs2v::Test {
 protected:
     void SetUp() override {
         // Initialize serializer, analyzer, handler manager

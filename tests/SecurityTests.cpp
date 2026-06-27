@@ -22,9 +22,9 @@
 #include "Utils/PasswordHasher.h"
 #include "Utils/TokenManager.h"
 
-using ::testing::_;
-using ::testing::Return;
-using ::testing::NiceMock;
+using ::rs2v::_;
+using ::rs2v::Return;
+using ::rs2v::NiceMock;
 
 // Mock SecurityConfig
 class MockSecurityConfig : public SecurityConfig {
@@ -37,7 +37,7 @@ public:
 };
 
 // Fixture
-class SecurityTest : public ::testing::Test {
+class SecurityTest : public ::rs2v::Test {
 protected:
     void SetUp() override {
         cfg = std::make_shared<NiceMock<MockSecurityConfig>>();
@@ -143,7 +143,4 @@ TEST_F(SecurityTest, ConcurrentBan_Unban_ThreadSafety) {
     EXPECT_FALSE(admin->IsBanned(player));
 }
 
-int main(int argc, char** argv) {
-    ::testing::InitGoogleTest(&argc, argv);
-    return RUN_ALL_TESTS();
-}
+RS2V_TEST_MAIN()

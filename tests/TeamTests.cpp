@@ -16,10 +16,10 @@
 #include "Game/PlayerManager.h"
 #include "Utils/Logger.h"
 
-using ::testing::_; using ::testing::Return;
+using ::rs2v::_; using ::rs2v::Return;
 
 // Fixture
-class TeamTests : public ::testing::Test {
+class TeamTests : public ::rs2v::Test {
 protected:
     void SetUp() override {
         pm = std::make_unique<PlayerManager>();
@@ -140,7 +140,4 @@ TEST_F(TeamTests, SwapToSameTeam_NoOp) {
     EXPECT_EQ(tm->GetPlayerTeam(pid), TeamID::NORTH_VIETNAM);
 }
 
-int main(int argc, char** argv) {
-    ::testing::InitGoogleTest(&argc, argv);
-    return RUN_ALL_TESTS();
-}
+RS2V_TEST_MAIN()

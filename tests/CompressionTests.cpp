@@ -5,7 +5,7 @@
 // that is used by NetworkManager, PacketAnalyzer and BandwidthManager to
 // minimise wire size of large payloads while respecting MTU limits.
 //
-// GoogleTest / GoogleMock are employed so that the tests can run out–of–process
+// The RS2V native test framework is employed so that the tests can run out–of–process
 // from a live server instance and still validate every public contract of the
 // compression façade.
 
@@ -24,10 +24,10 @@
 #include "Utils/PerformanceProfiler.h"
 // -----------------------------------------------------------------------------
 
-using ::testing::_;
-using ::testing::Return;
-using ::testing::Invoke;
-using ::testing::NiceMock;
+using ::rs2v::_;
+using ::rs2v::Return;
+using ::rs2v::Invoke;
+using ::rs2v::NiceMock;
 
 /* -------------------------------------------------------------------------- */
 /*                               Test doubles                                 */
@@ -56,7 +56,7 @@ static std::vector<uint8_t> MakeRandomBuffer(size_t bytes)
 /* -------------------------------------------------------------------------- */
 /*                                  Fixture                                   */
 /* -------------------------------------------------------------------------- */
-class CompressionTest : public ::testing::Test
+class CompressionTest : public ::rs2v::Test
 {
 protected:
     void SetUp() override
@@ -261,8 +261,4 @@ TEST_F(CompressionTest, Decompress_TruncatedStream_Throws)
 /*                                Test Runner                                */
 /* -------------------------------------------------------------------------- */
 
-int main(int argc, char** argv)
-{
-    ::testing::InitGoogleTest(&argc, argv);
-    return RUN_ALL_TESTS();
-}
+RS2V_TEST_MAIN()

@@ -1,7 +1,7 @@
 // tests/ConfigValidationTests.cpp
 // Domain-specific validation tests for configuration wrappers
 //
-// GoogleTest / GoogleMock
+// RS2V native test framework (TestFramework.h / TestMock.h)
 
 #include "TestFramework.h"
 #include <memory>
@@ -34,7 +34,7 @@ void write(const std::string& file, const std::string& text)
 /* -------------------------------------------------------------------------- */
 /*                               Test Fixture                                 */
 /* -------------------------------------------------------------------------- */
-class ConfigValidationTest : public ::testing::Test
+class ConfigValidationTest : public ::rs2v::Test
 {
 protected:
     void SetUp() override   { std::filesystem::create_directories(kTmp); }
@@ -263,8 +263,4 @@ TickRate=60
 } // namespace
 
 // test-runner
-int main(int argc,char**argv)
-{
-    ::testing::InitGoogleTest(&argc,argv);
-    return RUN_ALL_TESTS();
-}
+RS2V_TEST_MAIN()

@@ -13,10 +13,10 @@
 #include "Config/MapConfig.h"
 #include "Utils/Logger.h"
 
-using ::testing::_;
-using ::testing::Return;
-using ::testing::Invoke;
-using ::testing::StrictMock;
+using ::rs2v::_;
+using ::rs2v::Return;
+using ::rs2v::Invoke;
+using ::rs2v::StrictMock;
 
 // Mock ConfigManager for MapConfig
 class MockConfigManager : public ConfigManager {
@@ -27,7 +27,7 @@ public:
 };
 
 // Fixture for MapConfig tests
-class MapConfigTest : public ::testing::Test {
+class MapConfigTest : public ::rs2v::Test {
 protected:
     void SetUp() override {
         // Prepare temporary config directory

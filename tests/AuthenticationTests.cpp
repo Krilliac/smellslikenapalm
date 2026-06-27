@@ -30,10 +30,10 @@
 #include "Security/PasswordHasher.h"
 #include "Security/TokenManager.h"
 
-using ::testing::_;
-using ::testing::Return;
-using ::testing::InSequence;
-using ::testing::NiceMock;
+using ::rs2v::_;
+using ::rs2v::Return;
+using ::rs2v::InSequence;
+using ::rs2v::NiceMock;
 
 // A mock EACProxy exercising the virtual surface callers depend on.
 class MockEACProxy : public EACProxy {
@@ -45,7 +45,7 @@ public:
     MOCK_METHOD(bool, IsClientAuthenticated, (const std::string&), (const, override));
 };
 
-class AuthenticationTest : public ::testing::Test {
+class AuthenticationTest : public ::rs2v::Test {
 protected:
     void SetUp() override {
         eac = std::make_unique<EACProxy>();
@@ -327,7 +327,4 @@ TEST_F(AuthenticationTest, FullAuthenticationFlow_Success) {
     EXPECT_FALSE(auth->IsLockedOut(validSteamId));
 }
 
-int main(int argc, char** argv) {
-    ::testing::InitGoogleTest(&argc, argv);
-    return RUN_ALL_TESTS();
-}
+RS2V_TEST_MAIN()

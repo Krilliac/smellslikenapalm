@@ -99,7 +99,7 @@ private:
     std::mt19937 rng;
 };
 
-class LoadTests : public ::testing::Test {
+class LoadTests : public ::rs2v::Test {
 protected:
     void SetUp() override {
         metrics = std::make_unique<LoadMetrics>();
@@ -152,8 +152,5 @@ TEST_F(LoadTests, StressLoad_MaxCapacity) {
 }
 
 // This file did not define its own main() (unlike most test files), and we do
-// not link gtest_main — so provide the entry point here.
-int main(int argc, char** argv) {
-    ::testing::InitGoogleTest(&argc, argv);
-    return RUN_ALL_TESTS();
-}
+// the native framework has no separate main lib — so provide the entry point here.
+RS2V_TEST_MAIN()

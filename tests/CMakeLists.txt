@@ -2,8 +2,8 @@
 # Test suite for the RS2V server emulator.
 #
 # Design constraints (do NOT "simplify" these away):
-#   * Each tests/*Tests.cpp file defines its OWN main() (InitGoogleTest +
-#     RUN_ALL_TESTS). Therefore we build ONE executable per test file.
+#   * Each tests/*Tests.cpp file provides its OWN entry point via the
+#     RS2V_TEST_MAIN() macro. Therefore we build ONE executable per test file.
 #   * The suite uses the RS2V NATIVE test framework (tests/TestFramework.h +
 #     tests/TestMock.h) — a self-contained, dependency-free reimplementation of
 #     the GoogleTest/GoogleMock subset these tests use. There is NO external

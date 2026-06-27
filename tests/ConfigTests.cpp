@@ -22,16 +22,16 @@
 #include "Utils/Logger.h"
 #include "Utils/FileUtils.h"
 
-using ::testing::_;
-using ::testing::Return;
-using ::testing::InSequence;
-using ::testing::StrictMock;
-using ::testing::NiceMock;
-using ::testing::Invoke;
-using ::testing::DoAll;
-using ::testing::SetArgReferee;
-using ::testing::AtLeast;
-using ::testing::Between;
+using ::rs2v::_;
+using ::rs2v::Return;
+using ::rs2v::InSequence;
+using ::rs2v::StrictMock;
+using ::rs2v::NiceMock;
+using ::rs2v::Invoke;
+using ::rs2v::DoAll;
+using ::rs2v::SetArgReferee;
+using ::rs2v::AtLeast;
+using ::rs2v::Between;
 
 // Constants for configuration testing
 constexpr const char* TEST_CONFIG_DIR = "test_configs";
@@ -231,7 +231,7 @@ private:
 };
 
 // Test fixture for configuration tests
-class ConfigTest : public ::testing::Test {
+class ConfigTest : public ::rs2v::Test {
 protected:
     void SetUp() override {
         // Create test directory and files
@@ -855,7 +855,4 @@ TEST_F(ConfigTest, EdgeCase_NullAndControlCharacters_Sanitized) {
 } // namespace
 
 // Test runner entry point
-int main(int argc, char** argv) {
-    ::testing::InitGoogleTest(&argc, argv);
-    return RUN_ALL_TESTS();
-}
+RS2V_TEST_MAIN()

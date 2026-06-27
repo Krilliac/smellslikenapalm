@@ -16,9 +16,9 @@
 #include "Network/SteamQuery.h"
 #include "Utils/Logger.h"
 
-using ::testing::_;
-using ::testing::Return;
-using ::testing::Invoke;
+using ::rs2v::_;
+using ::rs2v::Return;
+using ::rs2v::Invoke;
 
 // Mock SteamAPI wrapper
 class MockSteamAPI : public ISteamAPI {
@@ -36,7 +36,7 @@ public:
 };
 
 // Fixture
-class SteamQueryTest : public ::testing::Test {
+class SteamQueryTest : public ::rs2v::Test {
 protected:
     void SetUp() override {
         mockAPI = std::make_shared<MockSteamAPI>();
@@ -64,7 +64,7 @@ TEST_F(SteamQueryTest, InitializeShutdown_Succeeds) {
 TEST_F(SteamQueryTest, GetSetUserStat_Succeeds) {
     int32_t value = 0;
     EXPECT_CALL(*mockAPI, GetUserStat("Kills", _))
-        .WillOnce(DoAll(::testing::SetArgReferee<1>(150), Return(true)));
+        .WillOnce(DoAll(::rs2v::SetArgReferee<1>(150), Return(true)));
     EXPECT_TRUE(sq->GetStat("Kills", value));
     EXPECT_EQ(value, 150);
 
@@ -149,7 +149,4 @@ TEST_F(SteamQueryTest, APIUnavailable_FailsAll) {
     EXPECT_FALSE(sq->DownloadScores(1).has_value());
 }
 
-int main(int argc, char** argv) {
-    ::testing::InitGoogleTest(&argc, argv);
-    return RUN_ALL_TESTS();
-}
+RS2V_TEST_MAIN()

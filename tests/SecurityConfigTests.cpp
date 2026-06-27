@@ -26,7 +26,7 @@ void WriteFile(const std::string &name, const std::string &text) {
     out << text;
 }
 
-struct SecurityConfigTest : public ::testing::Test {
+struct SecurityConfigTest : public ::rs2v::Test {
     void SetUp() override {
         std::filesystem::remove_all(kTmpDir);
     }
