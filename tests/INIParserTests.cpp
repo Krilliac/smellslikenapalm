@@ -16,7 +16,7 @@
 //     colliding with the real INISection in Config/INIParserTypes.h.
 //   * The stray, unmatched `} // namespace` at end of file was removed.
 
-#include <gtest/gtest.h>
+#include "TestFramework.h"
 #include <algorithm>
 #include <memory>
 #include <string>
@@ -668,7 +668,7 @@ private:
 };
 
 // Test fixture for INI parser tests
-class INIParserTest : public ::testing::Test {
+class INIParserTest : public ::rs2v::Test {
 protected:
     void SetUp() {
         // Create test directory and files
@@ -1364,7 +1364,4 @@ TEST_F(INIParserTest, Integration_FullCycle_ParseModifyWrite) {
 
 
 // Test runner entry point
-int main(int argc, char** argv) {
-    ::testing::InitGoogleTest(&argc, argv);
-    return RUN_ALL_TESTS();
-}
+RS2V_TEST_MAIN()

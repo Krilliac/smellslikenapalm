@@ -2,9 +2,9 @@
 // Comprehensive performance benchmarks for core subsystems
 //
 // Covers: packet analysis, handler dispatch, config access, memory pool, physics simulation.
-// Uses GoogleTest for measurement and assertions.
+// Uses the RS2V native test framework for measurement and assertions.
 
-#include <gtest/gtest.h>
+#include "TestFramework.h"
 #include <chrono>
 #include <vector>
 #include <random>
@@ -120,7 +120,4 @@ TEST(PerformanceTests, GameModeUpdate) {
     )
 }
 
-int main(int argc, char** argv) {
-    ::testing::InitGoogleTest(&argc, argv);
-    return RUN_ALL_TESTS();
-}
+RS2V_TEST_MAIN()

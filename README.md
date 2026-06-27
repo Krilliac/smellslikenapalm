@@ -159,23 +159,28 @@ The RS2V server is built on a modular, event-driven architecture designed for sc
 
 ### Dependencies Installation
 
+> **Note on testing:** the test suite uses the project's own native test
+> framework (`tests/TestFramework.h` + `tests/TestMock.h`) and has **no external
+> test dependency** — GoogleTest/GoogleMock are not required and are no longer
+> fetched at configure time. The suite builds and runs fully offline.
+
 #### Ubuntu/Debian
 ```bash
 sudo apt update
 sudo apt install -y build-essential cmake libssl-dev libjsoncpp-dev \
-                    libsteam-api-dev libgtest-dev zlib1g-dev
+                    libsteam-api-dev zlib1g-dev
 ```
 
 #### CentOS/RHEL
 ```bash
 sudo yum groupinstall "Development Tools"
 sudo yum install cmake3 openssl-devel jsoncpp-devel steam-sdk-devel \
-                 gtest-devel zlib-devel
+                 zlib-devel
 ```
 
 #### Windows (vcpkg)
 ```powershell
-vcpkg install openssl nlohmann-json gtest zlib
+vcpkg install openssl nlohmann-json zlib
 ```
 
 ### Build Configuration Options

@@ -17,7 +17,7 @@
 //   * `Lerp` is a member (a.Lerp(b, t)), not a static `Vector3::Lerp`.
 //   * There is no `Clamp`; component clamping is done inline below.
 
-#include <gtest/gtest.h>
+#include "TestFramework.h"
 #include "Math/Vector3.h"
 #include <algorithm>
 #include <cmath>
@@ -111,7 +111,4 @@ TEST(Vector3Test, Edge_ZeroVectorNormalization) {
     EXPECT_EQ(u, Vector3(0,0,0));
 }
 
-int main(int argc, char** argv) {
-    ::testing::InitGoogleTest(&argc, argv);
-    return RUN_ALL_TESTS();
-}
+RS2V_TEST_MAIN()

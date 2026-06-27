@@ -10,7 +10,7 @@
 // 6. Thread safety of timers under concurrent use.
 // 7. Performance: scheduling many timers.
 
-#include <gtest/gtest.h>
+#include "TestFramework.h"
 #include <chrono>
 #include <thread>
 #include <atomic>
@@ -22,7 +22,7 @@
 using namespace std::chrono;
 
 // Fixture for high-resolution timer
-class HighResTimerTest : public ::testing::Test {
+class HighResTimerTest : public ::rs2v::Test {
 protected:
     void SetUp() override {
         start = high_resolution_clock::now();
@@ -46,7 +46,7 @@ TEST_F(HighResTimerTest, TimerSleep_YieldsApproxDuration) {
 }
 
 // Fixture for Timer class
-class TimerTest : public ::testing::Test {
+class TimerTest : public ::rs2v::Test {
 protected:
     Timer timer;
 };
@@ -146,7 +146,4 @@ TEST_F(TimerTest, Performance_ManyTimers_ScheduleExecute) {
     EXPECT_LT(ms, 200.0);  // scheduling overhead <200ms
 }
 
-int main(int argc, char** argv) {
-    ::testing::InitGoogleTest(&argc, argv);
-    return RUN_ALL_TESTS();
-}
+RS2V_TEST_MAIN()

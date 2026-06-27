@@ -17,7 +17,7 @@
 //     (see HasAnyResolvedSymbol) rather than fail — a symbol-less CI runner
 //     must still go green.
 
-#include <gtest/gtest.h>
+#include "TestFramework.h"
 
 #include "Utils/StackTrace.h"
 
@@ -102,7 +102,7 @@ TEST(StackTraceTests, FunctionNameAppearsWhenSymbolsAvailable) {
     rs2v::StackTrace trace = DistinctlyNamedCaptureFunction();
 
     if (!HasAppSymbols(trace)) {
-        GTEST_SKIP() << "Application symbol resolution unavailable in this "
+        SKIP_TEST() << "Application symbol resolution unavailable in this "
                         "build/environment (no PDB / stripped binary; system-DLL "
                         "exports don't count); skipping name assertion.";
     }
@@ -115,7 +115,4 @@ TEST(StackTraceTests, FunctionNameAppearsWhenSymbolsAvailable) {
         << text;
 }
 
-int main(int argc, char** argv) {
-    ::testing::InitGoogleTest(&argc, argv);
-    return RUN_ALL_TESTS();
-}
+RS2V_TEST_MAIN()

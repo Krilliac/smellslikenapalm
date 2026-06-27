@@ -10,8 +10,8 @@
 // 6. Persistence: saving/loading script state.
 // 7. Edge cases: empty scripts, infinite loops, concurrent script contexts.
 
-#include <gtest/gtest.h>
-#include <gmock/gmock.h>
+#include "TestFramework.h"
+#include "TestMock.h"
 #include <string>
 #include <chrono>
 #include <thread>
@@ -20,7 +20,7 @@
 #include "Game/GameServer.h"
 #include "Utils/Logger.h"
 
-using ::testing::_;
+using ::rs2v::_;
 
 // Mock GameServer to expose API to scripts
 class MockGameServer : public GameServer {
@@ -30,7 +30,7 @@ public:
 };
 
 // Fixture for scripting tests
-class ScriptingTest : public ::testing::Test {
+class ScriptingTest : public ::rs2v::Test {
 protected:
     void SetUp() override {
         engine = std::make_unique<ScriptEngine>();
@@ -191,7 +191,4 @@ TEST_F(ScriptingTest, Performance_MultipleScripts_CompileAndExec) {
     EXPECT_LT(ms, 200.0);  // 1000 executes <200ms
 }
 
-int main(int argc, char** argv) {
-    ::testing::InitGoogleTest(&argc, argv);
-    return RUN_ALL_TESTS();
-}
+RS2V_TEST_MAIN()

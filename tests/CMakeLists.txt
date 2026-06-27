@@ -2,10 +2,19 @@
 # Test suite for the RS2V server emulator.
 #
 # Design constraints (do NOT "simplify" these away):
-#   * Each tests/*Tests.cpp file defines its OWN main() (InitGoogleTest +
-#     RUN_ALL_TESTS). Therefore we build ONE executable per test file and we
-#     NEVER link gtest_main.
-#   * GoogleTest/GoogleMock are not vendored — they are pulled via FetchContent.
+#   * Each tests/*Tests.cpp file provides its OWN entry point via the
+#     RS2V_TEST_MAIN() macro. Therefore we build ONE executable per test file.
+#   * The suite uses the RS2V NATIVE test framework (tests/TestFramework.h +
+#     tests/TestMock.h) — a self-contained, dependency-free reimplementation of
+#     the GoogleTest/GoogleMock subset these tests use. There is NO external
+#     test dependency and NO network access at configure or build time.
+#
+#     Why: GoogleTest was previously pulled via CMake FetchContent, which clones
+#     github.com/google/googletest at configure time. In offline / sandboxed /
+#     restricted-CI environments that clone fails and the whole suite becomes
+#     un-buildable. The native framework removes that dependency entirely while
+#     keeping the test sources unchanged (they just include the native headers).
+#
 #   * Tests link the rs2v_core static library defined in the root CMakeLists.txt.
 #
 # This is an explicit ALLOW-LIST, not a glob: only files known to compile (after
@@ -21,23 +30,14 @@
 # exist, it is EXCLUDED rather than rewritten (rewriting would mean inventing
 # new test behavior, which is out of scope).
 
-include(FetchContent)
-
-set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
-
-FetchContent_Declare(
-    googletest
-    GIT_REPOSITORY https://github.com/google/googletest.git
-    GIT_TAG        v1.15.2
-)
-FetchContent_MakeAvailable(googletest)
-
 # Helper: add one test executable per source file, each with its own main().
+# The native framework is header-only, so tests just need the tests/ directory
+# on the include path (for "TestFramework.h" / "TestMock.h") plus rs2v_core.
 function(rs2v_add_test test_name)
     add_executable(${test_name} ${test_name}.cpp)
-    target_link_libraries(${test_name}
-        PRIVATE rs2v_core GTest::gtest GTest::gmock Threads::Threads)
-    target_include_directories(${test_name} PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(${test_name} PRIVATE rs2v_core Threads::Threads)
+    target_include_directories(${test_name}
+        PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR})
     add_test(NAME ${test_name} COMMAND ${test_name})
 endfunction()
 
@@ -60,6 +60,20 @@ rs2v_add_test(ActorReplicationTests)     # actor-channel NetGUID/SerializeNewAct
 rs2v_add_test(BitReaderFuzzTests)        # fuzz + malformed-input hardening for BitReader/BitWriter (overflow safety, no OOB/hang, round-trip)
 rs2v_add_test(PacketCodecFuzzTests)      # fuzz/hostile-input: random+mutated+boundary bytes into Decode/Encode (no crash/OOB/hang), valid round-trip
 rs2v_add_test(NetworkPacketSafetyTests)  # malformed-input bounds checks for legacy Packet readers (ReadString/DecodeString/ReadUInt/ReadFloat/ReadBytes)
+
+# -----------------------------------------------------------------------------
+# Unit coverage for self-contained subsystem APIs (added with the native test
+# framework). Each targets the REAL src/ API surface and asserts published
+# vectors / round-trips / invariants.
+# -----------------------------------------------------------------------------
+rs2v_add_test(StringUtilsTests)        # Utils/StringUtils: trim/split/join/case/parse
+rs2v_add_test(MathUtilsTests)          # Utils/MathUtils: clamp/lerp/remap/angles/gcd/quadratic
+rs2v_add_test(CryptoUtilsTests)        # Utils/CryptoUtils: SHA-256/HMAC/Base64 vectors + RNG
+rs2v_add_test(ProtocolUtilsTests)      # Protocol/ProtocolUtils: hex/base64/checksum/tag<->type
+rs2v_add_test(NetworkUtilsTests)       # Network/NetworkUtils: IPv4 validate/normalize, ports
+rs2v_add_test(BoundsTests)             # Game/Bounds: AABB contains/center/size
+rs2v_add_test(RandomGeneratorTests)    # Utils/RandomGenerator: seed determinism, range bounds
+rs2v_add_test(CompressionHandlerTests) # Protocol/CompressionHandler: NONE + zlib round-trips
 
 # Scripting is OFF by default (deprecated .NET COM hosting). The scripting test
 # is gated on ENABLE_SCRIPTING, but it ALSO references Scripting/ScriptEngine.h

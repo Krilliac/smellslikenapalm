@@ -10,15 +10,15 @@
 //  6. Decay of progress when zone is vacated.
 //  7. Edge cases: zero objectives, invalid IDs.
 
-#include <gtest/gtest.h>
-#include <gmock/gmock.h>
+#include "TestFramework.h"
+#include "TestMock.h"
 #include <vector>
 
 #include "Game/GameMode.h"
 #include "Math/Vector3.h"
 #include "Utils/Logger.h"
 
-using ::testing::_;
+using ::rs2v::_;
 
 // Minimal GameModeDefinition for testing
 static GameModeDefinition MakeConquestDef() {
@@ -60,7 +60,7 @@ public:
     }
 };
 
-class ObjectiveTest : public ::testing::Test {
+class ObjectiveTest : public ::rs2v::Test {
 protected:
     void SetUp() override {
         gm = std::make_unique<TestGameMode>();
@@ -131,7 +131,4 @@ TEST_F(ObjectiveTest, InvalidObjectiveId_NoCrash) {
     EXPECT_NO_FATAL_FAILURE(gm->TriggerObjectiveCapture(999, TeamID::NORTH_VIETNAM));
 }
 
-int main(int argc, char** argv) {
-    ::testing::InitGoogleTest(&argc, argv);
-    return RUN_ALL_TESTS();
-}
+RS2V_TEST_MAIN()
