@@ -83,7 +83,14 @@ bool RoleSystem::AssignRole(uint32_t playerId, CombatRole role) {
     uint32_t teamId = tm->GetPlayerTeam(playerId);
     if (teamId == 0) return false;
 
-    if (!IsRoleAvailable(teamId, role)) {
+    // A player may ALWAYS re-select the role they already hold, even when that role is at its
+    // team cap - they already occupy the slot (re-confirming loadout / re-deploying as the same
+    // limited role). GetRoleCount counts the requester themselves, so without this exemption the
+    // lone Sniper (cap 1) is rejected when re-selecting Sniper. Mirrors the source's
+    // "ClassIndex == Roles[I].RoleInfoClass.ClassIndex" clause in
+    // ROPlayerReplicationInfo.SelectRoleByClass.
+    const bool alreadyMine = (m_playerRoles.count(playerId) > 0) && (GetPlayerRole(playerId) == role);
+    if (!alreadyMine && !IsRoleAvailable(teamId, role)) {
         Logger::Warn("Role %s not available for player %u on team %u",
                      GetRoleName(role).c_str(), playerId, teamId);
         return false;
