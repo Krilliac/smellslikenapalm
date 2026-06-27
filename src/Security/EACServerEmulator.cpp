@@ -194,6 +194,17 @@ void EACServerEmulator::HandleMemoryReply(uint32_t clientId, const uint8_t* data
     size_t payloadSize = dataSize - (1 + sizeof(reqId) + sizeof(reply));
     Logger::Debug("[EACServerEmulator::HandleMemoryReply] Payload size=%zu bytes", payloadSize);
 
+    // GUARD (out-of-bounds read): reply.length is fully wire-controlled (up to 4 GB) but the
+    // payload that actually follows the header is only payloadSize bytes. A consumer that trusts
+    // reply.length as the readable size (RequestMemoryRead forwards it verbatim to its callback)
+    // would read past the buffer. Clamp reply.length to the bytes we actually received before
+    // handing the reply to any callback.
+    if (reply.length > payloadSize) {
+        Logger::Warn("[EACServerEmulator::HandleMemoryReply] reply.length=%u exceeds received payload=%zu for request %u; clamping",
+                     reply.length, payloadSize, reqId);
+        reply.length = static_cast<uint32_t>(payloadSize);
+    }
+
     // Find and execute callback
     std::function<void(const MemoryReplyPacket&, const uint8_t*)> callback;
     {
