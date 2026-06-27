@@ -394,16 +394,32 @@ void ProtocolDecoder::AnalyzeUE3Bunch(const uint8_t* data, size_t len) {
     }
 }
 
+// Verified RS2-7258 static class export indices -> class name (the names match
+// the loaded netfields_u_<Class> tables). Source: docs/re/open_bunch_structure.md
+// §1, bit-exact against the capture.
+static std::string ResolveActorClassIndex(uint32_t idx) {
+    switch (idx) {
+        case 57520: return "ROPlayerController";
+        case 86701: return "ROPlayerReplicationInfo";
+        case 90245: return "ROTeamInfo";
+        case 70887: return "ROGameReplicationInfo";
+        default:    return std::string();
+    }
+}
+
 // Decode the bit-packed property record stream inside an actor-channel bunch.
-// We don't (yet) parse the open-bunch SerializeNewActor class id, so we use a
-// best-FIT heuristic: a channel sticks to whichever class table decodes its
-// bunches most cleanly. This leverages the existing handle tables to recover
-// real property NAMES + VALUES instead of guessing a byte layout.
+// For an OPEN bunch we parse the SerializeNewActor header to identify the actor's
+// class EXACTLY (by its static export index) and to find where the property block
+// begins; the channel is then bound to that class. Non-open bunches reuse the
+// bound class. A best-fit scan remains only as a fallback for bunches seen before
+// their open. This recovers real UE3 property NAMES + VALUES via the handle
+// tables instead of guessing a byte layout.
 void ProtocolDecoder::DecodeBunchProperties(const UE3BunchHeader& header,
                                             const uint8_t* payload, size_t payloadLen) {
     if (!payload || payloadLen == 0) return;
 
     auto& chan = m_channelStats[header.ChannelIndex];
+    const size_t validBits = payloadLen * 8;
 
     auto applyDecode = [&](const BunchDecodeResult& res) {
         chan.bunchesDecoded++;
@@ -416,15 +432,31 @@ void ProtocolDecoder::DecodeBunchProperties(const UE3BunchHeader& header,
         }
     };
 
-    // Channel already bound to a class -> decode directly.
+    // OPEN bunch: identify the class exactly and skip its SerializeNewActor header.
+    size_t startBit = 0;
+    if (header.Open) {
+        auto hdr = m_propDecoder->ParseOpenHeader(payload, payloadLen, validBits,
+                                                  &ResolveActorClassIndex);
+        if (hdr.ok && !hdr.className.empty()) {
+            chan.className = hdr.className;
+            chan.bestFitScore = 1.0;        // exact identification, not a guess
+            startBit = hdr.headerBits;
+            Logger::Debug("ProtocolDecoder: ch%u open -> class %s (idx=%u), property "
+                          "block at bit %zu", header.ChannelIndex,
+                          hdr.className.c_str(), hdr.classIndex, hdr.headerBits);
+        }
+    }
+
+    // Decode with the bound class (exact when identified via the open header).
     if (!chan.className.empty()) {
         if (const NetFieldTable* t = m_netFields.GetClass(chan.className)) {
-            applyDecode(m_propDecoder->Decode(*t, payload, payloadLen));
+            applyDecode(m_propDecoder->Decode(*t, payload, payloadLen, validBits, startBit));
             return;
         }
     }
 
-    // Otherwise try every class with value types and keep the best fit.
+    // Fallback: a non-open bunch on a channel whose open we never saw. Try the
+    // value-typed classes and keep the best fit (no header to skip here).
     const NetFieldTable* bestTable = nullptr;
     BunchDecodeResult bestRes;
     double bestScore = 0.0;
@@ -438,9 +470,6 @@ void ProtocolDecoder::DecodeBunchProperties(const UE3BunchHeader& header,
             bestRes = std::move(res);
         }
     }
-
-    // Bind the channel only on a confident fit; otherwise leave it open so a
-    // later, cleaner bunch can claim it.
     if (bestTable && bestScore >= 0.6) {
         chan.className = bestTable->ClassName();
         chan.bestFitScore = bestScore;

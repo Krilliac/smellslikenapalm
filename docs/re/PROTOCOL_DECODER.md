@@ -31,10 +31,15 @@ Two independent paths run per connection:
    `ReadInt(maxHandle)` handles followed by type-directed bit-packed values. This
    path parses the real bunch with `UE3Protocol::ParseBunch`, then decodes the
    property stream against the known class tables, recovering actual UE3 property
-   **names and values** (e.g. `Location=(x,y,z)`, `bNetOwner=true`). Because the
-   open-bunch class id isn't parsed yet, each channel is bound to whichever class
-   table decodes its bunches with the best **fit score** (clean end + bit
-   coverage), and sticks to it.
+   **names and values** (e.g. `Location=(x,y,z)`, `bNetOwner=true`).
+   For an **open** bunch it first parses the `SerializeNewActor` header
+   (`BunchPropertyDecoder::ParseOpenHeader`, per `open_bunch_structure.md`): the
+   32-bit static class ref, compressed `Location`, optional `Rotation`, and the
+   PlayerController `NetPlayerIndex` byte. The class is identified **exactly** by
+   its verified static export index (PC=57520, PRI=86701, TeamInfo=90245,
+   GRI=70887), the channel is bound to it, and the property block is decoded from
+   the correct post-header bit offset. A best-fit scan remains only as a fallback
+   for bunches seen before their open.
 
 Value codecs implemented (per the codec spec): bool (1 bit), byte (8 bits),
 int/float (32 bits LE), FString, compressed `FVector`/`FRotator`, `Quat`,
@@ -72,9 +77,13 @@ ctest --test-dir build -R ProtocolDecoderSelfTest --output-on-failure
 
 ## Known limitations / next steps
 
-- The open-bunch `SerializeNewActor` class id is not yet parsed; channel→class is
-  inferred by best-fit. Parsing it (see `docs/re/open_bunch_structure.md`) would
-  make class binding exact.
+- Channel→class binding is now **exact** for actors whose open-bunch class index
+  is known (PC/PRI/TeamInfo/GRI). Other actor classes (Pawn/Weapon/projectiles)
+  fall back to best-fit; add their verified static indices to
+  `ResolveActorClassIndex` to make them exact too.
+- `ROPlayerReplicationInfo` is currently a *lean* table (names only, no value
+  types), so a PRI channel is identified but its values aren't decoded.
+  Regenerating it with the type column (the rich format) unlocks PRI value decode.
 - Enum-byte widths need each enum's `NumEnums`; not present in the handle tables,
   so enum values currently stop the decode. Capturing enum sizes would extend
   coverage past the first enum property.

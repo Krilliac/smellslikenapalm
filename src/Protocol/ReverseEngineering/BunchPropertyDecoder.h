@@ -20,6 +20,7 @@
 #include <cstdint>
 #include <string>
 #include <vector>
+#include <functional>
 
 #include "Protocol/ReverseEngineering/NetFieldTable.h"
 
@@ -61,10 +62,32 @@ public:
         : m_maxChannels(maxChannels) {}
 
     // Decode the property stream in [payload, payload+numBytes). validBits caps
-    // the meaningful bit length (defaults to numBytes*8).
+    // the meaningful bit length (defaults to numBytes*8). startBit skips a leading
+    // header (e.g. an open bunch's SerializeNewActor block, see ParseOpenHeader).
     BunchDecodeResult Decode(const NetFieldTable& table,
                              const uint8_t* payload, size_t numBytes,
-                             size_t validBits = 0) const;
+                             size_t validBits = 0, size_t startBit = 0) const;
+
+    // Result of parsing an actor-channel OPEN bunch's SerializeNewActor header
+    // (docs/re/open_bunch_structure.md): a static class ref, compressed Location,
+    // optional Rotation, optional PlayerController NetPlayerIndex byte. The
+    // property block begins at headerBits.
+    struct OpenHeaderResult {
+        bool        ok = false;
+        uint32_t    classIndex = 0;   // package-map static export index
+        std::string className;        // resolved name (empty if unknown)
+        size_t      headerBits = 0;   // bit offset where the property block starts
+    };
+
+    // Parse the open header. classResolver maps a static class export index to a
+    // class name (empty if unknown); it decides PlayerController (NetPlayerIndex
+    // byte) and lets the caller bind the channel exactly. hasInitialRotation tells
+    // whether the class emits a compressed Rotation (false for PC/Info/PRI/GRI/
+    // TeamInfo — see the doc); when null, rotation is assumed absent.
+    OpenHeaderResult ParseOpenHeader(
+        const uint8_t* payload, size_t numBytes, size_t validBits,
+        const std::function<std::string(uint32_t)>& classResolver,
+        const std::function<bool(const std::string&)>& hasInitialRotation = {}) const;
 
     void SetMaxChannels(uint32_t v) { m_maxChannels = v; }
     uint32_t MaxChannels() const { return m_maxChannels; }

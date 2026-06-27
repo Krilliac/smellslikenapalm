@@ -275,6 +275,60 @@ static void TestDecoderAsyncDrain() {
     dec.Shutdown();   // joins the worker cleanly
 }
 
+// Bit-exact replica of the real capture's ch21 TeamInfo OPEN bunch
+// (docs/re/open_bunch_structure.md §4.2): classRef(90245) + Location(0,0,0) +
+// {handle 23 TeamIndex int = 2}. Verifies the SerializeNewActor header parse
+// (class identity + headerBits=43) and that the property block decodes from the
+// correct bit offset.
+static void TestOpenBunchHeaderParse(const std::string& dir) {
+    std::printf("TestOpenBunchHeaderParse\n");
+    NetFieldTable t;
+    CHECK(t.LoadFromFile(dir + "/netfields_u_ROTeamInfo.txt", "ROTeamInfo"));
+    const uint32_t M = t.MaxIndex();
+
+    BitWriter bw;
+    // [class ref] selector=0 (static) + SerializeInt(index, 1<<31)
+    bw.WriteBit(false);
+    bw.SerializeInt(90245u, 0x80000000u);
+    // [Location] compressed (0,0,0): Bits=0 -> SerializeInt(0,20) + 3x SerializeInt(Bias,Max)
+    bw.SerializeInt(0u, 20u);
+    bw.SerializeInt(2u, 4u);   // 0 + Bias(2)
+    bw.SerializeInt(2u, 4u);
+    bw.SerializeInt(2u, 4u);
+    // [property block] handle 23 TeamIndex (int) = 2
+    bw.SerializeInt(23u, M);
+    bw.WriteInt32(2);
+
+    auto bytes = bw.GetBytes();
+
+    BunchPropertyDecoder dec(1024);
+    auto resolver = [](uint32_t idx) -> std::string {
+        return idx == 90245u ? std::string("ROTeamInfo") : std::string();
+    };
+    auto hdr = dec.ParseOpenHeader(bytes.data(), bytes.size(), bw.NumBits(), resolver);
+    CHECK(hdr.ok);
+    CHECK_EQ(hdr.classIndex, 90245u);
+    CHECK_EQ(hdr.className, std::string("ROTeamInfo"));
+    CHECK_EQ(hdr.headerBits, 43u);   // 1 selector + 31 classIdx + 11 location
+
+    // Decode the property block starting after the header.
+    auto res = dec.Decode(t, bytes.data(), bytes.size(), bw.NumBits(), hdr.headerBits);
+    CHECK(res.properties.size() >= 1);
+    if (!res.properties.empty()) {
+        CHECK_EQ(res.properties[0].name, std::string("TeamIndex"));
+        CHECK_EQ(res.properties[0].valueSummary, std::string("2"));
+        CHECK(res.properties[0].valueDecoded);
+    }
+
+    // A dynamic-selector (bit=1) header must be rejected as "not a class ref".
+    BitWriter dyn;
+    dyn.WriteBit(true);
+    dyn.SerializeInt(5u, 1024u);
+    auto db = dyn.GetBytes();
+    auto bad = dec.ParseOpenHeader(db.data(), db.size(), dyn.NumBits(), resolver);
+    CHECK(!bad.ok);
+}
+
 int main() {
     std::printf("=== ProtocolDecoder / NetFieldTable self-tests ===\n");
     const std::string dir = NetfieldsDir();
@@ -286,6 +340,7 @@ int main() {
     TestRegistry(dir);
     TestDecodeRoundTrip(dir);
     TestDecodeStopsOnEnum(dir);
+    TestOpenBunchHeaderParse(dir);
     TestDecoderSyncLayout();
     TestDecoderAsyncDrain();
 

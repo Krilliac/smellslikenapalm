@@ -3,6 +3,7 @@
 #include "Protocol/ReverseEngineering/BunchPropertyDecoder.h"
 #include "Network/BitReader.h"
 
+#include <algorithm>
 #include <cmath>
 #include <sstream>
 
@@ -149,9 +150,62 @@ bool DecodeValue(BitReader& r, const NetField& f, uint32_t maxChannels,
 
 } // namespace
 
+// Advance a BitReader by `bits` (it has no seek). Reads are bounds-checked, so a
+// startBit past the buffer simply leaves the reader overflowed.
+static void SkipBits(BitReader& r, size_t bits) {
+    while (bits > 0) {
+        int n = static_cast<int>(std::min<size_t>(32, bits));
+        r.ReadBits(n);
+        bits -= n;
+    }
+}
+
+BunchPropertyDecoder::OpenHeaderResult BunchPropertyDecoder::ParseOpenHeader(
+    const uint8_t* payload, size_t numBytes, size_t validBits,
+    const std::function<std::string(uint32_t)>& classResolver,
+    const std::function<bool(const std::string&)>& hasInitialRotation) const {
+
+    OpenHeaderResult out;
+    if (!payload || numBytes == 0) return out;
+    size_t bitsTotal = (validBits != 0) ? validBits : numBytes * 8;
+    BitReader r(payload, numBytes, bitsTotal);
+
+    // [class/archetype ref] = 1 selector bit + SerializeInt(index, 1<<31).
+    // For a class ref the selector is 0 (static object).
+    bool selector = r.ReadBit();
+    if (selector) {
+        // Dynamic ref form — not a class ref; can't identify the actor class.
+        return out;
+    }
+    out.classIndex = r.SerializeInt(0x80000000u);
+    if (r.IsOverflowed()) return out;
+
+    if (classResolver) out.className = classResolver(out.classIndex);
+
+    // [compressed Location] — ALWAYS present.
+    std::string tmp;
+    if (!DecodeCompressedVector(r, m_maxChannels, tmp)) return out;
+
+    // [compressed Rotation] — only when the class's bNetInitialRotation is true
+    // (false for PC/Info/PRI/GRI/TeamInfo, so absent for all menu actors).
+    if (hasInitialRotation && hasInitialRotation(out.className)) {
+        if (!DecodeCompressedRotator(r, tmp)) return out;
+    }
+
+    // [NetPlayerIndex] — a BYTE, only for PlayerController actors.
+    if (out.className.find("PlayerController") != std::string::npos) {
+        r.ReadByte();
+        if (r.IsOverflowed()) return out;
+    }
+
+    out.headerBits = r.BitPos();
+    out.ok = !r.IsOverflowed();
+    return out;
+}
+
 BunchDecodeResult BunchPropertyDecoder::Decode(const NetFieldTable& table,
                                                const uint8_t* payload, size_t numBytes,
-                                               size_t validBits) const {
+                                               size_t validBits, size_t startBit) const {
     BunchDecodeResult result;
     result.className = table.ClassName();
     result.bitsTotal = (validBits != 0) ? validBits : numBytes * 8;
@@ -162,6 +216,8 @@ BunchDecodeResult BunchPropertyDecoder::Decode(const NetFieldTable& table,
     }
 
     BitReader r(payload, numBytes, result.bitsTotal);
+    if (startBit > 0) SkipBits(r, startBit);
+    if (r.IsOverflowed()) { result.status = BunchDecodeStatus::Overflow; return result; }
     result.status = BunchDecodeStatus::CleanEnd;
 
     // Bound the loop independently of bit math (defensive against a pathological
