@@ -208,3 +208,17 @@ if(BUILD_TESTS)
     enable_testing()
     add_subdirectory(tests)
 endif()
+
+# Self-contained RE self-test (opt-in via -DBUILD_RE_SELFTEST=ON). Unlike the
+# main suite this needs NO GoogleTest / no network: it has its own main() and
+# links only rs2v_core, so it builds and runs in offline/sandbox environments.
+option(BUILD_RE_SELFTEST "Build the network-free reverse-engineering self-test" OFF)
+if(BUILD_RE_SELFTEST)
+    enable_testing()
+    add_executable(ProtocolDecoderSelfTest tests/ProtocolDecoderTests.cpp)
+    target_link_libraries(ProtocolDecoderSelfTest PRIVATE rs2v_core Threads::Threads)
+    target_include_directories(ProtocolDecoderSelfTest PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    add_test(NAME ProtocolDecoderSelfTest
+             COMMAND ProtocolDecoderSelfTest
+             WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+endif()
