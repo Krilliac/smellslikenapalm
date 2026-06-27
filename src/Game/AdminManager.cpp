@@ -6,6 +6,12 @@
 #include "Config/ServerConfig.h"
 #include "Network/ClientConnection.h"
 #include "Game/GameServer.h"
+#include "Game/MapManager.h"
+#include "Game/MapVoteManager.h"
+#include "Game/WorkshopManager.h"
+#include "Game/ModManager.h"
+#include "Game/MutatorManager.h"
+#include "Config/MapConfig.h"
 #include <algorithm>
 #include <chrono>
 #include <fstream>
@@ -154,6 +160,30 @@ bool AdminManager::HandleAdminCommand(uint32_t clientId, const std::string& comm
         bool result = ListAdmins(clientId);
         Logger::Trace("[AdminManager::HandleAdminCommand] Exit: return %d (list)", result);
         return result;
+    }
+    else if (command == "changemap" && args.size() == 1)
+    {
+        return ChangeMap(clientId, args[0]);
+    }
+    else if (command == "rotation")
+    {
+        return MapRotationCommand(clientId, args);
+    }
+    else if (command == "startvote")
+    {
+        return StartMapVote(clientId);
+    }
+    else if (command == "workshop")
+    {
+        return WorkshopCommand(clientId, args);
+    }
+    else if (command == "mods" && args.empty())
+    {
+        return ListMods(clientId);
+    }
+    else if (command == "mutators" && args.empty())
+    {
+        return ListMutators(clientId);
     }
     else
     {
@@ -356,4 +386,143 @@ std::string AdminManager::JoinArgs(const std::vector<std::string>& args, const s
     std::string result = oss.str();
     Logger::Trace("[AdminManager::JoinArgs] Exit: result='%s'", result.c_str());
     return result;
+}
+
+// ---------------------------------------------------------------------------
+// Map / workshop / mod / mutator admin commands
+// ---------------------------------------------------------------------------
+
+bool AdminManager::ChangeMap(uint32_t adminClientId, const std::string& mapName)
+{
+    Logger::Trace("[AdminManager::ChangeMap] Entry: client=%u, map='%s'", adminClientId, mapName.c_str());
+    auto conn = m_server->GetClientConnection(adminClientId);
+    auto* mapMgr = m_server->GetMapManager();
+    if (!mapMgr) {
+        if (conn) conn->SendChatMessage("MapManager unavailable.");
+        return false;
+    }
+    if (mapMgr->LoadMap(mapName)) {
+        if (conn) conn->SendChatMessage("Changed map to: " + mapName);
+        m_server->BroadcastChatMessage("Admin changed map to " + mapName);
+        Logger::Info("AdminManager: client %u changed map to '%s'", adminClientId, mapName.c_str());
+        return true;
+    }
+    if (conn) conn->SendChatMessage("Failed to load map: " + mapName);
+    Logger::Warn("AdminManager: failed to change map to '%s'", mapName.c_str());
+    return false;
+}
+
+bool AdminManager::MapRotationCommand(uint32_t adminClientId, const std::vector<std::string>& args)
+{
+    auto conn = m_server->GetClientConnection(adminClientId);
+    if (!conn) return false;
+
+    std::string sub = args.empty() ? "list" : StringUtils::ToLower(args[0]);
+
+    if (sub == "list") {
+        auto* mapMgr = m_server->GetMapManager();
+        auto gc = m_server->GetGameConfig();
+        (void)gc;
+        // The rotation is the set of map definitions; list them in config order.
+        if (auto sc = m_server->GetServerConfig()) {
+            MapConfig mc(*sc);
+            mc.Initialize();
+            conn->SendChatMessage("Map rotation:");
+            for (const auto& name : mc.GetAvailableMaps()) {
+                std::string mark = (mapMgr && name == mapMgr->GetCurrentMapName()) ? " *" : "";
+                conn->SendChatMessage(" - " + name + mark);
+            }
+            return true;
+        }
+        return false;
+    }
+
+    // Runtime add/remove of rotation entries is config-driven: maps are defined
+    // in maps.ini. Surface this clearly rather than silently no-op.
+    if (sub == "add" || sub == "remove") {
+        conn->SendChatMessage("Rotation is defined in maps.ini; edit it and run 'reload map', "
+                              "then use 'changemap <id>' to switch immediately.");
+        return true;
+    }
+
+    conn->SendChatMessage("Usage: rotation [list|add <id>|remove <id>]");
+    return false;
+}
+
+bool AdminManager::StartMapVote(uint32_t adminClientId)
+{
+    auto conn = m_server->GetClientConnection(adminClientId);
+    bool ok = m_server->StartMapVote();
+    if (conn) conn->SendChatMessage(ok ? "Map vote started." : "Could not start map vote.");
+    return ok;
+}
+
+bool AdminManager::WorkshopCommand(uint32_t adminClientId, const std::vector<std::string>& args)
+{
+    auto conn = m_server->GetClientConnection(adminClientId);
+    auto* ws = m_server->GetWorkshopManager();
+    if (!conn) return false;
+    if (!ws) { conn->SendChatMessage("WorkshopManager unavailable."); return false; }
+
+    std::string sub = args.empty() ? "list" : StringUtils::ToLower(args[0]);
+
+    if (sub == "list") {
+        const auto& items = ws->GetItems();
+        conn->SendChatMessage("Workshop items (" + std::to_string(items.size()) + "):");
+        for (const auto& it : items) {
+            conn->SendChatMessage(" - [" + WorkshopManager::TypeToString(it.type) + "] " +
+                                  it.fileName + (it.present ? " (ok)" : " (MISSING)"));
+        }
+        return true;
+    }
+    if (sub == "reload") {
+        ws->Reload();
+        conn->SendChatMessage("Workshop manifest reloaded.");
+        return true;
+    }
+    if (sub == "validate") {
+        size_t missing = ws->ValidateItems();
+        conn->SendChatMessage("Workshop validate: " + std::to_string(missing) + " missing.");
+        return true;
+    }
+    if (sub == "download") {
+        size_t n = ws->DownloadMissing();
+        conn->SendChatMessage("Workshop download complete: " + std::to_string(n) + " fetched "
+                              "(0 if download disabled / dry-run).");
+        return true;
+    }
+
+    conn->SendChatMessage("Usage: workshop [list|reload|validate|download]");
+    return false;
+}
+
+bool AdminManager::ListMods(uint32_t adminClientId)
+{
+    auto conn = m_server->GetClientConnection(adminClientId);
+    auto* mods = m_server->GetModManager();
+    if (!conn) return false;
+    if (!mods) { conn->SendChatMessage("ModManager unavailable."); return false; }
+
+    const auto& list = mods->GetMods();
+    conn->SendChatMessage("Mods/assets (" + std::to_string(list.size()) + "):");
+    for (const auto& m : list) {
+        conn->SendChatMessage(" - " + m.name + (m.isAsset ? " [asset]" : " [mod]") +
+                              (m.present ? "" : " (MISSING)"));
+    }
+    return true;
+}
+
+bool AdminManager::ListMutators(uint32_t adminClientId)
+{
+    auto conn = m_server->GetClientConnection(adminClientId);
+    auto* mut = m_server->GetMutatorManager();
+    if (!conn) return false;
+    if (!mut) { conn->SendChatMessage("MutatorManager unavailable."); return false; }
+
+    auto active = mut->GetActiveNames();
+    conn->SendChatMessage("Active mutators (" + std::to_string(active.size()) + "):");
+    for (const auto& n : active) conn->SendChatMessage(" - " + n);
+    auto registered = mut->GetRegisteredIds();
+    conn->SendChatMessage("Available: " + StringUtils::Join(registered, ", "));
+    return true;
 }

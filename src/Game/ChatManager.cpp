@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <sstream>
 #include "Game/AdminManager.h"
+#include "Game/MapVoteManager.h"
 
 ChatManager::ChatManager(GameServer* server)
     : m_server(server)
@@ -275,6 +276,29 @@ void ChatManager::ProcessChatCommand(uint32_t clientId, const std::string& messa
         std::string teamMsg = Join(parts, " ");
         Logger::Debug("[ChatManager::ProcessChatCommand] Processing /team message='%s'", teamMsg.c_str());
         HandleTeamChat(clientId, teamMsg);
+    }
+    else if (cmd == "votemap") {
+        // Player-facing map vote. With an argument, cast a vote for that option;
+        // with no argument, (re)show the current options if a vote is active.
+        auto conn = m_server->GetClientConnection(clientId);
+        auto* vote = m_server->GetMapVoteManager();
+        if (!vote || !vote->IsVoteActive()) {
+            if (conn) conn->SendChatMessage("No map vote is currently active.");
+        } else if (parts.empty()) {
+            const auto& cands = vote->GetCandidates();
+            if (conn) {
+                conn->SendChatMessage("Map vote options (type /votemap <number>):");
+                for (size_t i = 0; i < cands.size(); ++i) {
+                    conn->SendChatMessage("  " + std::to_string(i + 1) + ") " + cands[i].displayName);
+                }
+            }
+        } else {
+            int choice = 0;
+            try { choice = std::stoi(parts[0]); } catch (...) { choice = 0; }
+            // Options are presented 1-based to players; internal index is 0-based.
+            bool ok = m_server->CastMapVote(clientId, choice - 1);
+            if (conn) conn->SendChatMessage(ok ? "Vote recorded." : "Invalid vote option.");
+        }
     }
     else {
         Logger::Debug("[ChatManager::ProcessChatCommand] Unknown built-in command '%s', passing to AdminManager", cmd.c_str());

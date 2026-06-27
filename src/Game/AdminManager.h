@@ -36,6 +36,14 @@ public:
     bool ReloadConfig(uint32_t adminClientId, const std::string& section);
     bool ListAdmins(uint32_t adminClientId);
 
+    // Map / workshop / mod / mutator administration
+    bool ChangeMap(uint32_t adminClientId, const std::string& mapName);
+    bool MapRotationCommand(uint32_t adminClientId, const std::vector<std::string>& args);
+    bool StartMapVote(uint32_t adminClientId);
+    bool WorkshopCommand(uint32_t adminClientId, const std::vector<std::string>& args);
+    bool ListMods(uint32_t adminClientId);
+    bool ListMutators(uint32_t adminClientId);
+
 private:
     GameServer* m_server;
     std::shared_ptr<ServerConfig> m_config;

@@ -231,6 +231,13 @@ void DamageSystem::SetFriendlyFireDamageScale(float scale) {
     Logger::Trace("[DamageSystem::SetFriendlyFireDamageScale] Exit");
 }
 
+void DamageSystem::SetGlobalDamageScale(float scale) {
+    Logger::Trace("[DamageSystem::SetGlobalDamageScale] Entry: scale=%.2f", scale);
+    m_globalDamageScale = (scale < 0.0f) ? 0.0f : scale;
+    Logger::Info("[DamageSystem::SetGlobalDamageScale] Global damage scale set to %.2f", m_globalDamageScale);
+    Logger::Trace("[DamageSystem::SetGlobalDamageScale] Exit");
+}
+
 float DamageSystem::CalculateFinalDamage(DamageEvent& event) const {
     Logger::Trace("[DamageSystem::CalculateFinalDamage] Entry: baseDamage=%.1f, hitZone=%d, isFriendlyFire=%d",
                   event.baseDamage, static_cast<int>(event.hitZone), event.isFriendlyFire);

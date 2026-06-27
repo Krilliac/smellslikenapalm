@@ -24,6 +24,8 @@ struct MapDefinition {
     int         objectiveCount    = 0;
     int         usTeamSpawns      = 0;
     int         nvaTeamSpawns     = 0;
+    std::string defaultMode;             // fallback ModeID when rotation omits one
+    int         voteWeight        = 50;  // 1-100 likelihood weight for map voting
 
     // Spawn point and bounds data (loaded from map file)
     std::vector<Vector3> spawnPoints;
@@ -74,10 +76,15 @@ public:
     // Get list of all available map names
     std::vector<std::string> GetAvailableMaps() const;
 
+    // Resolve a maps.ini 'file' value to a usable path (relative to the maps
+    // assets directory unless it is absolute or already has a directory).
+    std::string ResolveMapFilePath(const std::string& file) const;
+
 private:
     void ApplyProperty(MapDefinition& def, const std::string& key, const std::string& val);
 
     std::string                                    m_mapsDir;
+    std::string                                    m_rotationFile;
     std::string                                    m_configPath;
     std::map<std::string, MapDefinition>           m_mapDefinitions;
 };

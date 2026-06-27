@@ -105,10 +105,16 @@ public:
     void SetFriendlyFireEnabled(bool enabled);
     void SetFriendlyFireDamageScale(float scale);
 
+    // Global damage multiplier applied to every damage event (1.0 = vanilla).
+    // Used by gameplay mutators such as hardcore_damage.
+    void  SetGlobalDamageScale(float scale);
+    float GetGlobalDamageScale() const { return m_globalDamageScale; }
+
 private:
     GameServer* m_server;
     bool m_friendlyFireEnabled = true;
     float m_friendlyFireScale = 0.5f;  // 50% damage for friendly fire
+    float m_globalDamageScale = 1.0f;  // mutator-controlled global multiplier
 
     DamageCallback m_damageCallback;
     KillCallback m_killCallback;
