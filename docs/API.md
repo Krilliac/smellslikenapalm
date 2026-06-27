@@ -1,14 +1,11 @@
-# RS2V Custom Server – **Complete API Reference** (`API.md`)  
-*Version 0.9.0-alpha · Last updated 2025-07-12*
+# RS2V Custom Server — API Reference
 
-> ⚠️ **HEADS-UP:** This repository is under **active development**.  
-> -  The public API, file layout, and naming conventions are **not yet frozen** and may change without notice.  
-> -  Some subsystems are still stubs or proofs-of-concept.  
-> -  Comprehensive tests exist, but the **main target** currently **does not compile** on all platforms.  
-> -  Expect breaking commits, temporary build failures, and force-pushes while we stabilise the architecture.  
-> -  Use the `develop` branch at your own risk; the `main` branch is rebased regularly.  
-> We welcome issues and pull-requests, but please sync often and review [TODO.md](TODO.md) before starting major work.  
-> For a stable, feature-complete server build, follow releases tagged `v1.x` (scheduled after the CI pipeline turns 🌕 green).
+> **Status: under active development.** The public API, file layout, and naming
+> conventions are not frozen and may change without notice; some subsystems are
+> stubs or proofs-of-concept. The server target builds (Linux GCC/Clang, Windows
+> MSVC), but end-to-end gameplay is not yet functional — see the README's
+> *Current status* section and [`TODO.md`](../TODO.md). Sync (rebase on `main`)
+> before starting major work.
 
 ## Contents
 1. [Core Conventions](#1-core-conventions)  
@@ -30,7 +27,7 @@
 ## 1. Core Conventions
 | Topic | Convention |
 |-------|------------|
-| Header paths | `Server//…`, `telemetry/…` |
+| Header paths | `src/…`, `telemetry/…` |
 | Namespaces | Low-level → `Utils`, domain → subsystem (`Network`, `Physics`, `Telemetry`, …) |
 | Resource ownership | `std::unique_ptr` for transfers; raw refs for views |
 | Time | Always `std::chrono` (never raw integers) |
@@ -44,7 +41,7 @@
 | `ENABLE_TELEMETRY` | `ON` | Compiles TelemetryManager & Reporters |
 | `ENABLE_SCRIPTING` | `OFF` | Enables the C# scripting host & native plugin loader. **Currently does not build** (deprecated .NET COM host) — disabled pending a rework. |
 | `ENABLE_COMPRESSION` | `ON` | Links zlib (or a built-in stub) and activates `CompressionHandler` |
-| `BUILD_TESTS` | `OFF` | Builds the GoogleTest suites |
+| `BUILD_TESTS` | `OFF` | Builds the native test suite (no GoogleTest dependency) |
 
 ## 3. Error-Handling Contract
 | Layer | Model | Typical Error Class |

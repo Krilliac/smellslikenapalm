@@ -1,0 +1,60 @@
+# .promptignore — paths excluded when feeding repo context to AI assistants.
+# Syntax follows .gitignore conventions. The docs/ tree stays visible: it is the
+# canonical documentation home and is meant to be read as project context.
+
+# Third-party / vendored code (large, not project code)
+third_party/
+ThirdParty/
+vendor/
+
+# Build artifacts
+build/
+build-*/
+out/
+cmake-build-*/
+CMakeFiles/
+bin/
+obj/
+
+# Binary / non-text artifacts
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.dylib
+*.dll
+*.exe
+*.out
+*.pdb
+
+# Generated packet-handler output (re-emitted by PacketHandlerCodeGen at build time)
+**/Generated/Handlers/
+
+# Runtime-generated capture / log output
+packetlog/
+protocol_analysis/
+telemetry/output/
+*.log
+*.pcap
+
+# IDE / editor / VCS internals
+.vs/
+.vscode/
+.idea/
+.git/
+
+# Compressed archives
+*.zip
+*.tar.gz
+*.7z
+*.rar
+
+# Generated API docs (the docs/ markdown wiki stays visible)
+docs/html/
+docs/xml/
+docs/api/
+
+# OS cruft
+.DS_Store
+Thumbs.db

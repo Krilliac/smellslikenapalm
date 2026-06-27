@@ -1,7 +1,7 @@
 # TELEMETRY.md — Telemetry System Guide
 
 *Version 0.9.0-alpha · Last updated 2025-07-12*  
-*Stability: 🚧 Under active development — APIs and file layouts may change.*
+*Stability: under active development — APIs and file layouts may change.*
 
 Comprehensive reference for the **Telemetry** subsystem: design, configuration, usage, and extension.  
 For API details see [API.md](API.md). For deployment see [DEPLOYMENT.md](DEPLOYMENT.md).
