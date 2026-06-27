@@ -38,23 +38,32 @@ void DamageSystem::Shutdown() {
     Logger::Trace("[DamageSystem::Shutdown] Exit");
 }
 
-float DamageSystem::GetHitZoneMultiplier(HitZone zone) const {
-    Logger::Trace("[DamageSystem::GetHitZoneMultiplier] Entry: zone=%d", static_cast<int>(zone));
-    float multiplier;
-    // RS2V damage model: head/spine = instant kill, chest = high, limbs = reduced
+float DamageSystem::ApplyHitZoneEffect(float adjustedDamage, HitZone zone) const {
+    Logger::Trace("[DamageSystem::ApplyHitZoneEffect] Entry: dmg=%.1f, zone=%d", adjustedDamage, static_cast<int>(zone));
+    // RS2V damage model (ROPawn.uc TakeDamage, lines 8245-8252): the hit zone CAPS the
+    // damage a single hit can deal - it does NOT scale it. Instant-death zones (head/spine)
+    // force a lethal hit (actualDamage = Max(dmg, HealthMax)); every other zone limits the
+    // hit to that zone's ZoneHealth (actualDamage = Min(dmg, ZoneHealth)). Source ZoneHealth
+    // defaults: torso/abdomen=100, upper-arm=30, forearm=20, hand=10, thigh=35, calf=20, foot=10.
+    // Our HitZone enum is coarser than the source's per-bone zones, so each limb is mapped to
+    // its proximal (largest) sub-zone cap (arm->upper-arm 30, leg->thigh 35); finer hit zones
+    // would refine these. The former flat multiplier let a 300-dmg rocket deal ~120 to a limb;
+    // the cap holds that to the zone's health.
+    constexpr float kLethal = 1.0e6f;  // >= any plausible max health -> guaranteed instant death
+    float result;
     switch (zone) {
-        case HitZone::Head:      multiplier = 10.0f; break;
-        case HitZone::Chest:     multiplier = 1.0f; break;
-        case HitZone::Stomach:   multiplier = 0.9f; break;
+        case HitZone::Head:      result = std::max(adjustedDamage, kLethal); break;  // instant-death zone
+        case HitZone::Chest:     result = std::min(adjustedDamage, 100.0f);  break;  // torso ZoneHealth
+        case HitZone::Stomach:   result = std::min(adjustedDamage, 100.0f);  break;  // abdomen ZoneHealth
         case HitZone::LeftArm:
-        case HitZone::RightArm:  multiplier = 0.5f; break;
+        case HitZone::RightArm:  result = std::min(adjustedDamage, 30.0f);   break;  // upper-arm (coarse arm)
         case HitZone::LeftLeg:
-        case HitZone::RightLeg:  multiplier = 0.4f; break;
-        default:                 multiplier = 1.0f; break;
+        case HitZone::RightLeg:  result = std::min(adjustedDamage, 35.0f);   break;  // thigh (coarse leg)
+        default:                 result = adjustedDamage;                    break;
     }
-    Logger::Debug("[DamageSystem::GetHitZoneMultiplier] zone=%d -> multiplier=%.1f", static_cast<int>(zone), multiplier);
-    Logger::Trace("[DamageSystem::GetHitZoneMultiplier] Exit: return %.1f", multiplier);
-    return multiplier;
+    Logger::Debug("[DamageSystem::ApplyHitZoneEffect] zone=%d: %.1f -> %.1f", static_cast<int>(zone), adjustedDamage, result);
+    Logger::Trace("[DamageSystem::ApplyHitZoneEffect] Exit: return %.1f", result);
+    return result;
 }
 
 bool DamageSystem::IsFriendlyFire(uint32_t attackerId, uint32_t victimId) const {
@@ -236,12 +245,9 @@ float DamageSystem::CalculateFinalDamage(DamageEvent& event) const {
                   event.baseDamage, static_cast<int>(event.hitZone), event.isFriendlyFire);
     float dmg = event.baseDamage;
 
-    // Apply hit zone multiplier
-    float zoneMultiplier = GetHitZoneMultiplier(event.hitZone);
-    dmg *= zoneMultiplier;
-    Logger::Debug("[DamageSystem::CalculateFinalDamage] After zone multiplier (%.1f): dmg=%.1f", zoneMultiplier, dmg);
-
-    // Apply friendly fire scaling
+    // Apply friendly-fire scaling first, so it becomes part of the "adjusted damage" the
+    // hit-zone effect then caps - mirroring the source, where AdjustDamage modifiers run
+    // before the final per-zone clamp on actualDamage.
     if (event.isFriendlyFire) {
         if (!m_friendlyFireEnabled) {
             Logger::Debug("[DamageSystem::CalculateFinalDamage] Friendly fire disabled, returning 0 damage");
@@ -251,6 +257,12 @@ float DamageSystem::CalculateFinalDamage(DamageEvent& event) const {
         dmg *= m_friendlyFireScale;
         Logger::Debug("[DamageSystem::CalculateFinalDamage] After friendly fire scale (%.2f): dmg=%.1f", m_friendlyFireScale, dmg);
     }
+
+    // Apply the hit-zone effect: a per-zone damage CAP (head = instant death), NOT a
+    // multiplier - mirroring ROPawn.TakeDamage. A flat multiplier let high-damage weapons
+    // deal unbounded limb damage; the source caps each zone at its ZoneHealth instead.
+    dmg = ApplyHitZoneEffect(dmg, event.hitZone);
+    Logger::Debug("[DamageSystem::CalculateFinalDamage] After hit-zone effect: dmg=%.1f", dmg);
 
     float result = std::max(0.0f, dmg);
     Logger::Trace("[DamageSystem::CalculateFinalDamage] Exit: return %.1f", result);

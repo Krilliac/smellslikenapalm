@@ -88,8 +88,11 @@ public:
     void ApplyFireDamage(uint32_t attackerId, const Vector3& center,
                          float radius, float damagePerSecond, float duration);
 
-    // Hit zone damage multiplier
-    float GetHitZoneMultiplier(HitZone zone) const;
+    // Hit-zone effect: per-zone damage CAP (head = instant death), mirroring
+    // ROPawn.TakeDamage (Min(dmg, ZoneHealth); instant-death zones force a lethal hit).
+    // Replaces the former GetHitZoneMultiplier - a flat multiplier let high-damage
+    // weapons deal unbounded limb damage; the source caps each zone instead.
+    float ApplyHitZoneEffect(float adjustedDamage, HitZone zone) const;
 
     // Friendly fire check
     bool IsFriendlyFire(uint32_t attackerId, uint32_t victimId) const;
