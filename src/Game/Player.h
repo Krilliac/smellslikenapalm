@@ -57,6 +57,14 @@ public:
     void MarkDeath();
     bool CanRespawn(int respawnDelaySec) const;
 
+    // Deploy/ready state: a player is only (auto-)spawned into the world once they have
+    // actually DEPLOYED (picked a role / hit deploy), mirroring ROPlayerController.
+    // IsReadyToSpawn + the SpawnReadyStatus==Ready gate in ROGameInfo.PlayerShouldRespawn.
+    // Set true on the SelectRoleByClass/role RPC; defaults false so a player sitting in the
+    // team/role-select menu (Dead + on a team) is NOT force-spawned into the world.
+    void SetReadyToSpawn(bool ready) { m_readyToSpawn = ready; }
+    bool IsReadyToSpawn() const { return m_readyToSpawn; }
+
     // Networking
     std::shared_ptr<ClientConnection> GetConnection() const;
 
@@ -76,4 +84,5 @@ private:
     std::vector<InventoryItem> m_inventory;
 
     std::chrono::steady_clock::time_point m_deathTime;
+    bool m_readyToSpawn = false;   // has the player deployed (role-select/deploy)? gates respawn
 };

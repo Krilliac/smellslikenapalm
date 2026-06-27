@@ -100,7 +100,7 @@ void PlayerManager::Update()
         // players to Alive after the respawn delay. Only respawn a player who has actually
         // joined a team and died.
         if (pl->GetState() == PlayerState::Dead && pl->GetTeam() != 0 &&
-            pl->CanRespawn(m_respawnDelaySec)) {
+            pl->IsReadyToSpawn() && pl->CanRespawn(m_respawnDelaySec)) {
             // Block respawn once the team has exhausted its reinforcement tickets,
             // mirroring ROGameInfo.PlayerShouldRespawn (returns false when
             // Team.ReinforcementsRemaining <= 0 for ticket-based modes). The per-death

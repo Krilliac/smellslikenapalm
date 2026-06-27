@@ -3,6 +3,8 @@
 #include "Network/ConnectionManager.h"
 #include "Game/GameServer.h"
 #include "Game/TeamManager.h"
+#include "Game/PlayerManager.h"
+#include "Game/Player.h"
 #include "Config/ConfigManager.h"
 #include "Utils/Logger.h"
 #include "Network/Packet.h"
@@ -1258,6 +1260,16 @@ void ConnectionManager::DecodeInboundActorBunch(uint32_t clientId,
     // bCloseMenu "deploy" bit once the WeaponSelectionInfo struct offset is pinned by testing).
     if (bunch.chIndex == 2 && handle == 175) {
         ControlState& cs = GetControlState(clientId);
+        // The client picked a role / hit deploy: mark the player DEPLOYED so the game-layer
+        // respawn loop (PlayerManager::Update) will (re)spawn them. Mirrors the real
+        // ROPlayerController setting SpawnReadyStatus = Ready on deploy; without it a player
+        // gated by IsReadyToSpawn() would never (auto-)respawn. Null-guarded (the mock client
+        // has no game-layer Player).
+        if (m_server) {
+            if (auto* pm = m_server->GetPlayerManager()) {
+                if (auto pl = pm->GetPlayer(clientId)) pl->SetReadyToSpawn(true);
+            }
+        }
         if (cs.teamSelected && !cs.spawned) {
             cs.spawned = true;
             Logger::Info("[ConnectionManager] client %u: SelectRoleByClass -> spawning pawn + possession",

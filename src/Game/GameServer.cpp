@@ -777,6 +777,10 @@ void GameServer::HandleRoleSelection(uint32_t clientId, const std::vector<uint8_
             for (const auto& eq : loadout.equipment) {
                 player->AddItem(eq, 1);
             }
+            // Selecting a role IS the deploy action - mark the player ready so the respawn
+            // loop will spawn them (the ready-gate in PlayerManager::Update). Mirrors the
+            // netcode SelectRoleByClass path in ConnectionManager::DecodeInboundActorBunch.
+            player->SetReadyToSpawn(true);
             Logger::Debug("[GameServer::HandleRoleSelection] Loadout applied to player %u", clientId);
         } else {
             Logger::Warn("[GameServer::HandleRoleSelection] Player %u not found in PlayerManager", clientId);
