@@ -28,6 +28,7 @@
 #include "Game/ObjectiveSystem.h"
 #include "Game/CommanderAbilities.h"
 #include "Game/SpawnSystem.h"
+#include "Game/SpawnPoint.h"
 #include "Game/WeaponDatabase.h"
 #include "Game/DamageSystem.h"
 #include "Game/ProjectileManager.h"
@@ -425,6 +426,10 @@ bool GameServer::Initialize() {
         // Register the loaded map's objectives with the (already-ticking)
         // ObjectiveSystem so capture zones become live.
         PopulateObjectivesFromMap();
+        // Feed the map's spawn points into the SpawnSystem. Without this the
+        // SpawnSystem stays empty and SpawnPlayerAtDefault fails with "No
+        // available spawn locations", so a joined player never gets a pawn.
+        PopulateSpawnsFromMap();
     }
 
     // Optional central round/state layer. Off by default: the per-mode classes
@@ -934,6 +939,51 @@ void GameServer::PopulateObjectivesFromMap() {
                      orderedIds.size());
     }
     Logger::Trace("[GameServer::PopulateObjectivesFromMap] Exit");
+}
+
+void GameServer::PopulateSpawnsFromMap() {
+    Logger::Trace("[GameServer::PopulateSpawnsFromMap] Entry");
+    if (!m_spawnSystem || !m_mapManager) {
+        Logger::Debug("[GameServer::PopulateSpawnsFromMap] SpawnSystem or MapManager unavailable; skipping");
+        return;
+    }
+    std::vector<SpawnPoint> points = m_mapManager->GetSpawnPoints();
+    if (points.empty()) {
+        Logger::Warn("[GameServer::PopulateSpawnsFromMap] Map provides no spawn points");
+        return;
+    }
+
+    // The playable factions are team 1 and team 2. A map spawn point that does
+    // not name one of them (teamId 0/255 from the geometry fallback or an
+    // unassigned definition) is registered for BOTH teams so each side has
+    // somewhere to spawn; a point that DOES name a team is registered as-is.
+    auto addFor = [&](const SpawnPoint& sp, uint32_t team) {
+        SpawnLocation loc;
+        loc.type     = SpawnType::BaseSpawn;
+        loc.name     = sp.name.empty() ? ("spawn_" + std::to_string(sp.id)) : sp.name;
+        loc.position = sp.position;
+        loc.rotation = sp.rotation;
+        loc.teamId   = team;
+        loc.isActive = sp.enabled;
+        m_spawnSystem->AddSpawnLocation(loc);
+    };
+
+    size_t before1 = m_spawnSystem->GetTeamSpawns(1).size();
+    size_t before2 = m_spawnSystem->GetTeamSpawns(2).size();
+    for (const auto& sp : points) {
+        if (sp.teamId == 1 || sp.teamId == 2) {
+            addFor(sp, sp.teamId);
+        } else {
+            addFor(sp, 1);
+            addFor(sp, 2);
+        }
+    }
+    Logger::Info("[GameServer::PopulateSpawnsFromMap] Registered spawns from %zu map points "
+                 "(team1: %zu->%zu, team2: %zu->%zu)",
+                 points.size(),
+                 before1, m_spawnSystem->GetTeamSpawns(1).size(),
+                 before2, m_spawnSystem->GetTeamSpawns(2).size());
+    Logger::Trace("[GameServer::PopulateSpawnsFromMap] Exit");
 }
 
 void GameServer::ChangeMap() {

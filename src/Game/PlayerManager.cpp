@@ -90,7 +90,11 @@ void PlayerManager::Update()
     float deltaSeconds = 1.0f / m_server->GetServerConfig()->GetTickRate();
     for (auto& [id, pl] : m_players) {
         auto conn = pl->GetConnection();
-        if (conn) {
+        // Only dump when there is an actual packet. This runs every tick for
+        // every player; LastRawPacket() is usually empty, and dumping an empty
+        // buffer made PacketAnalyzer log "empty packet received" tens of times a
+        // second per player (tens of thousands of lines in one session).
+        if (conn && !conn->LastRawPacket().empty()) {
             DumpPacketForAnalysis(conn->LastRawPacket(), "Update_PlayerTelemetry");
         }
 

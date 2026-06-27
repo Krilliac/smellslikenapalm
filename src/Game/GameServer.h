@@ -177,6 +177,9 @@ private:
     // Register the current map's objective definitions with the ObjectiveSystem,
     // applying linear territory ordering when the active mode is Territory.
     void PopulateObjectivesFromMap();
+    // Feed the loaded map's spawn points into the SpawnSystem so joined players
+    // can actually spawn (otherwise SpawnSystem is empty -> "no spawn locations").
+    void PopulateSpawnsFromMap();
 
     std::unique_ptr<NetworkManager>     m_networkManager;
     std::shared_ptr<ConfigManager>      m_configManager;
