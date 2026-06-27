@@ -18,6 +18,7 @@
 #include "Config/ServerConfig.h"
 #include "Utils/Logger.h"
 
+#include <chrono>
 #include <cstring>
 
 ConnectionLoginBridge::ConnectionLoginBridge(Dependencies deps)
@@ -373,4 +374,54 @@ bool ConnectionLoginBridge::WasSpawnAttempted(uint32_t clientId) const
 {
     auto it = m_spawnAttempted.find(clientId);
     return it != m_spawnAttempted.end() && it->second;
+}
+
+// --- Ban administration (single authoritative store: SecurityManager) --------
+
+bool ConnectionLoginBridge::BanSteamId(const std::string& steamId, int durationMinutes,
+                                       const std::string& reason)
+{
+    if (!m_security) {
+        Logger::Warn("[LoginBridge::BanSteamId] No SecurityManager; cannot ban '%s'", steamId.c_str());
+        return false;
+    }
+    if (durationMinutes <= 0) {
+        m_security->BanClient(steamId, BanType::Permanent, std::chrono::seconds(0), reason);
+    } else {
+        m_security->BanClient(steamId, BanType::Temporary,
+                              std::chrono::minutes(durationMinutes), reason);
+    }
+    return true;
+}
+
+bool ConnectionLoginBridge::UnbanSteamId(const std::string& steamId)
+{
+    if (!m_security) return false;
+    return m_security->UnbanClient(steamId);
+}
+
+bool ConnectionLoginBridge::IsSteamIdBanned(const std::string& steamId) const
+{
+    return m_security && m_security->IsBanned(steamId);
+}
+
+std::vector<BanRecord> ConnectionLoginBridge::GetActiveBans() const
+{
+    std::vector<BanRecord> out;
+    if (!m_security) return out;
+    const auto now = std::chrono::system_clock::now();
+    for (const auto& e : m_security->GetAllBans()) {
+        BanRecord r;
+        r.steamId = e.steamId;
+        r.reason  = e.reason;
+        if (e.type == BanType::Permanent) {
+            r.permanent = true;
+        } else {
+            auto rem = std::chrono::duration_cast<std::chrono::seconds>(e.expiresAt - now).count();
+            if (rem <= 0) continue;  // already expired — not "active"
+            r.remainingSeconds = rem;
+        }
+        out.push_back(std::move(r));
+    }
+    return out;
 }

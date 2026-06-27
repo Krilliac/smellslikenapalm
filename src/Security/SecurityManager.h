@@ -43,6 +43,11 @@ public:
     // Query ban status
     bool IsBanned(const std::string& steamId) const;
 
+    // Snapshot of all current bans (for the `banlist` admin command). Returns the
+    // BanManager's own entries; callers that must stay free of Security headers
+    // should go through ConnectionLoginBridge, which maps these to BanRecord.
+    std::vector<BanEntry> GetAllBans() const;
+
 private:
     std::shared_ptr<SecurityConfig>        m_config;
     Authentication                         m_auth;

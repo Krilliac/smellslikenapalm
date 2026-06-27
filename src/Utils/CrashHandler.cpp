@@ -279,7 +279,50 @@ void SignalHandler(int sig) {
 }
 #endif  // POSIX
 
+// Count of non-fatal exceptions reported via ReportNonFatalException.
+std::atomic<unsigned long long> g_nonFatalCount{0};
+
 }  // namespace
+
+void ReportNonFatalException(const char* context) noexcept {
+    // Reporting runs in a recovery path and must never throw. Wrap the whole body
+    // so a logging/allocation failure can't turn a recovered error into a crash.
+    try {
+        g_nonFatalCount.fetch_add(1, std::memory_order_relaxed);
+
+        // Distinct banner so log scrapers/alerts don't mistake a recovered error
+        // for a fatal crash (which uses kBanner / "RS2V CRASH").
+        EmitLine("");
+        EmitLine("----- RS2V NON-FATAL EXCEPTION -----");
+        EmitLine(std::string("Context          : ") + (context ? context : "(unspecified)"));
+
+        if (std::current_exception()) {
+            try {
+                std::rethrow_exception(std::current_exception());
+            } catch (const std::exception& e) {
+                EmitLine(std::string("Exception type   : ") + typeid(e).name());
+                EmitLine(std::string("Exception message: ") + e.what());
+            } catch (...) {
+                EmitLine("Exception        : non-std exception (unknown type)");
+            }
+        } else {
+            EmitLine("Exception        : (none in flight)");
+        }
+
+        // The trace is captured at the catch site (not the throw site), so it
+        // shows which boundary recovered — still useful for locating the source.
+        EmitStackTrace();
+        EmitLine(std::string("Recovered; server continues. Total non-fatal: ") +
+                 std::to_string(g_nonFatalCount.load(std::memory_order_relaxed)));
+        EmitLine("----- END NON-FATAL EXCEPTION -----");
+    } catch (...) {
+        // Last-resort: never propagate out of the reporter.
+    }
+}
+
+unsigned long long NonFatalExceptionCount() noexcept {
+    return g_nonFatalCount.load(std::memory_order_relaxed);
+}
 
 void InstallCrashHandler() {
     bool expected = false;

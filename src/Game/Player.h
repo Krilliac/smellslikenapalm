@@ -47,6 +47,11 @@ public:
     void SetTeam(uint32_t teamId);
     uint32_t GetTeam() const;
 
+    // God mode (admin/dev testing): when set, DamageSystem ignores all incoming
+    // damage to this player. Persists across respawns until explicitly cleared.
+    void SetGodMode(bool enabled) { m_godMode = enabled; }
+    bool IsGodMode() const { return m_godMode; }
+
     // Inventory
     void AddItem(const std::string& name, int qty);
     bool RemoveItem(const std::string& name, int qty);
@@ -72,6 +77,7 @@ private:
     Vector3     m_orientation;
     int         m_health;
     uint32_t    m_teamId;
+    bool        m_godMode = false;
 
     std::vector<InventoryItem> m_inventory;
 

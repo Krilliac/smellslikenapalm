@@ -26,8 +26,12 @@
 #include <memory>
 #include <unordered_map>
 
+#include <string>
+#include <vector>
+
 #include "Network/HandshakeState.h"   // ClientLoggedInEvent / ClientJoinedEvent
 #include "Game/ReplicationInfo.h"
+#include "Game/BanRecord.h"
 
 class PlayerManager;
 class TeamManager;
@@ -76,6 +80,20 @@ public:
     // Fired when a client sends NMT_Join. Runs PostLogin: team pick + spawn +
     // mark active.
     void OnClientJoined(const ClientJoinedEvent& ev);
+
+    // ---- Ban administration (forwards to the owned SecurityManager) ----------
+    //
+    // The bridge owns the SecurityManager, which owns the single authoritative
+    // ban store (BanManager). Exposing these here lets the admin/command layer
+    // drive bans through that one store WITHOUT including the Security headers
+    // (which clash with the Network layer's ClientAddress). All are no-ops
+    // returning false/empty if no SecurityManager is available.
+    //
+    // durationMinutes <= 0 means a permanent ban.
+    bool BanSteamId(const std::string& steamId, int durationMinutes, const std::string& reason);
+    bool UnbanSteamId(const std::string& steamId);
+    bool IsSteamIdBanned(const std::string& steamId) const;
+    std::vector<BanRecord> GetActiveBans() const;
 
     // ---- Test / introspection accessors -------------------------------------
 

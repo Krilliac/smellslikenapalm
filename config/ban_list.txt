@@ -1,28 +1,15 @@
-#===============================================================================
-# RS2V Custom Server – Active Ban List
-# Path: config/ban_list.txt
+# RS2V ban list (managed by the server — edits may be overwritten on save)
 #
-# Format per line:
-#   SteamID64           Type          ExpiresAt(UTC)        Reason
-#   -----------------   -----------   -------------------   ------------------------------
-#   <SteamID64>         <perm/temp>   YYYY-MM-DD HH:MM:SS   <Optional reason text>
+# This file is owned by the security layer (BanManager). It is rewritten whenever
+# a ban is added, removed, or an expired ban is cleaned up, so hand edits are
+# best made while the server is stopped.
 #
-# Fields:
-#   SteamID64      – 64-bit Steam ID of banned user
-#   Type           – “perm” for permanent ban; “temp” for temporary ban
-#   ExpiresAt      – UTC timestamp when ban expires (“permanent” if perm)
-#   Reason         – Human-readable reason or notes (optional)
+# Format (pipe-delimited), one ban per line:
+#   SteamID64|P|<unused>|reason             permanent ban
+#   SteamID64|T|<expiryUnixSeconds>|reason  temporary ban (UTC seconds since epoch)
 #
-# Lines beginning with ‘#’ are ignored.
-#===============================================================================
-
-# Permanent bans
-76561198000000010    perm          permanent              Cheating detected via EAC
-
-# Temporary bans (examples)
-76561198000000011    temp          2025-07-15 14:30:00   Toxic behavior
-76561198000000012    temp          2025-08-01 00:00:00   Map exploit abuse
-
-#===============================================================================
-# End of ban_list.txt
-#===============================================================================
+# Blank lines and lines beginning with '#' are ignored.
+#
+# Examples (commented out — uncomment and edit to pre-seed bans):
+#   76561198000000010|P||Cheating detected via EAC
+#   76561198000000011|T|1893456000|Toxic behavior

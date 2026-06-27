@@ -14,7 +14,7 @@
 DamageSystem::DamageSystem(GameServer* server)
     : m_server(server)
 {
-    Logger::Trace("[DamageSystem::DamageSystem] Entry: server=%p", server);
+    Logger::Trace("[DamageSystem::DamageSystem] Entry: server=%p", static_cast<const void*>(server));
     Logger::Trace("[DamageSystem::DamageSystem] Exit");
 }
 
@@ -81,6 +81,14 @@ void DamageSystem::ApplyDamage(const DamageEvent& event) {
     if (!victim || !victim->IsAlive()) {
         Logger::Debug("[DamageSystem::ApplyDamage] Victim %u is null or dead, skipping damage", event.victimId);
         Logger::Trace("[DamageSystem::ApplyDamage] Exit (victim invalid)");
+        return;
+    }
+
+    // God mode (set by the admin `god` command) makes a player immune to all
+    // incoming damage. Honoured here so every damage path — bullets, explosions,
+    // fire DoT — respects it from one place.
+    if (victim->IsGodMode()) {
+        Logger::Debug("[DamageSystem::ApplyDamage] Victim %u is in god mode, ignoring damage", event.victimId);
         return;
     }
 

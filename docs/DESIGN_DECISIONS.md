@@ -45,4 +45,63 @@ unreachable (a C++23 compiler is always ≥ GCC 12); they are left inert for now
 can be removed in a dedicated cleanup. Existing C++17 code keeps compiling — it is a
 migration target, to be modernised opportunistically rather than in one large churn.
 
+## 2026-06-27 — Unified command system with one central permission gate
+**Context:** Admin commands lived in `AdminManager::HandleAdminCommand` with a
+binary `IsAdmin` check and no graded permissions, and `docs/ADMIN_COMMANDS.md`
+described a much richer system (levels, RCON, ~18 commands) that the code never
+implemented. There was no console or remote-control path, and persisted bans were
+never loaded at startup. The task called for admin/dev/mod/player/console/config/
+automation commands reachable in-game, from the console, and remotely (SOAP) — by
+humans and AI alike.
+**Decision:** Introduce `CommandManager` (`src/Game/CommandManager`) as the single
+source of truth for commands: one registry, one `CommandContext` abstraction
+(invoker + permission level + reply sink), and one central permission gate. Three
+thin transports build a context and call it — in-game chat (`ChatManager`), local
+console stdin (`ConsoleInput`, Console level), and a SOAP/HTTP endpoint
+(`RemoteAdminServer`, for tooling/AI). `AdminManager` is reduced to the
+authorization/ban *data store* plus the privileged kick/ban/unban operations the
+manager calls; it no longer parses commands. Permission tiers are
+Player/Helper/Moderator/Admin/Dev/Console, resolved from `admin_list.txt` levels.
+**Rules out:** Per-transport command parsing or authorization (a second command
+path is a security and drift hazard — the gate must live in exactly one place);
+re-adding command dispatch to `AdminManager`; a binary admin/non-admin model.
+**Consequences:** New commands are added once in `CommandHandlers.cpp` and are
+immediately reachable from every transport at the correct level. The remote SOAP
+endpoint is off unless a port *and* password are set and binds all interfaces
+(socket-layer limitation) — operators must firewall it. God mode is honoured in
+`DamageSystem` via a `Player` flag. The legacy `[Admin] rcon_*` keys remain inert
+(no Source-RCON implementation); the remote transport uses `[RemoteAdmin]`.
+
+## 2026-06-27 — Single authoritative ban store; non-fatal exception recovery
+**Context:** Two ban stores pointed at the same `config/ban_list.txt` in
+incompatible formats: `AdminManager` (`steamId epochSeconds`, used by the command
+system + anti-cheat) and `SecurityManager::m_banManager` (`steamId|T/P|expiry|reason`,
+the store that actually enforces bans at connect time). `AdminManager`'s
+`IsBanned` had no callers, so its list was a shadow that never enforced anything
+yet wrote the shared file — which `BanManager`'s destructor then truncated on
+shutdown. The shipped sample file was in a *third* format neither could parse, and
+`BanManager` serialised `steady_clock` epochs (per-process), so temporary bans
+were meaningless after a restart. Separately, a recoverable exception escaping a
+subsystem boundary (e.g. one bad packet, one bad command) reached
+`std::terminate` and killed the whole server.
+**Decision:** (1) Make `SecurityManager`/`BanManager` the single ban owner.
+`AdminManager` ban ops delegate via `GameServer` → `ConnectionLoginBridge`
+(which keeps the Security headers — and their `ClientAddress` clash — out of the
+Game TUs) and surface bans as a neutral `BanRecord`. `AdminManager` drops its
+shadow map and file I/O. `BanManager` switches to `system_clock` so temporary
+bans persist correctly. (2) Add `rs2v::ReportNonFatalException` / `rs2v::Guard`
+to the crash handler — the complement of the existing `std::set_terminate` path:
+catch at a boundary, log with the same diagnostics, and continue. Guards wrap the
+game tick, per-packet dispatch, command dispatch, and the console/remote worker
+threads; `query` reports the recovered-exception count.
+**Rules out:** A second ban list anywhere; AdminManager owning ban persistence;
+persisting `steady_clock` time points; letting a recoverable per-boundary
+exception propagate to `std::terminate`.
+**Consequences:** One ban file, one format (pipe-delimited, wall-clock expiry),
+machine-managed. Reaching the security layer from Game code goes through the
+bridge's neutral forwarders, never a raw `SecurityManager*`. A throwing handler or
+malformed packet now logs a `NON-FATAL EXCEPTION` banner and the server keeps
+running; only genuinely unrecoverable faults (signals, uncaught exceptions that
+escape all guards) remain fatal.
+
 <!-- Append new decisions above this line, newest first. -->

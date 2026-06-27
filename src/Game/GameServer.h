@@ -9,7 +9,9 @@
 #include <thread>
 #include <mutex>
 #include <queue>
+#include <functional>
 #include "Network/Packet.h"
+#include "Game/BanRecord.h"
 
 class NetworkManager;
 class AdminManager;
@@ -46,6 +48,9 @@ class RoundManager;
 class ProtocolHandler;
 class ReplicationManager;
 class ConnectionLoginBridge;
+class CommandManager;
+class ConsoleInput;
+class RemoteAdminServer;
 
 struct PacketAnalysisResult;
 
@@ -72,6 +77,15 @@ public:
 
     void BroadcastChatMessage(const std::string& msg);
 
+    // --- Ban administration (single authoritative store, owned by the security
+    // layer behind the login bridge). AdminManager and the command system go
+    // through here so there is exactly one ban store. durationMinutes <= 0 is a
+    // permanent ban. No-ops returning false/empty before the bridge exists. ---
+    bool BanSteamId(const std::string& steamId, int durationMinutes, const std::string& reason);
+    bool UnbanSteamId(const std::string& steamId);
+    bool IsSteamIdBanned(const std::string& steamId) const;
+    std::vector<BanRecord> GetActiveBans() const;
+
     uint32_t FindClientBySteamID(const std::string& steamId) const;
     std::shared_ptr<ClientConnection> GetClientConnection(uint32_t clientId) const;
     std::vector<std::shared_ptr<ClientConnection>> GetAllConnections() const;
@@ -86,6 +100,8 @@ public:
     MutatorManager*                 GetMutatorManager()     const;
     NetworkManager*                 GetNetworkManager()     const;
     AdminManager*                   GetAdminManager()       const;
+    ChatManager*                    GetChatManager()        const;
+    CommandManager*                 GetCommandManager()     const;
     RoleSystem*                     GetRoleSystem()         const;
     TicketSystem*                   GetTicketSystem()       const;
     ObjectiveSystem*                GetObjectiveSystem()    const;
@@ -105,6 +121,24 @@ public:
     std::shared_ptr<ConfigManager>  GetConfigManager()      const;
 
     void ChangeMap();
+
+    // --- Runtime controls driven by the command system ---
+    // Graceful shutdown requested by the `shutdown` command (or a transport).
+    // The main loop polls IsShutdownRequested() and stops the game clock.
+    void RequestShutdown();
+    bool IsShutdownRequested() const { return m_shutdownRequested.load(); }
+
+    // Tick rate is owned by the GameClock in main(); a hook lets the `tickrate`
+    // command reach it without GameServer depending on GameClock. SetTickRate
+    // applies the hook (if installed) and records the value for `status`.
+    void SetTickRateHook(std::function<void(int)> hook);
+    bool SetTickRate(int rate);
+    int  GetTickRate() const { return m_currentTickRate; }
+
+    // Simulation speed multiplier applied to the per-tick delta (1.0 = normal).
+    // Used by the `timescale` dev command for slow-mo / fast-forward testing.
+    void  SetTimeScale(float scale);
+    float GetTimeScale() const { return m_timeScale; }
 
     // Map voting. StartMapVote begins an end-of-round vote (using the current
     // map as the excluded option); CastMapVote records a client's pick; the
@@ -155,6 +189,9 @@ private:
     std::string                         m_pendingVoteWinner;
     std::unique_ptr<AdminManager>       m_adminManager;
     std::unique_ptr<ChatManager>        m_chatManager;
+    std::unique_ptr<CommandManager>     m_commandManager;
+    std::unique_ptr<ConsoleInput>       m_consoleInput;
+    std::unique_ptr<RemoteAdminServer>  m_remoteAdminServer;
     std::unique_ptr<GameMode>           m_gameMode;
 
     // RS2V game systems
@@ -187,6 +224,12 @@ private:
     // Game tick timing
     float m_lastTickTime = 0.0f;
     float m_tickDeltaSeconds = 1.0f / 60.0f;  // 60Hz default
+    float m_timeScale = 1.0f;                  // command-controlled sim speed
+
+    // Runtime control state driven by the command system.
+    std::atomic<bool>          m_shutdownRequested{false};
+    std::function<void(int)>   m_tickRateHook;        // installed by main()
+    int                        m_currentTickRate = 60;
 
     // Packet handlers for RS2V systems
     void HandleRoleSelection(uint32_t clientId, const std::vector<uint8_t>& data);

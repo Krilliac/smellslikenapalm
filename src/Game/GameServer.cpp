@@ -5,6 +5,9 @@
 #include "Network/NetworkManager.h"
 #include "Game/AdminManager.h"
 #include "Game/ChatManager.h"
+#include "Game/CommandManager.h"
+#include "Network/ConsoleInput.h"
+#include "Network/RemoteAdminServer.h"
 #include "Game/GameMode.h"
 #include "Config/ConfigManager.h"
 #include "Config/GameConfig.h"
@@ -41,6 +44,7 @@
 #include "Network/ClientConnection.h"
 #include "Utils/PathUtils.h"
 #include "Utils/HandlerLibraryManager.h"
+#include "Utils/CrashHandler.h"
 #include "Protocol/ReverseEngineering/ProtocolDecoder.h"
 #include <chrono>
 #include <thread>
@@ -257,6 +261,12 @@ bool GameServer::Initialize() {
 
     m_chatManager   = std::make_unique<ChatManager>(this);
     m_chatManager->Initialize();
+
+    // Unified command system — single source of truth for admin/dev/mod/player/
+    // console/config/automation commands. All transports (chat, console, SOAP)
+    // dispatch through this one registry.
+    m_commandManager = std::make_unique<CommandManager>(this);
+    m_commandManager->Initialize();
 
     // Initialize RS2V game systems
     Logger::Debug("[GameServer::Initialize] Initializing RS2V game systems");
@@ -488,6 +498,41 @@ bool GameServer::Initialize() {
     // Fully guarded — never crashes when neither is available.
     DynamicReloadGeneratedHandlers();
 
+    // Record the configured tick rate so `status`/`tickrate` report truthfully
+    // even before main() installs the GameClock hook.
+    if (m_serverConfig) m_currentTickRate = m_serverConfig->GetTickRate();
+
+    // Local console (stdin) command transport. Enabled by default; a headless
+    // launch with no TTY simply sees EOF and the reader thread exits cleanly.
+    {
+        bool consoleEnabled = m_configManager ? m_configManager->GetBool("Console.enabled", true) : true;
+        if (consoleEnabled) {
+            m_consoleInput = std::make_unique<ConsoleInput>(this);
+            m_consoleInput->Start();
+        } else {
+            Logger::Info("[GameServer::Initialize] Console command input disabled by config");
+        }
+    }
+
+    // Remote SOAP command transport (for tooling / AI automation). Off unless a
+    // port AND password are configured — never expose remote control by default.
+    {
+        RemoteAdminConfig rc;
+        rc.port     = m_configManager ? static_cast<uint16_t>(m_configManager->GetInt("RemoteAdmin.soap_port", 0)) : 0;
+        rc.password = m_configManager ? m_configManager->GetString("RemoteAdmin.password", "") : "";
+        rc.defaultLevel = m_configManager ? m_configManager->GetInt("RemoteAdmin.level", static_cast<int>(CommandLevel::Admin)) : static_cast<int>(CommandLevel::Admin);
+        if (rc.port != 0 && !rc.password.empty()) {
+            m_remoteAdminServer = std::make_unique<RemoteAdminServer>(this, rc);
+            if (!m_remoteAdminServer->Start()) {
+                Logger::Warn("[GameServer::Initialize] Remote SOAP admin server failed to start on port %u", rc.port);
+                m_remoteAdminServer.reset();
+            }
+        } else {
+            Logger::Info("[GameServer::Initialize] Remote SOAP admin server disabled "
+                         "(set RemoteAdmin.soap_port and RemoteAdmin.password to enable)");
+        }
+    }
+
     m_running = true;
     Logger::Info("GameServer initialized successfully");
     Logger::Trace("[GameServer::Initialize] Exit, returning true");
@@ -526,6 +571,10 @@ void GameServer::Run() {
             continue;
         }
 
+        // Per-packet guard: packet payloads are attacker-controlled. A handler
+        // that throws on a crafted packet is logged non-fatally and we advance to
+        // the next packet, rather than letting one bad packet abort the whole tick.
+        rs2v::Guard("packet dispatch", [&] {
         std::string tag = qpkt.packet.GetTag();
         Logger::Debug("[GameServer::Run] Processing packet tag='%s' from clientId=%u", tag.c_str(), qpkt.clientId);
         if (tag == "CHAT_MESSAGE" && m_chatManager) {
@@ -559,9 +608,10 @@ void GameServer::Run() {
         } else {
             Logger::Debug("[GameServer::Run] Unhandled packet tag '%s' and no GameMode available", tag.c_str());
         }
+        });  // rs2v::Guard (per-packet dispatch)
     }
 
-    float dt = m_tickDeltaSeconds;
+    float dt = m_tickDeltaSeconds * m_timeScale;
 
     // Tick core subsystems with game logic timing
     {
@@ -621,6 +671,17 @@ void GameServer::Shutdown() {
     m_running = false;
     StopAutoRegen();
 
+    // Stop command transports first so no late command runs against subsystems
+    // that are about to be torn down.
+    if (m_remoteAdminServer) {
+        m_remoteAdminServer->Stop();
+        m_remoteAdminServer.reset();
+    }
+    if (m_consoleInput) {
+        m_consoleInput->Stop();
+        m_consoleInput.reset();
+    }
+
     // Shutdown login bridge / replication first (they reference the game
     // subsystems below). The bridge owns and shuts down its SecurityManager.
     Logger::Debug("[GameServer::Shutdown] Destroying login bridge and replication");
@@ -657,6 +718,10 @@ void GameServer::Shutdown() {
         m_gameMode.reset();
     } else {
         Logger::Debug("[GameServer::Shutdown] No active GameMode to end");
+    }
+    if (m_commandManager) {
+        m_commandManager->Shutdown();
+        m_commandManager.reset();
     }
     m_chatManager.reset();
     if (m_adminManager) {
@@ -730,6 +795,8 @@ ModManager*         GameServer::GetModManager()         const { return m_modMana
 MutatorManager*     GameServer::GetMutatorManager()     const { return m_mutatorManager.get();     }
 NetworkManager*     GameServer::GetNetworkManager()     const { return m_networkManager.get();     }
 AdminManager*       GameServer::GetAdminManager()       const { return m_adminManager.get();       }
+ChatManager*        GameServer::GetChatManager()        const { return m_chatManager.get();        }
+CommandManager*     GameServer::GetCommandManager()     const { return m_commandManager.get();     }
 RoleSystem*         GameServer::GetRoleSystem()         const { return m_roleSystem.get();         }
 TicketSystem*       GameServer::GetTicketSystem()       const { return m_ticketSystem.get();       }
 ObjectiveSystem*    GameServer::GetObjectiveSystem()    const { return m_objectiveSystem.get();    }
@@ -748,6 +815,57 @@ RoundManager*       GameServer::GetRoundManager()       const { return m_roundMa
 std::shared_ptr<GameConfig>    GameServer::GetGameConfig()    const { return m_gameConfig;    }
 std::shared_ptr<ServerConfig>  GameServer::GetServerConfig()  const { return m_serverConfig;  }
 std::shared_ptr<ConfigManager> GameServer::GetConfigManager() const { return m_configManager; }
+
+// --- Ban administration: forward to the single authoritative store behind the
+// login bridge (SecurityManager/BanManager). The bridge keeps the Security
+// headers out of this TU (they clash with the Network ClientAddress). ---
+
+bool GameServer::BanSteamId(const std::string& steamId, int durationMinutes, const std::string& reason) {
+    return m_loginBridge ? m_loginBridge->BanSteamId(steamId, durationMinutes, reason) : false;
+}
+
+bool GameServer::UnbanSteamId(const std::string& steamId) {
+    return m_loginBridge ? m_loginBridge->UnbanSteamId(steamId) : false;
+}
+
+bool GameServer::IsSteamIdBanned(const std::string& steamId) const {
+    return m_loginBridge ? m_loginBridge->IsSteamIdBanned(steamId) : false;
+}
+
+std::vector<BanRecord> GameServer::GetActiveBans() const {
+    return m_loginBridge ? m_loginBridge->GetActiveBans() : std::vector<BanRecord>{};
+}
+
+// --- Runtime controls driven by the command system ---
+
+void GameServer::RequestShutdown() {
+    Logger::Info("[GameServer::RequestShutdown] Graceful shutdown requested via command");
+    m_shutdownRequested.store(true);
+}
+
+void GameServer::SetTickRateHook(std::function<void(int)> hook) {
+    m_tickRateHook = std::move(hook);
+}
+
+bool GameServer::SetTickRate(int rate) {
+    if (rate < 1 || rate > 256) {
+        Logger::Warn("[GameServer::SetTickRate] Rejected out-of-range tick rate %d", rate);
+        return false;
+    }
+    m_currentTickRate = rate;
+    m_tickDeltaSeconds = 1.0f / static_cast<float>(rate);
+    if (m_tickRateHook) m_tickRateHook(rate);
+    if (m_configManager) m_configManager->SetInt("Network.tick_rate", rate);
+    Logger::Info("[GameServer::SetTickRate] Tick rate set to %d Hz", rate);
+    return true;
+}
+
+void GameServer::SetTimeScale(float scale) {
+    if (scale < 0.05f) scale = 0.05f;
+    if (scale > 8.0f)  scale = 8.0f;
+    m_timeScale = scale;
+    Logger::Info("[GameServer::SetTimeScale] Time scale set to %.2f", scale);
+}
 
 void GameServer::PopulateObjectivesFromMap() {
     Logger::Trace("[GameServer::PopulateObjectivesFromMap] Entry");
