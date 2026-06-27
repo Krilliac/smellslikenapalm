@@ -303,7 +303,15 @@ bool AdminManager::ListAdmins(uint32_t adminClientId)
 void AdminManager::SaveBanList() const
 {
     Logger::Trace("[AdminManager::SaveBanList] Entry");
-    const std::string path = "config/ban_list.txt";
+    // Use a SEPARATE file from config/ban_list.txt, which is the AUTHORITATIVE ban store that
+    // BanManager owns and SecurityManager enforces at connect (IsBanned). AdminManager previously
+    // truncated + rewrote that SAME file in an incompatible SPACE-delimited format, WIPING
+    // BanManager's real PIPE-delimited bans on every admin /ban and writing records BanManager
+    // skips as malformed. Keeping AdminManager on its own file stops the mutual corruption.
+    // FOLLOW-UP (non-additive): make admin /ban delegate to SecurityManager::BanClient so the
+    // ban actually ENFORCES at connect (today it only kicks the online session); see
+    // docs/hardening/HARDENING_LOG.md.
+    const std::string path = "config/admin_ban_list.txt";
     Logger::Debug("[AdminManager::SaveBanList] Saving to path='%s', %zu bans", path.c_str(), m_bans.size());
     std::ofstream file(path, std::ios::trunc);
     if (!file.is_open())
@@ -327,7 +335,15 @@ void AdminManager::SaveBanList() const
 void AdminManager::LoadBanList()
 {
     Logger::Trace("[AdminManager::LoadBanList] Entry");
-    const std::string path = "config/ban_list.txt";
+    // Use a SEPARATE file from config/ban_list.txt, which is the AUTHORITATIVE ban store that
+    // BanManager owns and SecurityManager enforces at connect (IsBanned). AdminManager previously
+    // truncated + rewrote that SAME file in an incompatible SPACE-delimited format, WIPING
+    // BanManager's real PIPE-delimited bans on every admin /ban and writing records BanManager
+    // skips as malformed. Keeping AdminManager on its own file stops the mutual corruption.
+    // FOLLOW-UP (non-additive): make admin /ban delegate to SecurityManager::BanClient so the
+    // ban actually ENFORCES at connect (today it only kicks the online session); see
+    // docs/hardening/HARDENING_LOG.md.
+    const std::string path = "config/admin_ban_list.txt";
     Logger::Debug("[AdminManager::LoadBanList] Loading from path='%s'", path.c_str());
     m_bans.clear();
 
