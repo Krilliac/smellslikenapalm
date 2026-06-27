@@ -84,10 +84,17 @@ bool ConfigManager::LoadConfiguration(const std::string& configFile) {
 
     while (std::getline(file, line)) {
         ++lineNumber;
-        // Strip comments
-        if (auto pos = line.find('#'); pos != std::string::npos) {
-            Logger::Trace("[ConfigManager::LoadConfiguration] Line %zu: stripping comment at position %zu", lineNumber, pos);
-            line.erase(pos);
+        // Strip trailing comments. A '#' only starts a comment when it is at the START of the
+        // line or is PRECEDED BY WHITESPACE - otherwise it is a literal character inside a value
+        // (e.g. rcon_password=Sup#rSecret!). The previous code erased from the FIRST '#' anywhere
+        // on the line, silently truncating any value that contained '#' - corrupting/weakening
+        // secrets, paths, and regexes. In-value '#' (no leading whitespace) is now preserved.
+        for (size_t i = 0; i < line.size(); ++i) {
+            if (line[i] == '#' && (i == 0 || std::isspace(static_cast<unsigned char>(line[i - 1])))) {
+                Logger::Trace("[ConfigManager::LoadConfiguration] Line %zu: stripping comment at position %zu", lineNumber, i);
+                line.erase(i);
+                break;
+            }
         }
         line = StringUtils::Trim(line);
         if (line.empty()) {
