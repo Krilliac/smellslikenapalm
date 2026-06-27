@@ -9,17 +9,25 @@
 #include <cstdint>
 #include <string>
 #include <vector>
+#include <deque>
 #include <map>
 #include <unordered_map>
 #include <mutex>
+#include <condition_variable>
+#include <thread>
+#include <atomic>
 #include <memory>
 #include <chrono>
 #include <functional>
 #include <optional>
 
+#include "Protocol/ReverseEngineering/NetFieldTable.h"
+#include "Protocol/ReverseEngineering/BunchPropertyDecoder.h"
+
 // Forward declarations
 class Packet;
 struct PacketMetadata;
+struct UE3BunchHeader;
 
 // Detected field type from heuristic analysis
 enum class DetectedFieldType : uint8_t {
@@ -59,7 +67,8 @@ struct DetectedField {
     double               minValue = 0.0;
     double               maxValue = 0.0;
     double               avgValue = 0.0;
-    double               variance = 0.0;
+    double               variance = 0.0;   // population variance (m2 / n)
+    double               m2 = 0.0;         // Welford running sum of squared deltas
 
     // For string fields
     size_t               minLength = 0;
@@ -89,6 +98,12 @@ struct DecodedPacketStructure {
     // Direction tracking
     uint64_t                 clientToServerCount = 0;
     uint64_t                 serverToClientCount = 0;
+
+    // Layout inference: rather than locking the field layout from the FIRST
+    // (possibly atypical) packet, we buffer the earliest samples and infer the
+    // layout once from the MODAL payload size. layoutFinalized gates that.
+    bool                     layoutFinalized = false;
+    std::vector<std::vector<uint8_t>> sampleBuffer;   // capped; cleared after infer
 };
 
 // Per-client connection session for protocol analysis
@@ -111,15 +126,17 @@ struct ClientAnalysisSession {
     // Per-tag packet counters
     std::unordered_map<std::string, uint64_t> tagCounts;
 
-    // Raw packet log (capped to prevent memory bloat)
+    // Raw packet log — a rolling window of the MOST RECENT packets. A deque so
+    // that, once the cap is reached, the oldest record is popped in O(1) and the
+    // newest is retained (the previous vector-with-cap kept only the *earliest*
+    // N packets and silently dropped everything after).
     struct RawPacketRecord {
         std::chrono::steady_clock::time_point timestamp;
         std::string tag;
         std::vector<uint8_t> data;
         bool inbound; // true = client->server, false = server->client
     };
-    std::vector<RawPacketRecord> recentPackets;
-    static constexpr size_t MAX_RECENT_PACKETS = 1000;
+    std::deque<RawPacketRecord> recentPackets;
 };
 
 // UE3 bunch-level analysis data
@@ -136,15 +153,36 @@ struct BunchAnalysis {
 // Configuration for the protocol decoder
 struct ProtocolDecoderConfig {
     bool     enabled = true;
-    bool     logRawPackets = true;
-    bool     exportJsonDefinitions = true;
+    // SAFE-BY-DEFAULT: retaining full attacker-controlled payloads and writing
+    // JSON to disk on a shipped server is a memory/disk-fill and info-leak risk,
+    // so both default OFF. Structural analysis (sizes, fields, bunches) still
+    // runs. Operators opt in for an active RE session.
+    bool     logRawPackets = false;
+    bool     exportJsonDefinitions = false;
     bool     detectUE3Bunches = true;
     bool     trackFieldStatistics = true;
+    bool     decodeBunchProperties = true;   // bit-packed property decode vs handle tables
+    bool     asyncAnalysis = true;           // run analysis off the network hot path
+    bool     persistState = true;            // merge cumulative stats across runs
     size_t   minSamplesForConfidence = 10;
     float    fieldConfidenceThreshold = 0.7f;
     std::string outputDirectory = "protocol_analysis";
+    std::string netfieldsDir = "data/re/netfields"; // per-class handle tables
+    uint32_t maxChannels = 1024;             // object-ref / None bound (RS2-7258 [H])
     size_t   maxRawPacketsPerClient = 1000;
+    size_t   maxSampleBuffer = 64;           // payloads buffered for layout inference
+    size_t   maxAnalysisQueue = 50000;       // async queue cap (drop-oldest beyond)
     int      exportIntervalSeconds = 300; // auto-export every 5 min
+};
+
+// Per-channel decoded-property aggregation (results of bit-packed bunch decode).
+struct ChannelPropertyStats {
+    std::string className;                       // best-fit class for this channel
+    double      bestFitScore = 0.0;
+    uint64_t    bunchesDecoded = 0;
+    // property name -> times seen, with a sample of the last decoded value
+    struct PropAgg { uint64_t count = 0; std::string lastValue; uint32_t handle = 0; };
+    std::map<std::string, PropAgg> properties;
 };
 
 // Callback for real-time protocol discoveries
@@ -187,6 +225,9 @@ public:
     bool ExportClientCapture(uint32_t clientId, const std::string& outputPath = "") const;
     std::string GenerateProtocolReport() const;
 
+    // Decoded bit-packed bunch properties, keyed by UE3 channel index.
+    std::map<uint8_t, ChannelPropertyStats> GetChannelPropertyStats() const;
+
     // Callbacks
     void SetDiscoveryCallback(ProtocolDiscoveryCallback cb);
 
@@ -216,6 +257,11 @@ private:
     // UE3 bunch analysis results
     std::vector<BunchAnalysis> m_bunchHistory;
 
+    // Bit-packed property decoding (channel -> aggregated decoded properties).
+    NetFieldRegistry m_netFields;
+    std::unique_ptr<BunchPropertyDecoder> m_propDecoder;
+    std::map<uint8_t, ChannelPropertyStats> m_channelStats;
+
     // Statistics
     DecoderStatistics m_stats;
 
@@ -225,12 +271,53 @@ private:
     // Auto-export timer
     std::chrono::steady_clock::time_point m_lastExportTime;
 
+    // ---- async analysis pipeline ----
+    // The network hot path only copies bytes and enqueues; a single worker thread
+    // drains the queue and runs all analysis, so per-packet work never blocks the
+    // socket threads. FIFO + single worker preserves connect/packet/disconnect
+    // ordering. The queue is bounded (drop-oldest) to cap memory under flood.
+    enum class CaptureKind { Connected, Disconnected, PacketRecv, PacketSent, RawUDP };
+    struct CaptureEvent {
+        CaptureKind kind;
+        uint32_t clientId = 0;
+        std::string ip;          // Connected
+        std::string tag;         // PacketRecv/Sent
+        std::vector<uint8_t> data;
+    };
+    std::deque<CaptureEvent> m_queue;
+    std::mutex m_queueMutex;
+    std::condition_variable m_queueCv;
+    std::thread m_worker;
+    std::atomic<bool> m_workerRunning{false};
+    uint64_t m_droppedEvents = 0;
+
+    void Enqueue(CaptureEvent&& ev);
+    void WorkerLoop();
+    void ProcessEvent(const CaptureEvent& ev);     // runs under m_mutex
+    // Synchronous bodies (called by ProcessEvent or directly in sync mode).
+    void HandleConnected(uint32_t clientId, const std::string& ip);
+    void HandleDisconnected(uint32_t clientId);
+    void HandlePacket(uint32_t clientId, const std::vector<uint8_t>& data,
+                      const std::string& tag, bool inbound);
+    void HandleRawUDP(uint32_t clientId, const std::vector<uint8_t>& data);
+
     // Core analysis methods
     void AnalyzePacketPayload(const std::string& tag, const std::vector<uint8_t>& data, bool inbound);
     void AnalyzeUE3Bunch(const uint8_t* data, size_t len);
+    void DecodeBunchProperties(const UE3BunchHeader& header,
+                               const uint8_t* payload, size_t payloadLen);
+    void InferLayoutFromSamples(DecodedPacketStructure& structure);
     void DetectFieldTypes(DecodedPacketStructure& structure, const std::vector<uint8_t>& data);
     void RefineFieldDetection(DecodedPacketStructure& structure);
     void UpdateFieldStatistics(DetectedField& field, const std::vector<uint8_t>& data, size_t offset);
+
+    // Persistence (cumulative cross-run stats).
+    void LoadPersistentState();
+    void SavePersistentState() const;
+
+    // Export internals that assume m_mutex is already held (no re-lock dance).
+    bool ExportProtocolDefinitionsLocked(const std::string& outputPath) const;
+    bool ExportClientCaptureLocked(uint32_t clientId, const std::string& outputPath) const;
 
     // Heuristic field detection
     DetectedFieldType ClassifyFieldAt(const std::vector<uint8_t>& data, size_t offset, size_t remaining);
@@ -248,6 +335,7 @@ private:
     std::string FieldTypeToString(DetectedFieldType type) const;
     std::string StructureToJson(const DecodedPacketStructure& structure) const;
     std::string GenerateFieldName(DetectedFieldType type, size_t fieldIndex) const;
+    static std::string JsonEscape(const std::string& s);
 
     // Auto-export check
     void MaybeAutoExport();

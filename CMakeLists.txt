@@ -100,7 +100,13 @@ endif()
 # dir on PATH, so a dynamically-linked exe fails at launch with a missing-DLL
 # error (STATUS_ENTRYPOINT_NOT_FOUND / 0xc0000139). Static linking makes the
 # tool self-contained and runnable from any environment.
-if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+#
+# This is a MinGW/Windows-only need. On Linux a full `-static` link FAILS when
+# OpenSSL is found, because the system ships libssl/libcrypto as shared-only
+# objects ("attempted static link of dynamic object libssl.so"). Gate to MINGW so
+# Linux gcc links the tool normally (dynamic libssl is fine there); MSVC never
+# entered this block.
+if(MINGW)
     target_link_options(PacketHandlerCodeGen PRIVATE -static -static-libgcc -static-libstdc++)
 endif()
 
@@ -207,4 +213,18 @@ message(STATUS "")
 if(BUILD_TESTS)
     enable_testing()
     add_subdirectory(tests)
+endif()
+
+# Self-contained RE self-test (opt-in via -DBUILD_RE_SELFTEST=ON). Unlike the
+# main suite this needs NO GoogleTest / no network: it has its own main() and
+# links only rs2v_core, so it builds and runs in offline/sandbox environments.
+option(BUILD_RE_SELFTEST "Build the network-free reverse-engineering self-test" OFF)
+if(BUILD_RE_SELFTEST)
+    enable_testing()
+    add_executable(ProtocolDecoderSelfTest tests/ProtocolDecoderTests.cpp)
+    target_link_libraries(ProtocolDecoderSelfTest PRIVATE rs2v_core Threads::Threads)
+    target_include_directories(ProtocolDecoderSelfTest PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    add_test(NAME ProtocolDecoderSelfTest
+             COMMAND ProtocolDecoderSelfTest
+             WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 endif()

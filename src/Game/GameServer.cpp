@@ -376,10 +376,18 @@ bool GameServer::Initialize() {
     {
         ProtocolDecoderConfig decoderCfg;
         decoderCfg.enabled = m_configManager->GetBool("ReverseEngineering.enabled", true);
-        decoderCfg.logRawPackets = m_configManager->GetBool("ReverseEngineering.log_raw_packets", true);
-        decoderCfg.exportJsonDefinitions = m_configManager->GetBool("ReverseEngineering.export_json", true);
+        // SAFE-BY-DEFAULT: retaining raw attacker payloads and writing JSON on a
+        // shipped server is a memory/disk-fill + info-leak risk, so these default
+        // OFF; an operator opts in for an active RE session.
+        decoderCfg.logRawPackets = m_configManager->GetBool("ReverseEngineering.log_raw_packets", false);
+        decoderCfg.exportJsonDefinitions = m_configManager->GetBool("ReverseEngineering.export_json", false);
         decoderCfg.detectUE3Bunches = m_configManager->GetBool("ReverseEngineering.detect_ue3_bunches", true);
+        decoderCfg.decodeBunchProperties = m_configManager->GetBool("ReverseEngineering.decode_bunch_properties", true);
+        decoderCfg.asyncAnalysis = m_configManager->GetBool("ReverseEngineering.async_analysis", true);
+        decoderCfg.persistState = m_configManager->GetBool("ReverseEngineering.persist_state", true);
         decoderCfg.outputDirectory = m_configManager->GetString("ReverseEngineering.output_dir", "protocol_analysis");
+        decoderCfg.netfieldsDir = m_configManager->GetString("ReverseEngineering.netfields_dir", "data/re/netfields");
+        decoderCfg.maxChannels = static_cast<uint32_t>(m_configManager->GetInt("ReverseEngineering.max_channels", 1024));
         decoderCfg.exportIntervalSeconds = m_configManager->GetInt("ReverseEngineering.export_interval", 300);
         GetProtocolDecoder().Initialize(decoderCfg);
 
