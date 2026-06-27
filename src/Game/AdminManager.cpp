@@ -218,6 +218,16 @@ bool AdminManager::BanPlayer(uint32_t adminClientId, const std::string& targetSt
         Logger::Debug("[AdminManager::BanPlayer] Target '%s' is not currently online, adding offline ban", targetSteamId.c_str());
     }
 
+    // GUARD (integer overflow / UB): durationMinutes is operator-supplied. An enormous value
+    // (e.g. ~2e9, which still parses as a valid int) overflows when std::chrono::minutes is
+    // converted into system_clock's finer ticks for the addition below, yielding a garbage
+    // (often past) expiry. Cap at ~100 years - longer than any real ban, far below overflow.
+    constexpr int kMaxBanMinutes = 100 * 365 * 24 * 60;  // ~100 years, fits int and avoids tick overflow
+    if (durationMinutes > kMaxBanMinutes) {
+        Logger::Warn("[AdminManager::BanPlayer] duration %d min exceeds cap; clamping to %d (~100y)", durationMinutes, kMaxBanMinutes);
+        durationMinutes = kMaxBanMinutes;
+    }
+    if (durationMinutes < 0) durationMinutes = 0;  // defensive; HandleAdminCommand already clamps negatives
     const auto expires = std::chrono::system_clock::now() + std::chrono::minutes(durationMinutes);
     m_bans[targetSteamId] = expires;
     Logger::Debug("[AdminManager::BanPlayer] Ban recorded for '%s', duration=%d min, total bans=%zu", targetSteamId.c_str(), durationMinutes, m_bans.size());
