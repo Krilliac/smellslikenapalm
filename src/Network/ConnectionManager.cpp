@@ -13,6 +13,8 @@
 #include "Network/HandshakeState.h"
 #include "Network/ControlChannel.h"
 #include "Network/BitWriter.h"
+#include "Network/ActorReplication.h"
+#include <cstdlib>
 #include "Network/BitReader.h"
 #include "Network/PacketRecorder.h"
 #include "../../telemetry/TelemetryManager.h"
@@ -699,6 +701,21 @@ const std::vector<ActorBunchRecord>& GetActorBootstrapRecords() {
 } // namespace
 
 void ConnectionManager::SendActorBootstrap(uint32_t clientId) {
+    // LIVE per-session replication (milestone 1). The canned actor_bootstrap.bin
+    // replay carries another session's actor state (stale GUIDs / PRI / position),
+    // which the retail client tears down (ch3..ch140 closed with empty bClose) - so
+    // it never has a real GRI/PRI and the team menu can't function. Build the
+    // menu-critical actors live instead. Set RS2V_LIVE_REPL=0 to fall back to the
+    // canned replay for A/B comparison.
+    {
+        const char* lr = std::getenv("RS2V_LIVE_REPL");
+        const bool useCanned = lr && (lr[0] == '0' || lr[0] == 'n' || lr[0] == 'N');
+        if (!useCanned) {
+            SendLiveActorBootstrap(clientId);
+            return;
+        }
+    }
+
     const std::vector<ActorBunchRecord>& records = GetActorBootstrapRecords();
     if (records.empty()) {
         return;
@@ -831,6 +848,95 @@ void ConnectionManager::SendActorBootstrap(uint32_t clientId) {
                    "ClientShowTeamSelect");
         // Establish the local PC->PRI link (handle 23 -> ch26) so ROPC.PlayerReplicationInfo
         // is non-none before the role/unit-select UI ever opens. Unreliable, so send a few.
+        SendLocalPriLink(clientId, 5);
+    }
+}
+
+// Live per-session actor bootstrap (milestone 1): open the menu-critical actors -
+// GameReplicationInfo, two TeamInfos, the owning client's PlayerController (ch2,
+// NetPlayerIndex 0) and its PlayerReplicationInfo (ch26) - with THIS session's
+// values, then pop the team-select menu. Class refs are the static PackageMap
+// indices recovered from the real-server capture (they resolve because we replay
+// the same PackageMap export): PC=57520, PRI=86701, GRI=70887, TeamInfo=90245.
+// maxHandle per class = the NetFieldTable maxIndex loaded at startup.
+void ConnectionManager::SendLiveActorBootstrap(uint32_t clientId) {
+    using ActorRepl::ActorOpenHeader;
+    using ActorRepl::NetGUIDRef;
+    using ActorRepl::MakeOpeningActorBunch;
+
+    auto conn = GetConnection(clientId);
+    if (!conn) return;
+    ControlState& cs = GetControlState(clientId);
+
+    constexpr uint32_t kClsPC = 57520, kClsPRI = 86701, kClsGRI = 70887, kClsTeam = 90245;
+    constexpr uint32_t kMaxGRI = 184, kMaxPC = 531, kMaxPRI = 98, kMaxTeam = 78;
+    constexpr uint32_t kChGRI = 3, kChTeam0 = 4, kChTeam1 = 5, kChPC = 2, kChPRI = 26;
+    constexpr uint32_t kGameClassIx = 69601;   // ROGame.ROGameInfoTerritories (GRI.GameClass h33)
+
+    // Match the real pre-actor control sequence (one NMT 0x24 before the opens).
+    static const std::vector<uint8_t> kPreActorNmt24 = {0x24, 0x01, 0x00, 0x00, 0x00};
+    SendRawToClient(clientId, kPreActorNmt24);
+
+    auto hdrFor = [](uint32_t cls, bool isPC) {
+        ActorOpenHeader h;
+        h.classRef = NetGUIDRef{false, cls};
+        h.isPlayerController = isPC;
+        h.netPlayerIndex = 0;          // owning client's PC (UnConn HandleClientPlayer)
+        return h;
+    };
+
+    // Deliver the PlayerController (ch2) FIRST in its own reliable packet. Live
+    // header-only open with NetPlayerIndex 0 (owning client). This is STABLE (the
+    // client creates ch2 and does not churn) but is not yet ADOPTED as the local PC
+    // (the client sends no bunches on ch2, so the team menu's LocalPlayer!=none gate
+    // stays false). The captured 925-bit ch2 block DOES get adopted but carries
+    // stale cross-session NetGUID refs that the client can't resolve -> open/close
+    // churn + a hard client hang, so it is NOT usable verbatim. Next iteration: build
+    // the minimal PC property block (scalar adoption fields + a corrected PRI->ch26
+    // ref) from the decoded capture. See [[project-replication-frontier]].
+    {
+        auto pc = MakeOpeningActorBunch(kChPC, 1, hdrFor(kClsPC, true), nullptr);
+        cs.ch2OutReliable = 1;     // seed ch2 reliable seq; SendCh2Rpc uses seq+1
+        cs.actorChType    = 2;
+        SendReliableBunches(clientId, { pc });
+    }
+
+    // BATCH the remaining opens (GRI, TeamInfo x2, PRI) into ONE reliable packet.
+    // Sending each as its own packet made all five retransmit independently until
+    // acked, which the client saw as a rapid open/close churn (~7x). One batched
+    // packet is acked once and the channels settle. (All five payloads are tiny, so
+    // the datagram stays well under the client's receive buffer.)
+    std::string name = conn->GetPlayerName();
+    if (name.empty()) name = "Player" + std::to_string(clientId);
+    const int32_t playerId = static_cast<int32_t>(clientId);
+
+    std::vector<PacketCodec::Bunch> batch;
+    batch.push_back(MakeOpeningActorBunch(kChGRI, 1, hdrFor(kClsGRI, false), [&](BitWriter& w) {
+        ActorRepl::WritePropObject(w, 33, kMaxGRI, NetGUIDRef{false, kGameClassIx});  // GameClass
+    }));
+    batch.push_back(MakeOpeningActorBunch(kChTeam0, 1, hdrFor(kClsTeam, false), [&](BitWriter& w) {
+        ActorRepl::WritePropInt(w, 23, kMaxTeam, 0);   // TeamIndex 0
+    }));
+    batch.push_back(MakeOpeningActorBunch(kChTeam1, 1, hdrFor(kClsTeam, false), [&](BitWriter& w) {
+        ActorRepl::WritePropInt(w, 23, kMaxTeam, 1);   // TeamIndex 1
+    }));
+    batch.push_back(MakeOpeningActorBunch(kChPRI, 1, hdrFor(kClsPRI, false), [&](BitWriter& w) {
+        ActorRepl::WritePropInt   (w, 36, kMaxPRI, playerId);   // PlayerID
+        ActorRepl::WritePropString(w, 37, kMaxPRI, name);       // PlayerName
+    }));
+    SendReliableBunches(clientId, batch);
+
+    Logger::Info("[ConnectionManager::SendLiveActorBootstrap] client %u: opened live GRI(ch%u) "
+                 "TeamInfo(ch%u,ch%u) PC(ch2) PRI(ch26); popping team-select",
+                 clientId, kChGRI, kChTeam0, kChTeam1);
+
+    // Pop the team-select menu on the now-owned ch2 (ClientShowTeamSelect, handle 206),
+    // then assert the PC->PRI link so the role/unit-select UI has a non-none LocalPRI.
+    {
+        BitWriter fw;
+        fw.SerializeInt(206, kMaxPC);
+        SendCh2Rpc(clientId, fw.GetBytes(), static_cast<uint32_t>(fw.NumBits()),
+                   "ClientShowTeamSelect");
         SendLocalPriLink(clientId, 5);
     }
 }

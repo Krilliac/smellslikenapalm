@@ -209,6 +209,9 @@ private:
     // state) - this is a best-effort replay; correct per-session actor replication
     // is a later step.
     void SendActorBootstrap(uint32_t clientId);
+    // Live per-session actor bootstrap (GRI + TeamInfo + local PC/PRI) — replaces the
+    // canned capture replay so the client keeps real actors and the team menu works.
+    void SendLiveActorBootstrap(uint32_t clientId);
 
     // ------------------------------------------------------------------------
     //  CONTROL-CHANNEL INBOUND PATH.
