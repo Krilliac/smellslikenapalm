@@ -650,6 +650,7 @@ TeamManager*        GameServer::GetTeamManager()        const { return m_teamMan
 MapManager*         GameServer::GetMapManager()         const { return m_mapManager.get();         }
 NetworkManager*     GameServer::GetNetworkManager()     const { return m_networkManager.get();     }
 AdminManager*       GameServer::GetAdminManager()       const { return m_adminManager.get();       }
+SecurityManager*    GameServer::GetSecurityManager()    const { return m_loginBridge ? m_loginBridge->GetSecurityManager() : nullptr; }
 RoleSystem*         GameServer::GetRoleSystem()         const { return m_roleSystem.get();         }
 TicketSystem*       GameServer::GetTicketSystem()       const { return m_ticketSystem.get();       }
 ObjectiveSystem*    GameServer::GetObjectiveSystem()    const { return m_objectiveSystem.get();    }

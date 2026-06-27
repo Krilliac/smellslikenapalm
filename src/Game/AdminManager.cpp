@@ -6,6 +6,8 @@
 #include "Config/ServerConfig.h"
 #include "Network/ClientConnection.h"
 #include "Game/GameServer.h"
+#include "Security/SecurityManager.h"   // delegate admin /ban to the authoritative ban store
+#include "Security/BanManager.h"        // BanType
 #include <algorithm>
 #include <chrono>
 #include <fstream>
@@ -228,6 +230,20 @@ bool AdminManager::BanPlayer(uint32_t adminClientId, const std::string& targetSt
         durationMinutes = kMaxBanMinutes;
     }
     if (durationMinutes < 0) durationMinutes = 0;  // defensive; HandleAdminCommand already clamps negatives
+    // Delegate to the AUTHORITATIVE ban store (SecurityManager -> BanManager) so the ban is
+    // ENFORCED at connect (the IsBanned gate), not merely a one-time kick of the online session.
+    // GetSteamID now returns the real Steam64, so this matches the target on reconnect. The
+    // m_bans map below is kept only as a redundant local mirror (its own admin_ban_list.txt).
+    if (auto* sec = m_server ? m_server->GetSecurityManager() : nullptr) {
+        sec->BanClient(targetSteamId,
+                       durationMinutes > 0 ? BanType::Temporary : BanType::Permanent,
+                       std::chrono::seconds(static_cast<long long>(durationMinutes) * 60),
+                       "admin ban");
+        Logger::Info("[AdminManager::BanPlayer] Delegated ban of '%s' to SecurityManager (enforced at connect)", targetSteamId.c_str());
+    } else {
+        Logger::Warn("[AdminManager::BanPlayer] No SecurityManager; ban of '%s' enforces as an online kick only", targetSteamId.c_str());
+    }
+
     const auto expires = std::chrono::system_clock::now() + std::chrono::minutes(durationMinutes);
     m_bans[targetSteamId] = expires;
     Logger::Debug("[AdminManager::BanPlayer] Ban recorded for '%s', duration=%d min, total bans=%zu", targetSteamId.c_str(), durationMinutes, m_bans.size());

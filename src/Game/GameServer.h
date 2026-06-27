@@ -40,6 +40,7 @@ class SkirmishMode;
 class ProtocolHandler;
 class ReplicationManager;
 class ConnectionLoginBridge;
+class SecurityManager;   // forward-declared only; Security headers are NOT included here
 
 struct PacketAnalysisResult;
 
@@ -76,6 +77,9 @@ public:
     MapManager*                     GetMapManager()         const;
     NetworkManager*                 GetNetworkManager()     const;
     AdminManager*                   GetAdminManager()       const;
+    // The authoritative SecurityManager (lives in the login bridge); may be null if security
+    // is unconfigured. Returns a pointer only - GameServer.h never includes Security headers.
+    SecurityManager*                GetSecurityManager()    const;
     RoleSystem*                     GetRoleSystem()         const;
     TicketSystem*                   GetTicketSystem()       const;
     ObjectiveSystem*                GetObjectiveSystem()    const;

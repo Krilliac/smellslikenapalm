@@ -87,6 +87,11 @@ public:
         return m_gri ? m_gri.get() : nullptr;
     }
 
+    // The authoritative SecurityManager (owned-or-injected) that runs the ban gate at
+    // connect; nullptr if security was not configured. Lets the admin layer route /ban
+    // through the single ENFORCED ban store rather than a parallel one.
+    SecurityManager* GetSecurityManager() const { return m_security; }
+
     // True once OnClientJoined successfully attempted a spawn for the client.
     bool WasSpawnAttempted(uint32_t clientId) const;
 
