@@ -24,6 +24,10 @@ class MapConfig;
 class PlayerManager;
 class TeamManager;
 class MapManager;
+class MapVoteManager;
+class WorkshopManager;
+class ModManager;
+class MutatorManager;
 class ClientConnection;
 class RoleSystem;
 class TicketSystem;
@@ -74,6 +78,10 @@ public:
     PlayerManager*                  GetPlayerManager()      const;
     TeamManager*                    GetTeamManager()        const;
     MapManager*                     GetMapManager()         const;
+    MapVoteManager*                 GetMapVoteManager()     const;
+    WorkshopManager*                GetWorkshopManager()    const;
+    ModManager*                     GetModManager()         const;
+    MutatorManager*                 GetMutatorManager()     const;
     NetworkManager*                 GetNetworkManager()     const;
     AdminManager*                   GetAdminManager()       const;
     RoleSystem*                     GetRoleSystem()         const;
@@ -93,6 +101,12 @@ public:
     std::shared_ptr<ConfigManager>  GetConfigManager()      const;
 
     void ChangeMap();
+
+    // Map voting. StartMapVote begins an end-of-round vote (using the current
+    // map as the excluded option); CastMapVote records a client's pick; the
+    // winning map is consumed by the next ChangeMap().
+    bool StartMapVote();
+    bool CastMapVote(uint32_t clientId, int optionIndex);
 
     // Packet queue — used by NetworkManager/ConnectionManager to push received packets
     void EnqueuePacket(const QueuedPacket& pkt);
@@ -125,6 +139,12 @@ private:
     std::unique_ptr<PlayerManager>      m_playerManager;
     std::unique_ptr<TeamManager>        m_teamManager;
     std::unique_ptr<MapManager>         m_mapManager;
+    std::unique_ptr<MapVoteManager>     m_mapVoteManager;
+    std::unique_ptr<WorkshopManager>    m_workshopManager;
+    std::unique_ptr<ModManager>         m_modManager;
+    std::unique_ptr<MutatorManager>     m_mutatorManager;
+    // The map chosen by the most recent concluded vote; consumed by ChangeMap().
+    std::string                         m_pendingVoteWinner;
     std::unique_ptr<AdminManager>       m_adminManager;
     std::unique_ptr<ChatManager>        m_chatManager;
     std::unique_ptr<GameMode>           m_gameMode;

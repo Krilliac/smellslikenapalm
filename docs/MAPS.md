@@ -407,11 +407,32 @@ Add entries to `config/workshop_items.txt`:
 | `LocalPath` | Server-side storage path relative to the data directory |
 | `Description` | Optional human-readable note (after `#`) |
 
+### Server Configuration
+
+Workshop behavior is controlled by the `[Workshop]` section of `config/server.ini`:
+
+```ini
+[Workshop]
+items_file       = config/workshop_items.txt
+app_id           = 418460          ; Rising Storm 2: Vietnam
+download_enabled = false           ; true = fetch missing items via steamcmd
+steamcmd_path    = steamcmd
+install_dir      =                 ; optional +force_install_dir
+```
+
+When `download_enabled = false` (the default), the server performs a **dry run**:
+it logs the exact `steamcmd` command it *would* run for each missing item but
+does not execute it. Set `download_enabled = true` (and provide a working
+`steamcmd`) to have the server fetch missing items at startup. Admins can also
+trigger this at runtime with `workshop download`.
+
 ### Notes
 
-- Workshop items are downloaded at server startup; changes to `workshop_items.txt` require a server restart.
-- Clients are prompted to download missing items when connecting.
-- The server validates that all required items are present before allowing a client to join gameplay.
+- The manifest is parsed at startup; `workshop reload` re-reads it without a restart.
+- `workshop validate` re-checks which items are present on disk.
+- Item presence is resolved against `<data_directory>/<local_path>/<file_name>`.
+- Mods (`.pak`) are additionally discovered from `[DataPaths].mods_path` and
+  registered by `ModManager`; see `mods` admin command.
 
 ---
 
@@ -451,9 +472,15 @@ The number of vote options and voting duration are controlled by the server's in
 |---|---|---|
 | `changemap <mapName>` | Switch to a map immediately | `changemap hill_937` |
 | `rotation list` | View the current map rotation | `rotation list` |
-| `rotation add <mapName>` | Add a map to the rotation | `rotation add my_custom_map` |
-| `rotation remove <mapName>` | Remove a map from the rotation | `rotation remove skirmish_field` |
+| `rotation add <mapName>` | Defined in maps.ini; edit + `reload map` | `rotation add my_custom_map` |
+| `rotation remove <mapName>` | Defined in maps.ini; edit + `reload map` | `rotation remove skirmish_field` |
+| `startvote` | Start an end-of-round map vote now | `startvote` |
+| `workshop [list\|reload\|validate\|download]` | Manage Steam Workshop items | `workshop list` |
+| `mods` | List registered mods / assets | `mods` |
+| `mutators` | List active and available mutators | `mutators` |
 | `status` | See the current map and mode | `status` |
+
+Players join an active vote with `/votemap` (show options) and `/votemap <number>` (cast).
 
 See [ADMIN_COMMANDS.md](ADMIN_COMMANDS.md) for full command reference.
 

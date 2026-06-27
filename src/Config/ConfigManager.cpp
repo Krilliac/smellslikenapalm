@@ -84,8 +84,11 @@ bool ConfigManager::LoadConfiguration(const std::string& configFile) {
 
     while (std::getline(file, line)) {
         ++lineNumber;
-        // Strip comments
-        if (auto pos = line.find('#'); pos != std::string::npos) {
+        // Strip comments. Both '#' and ';' begin a comment (the config files use
+        // ';' as their primary comment char, including inline after a value), so
+        // strip from the first occurrence of either. This also drops full-line
+        // ';' comment banners cleanly instead of logging them as invalid lines.
+        if (auto pos = line.find_first_of("#;"); pos != std::string::npos) {
             Logger::Trace("[ConfigManager::LoadConfiguration] Line %zu: stripping comment at position %zu", lineNumber, pos);
             line.erase(pos);
         }

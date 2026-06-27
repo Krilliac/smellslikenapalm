@@ -87,6 +87,25 @@ public:
     // EAC
     int         GetEACListenPort() const;
 
+    // Steam Workshop
+    std::string GetWorkshopItemsFile() const;
+    bool        IsWorkshopDownloadEnabled() const;
+    int         GetWorkshopAppId() const;
+    std::string GetSteamCmdPath() const;
+    std::string GetWorkshopInstallDir() const;
+
+    // Map voting
+    bool        IsMapVoteEnabled() const;
+    int         GetMapVoteOptions() const;
+    int         GetMapVoteDuration() const;
+
+    // Mods
+    std::string GetModsDir() const;
+
+    // Mutators
+    bool        IsMutatorsEnabled() const;
+    std::string GetEnabledMutators() const;  // comma-separated mutator ids
+
     // Access to underlying ConfigManager
     std::shared_ptr<ConfigManager> GetManager() const;
 

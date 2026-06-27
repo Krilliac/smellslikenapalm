@@ -2,12 +2,14 @@
 
 #include "Game/MapManager.h"
 #include "Utils/Logger.h"
+#include "Utils/StringUtils.h"
 #include "Config/MapConfig.h"
 #include "Network/NetworkManager.h"
 #include "Math/Vector3.h"
 #include <algorithm>
 #include <filesystem>
 #include <fstream>
+#include <sstream>
 #include <cstring>
 #include <random>
 
@@ -41,13 +43,16 @@ bool MapManager::LoadMap(const std::string& mapName)
         return false;
     }
 
-    // Initialize spawn points from map definition's Vector3 list
+    // Spawn points: prefer an on-disk spawns.txt (per-map or global), then the
+    // map definition's embedded list, then a random fallback within bounds.
     m_spawnPoints.clear();
-    for (const auto& pos : m_currentMap.spawnPoints) {
-        SpawnPoint sp;
-        sp.position = pos;
-        sp.teamId = 0;
-        m_spawnPoints.push_back(sp);
+    if (!LoadSpawnPointsFromDisk(mapName)) {
+        for (const auto& pos : m_currentMap.spawnPoints) {
+            SpawnPoint sp;
+            sp.position = pos;
+            sp.teamId = 0;
+            m_spawnPoints.push_back(sp);
+        }
     }
     if (m_spawnPoints.empty()) {
         // Fallback: random points in bounds
@@ -55,14 +60,170 @@ bool MapManager::LoadMap(const std::string& mapName)
     }
     Logger::Info("MapManager: %zu spawn points loaded", m_spawnPoints.size());
 
-    // Initialize objectives (convert from int to uint32_t)
+    // Per-map lighting overrides (lighting.json), if present.
+    LoadLighting(mapName);
+
+    // Objectives: use the definition's explicit id list if provided, otherwise
+    // synthesize sequential ids from objectiveCount so game modes have markers.
     m_objectives.clear();
-    for (int objId : m_currentMap.objectiveIds) {
-        m_objectives.push_back(static_cast<uint32_t>(objId));
+    if (!m_currentMap.objectiveIds.empty()) {
+        for (int objId : m_currentMap.objectiveIds) {
+            m_objectives.push_back(static_cast<uint32_t>(objId));
+        }
+    } else if (m_currentMap.objectiveCount > 0) {
+        for (int i = 0; i < m_currentMap.objectiveCount; ++i) {
+            m_objectives.push_back(static_cast<uint32_t>(i + 1));
+        }
+        Logger::Debug("MapManager: synthesized %d objective ids from objectiveCount",
+                      m_currentMap.objectiveCount);
     }
     Logger::Info("MapManager: %zu objectives loaded", m_objectives.size());
 
     return true;
+}
+
+std::string MapManager::MapAssetDir(const std::string& mapName) const
+{
+    // The map asset's directory (where the .umap lives). Per-map auxiliary files
+    // may live either directly beside the .umap or in a <mapName>/ subdirectory.
+    std::filesystem::path p(m_currentMap.filePath);
+    std::string base = p.has_parent_path() ? p.parent_path().string() : std::string(".");
+    (void)mapName;
+    return base;
+}
+
+bool MapManager::LoadSpawnPointsFromDisk(const std::string& mapName)
+{
+    namespace fs = std::filesystem;
+    std::string baseDir = MapAssetDir(mapName);
+
+    // Candidate locations, in priority order, matching data/maps/README.md.
+    std::vector<std::string> candidates = {
+        baseDir + "/" + mapName + "/spawns.txt",   // maps/<id>/spawns.txt
+        baseDir + "/spawns.txt",                    // maps/spawns.txt (flat layout)
+        baseDir + "/global_spawns.txt"              // shared fallback templates
+    };
+
+    for (const auto& path : candidates) {
+        if (!fs::exists(path)) continue;
+
+        std::ifstream f(path);
+        if (!f.is_open()) {
+            Logger::Warn("MapManager: spawns file exists but could not be opened: %s", path.c_str());
+            continue;
+        }
+
+        size_t before = m_spawnPoints.size();
+        std::string line;
+        uint32_t autoId = 1;
+        while (std::getline(f, line)) {
+            // Format: "x y z [teamId]" (whitespace separated), '#' starts a comment.
+            auto hash = line.find('#');
+            if (hash != std::string::npos) line = line.substr(0, hash);
+            std::istringstream iss(line);
+            float x, y, z;
+            if (!(iss >> x >> y >> z)) continue;  // skip blank/garbage lines
+            int teamId = 0;
+            iss >> teamId;                         // optional, defaults to 0/neutral
+
+            SpawnPoint sp;
+            sp.id = autoId++;
+            sp.position = {x, y, z};
+            sp.teamId = static_cast<uint32_t>(teamId);
+            sp.enabled = true;
+            m_spawnPoints.push_back(sp);
+        }
+
+        size_t added = m_spawnPoints.size() - before;
+        if (added > 0) {
+            Logger::Info("MapManager: loaded %zu spawn points from %s", added, path.c_str());
+            return true;
+        }
+        Logger::Warn("MapManager: spawns file '%s' contained no valid points", path.c_str());
+    }
+    return false;
+}
+
+void MapManager::LoadLighting(const std::string& mapName)
+{
+    namespace fs = std::filesystem;
+    m_lighting = MapLighting{};
+    // Seed defaults from the map definition's time_of_day.
+    m_lighting.timeOfDay = m_currentMap.timeOfDay;
+
+    std::string baseDir = MapAssetDir(mapName);
+    std::vector<std::string> candidates = {
+        baseDir + "/" + mapName + "/lighting.json",
+        baseDir + "/lighting.json"
+    };
+
+    std::string path;
+    for (const auto& c : candidates) {
+        if (fs::exists(c)) { path = c; break; }
+    }
+    if (path.empty()) {
+        Logger::Debug("MapManager: no lighting.json for '%s', using definition defaults", mapName.c_str());
+        return;
+    }
+
+    std::ifstream f(path);
+    if (!f.is_open()) {
+        Logger::Warn("MapManager: lighting file exists but could not be opened: %s", path.c_str());
+        return;
+    }
+    std::stringstream buf;
+    buf << f.rdbuf();
+    std::string json = buf.str();
+
+    // Tolerant, dependency-free extraction of the small documented schema:
+    //   { "time_of_day": "dusk", "sun_intensity": 0.8, "ambient_color": [r,g,b] }
+    auto findString = [&](const std::string& key) -> std::string {
+        auto k = json.find("\"" + key + "\"");
+        if (k == std::string::npos) return "";
+        auto colon = json.find(':', k);
+        if (colon == std::string::npos) return "";
+        auto q1 = json.find('"', colon + 1);
+        if (q1 == std::string::npos) return "";
+        auto q2 = json.find('"', q1 + 1);
+        if (q2 == std::string::npos) return "";
+        return json.substr(q1 + 1, q2 - q1 - 1);
+    };
+    auto findNumber = [&](const std::string& key, float fallback) -> float {
+        auto k = json.find("\"" + key + "\"");
+        if (k == std::string::npos) return fallback;
+        auto colon = json.find(':', k);
+        if (colon == std::string::npos) return fallback;
+        try {
+            size_t idx = colon + 1;
+            return std::stof(json.substr(idx), nullptr);
+        } catch (...) { return fallback; }
+    };
+
+    std::string tod = findString("time_of_day");
+    if (!tod.empty()) m_lighting.timeOfDay = tod;
+    m_lighting.sunIntensity = findNumber("sun_intensity", m_lighting.sunIntensity);
+
+    // ambient_color: parse the first three integers inside the array.
+    auto ac = json.find("\"ambient_color\"");
+    if (ac != std::string::npos) {
+        auto lb = json.find('[', ac);
+        auto rb = json.find(']', lb == std::string::npos ? ac : lb);
+        if (lb != std::string::npos && rb != std::string::npos && rb > lb) {
+            std::string inner = json.substr(lb + 1, rb - lb - 1);
+            std::istringstream iss(inner);
+            std::string tok;
+            int comp = 0;
+            while (std::getline(iss, tok, ',') && comp < 3) {
+                try { m_lighting.ambientColor[comp++] = std::stoi(StringUtils::Trim(tok)); }
+                catch (...) { /* leave default */ }
+            }
+        }
+    }
+
+    m_lighting.loaded = true;
+    Logger::Info("MapManager: lighting loaded from %s (timeOfDay='%s', sun=%.2f, ambient=[%d,%d,%d])",
+                 path.c_str(), m_lighting.timeOfDay.c_str(), m_lighting.sunIntensity,
+                 m_lighting.ambientColor[0], m_lighting.ambientColor[1], m_lighting.ambientColor[2]);
 }
 
 bool MapManager::LoadGeometry(const std::string& path)
@@ -108,10 +269,28 @@ bool MapManager::LoadGeometry(const std::string& path)
     if (magicVal == 0xC1832A9E) {
         Logger::Debug("[MapManager::LoadGeometry] Detected UE3 package format");
 
-        // Skip package header fields: version(4) + licensee(4) + headerSize(4)
-        file.seekg(12, std::ios::cur);
+        // UE3 package header (FPackageFileSummary): immediately after the tag
+        // comes a packed version int (low 16 = file version, high 16 = licensee
+        // version) followed by the total header size. We read them for logging /
+        // sanity-checking; full export-table parsing is out of scope here.
+        int32_t versionPacked = 0;
+        int32_t totalHeaderSize = 0;
+        file.read(reinterpret_cast<char*>(&versionPacked), sizeof(int32_t));
+        file.read(reinterpret_cast<char*>(&totalHeaderSize), sizeof(int32_t));
+        if (file.good()) {
+            uint16_t fileVersion = static_cast<uint16_t>(versionPacked & 0xFFFF);
+            uint16_t licenseeVersion = static_cast<uint16_t>((versionPacked >> 16) & 0xFFFF);
+            Logger::Debug("[MapManager::LoadGeometry] UE3 header: fileVersion=%u licenseeVersion=%u headerSize=%d",
+                          fileVersion, licenseeVersion, totalHeaderSize);
+            if (fileVersion != 0 && fileVersion != 7258) {
+                Logger::Warn("[MapManager::LoadGeometry] UE3 fileVersion %u != expected 7258 (RS2:V); map may be incompatible",
+                             fileVersion);
+            }
+        }
 
-        // Attempt to read bounds from the expected offset
+        // Attempt to read a bounding box from the following offset. This is a
+        // heuristic (real geometry lives in the export tables) but lets maps ship
+        // an authored AABB right after the summary for server-side bounds checks.
         float minX, minY, minZ, maxX, maxY, maxZ;
         file.read(reinterpret_cast<char*>(&minX), sizeof(float));
         file.read(reinterpret_cast<char*>(&minY), sizeof(float));

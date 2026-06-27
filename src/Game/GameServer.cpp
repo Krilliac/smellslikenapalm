@@ -16,6 +16,10 @@
 #include "Game/PlayerManager.h"
 #include "Game/TeamManager.h"
 #include "Game/MapManager.h"
+#include "Game/MapVoteManager.h"
+#include "Game/WorkshopManager.h"
+#include "Game/ModManager.h"
+#include "Game/MutatorManager.h"
 #include "Game/RoleSystem.h"
 #include "Game/TicketSystem.h"
 #include "Game/ObjectiveSystem.h"
@@ -226,6 +230,23 @@ bool GameServer::Initialize() {
     m_teamManager   = std::make_unique<TeamManager>(this);
     m_mapManager    = std::make_unique<MapManager>(this, m_mapConfig);
 
+    // Map voting
+    m_mapVoteManager = std::make_unique<MapVoteManager>(m_mapConfig);
+    m_mapVoteManager->SetEnabled(m_serverConfig->IsMapVoteEnabled());
+    m_mapVoteManager->SetOptionCount(m_serverConfig->GetMapVoteOptions());
+    m_mapVoteManager->SetVoteDurationSeconds(m_serverConfig->GetMapVoteDuration());
+
+    // Steam Workshop items (custom maps / mods / assets)
+    m_workshopManager = std::make_unique<WorkshopManager>(m_serverConfig);
+    m_workshopManager->Initialize();
+    m_workshopManager->DownloadMissing();   // dry-run unless Workshop.download_enabled
+    m_workshopManager->LogSummary();
+
+    // Mods + cosmetic assets (sourced from Workshop manifest + local mods dir)
+    m_modManager = std::make_unique<ModManager>(m_serverConfig);
+    m_modManager->Initialize(m_workshopManager.get());
+    m_modManager->LogSummary();
+
     m_adminManager  = std::make_unique<AdminManager>(this, m_serverConfig);
     m_adminManager->Initialize();
 
@@ -270,6 +291,16 @@ bool GameServer::Initialize() {
     m_damageSystem->Initialize();
     m_damageSystem->SetFriendlyFireEnabled(m_gameConfig->IsFriendlyFire());
 
+    // Gameplay mutators — created after DamageSystem since several mutators
+    // adjust damage/friendly-fire settings in their OnInit.
+    m_mutatorManager = std::make_unique<MutatorManager>(this);
+    if (m_serverConfig->IsMutatorsEnabled()) {
+        m_mutatorManager->LoadFromConfig(m_serverConfig->GetEnabledMutators());
+    } else {
+        Logger::Debug("[GameServer::Initialize] Mutators disabled by config");
+    }
+    m_mutatorManager->LogSummary();
+
     m_projectileManager = std::make_unique<ProjectileManager>(this);
     m_projectileManager->Initialize();
     m_damageSystem->SetOnKill([this](const KillEvent& kill) {
@@ -287,6 +318,7 @@ bool GameServer::Initialize() {
         if (m_territoryMode) m_territoryMode->OnPlayerKilled(kill.killerId, kill.victimId);
         if (m_supremacyMode) m_supremacyMode->OnPlayerKilled(kill.killerId, kill.victimId);
         if (m_skirmishMode) m_skirmishMode->OnPlayerKilled(kill.killerId, kill.victimId);
+        if (m_mutatorManager) m_mutatorManager->DispatchPlayerKilled(kill.killerId, kill.victimId);
     });
 
     m_helicopterPhysics = std::make_unique<HelicopterPhysics>(this);
@@ -559,6 +591,12 @@ void GameServer::Shutdown() {
 
     // Shutdown RS2V systems
     Logger::Debug("[GameServer::Shutdown] Destroying RS2V game systems");
+    // Mutators first: OnShutdown may reset DamageSystem state, so do it while
+    // DamageSystem is still alive.
+    if (m_mutatorManager) {
+        m_mutatorManager->Shutdown();
+        m_mutatorManager.reset();
+    }
     m_skirmishMode.reset();
     m_supremacyMode.reset();
     m_territoryMode.reset();
@@ -585,6 +623,9 @@ void GameServer::Shutdown() {
         m_adminManager->Shutdown();
         m_adminManager.reset();
     }
+    m_modManager.reset();
+    m_workshopManager.reset();
+    m_mapVoteManager.reset();
     m_mapManager.reset();
     m_teamManager.reset();
     m_playerManager.reset();
@@ -642,6 +683,10 @@ std::vector<std::shared_ptr<ClientConnection>> GameServer::GetAllConnections() c
 PlayerManager*      GameServer::GetPlayerManager()      const { return m_playerManager.get();      }
 TeamManager*        GameServer::GetTeamManager()        const { return m_teamManager.get();        }
 MapManager*         GameServer::GetMapManager()         const { return m_mapManager.get();         }
+MapVoteManager*     GameServer::GetMapVoteManager()     const { return m_mapVoteManager.get();     }
+WorkshopManager*    GameServer::GetWorkshopManager()    const { return m_workshopManager.get();    }
+ModManager*         GameServer::GetModManager()         const { return m_modManager.get();         }
+MutatorManager*     GameServer::GetMutatorManager()     const { return m_mutatorManager.get();     }
 NetworkManager*     GameServer::GetNetworkManager()     const { return m_networkManager.get();     }
 AdminManager*       GameServer::GetAdminManager()       const { return m_adminManager.get();       }
 RoleSystem*         GameServer::GetRoleSystem()         const { return m_roleSystem.get();         }
@@ -669,7 +714,22 @@ void GameServer::ChangeMap() {
         Logger::Trace("[GameServer::ChangeMap] Exit (no MapManager)");
         return;
     }
-    std::string nextMap = m_mapManager->GetNextMap();
+    // If an end-of-round vote concluded, honor its winner; otherwise fall back
+    // to simple rotation order.
+    std::string nextMap;
+    if (m_mapVoteManager && m_mapVoteManager->IsVoteActive()) {
+        m_pendingVoteWinner = m_mapVoteManager->ResolveWinner();
+        if (!m_pendingVoteWinner.empty()) {
+            Logger::Info("[GameServer::ChangeMap] Using map vote winner: '%s'", m_pendingVoteWinner.c_str());
+        }
+    }
+    if (!m_pendingVoteWinner.empty()) {
+        nextMap = m_pendingVoteWinner;
+        m_pendingVoteWinner.clear();
+    } else {
+        nextMap = m_mapManager->GetNextMap();
+    }
+
     // GUARD: an empty next-map (no rotation configured / lookup miss) must not be
     // fed to LoadMap. Keep the current map running instead of unloading to nothing.
     if (nextMap.empty()) {
@@ -680,6 +740,7 @@ void GameServer::ChangeMap() {
     Logger::Info("[GameServer::ChangeMap] Changing to next map: '%s'", nextMap.c_str());
     if (m_mapManager->LoadMap(nextMap)) {
         Logger::Debug("[GameServer::ChangeMap] Map loaded successfully, transitioning GameMode");
+        if (m_mutatorManager) m_mutatorManager->DispatchRoundEnd();
         if (m_gameMode) {
             Logger::Debug("[GameServer::ChangeMap] Ending current GameMode");
             m_gameMode->OnEnd();
@@ -689,6 +750,7 @@ void GameServer::ChangeMap() {
             Logger::Debug("[GameServer::ChangeMap] Creating new GameMode instance");
             m_gameMode = std::make_unique<GameMode>(this, *gmDef);
             m_gameMode->OnStart();
+            if (m_mutatorManager) m_mutatorManager->DispatchRoundStart();
         } else {
             Logger::Warn("[GameServer::ChangeMap] No valid game mode definition found after map change");
         }
@@ -696,6 +758,39 @@ void GameServer::ChangeMap() {
         Logger::Error("[GameServer::ChangeMap] Failed to change to map: %s", nextMap.c_str());
     }
     Logger::Trace("[GameServer::ChangeMap] Exit");
+}
+
+bool GameServer::StartMapVote()
+{
+    if (!m_mapVoteManager) {
+        Logger::Warn("[GameServer::StartMapVote] No MapVoteManager available");
+        return false;
+    }
+    if (!m_mapVoteManager->IsEnabled()) {
+        Logger::Debug("[GameServer::StartMapVote] Map voting disabled by config");
+        return false;
+    }
+    std::string current = m_mapManager ? m_mapManager->GetCurrentMapName() : "";
+    const auto& candidates = m_mapVoteManager->StartVote(current);
+    if (candidates.empty()) {
+        Logger::Warn("[GameServer::StartMapVote] No candidates; vote not started");
+        return false;
+    }
+
+    // Announce options to players.
+    std::string msg = "Map vote started! Type votemap <number>:";
+    BroadcastChatMessage(msg);
+    for (size_t i = 0; i < candidates.size(); ++i) {
+        BroadcastChatMessage("  " + std::to_string(i + 1) + ") " + candidates[i].displayName);
+    }
+    Logger::Info("[GameServer::StartMapVote] Vote started with %zu options", candidates.size());
+    return true;
+}
+
+bool GameServer::CastMapVote(uint32_t clientId, int optionIndex)
+{
+    if (!m_mapVoteManager) return false;
+    return m_mapVoteManager->CastVote(clientId, optionIndex);
 }
 
 // Packet queue implementation
