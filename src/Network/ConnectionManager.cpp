@@ -448,19 +448,36 @@ void ConnectionManager::FireClientLoggedIn(const ClientLoggedInEvent& ev) {
         if (!ev.options.PlayerName().empty()) conn->SetPlayerName(ev.options.PlayerName());
     }
 
-    // World-replication bootstrap goes out HERE - immediately after NMT_Welcome -
-    // exactly as the official server does (capture: Welcome f162 -> PackageMap
-    // f167-f185, BEFORE the client's "packages verified" reply at f227). Sending it
-    // on Join instead would deadlock a real client: it won't send Join/ready until
-    // it has reconciled the PackageMap. See docs/RS2V_PostJoin_Replication_7258.md.
-    SendReplicationBootstrap(ev.clientId);
-
+    // Run the game-layer login gate FIRST. The subscriber (ConnectionLoginBridge::
+    // OnClientLoggedIn -> PreLogin) enforces capacity / password / ban and, on
+    // rejection, MarkDisconnected()s the connection. PreLogin is synchronous, so
+    // this still completes within FireClientLoggedIn - the bootstrap below goes out
+    // in the same call, immediately after NMT_Welcome, before the client's
+    // "packages verified" reply - but only for an ACCEPTED login.
     if (m_clientLoggedInCb) {
         m_clientLoggedInCb(ev);
     } else {
         Logger::Debug("[ConnectionManager::FireClientLoggedIn] no Game subscriber for ClientLoggedIn (client %u)",
                       ev.clientId);
     }
+
+    // World-replication bootstrap goes out HERE - immediately after NMT_Welcome -
+    // exactly as the official server does (capture: Welcome f162 -> PackageMap
+    // f167-f185, BEFORE the client's "packages verified" reply at f227). Sending it
+    // on Join instead would deadlock a real client: it won't send Join/ready until
+    // it has reconciled the PackageMap. See docs/RS2V_PostJoin_Replication_7258.md.
+    //
+    // Gate it on the login being accepted: a rejected client (full / wrong password
+    // / banned) was MarkDisconnected() by the gate above, and must not receive any
+    // post-login world state. (SendRaw also drops on m_disconnected as defence in
+    // depth, but skipping the work here avoids a pointless bootstrap burst and
+    // leaving a rejected peer parked in WelcomeSent.)
+    if (auto conn = GetConnection(ev.clientId); conn && conn->IsDisconnected()) {
+        Logger::Info("[ConnectionManager::FireClientLoggedIn] login for client %u was rejected by the game "
+                     "layer; suppressing replication bootstrap", ev.clientId);
+        return;
+    }
+    SendReplicationBootstrap(ev.clientId);
 }
 
 void ConnectionManager::FireClientJoined(const ClientJoinedEvent& ev) {
@@ -469,6 +486,13 @@ void ConnectionManager::FireClientJoined(const ClientJoinedEvent& ev) {
     // client (until now SendPacket was suppressed to keep the handshake's wire
     // stream clean).
     if (auto conn = GetConnection(ev.clientId)) {
+        // A client rejected at PreLogin was MarkDisconnected() but not necessarily
+        // erased yet; don't let a Join that races the teardown drive actor bootstrap.
+        if (conn->IsDisconnected()) {
+            Logger::Info("[ConnectionManager::FireClientJoined] client %u is disconnected (rejected login); "
+                         "suppressing actor bootstrap", ev.clientId);
+            return;
+        }
         conn->SetHandshakeComplete(true);
     }
     // The PackageMap export went out earlier (on ClientLoggedIn / right after
@@ -1326,9 +1350,27 @@ bool ConnectionManager::ParseIncomingControl(uint32_t clientId, const std::vecto
         return false;
     }
 
+    // PacketCodec::Decode is intentionally LENIENT: it sets ok once it can read a
+    // PacketId, so a legacy Packet::Serialize() datagram (e.g. a non-empty
+    // CHAT_MESSAGE whose final payload byte is non-zero) can decode as ok with no
+    // actual UE3 content. Claiming such a datagram here - marking the peer UE3 and
+    // consuming it before the legacy Packet path runs - breaks the legacy/tools
+    // path the surrounding code still supports. Only treat this as UE3 when there
+    // is real UE3 evidence: at least one bunch or ack, OR the peer was already
+    // established as UE3 by an earlier genuine packet. Otherwise fall through and
+    // let the legacy Packet pipeline handle it.
+    const bool hasUE3Content = !pkt.bunches.empty() || !pkt.acks.empty();
+    auto conn = GetConnection(clientId);
+    const bool alreadyUE3 = conn && conn->IsUE3Client();
+    if (!hasUE3Content && !alreadyUE3) {
+        Logger::Debug("[ConnectionManager::ParseIncomingControl] client %u: decodable but no UE3 bunch/ack and peer "
+                      "not yet UE3; deferring to legacy Packet path", clientId);
+        return false;
+    }
+
     // This peer speaks UE3: mark it so the legacy emulator-Packet send path is
     // suppressed for it (a UE3 client mis-parses that format - see SendPacket).
-    if (auto conn = GetConnection(clientId)) {
+    if (conn) {
         conn->SetUE3Client(true);
     }
 

@@ -133,6 +133,16 @@ bool ClientConnection::SendRaw(const uint8_t* data, size_t len) {
                      m_clientId, len);
         return false;
     }
+    // Never push bytes after MarkDisconnected(): admin kick/ban and failed
+    // PreLogin mark the connection disconnected without immediately erasing it,
+    // and reliable retransmits / late bootstrap responses ride this raw path.
+    // Mirror SendPacket's guard so a kicked or rejected client stops receiving
+    // server traffic.
+    if (m_disconnected) {
+        Logger::Debug("[ClientConnection::SendRaw] Dropping %zu raw bytes to disconnected client %u",
+                      len, m_clientId);
+        return false;
+    }
     if (!CanSend((uint32_t)len)) {
         Logger::Warn("[ClientConnection::SendRaw] Bandwidth limit exceeded for client %u, dropping %zu raw bytes",
                      m_clientId, len);
