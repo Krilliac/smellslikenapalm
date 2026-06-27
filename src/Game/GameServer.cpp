@@ -454,6 +454,20 @@ void GameServer::Run() {
 
         std::string tag = qpkt.packet.GetTag();
         Logger::Debug("[GameServer::Run] Processing packet tag='%s' from clientId=%u", tag.c_str(), qpkt.clientId);
+
+        // AUTH GATE (defense-in-depth): every tag below CHAT drives state-changing gameplay
+        // (role/spawn/commander/squad/vehicle/weapon, plus the GameMode action fallthrough)
+        // and MUST require a completed handshake/login. Without this, any client that never
+        // logged in could drive gameplay pre-auth - this legacy string-tag path is reachable
+        // by any non-UE3 datagram. Real UE3 clients never use this path (their gameplay rides
+        // the UE3 control channel via DecodeInboundActorBunch), so the gate does not affect
+        // them. CHAT is allowed (already length-capped) so lobby chat is unimpeded.
+        if (tag != "CHAT_MESSAGE" && !conn->IsHandshakeComplete()) {
+            Logger::Warn("[GameServer::Run] Rejecting pre-auth gameplay packet tag='%s' from clientId=%u "
+                         "(handshake not complete)", tag.c_str(), qpkt.clientId);
+            continue;
+        }
+
         if (tag == "CHAT_MESSAGE" && m_chatManager) {
             Packet pktCopy = qpkt.packet;
             std::string chatText = pktCopy.ReadString();
