@@ -293,14 +293,28 @@ def encode_packet(pid, bunches, max_packet_bytes, acks=None):
             w.wint(b["chSeq"], 1024)
         if bR or b.get("bOpen", 0):
             w.wint(b["chType"], 8)
-        payload = b["payload"]
-        bits = len(payload) * 8
-        w.wint(bits, bd_max)
-        for byte in payload:
-            for i in range(8):
-                w.bit((byte >> i) & 1)
+        if "bits_payload" in b:
+            # Bit-level payload (e.g. a UE3 function-call RPC: SerializeInt(handle) +
+            # per-param Send bit + value), which is NOT byte-aligned. A list of 0/1 bits.
+            pbits = b["bits_payload"]
+            w.wint(len(pbits), bd_max)
+            for bit in pbits:
+                w.bit(bit)
+        else:
+            payload = b["payload"]
+            bits = len(payload) * 8
+            w.wint(bits, bd_max)
+            for byte in payload:
+                for i in range(8):
+                    w.bit((byte >> i) & 1)
     w.bit(1)               # terminator (high set bit of the last byte)
     return w.to_bytes()
+
+def sint_bits(val, maxv):
+    """Return SerializeInt(val, maxv) as a list of LSB-first bits (UE3 FBitWriter::WriteInt)."""
+    w = BitWriter()
+    w.wint(val, maxv)
+    return list(w.bits)
 
 # ----------------------------------------------------------------------------
 # Reactive mode: act as a real UE3 client - drive the StatelessConnect handshake
@@ -384,9 +398,101 @@ def react(host, port):
     print("\n=== react: " + ("PASS - handshake sends are well-formed" if ok else "FAIL - see above") + " ===")
     return 0 if ok else 1
 
+# ----------------------------------------------------------------------------
+# Spawn mode: drive the FULL menu->spawn path as a UE3 client - handshake, Join,
+# SelectTeam(170), SelectRoleByClass(175) - and verify the server reacts by
+# opening the pawn channel (the role->spawn step). This validates our SEND path
+# for the spawn flow server-side WITHOUT the retail client: it confirms the server
+# emits a well-formed pawn open in response to the role RPC (and that the ack-storm
+# fix didn't regress it). It canNOT prove the real client possesses (no UE3 logic
+# here) - that still needs a real-client test - but it closes the loop on "does the
+# server do the right thing when the menu RPCs arrive". Inbound ch>=2 bunches are
+# dispatched directly to ConnectionManager::DecodeInboundActorBunch (no reassembly),
+# so a single well-formed reliable ch2 bunch carrying SerializeInt(handle, 531) is
+# enough to trigger SelectTeam/SelectRoleByClass. See docs/re/pawn_spawn_replication.md.
+# ----------------------------------------------------------------------------
+ROPC_MAXHANDLE = 531        # kRoPcMaxHandle - PlayerController ClassNetCache max handle
+SELECT_TEAM = 170           # ROPlayerController.SelectTeam(byte TeamID)
+SELECT_ROLE = 175           # ROPlayerController.SelectRoleByClass(...)
+BOOTSTRAP_CH_MAX = 140      # actor-bootstrap uses ch2..140; the pawn opens ABOVE this
+
+def spawn(host, port):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.settimeout(1.5)
+    SERVER_BD = 1500 * 8
+    state = {"seq": 1, "pid": 0}
+
+    def send_recv(name, bunch):
+        dg = encode_packet(state["pid"], [bunch], 2048)
+        sock.sendto(dg, (host, port))
+        print(f"  -> {name}: pid={state['pid']} seq={bunch.get('chSeq')}")
+        state["pid"] += 1
+        got = []
+        try:
+            while True:
+                resp, _ = sock.recvfrom(4096)
+                got.append(decode_packet(resp, bd_max=SERVER_BD))
+        except socket.timeout:
+            pass
+        for d in got:
+            print(f"     <- {fmt_packet(d)}")
+        return got
+
+    def hs(name, payload, want_open=False):
+        b = {"bControl": 1 if want_open else 0, "bOpen": 1 if want_open else 0,
+             "bClose": 0, "bReliable": 1, "chIndex": 0, "chType": 1,
+             "chSeq": state["seq"], "payload": payload}
+        got = send_recv(name, b)
+        state["seq"] += 1
+        return got
+
+    def ch2_rpc(name, bits_payload):
+        b = {"bControl": 0, "bOpen": 0, "bClose": 0, "bReliable": 1,
+             "chIndex": 2, "chType": 2, "chSeq": state["seq"], "bits_payload": bits_payload}
+        got = send_recv(name, b)
+        state["seq"] += 1
+        return got
+
+    print(f"spawn: drive menu->spawn against {host}:{port}\n")
+    # 1-4. Handshake -> Join (same sequence react validates).
+    hs("HandshakeStart 0x1d", bytes([0x1d, 0x01]), want_open=True)
+    hs("HandshakeResponse 0x1f", bytes([0x1f, 0x00, 0x00, 0x00, 0x00]))
+    hs("SteamLogin 0x10", bytes([0x10, 0x00, 0x00, 0x00]))
+    join_got = hs("Join 0x09", bytes([0x09]))
+    boot = sorted({b2["chIndex"] for d in join_got for b2 in d.get("bunches", [])
+                   if b2["chIndex"] >= 2 and b2["bOpen"]})
+    print(f"     bootstrap opened {len(boot)} actor channels (ch{boot[0] if boot else '-'}..{boot[-1] if boot else '-'})\n")
+
+    # 5. SelectTeam(byte TeamID): SerializeInt(170,531) + Send presence bit(1) + TeamID byte.
+    team_bits = sint_bits(SELECT_TEAM, ROPC_MAXHANDLE) + [1] + [(1 >> i) & 1 for i in range(8)]
+    team_got = ch2_rpc("SelectTeam(170, TeamID=1)", team_bits)
+
+    # 6. SelectRoleByClass: SerializeInt(175,531). No params needed - the server spawns the
+    #    pawn on the first handle-175 after team-select (cs.teamSelected && !cs.spawned).
+    role_got = ch2_rpc("SelectRoleByClass(175)", sint_bits(SELECT_ROLE, ROPC_MAXHANDLE))
+
+    # The pawn-spawn opens a FRESH channel above the bootstrap range (kPawnCh=209).
+    after = team_got + role_got
+    pawn_opens = sorted({b2["chIndex"] for d in after for b2 in d.get("bunches", [])
+                         if b2["chIndex"] > BOOTSTRAP_CH_MAX and b2["bOpen"]})
+    # Count standalone ack-only datagrams (no bunches) - should be coalesced (few), not a storm.
+    ack_only = sum(1 for d in after if d.get("ok") and not d.get("bunches") and d.get("acks"))
+    bunch_pkts = sum(1 for d in after if d.get("bunches"))
+
+    print()
+    print(f"     pawn channel opens (>ch{BOOTSTRAP_CH_MAX}) after role-select: {pawn_opens}")
+    print(f"     server data packets: {bunch_pkts}; standalone ack-only datagrams: {ack_only}")
+    ok = bool(pawn_opens)
+    if ok:
+        print(f"\n=== spawn: PASS - server opened pawn channel(s) {pawn_opens} in response to SelectRoleByClass ===")
+    else:
+        print("\n=== spawn: FAIL - no pawn channel opened after SelectRoleByClass (check team->role advance) ===")
+    sock.close()
+    return 0 if ok else 1
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["replay", "drive", "react"])
+    ap.add_argument("mode", choices=["replay", "drive", "react", "spawn"])
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=7777)
     args = ap.parse_args()
@@ -394,6 +500,8 @@ def main():
         return replay(args.host, args.port)
     if args.mode == "react":
         return react(args.host, args.port)
+    if args.mode == "spawn":
+        return spawn(args.host, args.port)
     return drive(args.host, args.port)
 
 if __name__ == "__main__":
