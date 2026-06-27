@@ -16,6 +16,7 @@
 #include <map>
 #include <utility>
 #include <memory>
+#include <cstdint>
 
 #include "Game/BanRecord.h"
 
