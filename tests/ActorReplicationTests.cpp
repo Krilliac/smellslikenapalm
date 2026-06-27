@@ -5,7 +5,7 @@
 // channel; these round-trip it and anchor it to real-capture bytes.
 // Spec: docs/RS2V_ActorReplication_7258.md.
 
-#include <gtest/gtest.h>
+#include "TestFramework.h"
 
 #include "Network/ActorReplication.h"
 #include "Network/BitReader.h"

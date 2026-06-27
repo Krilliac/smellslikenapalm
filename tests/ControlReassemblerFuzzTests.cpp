@@ -23,7 +23,7 @@
 // Build:  cmake --build build-tests --target ControlReassemblerFuzzTests --config Debug -- /m:1
 // Run:    build-tests/tests/Debug/ControlReassemblerFuzzTests.exe
 
-#include <gtest/gtest.h>
+#include "TestFramework.h"
 
 #include "Network/ControlReassembler.h"
 #include "Network/PacketCodec.h"

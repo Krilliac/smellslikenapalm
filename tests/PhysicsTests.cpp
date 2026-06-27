@@ -10,8 +10,8 @@
 // 6. Performance under many bodies.
 // 7. Edge cases: zero-size bodies, out-of-bounds queries.
 
-#include <gtest/gtest.h>
-#include <gmock/gmock.h>
+#include "TestFramework.h"
+#include "TestMock.h"
 #include <vector>
 #include <random>
 #include <chrono>

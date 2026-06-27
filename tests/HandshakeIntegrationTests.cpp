@@ -16,7 +16,7 @@
 // bits), and the MaxPacket grows from the tiny StatelessConnect-handshake value
 // to the NMT value once the handshake completes - so this test does the same.
 
-#include <gtest/gtest.h>
+#include "TestFramework.h"
 
 #include "Network/HandshakeState.h"
 #include "Network/ControlChannel.h"

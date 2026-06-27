@@ -10,8 +10,8 @@
 //  6. Decay of progress when zone is vacated.
 //  7. Edge cases: zero objectives, invalid IDs.
 
-#include <gtest/gtest.h>
-#include <gmock/gmock.h>
+#include "TestFramework.h"
+#include "TestMock.h"
 #include <vector>
 
 #include "Game/GameMode.h"

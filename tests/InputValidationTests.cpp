@@ -1,8 +1,8 @@
 // tests/InputValidationTests.cpp
 // Unit tests for validating input handling and sanitization
 
-#include <gtest/gtest.h>
-#include <gmock/gmock.h>
+#include "TestFramework.h"
+#include "TestMock.h"
 #include <string>
 #include <vector>
 #include <filesystem>

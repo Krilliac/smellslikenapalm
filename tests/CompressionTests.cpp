@@ -9,8 +9,8 @@
 // from a live server instance and still validate every public contract of the
 // compression façade.
 
-#include <gtest/gtest.h>
-#include <gmock/gmock.h>
+#include "TestFramework.h"
+#include "TestMock.h"
 
 #include <memory>
 #include <random>

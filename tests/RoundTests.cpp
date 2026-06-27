@@ -9,7 +9,7 @@
 // 5. Round count management.
 // 6. Edge cases: zero-length rounds, concurrent end calls.
 
-#include <gtest/gtest.h>
+#include "TestFramework.h"
 #include <chrono>
 #include <thread>
 #include "Game/GameMode.h"

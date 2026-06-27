@@ -1,8 +1,8 @@
 // tests/GameTests.cpp
 // Comprehensive game logic and mechanics unit tests
 
-#include <gtest/gtest.h>
-#include <gmock/gmock.h>
+#include "TestFramework.h"
+#include "TestMock.h"
 #include <memory>
 #include <string>
 #include <vector>

@@ -24,7 +24,7 @@
 // hard failure; even without ASan, a guard buffer + length invariant catches the
 // common cases. A per-call watchdog (std::async + wait_for) catches hangs.
 
-#include <gtest/gtest.h>
+#include "TestFramework.h"
 
 #include "Network/BitReader.h"
 #include "Network/BitWriter.h"

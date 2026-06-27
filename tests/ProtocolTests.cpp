@@ -9,7 +9,7 @@
 // 5. Boundary and error cases: invalid tags, oversized payloads, empty payloads.
 // 6. Round-trip tests for all defined PacketTypes.
 
-#include <gtest/gtest.h>
+#include "TestFramework.h"
 #include <vector>
 #include <string>
 #include "Protocol/PacketTypes.h"

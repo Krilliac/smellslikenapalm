@@ -20,7 +20,7 @@
 // Build: cmake --build build-tests --target HandshakeStateFuzzTests --config Debug -- /m:1
 // Run:   build-tests/tests/Debug/HandshakeStateFuzzTests.exe
 
-#include <gtest/gtest.h>
+#include "TestFramework.h"
 
 #include "Network/HandshakeState.h"
 #include "Network/ControlChannel.h"

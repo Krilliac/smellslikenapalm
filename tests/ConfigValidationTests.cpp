@@ -3,7 +3,7 @@
 //
 // GoogleTest / GoogleMock
 
-#include <gtest/gtest.h>
+#include "TestFramework.h"
 #include <memory>
 #include <string>
 #include <filesystem>

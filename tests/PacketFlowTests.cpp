@@ -6,8 +6,8 @@
 // by dynamic handlers, and ensure correct dispatch ordering and error
 // recovery under packet loss and reordering.
 
-#include <gtest/gtest.h>
-#include <gmock/gmock.h>
+#include "TestFramework.h"
+#include "TestMock.h"
 #include <thread>
 #include <chrono>
 #include <vector>

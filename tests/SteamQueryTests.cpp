@@ -9,8 +9,8 @@
 // 5. Error handling: Steam API not available, invalid handles.
 // 6. Edge cases: zero-length names, nonexistent leaderboards, stale callbacks.
 
-#include <gtest/gtest.h>
-#include <gmock/gmock.h>
+#include "TestFramework.h"
+#include "TestMock.h"
 #include <thread>
 #include <chrono>
 #include "Network/SteamQuery.h"

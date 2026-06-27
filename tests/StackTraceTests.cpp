@@ -17,7 +17,7 @@
 //     (see HasAnyResolvedSymbol) rather than fail — a symbol-less CI runner
 //     must still go green.
 
-#include <gtest/gtest.h>
+#include "TestFramework.h"
 
 #include "Utils/StackTrace.h"
 

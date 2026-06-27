@@ -10,7 +10,7 @@
 // 6. Thread safety of timers under concurrent use.
 // 7. Performance: scheduling many timers.
 
-#include <gtest/gtest.h>
+#include "TestFramework.h"
 #include <chrono>
 #include <thread>
 #include <atomic>

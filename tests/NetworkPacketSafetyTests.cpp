@@ -13,7 +13,7 @@
 // no over-read), and that well-formed values still decode byte-for-byte (the fix is purely
 // additive). Found by the packet-dispatch security review (workflow wf_fff418dc-46f).
 
-#include <gtest/gtest.h>
+#include "TestFramework.h"
 
 #include <cstdint>
 #include <vector>

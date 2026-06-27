@@ -1,8 +1,8 @@
 // tests/MovementValidationTests.cpp
 // Unit tests for player movement validation and anti-cheat checks
 
-#include <gtest/gtest.h>
-#include <gmock/gmock.h>
+#include "TestFramework.h"
+#include "TestMock.h"
 #include <cmath>
 #include <vector>
 

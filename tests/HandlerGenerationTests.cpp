@@ -1,8 +1,8 @@
 // tests/HandlerGenerationTests.cpp
 // Comprehensive packet handler code generation and hot-reload testing
 
-#include <gtest/gtest.h>
-#include <gmock/gmock.h>
+#include "TestFramework.h"
+#include "TestMock.h"
 #include <memory>
 #include <string>
 #include <vector>

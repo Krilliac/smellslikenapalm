@@ -4,7 +4,7 @@
 // Covers: packet analysis, handler dispatch, config access, memory pool, physics simulation.
 // Uses GoogleTest for measurement and assertions.
 
-#include <gtest/gtest.h>
+#include "TestFramework.h"
 #include <chrono>
 #include <vector>
 #include <random>

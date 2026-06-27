@@ -9,8 +9,8 @@
 //  5.  Multithreaded access is lock-free and race-condition free.
 //  6.  Allocation / free latency stays <1µs for small blocks under load.
 
-#include <gtest/gtest.h>
-#include <gmock/gmock.h>
+#include "TestFramework.h"
+#include "TestMock.h"
 #include <vector>
 #include <thread>
 #include <atomic>

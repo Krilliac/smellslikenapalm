@@ -17,8 +17,8 @@
 // ConfigManager wiring) so they can be unit-tested in isolation; integrating
 // AuthManager into the live login flow is a separate follow-up.
 
-#include <gtest/gtest.h>
-#include <gmock/gmock.h>
+#include "TestFramework.h"
+#include "TestMock.h"
 #include <memory>
 #include <string>
 #include <vector>
@@ -39,10 +39,10 @@ using ::testing::NiceMock;
 class MockEACProxy : public EACProxy {
 public:
     MOCK_METHOD(bool, ValidateSessionTicket,
-                (const std::string& steamId, const std::vector<uint8_t>& ticket), (override));
+                (const std::string&, const std::vector<uint8_t>&), (override));
     MOCK_METHOD(bool, Initialize, (), (override));
     MOCK_METHOD(void, Shutdown, (), (override));
-    MOCK_METHOD(bool, IsClientAuthenticated, (const std::string& steamId), (const, override));
+    MOCK_METHOD(bool, IsClientAuthenticated, (const std::string&), (const, override));
 };
 
 class AuthenticationTest : public ::testing::Test {

@@ -17,7 +17,7 @@
 //   * `Lerp` is a member (a.Lerp(b, t)), not a static `Vector3::Lerp`.
 //   * There is no `Clamp`; component clamping is done inline below.
 
-#include <gtest/gtest.h>
+#include "TestFramework.h"
 #include "Math/Vector3.h"
 #include <algorithm>
 #include <cmath>

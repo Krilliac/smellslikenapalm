@@ -9,8 +9,8 @@
 // 5. Inventory limits and usage.
 // 6. Edge conditions: null player IDs, concurrent operations.
 
-#include <gtest/gtest.h>
-#include <gmock/gmock.h>
+#include "TestFramework.h"
+#include "TestMock.h"
 #include <chrono>
 #include <thread>
 #include <vector>

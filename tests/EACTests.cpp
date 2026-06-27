@@ -1,8 +1,8 @@
 // tests/EACTests.cpp
 // Comprehensive Easy Anti-Cheat (EAC) integration and emulation unit tests
 
-#include <gtest/gtest.h>
-#include <gmock/gmock.h>
+#include "TestFramework.h"
+#include "TestMock.h"
 #include <memory>
 #include <string>
 #include <vector>

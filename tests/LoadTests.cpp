@@ -6,7 +6,7 @@
 // compare-exchange helper (AtomicAdd) instead. No server APIs are exercised —
 // this file is a self-contained traffic simulation.
 
-#include <gtest/gtest.h>
+#include "TestFramework.h"
 #include <memory>
 #include <vector>
 #include <chrono>

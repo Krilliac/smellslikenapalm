@@ -9,8 +9,8 @@
 // 5. Performance of per-packet analysis under load.
 // 6. Edge cases: empty packets, corrupted headers, max-size packets.
 
-#include <gtest/gtest.h>
-#include <gmock/gmock.h>
+#include "TestFramework.h"
+#include "TestMock.h"
 #include <vector>
 #include <string>
 #include <chrono>

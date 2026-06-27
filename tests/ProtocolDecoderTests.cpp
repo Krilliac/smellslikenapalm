@@ -4,10 +4,13 @@
 //   * NetFieldTable / NetFieldRegistry  (handle-table parsing)
 //   * BunchPropertyDecoder              (bit-packed property decode vs codec spec)
 //
-// Deliberately does NOT use GoogleTest: the gtest suite is pulled via FetchContent
-// (network), which is unavailable in offline/CI-sandbox builds. This file defines
-// its own main() + CHECK macros and links only rs2v_core, so it builds and runs
-// with no network. Wire-up: -DBUILD_RE_SELFTEST=ON (see root CMakeLists.txt).
+// This file is fully self-contained: it defines its own main() + CHECK macros
+// and links only rs2v_core, so it builds and runs with no network and no test
+// framework at all. Wire-up: -DBUILD_RE_SELFTEST=ON (see root CMakeLists.txt).
+//
+// (The rest of the suite now uses the RS2V native test framework in
+// tests/TestFramework.h, which is also dependency-free and offline — the
+// previous GoogleTest-via-FetchContent setup has been removed.)
 
 #include "Protocol/ReverseEngineering/NetFieldTable.h"
 #include "Protocol/ReverseEngineering/BunchPropertyDecoder.h"

@@ -18,7 +18,7 @@
 // requires worker threads to drain its queue, so a 0-thread pool never runs
 // tasks (not the behavior the original test assumed).
 
-#include <gtest/gtest.h>
+#include "TestFramework.h"
 #include <atomic>
 #include <vector>
 #include <chrono>

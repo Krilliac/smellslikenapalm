@@ -10,8 +10,8 @@
 // 6. TimeUtils: ISO8601 formatting, parsing, deadline waits.
 // 7. Edge cases: empty inputs, invalid paths, Unicode handling.
 
-#include <gtest/gtest.h>
-#include <gmock/gmock.h>
+#include "TestFramework.h"
+#include "TestMock.h"
 #include <filesystem>
 #include <fstream>
 #include <vector>

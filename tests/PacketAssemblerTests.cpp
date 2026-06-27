@@ -16,7 +16,7 @@
 //     (verified against the official server; opening it stalled the real client);
 //   * the server must ack received PacketIds.
 
-#include <gtest/gtest.h>
+#include "TestFramework.h"
 
 #include "Network/PacketAssembler.h"
 #include "Network/PacketCodec.h"

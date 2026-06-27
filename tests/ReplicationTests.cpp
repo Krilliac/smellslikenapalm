@@ -10,8 +10,8 @@
 // 6. Performance under many actors and high-frequency updates.
 // 7. Edge cases: no changes, all properties changed, network jitter.
 
-#include <gtest/gtest.h>
-#include <gmock/gmock.h>
+#include "TestFramework.h"
+#include "TestMock.h"
 #include <vector>
 #include <random>
 #include <chrono>

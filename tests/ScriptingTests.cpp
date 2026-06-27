@@ -10,8 +10,8 @@
 // 6. Persistence: saving/loading script state.
 // 7. Edge cases: empty scripts, infinite loops, concurrent script contexts.
 
-#include <gtest/gtest.h>
-#include <gmock/gmock.h>
+#include "TestFramework.h"
+#include "TestMock.h"
 #include <string>
 #include <chrono>
 #include <thread>

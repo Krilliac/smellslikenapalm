@@ -9,8 +9,8 @@
 // 5. Team swap requests.
 // 6. Edge cases: invalid team IDs, empty teams, concurrent assignments.
 
-#include <gtest/gtest.h>
-#include <gmock/gmock.h>
+#include "TestFramework.h"
+#include "TestMock.h"
 #include <vector>
 #include "Game/TeamManager.h"
 #include "Game/PlayerManager.h"

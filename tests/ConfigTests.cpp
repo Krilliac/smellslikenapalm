@@ -1,8 +1,8 @@
 // tests/ConfigTests.cpp
 // Comprehensive configuration management and validation unit tests
 
-#include <gtest/gtest.h>
-#include <gmock/gmock.h>
+#include "TestFramework.h"
+#include "TestMock.h"
 #include <memory>
 #include <string>
 #include <fstream>

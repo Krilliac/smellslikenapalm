@@ -7,7 +7,7 @@
 // against docs/RS2V_ControlChannel_WireSpec_7258.md. These are byte-exact ground
 // truth: if the codec decodes them wrong, a real client will reject our framing.
 
-#include <gtest/gtest.h>
+#include "TestFramework.h"
 
 #include "Network/PacketCodec.h"
 

@@ -10,8 +10,8 @@
 // 6. CSRF token generation/validation (if applicable).
 // 7. Edge cases: missing credentials, expired bans, concurrent bans.
 
-#include <gtest/gtest.h>
-#include <gmock/gmock.h>
+#include "TestFramework.h"
+#include "TestMock.h"
 #include <chrono>
 #include <thread>
 

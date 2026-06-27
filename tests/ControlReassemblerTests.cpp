@@ -11,7 +11,7 @@
 // (sequence numbers consumed by other channels, or lost) - so the reassembler
 // must SKIP a persistent gap rather than deadlock waiting for it.
 
-#include <gtest/gtest.h>
+#include "TestFramework.h"
 
 #include "Network/ControlReassembler.h"
 #include "Network/PacketCodec.h"

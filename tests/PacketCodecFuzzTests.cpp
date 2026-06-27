@@ -28,15 +28,16 @@
 // rejects (empty / zero-terminator). If you want a stricter reject policy, that
 // is a production-code decision, not a decoder-safety bug.
 //
-// Framework: GoogleTest, one executable per test file with its own main()
-// (matches tests/CMakeLists.txt rs2v_add_test convention).
+// Framework: RS2V native test framework (tests/TestFramework.h), one executable
+// per test file with its own main() (matches tests/CMakeLists.txt rs2v_add_test
+// convention).
 //
 // Build + run (from repo root, reusing the existing VS2022 test build dir):
 //   cmake --build build-tests --target PacketCodecFuzzTests --config Debug
 //   build-tests/tests/Debug/PacketCodecFuzzTests.exe
 // (or:  ctest --test-dir build-tests -C Debug -R PacketCodecFuzzTests -V )
 
-#include <gtest/gtest.h>
+#include "TestFramework.h"
 
 #include "Network/PacketCodec.h"
 

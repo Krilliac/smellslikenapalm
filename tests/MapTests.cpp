@@ -1,8 +1,8 @@
 // tests/MapTests.cpp
 // Comprehensive unit tests for MapManager and MapConfig
 
-#include <gtest/gtest.h>
-#include <gmock/gmock.h>
+#include "TestFramework.h"
+#include "TestMock.h"
 #include <filesystem>
 #include <fstream>
 #include <vector>

@@ -13,8 +13,8 @@
 // 9. Multiplayer replication of weapon state.
 // 10. Security: input validation for fire requests.
 
-#include <gtest/gtest.h>
-#include <gmock/gmock.h>
+#include "TestFramework.h"
+#include "TestMock.h"
 #include <vector>
 #include <chrono>
 #include <thread>

@@ -16,7 +16,7 @@
 //     colliding with the real INISection in Config/INIParserTypes.h.
 //   * The stray, unmatched `} // namespace` at end of file was removed.
 
-#include <gtest/gtest.h>
+#include "TestFramework.h"
 #include <algorithm>
 #include <memory>
 #include <string>

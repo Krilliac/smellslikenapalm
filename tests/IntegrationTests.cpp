@@ -1,8 +1,8 @@
 // tests/IntegrationTests.cpp
 // Comprehensive integration testing for smellslikenapalm server components
 
-#include <gtest/gtest.h>
-#include <gmock/gmock.h>
+#include "TestFramework.h"
+#include "TestMock.h"
 #include <memory>
 #include <string>
 #include <vector>

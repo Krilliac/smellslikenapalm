@@ -9,7 +9,7 @@
 // 5. Live reload of security settings.
 // 6. Edge cases: missing section, invalid values, zero/negative durations.
 
-#include <gtest/gtest.h>
+#include "TestFramework.h"
 #include <filesystem>
 #include <fstream>
 #include "Config/ConfigManager.h"

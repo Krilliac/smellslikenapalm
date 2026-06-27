@@ -3,9 +3,18 @@
 #
 # Design constraints (do NOT "simplify" these away):
 #   * Each tests/*Tests.cpp file defines its OWN main() (InitGoogleTest +
-#     RUN_ALL_TESTS). Therefore we build ONE executable per test file and we
-#     NEVER link gtest_main.
-#   * GoogleTest/GoogleMock are not vendored — they are pulled via FetchContent.
+#     RUN_ALL_TESTS). Therefore we build ONE executable per test file.
+#   * The suite uses the RS2V NATIVE test framework (tests/TestFramework.h +
+#     tests/TestMock.h) — a self-contained, dependency-free reimplementation of
+#     the GoogleTest/GoogleMock subset these tests use. There is NO external
+#     test dependency and NO network access at configure or build time.
+#
+#     Why: GoogleTest was previously pulled via CMake FetchContent, which clones
+#     github.com/google/googletest at configure time. In offline / sandboxed /
+#     restricted-CI environments that clone fails and the whole suite becomes
+#     un-buildable. The native framework removes that dependency entirely while
+#     keeping the test sources unchanged (they just include the native headers).
+#
 #   * Tests link the rs2v_core static library defined in the root CMakeLists.txt.
 #
 # This is an explicit ALLOW-LIST, not a glob: only files known to compile (after
@@ -21,23 +30,14 @@
 # exist, it is EXCLUDED rather than rewritten (rewriting would mean inventing
 # new test behavior, which is out of scope).
 
-include(FetchContent)
-
-set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
-
-FetchContent_Declare(
-    googletest
-    GIT_REPOSITORY https://github.com/google/googletest.git
-    GIT_TAG        v1.15.2
-)
-FetchContent_MakeAvailable(googletest)
-
 # Helper: add one test executable per source file, each with its own main().
+# The native framework is header-only, so tests just need the tests/ directory
+# on the include path (for "TestFramework.h" / "TestMock.h") plus rs2v_core.
 function(rs2v_add_test test_name)
     add_executable(${test_name} ${test_name}.cpp)
-    target_link_libraries(${test_name}
-        PRIVATE rs2v_core GTest::gtest GTest::gmock Threads::Threads)
-    target_include_directories(${test_name} PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(${test_name} PRIVATE rs2v_core Threads::Threads)
+    target_include_directories(${test_name}
+        PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR})
     add_test(NAME ${test_name} COMMAND ${test_name})
 endfunction()
 

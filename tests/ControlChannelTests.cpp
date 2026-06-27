@@ -11,7 +11,7 @@
 //     Parse the produced bytes, fields compare equal).
 // We also exercise the `expectType` parameter and overflow/short-buffer safety.
 
-#include <gtest/gtest.h>
+#include "TestFramework.h"
 
 #include <cstdint>
 #include <string>

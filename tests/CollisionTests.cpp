@@ -1,8 +1,8 @@
 // tests/CollisionTests.cpp
 // Comprehensive collision detection and physics validation tests
 
-#include <gtest/gtest.h>
-#include <gmock/gmock.h>
+#include "TestFramework.h"
+#include "TestMock.h"
 #include <memory>
 #include <vector>
 #include <chrono>

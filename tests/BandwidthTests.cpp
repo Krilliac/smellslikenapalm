@@ -1,8 +1,8 @@
 // tests/BandwidthTests.cpp
 // Comprehensive bandwidth management and network performance unit tests
 
-#include <gtest/gtest.h>
-#include <gmock/gmock.h>
+#include "TestFramework.h"
+#include "TestMock.h"
 #include <memory>
 #include <vector>
 #include <chrono>
