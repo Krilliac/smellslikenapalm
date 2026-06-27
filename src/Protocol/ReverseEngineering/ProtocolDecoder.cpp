@@ -394,17 +394,24 @@ void ProtocolDecoder::AnalyzeUE3Bunch(const uint8_t* data, size_t len) {
     }
 }
 
-// Verified RS2-7258 static class export indices -> class name (the names match
-// the loaded netfields_u_<Class> tables). Source: docs/re/open_bunch_structure.md
-// §1, bit-exact against the capture.
+// Static class export index -> class name (names match the loaded
+// netfields_u_<Class> tables). The four menu actors are bit-exact against the
+// capture (docs/re/open_bunch_structure.md §1); the Pawn/Weapon ranges are from
+// the MASTER_replication_reference §0 static-index table (used for channel
+// identification only — those tables are lean, so values aren't decoded).
 static std::string ResolveActorClassIndex(uint32_t idx) {
     switch (idx) {
-        case 57520: return "ROPlayerController";
-        case 86701: return "ROPlayerReplicationInfo";
-        case 90245: return "ROTeamInfo";
-        case 70887: return "ROGameReplicationInfo";
-        default:    return std::string();
+        case 57520: return "ROPlayerController";       // [H]
+        case 86701: return "ROPlayerReplicationInfo";  // [H]
+        case 90245: return "ROTeamInfo";               // [H]
+        case 70887: return "ROGameReplicationInfo";    // [H]
+        case 82735: case 75939: case 286097:           // ROWeapon/Inventory
+            return "ROWeapon";
+        default: break;
     }
+    // ROPawn subclasses cluster in this export-index range (respawn clusters).
+    if (idx >= 285994 && idx <= 286464) return "ROPawn";
+    return std::string();
 }
 
 // Decode the bit-packed property record stream inside an actor-channel bunch.

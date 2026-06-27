@@ -51,9 +51,12 @@ struct NetField {
     std::string  ownerClass;                 // declaring class, e.g. "Actor", "Pawn"
     NetPropKind  kind = NetPropKind::Unknown;
     std::string  name;                       // e.g. "Health"
-    std::string  rawType;                    // e.g. "struct Vector", "byte(enum ENetRole)"
-    NetValueType valueType = NetValueType::Unknown;
+    std::string  rawType;                    // e.g. "struct Vector", "byte[3]"
+    NetValueType valueType = NetValueType::Unknown; // base/element type
+    uint32_t     arrayDim = 1;               // >1 for a fixed C array (Type Name[N])
     int32_t      netIndex = -1;              // ni= value, informational
+
+    bool IsStaticArray() const { return arrayDim > 1; }
 };
 
 // One class's handle table.

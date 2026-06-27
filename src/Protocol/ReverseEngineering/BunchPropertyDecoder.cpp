@@ -243,6 +243,18 @@ BunchDecodeResult BunchPropertyDecoder::Decode(const NetFieldTable& table,
         p.type = f->rawType;
         p.bitStart = hStart;
 
+        // Fixed C array (ArrayDim>1): each record carries an 8-bit element index
+        // before the value (ue3_property_value_codec.md §1).
+        uint32_t element = 0;
+        bool isArrayElem = f->IsStaticArray();
+        if (isArrayElem) {
+            element = r.ReadByte();
+            if (r.IsOverflowed()) {
+                result.status = BunchDecodeStatus::Overflow;
+                break;
+            }
+        }
+
         if (f->kind == NetPropKind::Func) {
             // RPC marker — params need the function signature we don't have.
             p.valueSummary = "(rpc-call)";
@@ -255,6 +267,9 @@ BunchDecodeResult BunchPropertyDecoder::Decode(const NetFieldTable& table,
 
         std::string summary;
         bool ok = DecodeValue(r, *f, m_maxChannels, summary);
+        if (isArrayElem) {
+            p.name = f->name + "[" + std::to_string(element) + "]";
+        }
         p.valueSummary = summary;
         p.valueDecoded = ok;
         p.bitLen = r.BitPos() - hStart;

@@ -329,6 +329,49 @@ static void TestOpenBunchHeaderParse(const std::string& dir) {
     CHECK(!bad.ok);
 }
 
+// PRI value decode: the now-typed ROPlayerReplicationInfo table should decode a
+// scalar block (float/FString/UniqueNetId QWORD) and a static-array element
+// (byte[3] with its 8-bit element index), mirroring the capture's ch13 PRI.
+static void TestPRIValueDecode(const std::string& dir) {
+    std::printf("TestPRIValueDecode\n");
+    NetFieldTable t;
+    CHECK(t.LoadFromFile(dir + "/netfields_u_ROPlayerReplicationInfo.txt", "ROPlayerReplicationInfo"));
+    CHECK(t.HasValueTypes());            // enrichment took effect
+    CHECK_EQ(t.MaxIndex(), 98u);
+
+    // Static-array field carries arrayDim.
+    const NetField* ra = t.GetField(70);
+    CHECK(ra && ra->name == "RecentAchievements");
+    CHECK(ra && ra->IsStaticArray() && ra->arrayDim == 3u);
+    const NetField* uid = t.GetField(23);
+    CHECK(uid && uid->valueType == NetValueType::StructUniqueNetId);
+
+    const uint32_t M = t.MaxIndex();
+    BitWriter bw;
+    bw.SerializeInt(40u, M); bw.WriteFloat(164.0f);                  // Score
+    bw.SerializeInt(37u, M); bw.WriteString("DodgR");               // PlayerName
+    bw.SerializeInt(23u, M); bw.WriteUInt64(0x011000011835f45fULL); // UniqueId
+    bw.SerializeInt(70u, M); bw.WriteByte(1); bw.WriteByte(42);     // RecentAchievements[1]=42
+
+    auto bytes = bw.GetBytes();
+    BunchPropertyDecoder dec(1024);
+    auto res = dec.Decode(t, bytes.data(), bytes.size(), bw.NumBits());
+
+    CHECK_EQ(res.properties.size(), 4u);
+    if (res.properties.size() == 4) {
+        CHECK_EQ(res.properties[0].name, std::string("Score"));
+        CHECK_EQ(res.properties[0].valueSummary, std::string("164"));
+        CHECK_EQ(res.properties[1].name, std::string("PlayerName"));
+        CHECK_EQ(res.properties[1].valueSummary, std::string("\"DodgR\""));
+        CHECK_EQ(res.properties[2].name, std::string("UniqueId"));
+        CHECK(res.properties[2].valueSummary.rfind("uid:", 0) == 0);
+        CHECK_EQ(res.properties[3].name, std::string("RecentAchievements[1]"));
+        CHECK_EQ(res.properties[3].valueSummary, std::string("42"));
+        CHECK(res.properties[3].valueDecoded);
+    }
+    CHECK_EQ(res.bitsConsumed, bw.NumBits());
+}
+
 int main() {
     std::printf("=== ProtocolDecoder / NetFieldTable self-tests ===\n");
     const std::string dir = NetfieldsDir();
@@ -341,6 +384,7 @@ int main() {
     TestDecodeRoundTrip(dir);
     TestDecodeStopsOnEnum(dir);
     TestOpenBunchHeaderParse(dir);
+    TestPRIValueDecode(dir);
     TestDecoderSyncLayout();
     TestDecoderAsyncDrain();
 

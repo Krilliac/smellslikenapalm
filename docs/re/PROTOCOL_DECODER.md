@@ -77,13 +77,17 @@ ctest --test-dir build -R ProtocolDecoderSelfTest --output-on-failure
 
 ## Known limitations / next steps
 
-- Channel→class binding is now **exact** for actors whose open-bunch class index
-  is known (PC/PRI/TeamInfo/GRI). Other actor classes (Pawn/Weapon/projectiles)
-  fall back to best-fit; add their verified static indices to
-  `ResolveActorClassIndex` to make them exact too.
-- `ROPlayerReplicationInfo` is currently a *lean* table (names only, no value
-  types), so a PRI channel is identified but its values aren't decoded.
-  Regenerating it with the type column (the rich format) unlocks PRI value decode.
+- Channel→class binding is **exact** for the menu actors (PC/PRI/TeamInfo/GRI,
+  bit-exact indices) and identifies ROPawn (export-index range 285994–286464) and
+  ROWeapon by index for the channel map. Pawn/Weapon tables are lean, so those
+  channels are named but their values aren't decoded; adding their typed tables
+  would unlock pawn/weapon value decode.
+- `ROPlayerReplicationInfo` carries the verified scalar property types from
+  `open_bunch_structure.md` §4.3 (Score/PlayerName/UniqueId/Kills/… and the
+  byte/int static arrays), so a PRI open block decodes; other PRI handles not in
+  that block remain untyped and stop the decode if they appear.
+- Static C arrays (`Type Name[N]`) decode element-by-element via the 8-bit element
+  index. Dynamic `array<...>` members are a no-op on the wire (handle only).
 - Enum-byte widths need each enum's `NumEnums`; not present in the handle tables,
   so enum values currently stop the decode. Capturing enum sizes would extend
   coverage past the first enum property.

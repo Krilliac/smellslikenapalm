@@ -160,7 +160,24 @@ bool NetFieldTable::LoadFromFile(const std::string& path, const std::string& cla
             }
             f.rawType = type;
         }
-        f.valueType = ClassifyType(f.rawType, f.kind);
+
+        // A fixed C-array type is written as "<base>[N]" (e.g. "byte[3]",
+        // "int[11]", "obj<X>[16]"). Parse N -> arrayDim and classify the BASE
+        // type; the wire carries one element per record (handle + element byte +
+        // value), per ue3_property_value_codec.md §1.
+        std::string classifyType = f.rawType;
+        if (!classifyType.empty() && classifyType.back() == ']') {
+            size_t lb = classifyType.rfind('[');
+            if (lb != std::string::npos) {
+                uint32_t dim = 0;
+                if (ParseUInt(classifyType.substr(lb + 1, classifyType.size() - lb - 2), dim)
+                    && dim > 0) {
+                    f.arrayDim = dim;
+                    classifyType = Trim(classifyType.substr(0, lb));
+                }
+            }
+        }
+        f.valueType = ClassifyType(classifyType, f.kind);
         if (f.valueType != NetValueType::Unknown) m_hasValueTypes = true;
 
         maxHandleSeen = std::max(maxHandleSeen, handle);
