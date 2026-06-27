@@ -224,6 +224,13 @@ bool GameServer::Initialize() {
     m_securityConfig = std::make_shared<SecurityConfig>(*m_serverConfig);
     m_gameConfig     = std::make_shared<GameConfig>(*m_serverConfig);
     m_mapConfig      = std::make_shared<MapConfig>(*m_serverConfig);
+    // Load the map definitions from disk (config/maps.ini). Without this the
+    // MapConfig is empty and every LoadMap() fails with "definition not found",
+    // leaving the server mapless. Non-fatal: a failure falls back to whatever
+    // CreateDefaultConfig/empty set yields, and the server continues.
+    if (!m_mapConfig->Initialize()) {
+        Logger::Warn("[GameServer::Initialize] MapConfig::Initialize failed; map definitions may be unavailable");
+    }
 
     // Initialize network manager
     m_networkManager = std::make_unique<NetworkManager>(this);
