@@ -41,6 +41,8 @@ class HelicopterPhysics;
 class TerritoryMode;
 class SupremacyMode;
 class SkirmishMode;
+class GameState;
+class RoundManager;
 class ProtocolHandler;
 class ReplicationManager;
 class ConnectionLoginBridge;
@@ -96,6 +98,8 @@ public:
     TerritoryMode*                  GetTerritoryMode()      const;
     SupremacyMode*                  GetSupremacyMode()      const;
     SkirmishMode*                   GetSkirmishMode()       const;
+    GameState*                      GetGameState()          const;
+    RoundManager*                   GetRoundManager()       const;
     std::shared_ptr<GameConfig>     GetGameConfig()         const;
     std::shared_ptr<ServerConfig>   GetServerConfig()       const;
     std::shared_ptr<ConfigManager>  GetConfigManager()      const;
@@ -130,6 +134,10 @@ protected:
 private:
     std::string GetExeDir() const;
 
+    // Register the current map's objective definitions with the ObjectiveSystem,
+    // applying linear territory ordering when the active mode is Territory.
+    void PopulateObjectivesFromMap();
+
     std::unique_ptr<NetworkManager>     m_networkManager;
     std::shared_ptr<ConfigManager>      m_configManager;
     std::shared_ptr<NetworkConfig>      m_networkConfig;
@@ -162,6 +170,13 @@ private:
     std::unique_ptr<TerritoryMode>      m_territoryMode;
     std::unique_ptr<SupremacyMode>      m_supremacyMode;
     std::unique_ptr<SkirmishMode>       m_skirmishMode;
+
+    // Central round/game-state layer. Opt-in (Game.use_round_manager): when
+    // enabled, RoundManager drives the generic Preparation/Active/PostRound
+    // cycle over GameState. Off by default so the per-mode classes above remain
+    // the sole round drivers.
+    std::unique_ptr<GameState>          m_gameState;
+    std::unique_ptr<RoundManager>       m_roundManager;
 
     // Replication + the connection->player login bridge (the bridge owns the
     // SecurityManager internally; see GameServer::Initialize for why).

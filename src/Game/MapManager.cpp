@@ -63,21 +63,27 @@ bool MapManager::LoadMap(const std::string& mapName)
     // Per-map lighting overrides (lighting.json), if present.
     LoadLighting(mapName);
 
-    // Objectives: use the definition's explicit id list if provided, otherwise
-    // synthesize sequential ids from objectiveCount so game modes have markers.
+    // Objectives: prefer an on-disk objectives.txt with full positional capture
+    // zones; otherwise fall back to the definition's id list / objectiveCount and
+    // synthesize evenly-spread zones so the ObjectiveSystem still has real markers.
     m_objectives.clear();
-    if (!m_currentMap.objectiveIds.empty()) {
-        for (int objId : m_currentMap.objectiveIds) {
-            m_objectives.push_back(static_cast<uint32_t>(objId));
+    m_objectiveZones.clear();
+    if (!LoadObjectivesFromDisk(mapName)) {
+        if (!m_currentMap.objectiveIds.empty()) {
+            for (int objId : m_currentMap.objectiveIds) {
+                m_objectives.push_back(static_cast<uint32_t>(objId));
+            }
+        } else if (m_currentMap.objectiveCount > 0) {
+            for (int i = 0; i < m_currentMap.objectiveCount; ++i) {
+                m_objectives.push_back(static_cast<uint32_t>(i + 1));
+            }
+            Logger::Debug("MapManager: synthesized %d objective ids from objectiveCount",
+                          m_currentMap.objectiveCount);
         }
-    } else if (m_currentMap.objectiveCount > 0) {
-        for (int i = 0; i < m_currentMap.objectiveCount; ++i) {
-            m_objectives.push_back(static_cast<uint32_t>(i + 1));
-        }
-        Logger::Debug("MapManager: synthesized %d objective ids from objectiveCount",
-                      m_currentMap.objectiveCount);
+        BuildObjectiveZones();
     }
-    Logger::Info("MapManager: %zu objectives loaded", m_objectives.size());
+    Logger::Info("MapManager: %zu objectives loaded (%zu positional zones)",
+                 m_objectives.size(), m_objectiveZones.size());
 
     return true;
 }
@@ -142,6 +148,113 @@ bool MapManager::LoadSpawnPointsFromDisk(const std::string& mapName)
         Logger::Warn("MapManager: spawns file '%s' contained no valid points", path.c_str());
     }
     return false;
+}
+
+bool MapManager::LoadObjectivesFromDisk(const std::string& mapName)
+{
+    namespace fs = std::filesystem;
+    std::string baseDir = MapAssetDir(mapName);
+
+    // Candidate locations, in priority order, mirroring the spawns.txt scheme.
+    std::vector<std::string> candidates = {
+        baseDir + "/" + mapName + "/objectives.txt",   // maps/<id>/objectives.txt
+        baseDir + "/objectives.txt",                    // maps/objectives.txt (flat)
+        baseDir + "/global_objectives.txt"              // shared fallback templates
+    };
+
+    for (const auto& path : candidates) {
+        if (!fs::exists(path)) continue;
+
+        std::ifstream f(path);
+        if (!f.is_open()) {
+            Logger::Warn("MapManager: objectives file exists but could not be opened: %s", path.c_str());
+            continue;
+        }
+
+        std::vector<CaptureZone> zones;
+        std::string line;
+        uint32_t autoId = 1;
+        int order = 0;
+        while (std::getline(f, line)) {
+            // Format (whitespace separated, '#' starts a comment):
+            //   name x y z [radius] [order] [tunnel 0/1] [tunnelX tunnelY tunnelZ]
+            auto hash = line.find('#');
+            if (hash != std::string::npos) line = line.substr(0, hash);
+            std::istringstream iss(line);
+            std::string name;
+            float x, y, z;
+            if (!(iss >> name >> x >> y >> z)) continue;  // skip blank/garbage lines
+
+            CaptureZone zone;
+            zone.id = autoId++;
+            zone.name = name;
+            zone.type = ObjectiveType::Territory;
+            zone.position = {x, y, z};
+            zone.isActive = true;
+
+            float radius = 0.0f;
+            if (iss >> radius && radius > 0.0f) zone.captureRadius = radius;
+
+            int ord = order;
+            if (iss >> ord) zone.territoryOrder = ord; else zone.territoryOrder = order;
+
+            int tunnel = 0;
+            if (iss >> tunnel && tunnel != 0) {
+                zone.hasTunnel = true;
+                float tx, ty, tz;
+                if (iss >> tx >> ty >> tz) zone.tunnelPosition = {tx, ty, tz};
+                else zone.tunnelPosition = zone.position;
+            }
+
+            zones.push_back(zone);
+            ++order;
+        }
+
+        if (!zones.empty()) {
+            m_objectiveZones = std::move(zones);
+            m_objectives.clear();
+            for (const auto& z : m_objectiveZones) m_objectives.push_back(z.id);
+            Logger::Info("MapManager: loaded %zu objective zones from %s",
+                         m_objectiveZones.size(), path.c_str());
+            return true;
+        }
+        Logger::Warn("MapManager: objectives file '%s' contained no valid entries", path.c_str());
+    }
+    return false;
+}
+
+void MapManager::BuildObjectiveZones()
+{
+    // Synthesize positional capture zones from the bare objective id list so the
+    // ObjectiveSystem has real in-world markers even when a map ships no
+    // objectives.txt. Zones are spread evenly along the X axis within bounds.
+    m_objectiveZones.clear();
+    if (m_objectives.empty()) return;
+
+    Bounds b = GetMapBounds();
+    float minX = std::min(b.min.x, b.max.x), maxX = std::max(b.min.x, b.max.x);
+    float midY = (b.min.y + b.max.y) * 0.5f;
+    float midZ = (b.min.z + b.max.z) * 0.5f;
+    size_t n = m_objectives.size();
+
+    for (size_t i = 0; i < n; ++i) {
+        CaptureZone zone;
+        zone.id = m_objectives[i];
+        zone.name = "Objective " + std::to_string(zone.id);
+        zone.type = ObjectiveType::Territory;
+        float t = (n == 1) ? 0.5f : static_cast<float>(i) / static_cast<float>(n - 1);
+        zone.position = { minX + t * (maxX - minX), midY, midZ };
+        zone.territoryOrder = static_cast<int>(i);
+        zone.isActive = true;
+        m_objectiveZones.push_back(zone);
+    }
+    Logger::Debug("MapManager: synthesized %zu positional objective zones from id list",
+                  m_objectiveZones.size());
+}
+
+const std::vector<CaptureZone>& MapManager::GetObjectiveZones() const
+{
+    return m_objectiveZones;
 }
 
 void MapManager::LoadLighting(const std::string& mapName)

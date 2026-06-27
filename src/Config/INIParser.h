@@ -84,7 +84,7 @@ private:
     LineType ProcessLine(std::string& line, std::string& currentSection, size_t lineNumber);
     LineType ProcessSectionLine(const std::string& line, std::string& currentSection, size_t lineNumber);
     LineType ProcessKeyValueLine(const std::string& line, const std::string& currentSection, size_t lineNumber);
-    void    ProcessMultilineValue(std::istream& stream, const std::string& currentSection, size_t& lineNumber);
+    void    ProcessMultilineValue(std::istream& stream, const std::string& currentSection, size_t& lineNumber, const std::string& firstLine);
 
     // Helpers
     bool IsCommentLine(const std::string& line) const;

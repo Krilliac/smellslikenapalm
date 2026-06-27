@@ -161,7 +161,10 @@ bool INIParser::ParseStream(std::istream& stream) {
             case LineType::MULTILINE_START: {
                 // Handle multiline values if enabled
                 if (m_parserConfig.allowMultilineValues) {
-                    ProcessMultilineValue(stream, currentSection, lineNumber);
+                    // `line` has been trimmed by ProcessLine and still ends with
+                    // the continuation backslash; hand it over as the first
+                    // physical line of the multiline value.
+                    ProcessMultilineValue(stream, currentSection, lineNumber, line);
                 } else {
                     ParsingError err;
                     err.lineNumber = lineNumber;
@@ -696,9 +699,59 @@ INIParser::LineType INIParser::ProcessKeyValueLine(const std::string& line, cons
     return LineType::KEY_VALUE;
 }
 
-void INIParser::ProcessMultilineValue(std::istream& /*stream*/, const std::string& /*currentSection*/, size_t& /*lineNumber*/) {
-    // TODO: Implement multiline value processing
-    Logger::Debug("Processing multiline value (not implemented)");
+void INIParser::ProcessMultilineValue(std::istream& stream, const std::string& currentSection, size_t& lineNumber, const std::string& firstLine) {
+    // A multiline value is a "key = value" line whose value ends with a
+    // backslash continuation. Each subsequent line that also ends with a
+    // backslash continues the value; the first line without a trailing
+    // backslash terminates it. Continuation lines are concatenated with a
+    // newline so embedded structure is preserved, then the assembled logical
+    // line is handed to ProcessKeyValueLine for normal key/value handling.
+    const size_t startLine = lineNumber;
+
+    auto stripContinuation = [](const std::string& s) -> std::string {
+        // Drop the single trailing backslash (the line is already trimmed).
+        if (!s.empty() && s.back() == '\\') return s.substr(0, s.size() - 1);
+        return s;
+    };
+
+    std::string assembled = stripContinuation(firstLine);
+
+    std::string raw;
+    bool terminated = false;
+    while (std::getline(stream, raw)) {
+        lineNumber++;
+
+        std::string contLine = raw;
+        if (m_parserConfig.trimWhitespace) {
+            contLine = StringUtils::Trim(contLine);
+        }
+
+        // Skip blank and comment lines inside a multiline block.
+        if (contLine.empty() || IsCommentLine(contLine)) {
+            continue;
+        }
+
+        if (IsMultilineStart(contLine)) {
+            assembled += "\n" + stripContinuation(contLine);
+        } else {
+            assembled += "\n" + contLine;
+            terminated = true;
+            break;
+        }
+    }
+
+    if (!terminated) {
+        ParsingError err;
+        err.lineNumber = startLine;
+        err.line = firstLine;
+        err.message = "Unterminated multiline value (missing final non-continuation line)";
+        err.severity = ErrorSeverity::WARNING;
+        m_parsingErrors.push_back(err);
+        Logger::Warn("Unterminated multiline value starting at line %zu", startLine);
+    }
+
+    Logger::Debug("Assembled multiline value across lines %zu-%zu", startLine, lineNumber);
+    ProcessKeyValueLine(assembled, currentSection, startLine);
 }
 
 bool INIParser::IsCommentLine(const std::string& line) const {
