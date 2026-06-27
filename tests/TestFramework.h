@@ -534,10 +534,19 @@ namespace rs2v {
 using Test = ::native::Test;
 }  // namespace rs2v
 
+// RS2V_TEST_MAIN() emits the per-file entry point used when each test source is
+// built as its own standalone executable. In the consolidated single-binary
+// build (RS2V_TESTS_UNIFIED) every test TU is linked together and one shared
+// main() lives in TestMain.cpp, so the per-file macro must expand to nothing —
+// otherwise we'd have N conflicting definitions of main().
+#ifdef RS2V_TESTS_UNIFIED
+#define RS2V_TEST_MAIN()
+#else
 #define RS2V_TEST_MAIN()                                   \
     int main(int argc, char** argv) {                      \
         return ::native::RunAllTests(argc, argv);          \
     }
+#endif
 
 // ---------------------------------------------------------------------------
 // Core assertion plumbing.

@@ -2,8 +2,13 @@
 # Test suite for the RS2V server emulator.
 #
 # Design constraints (do NOT "simplify" these away):
-#   * Each tests/*Tests.cpp file provides its OWN entry point via the
-#     RS2V_TEST_MAIN() macro. Therefore we build ONE executable per test file.
+#   * By default all test sources are linked into ONE consolidated executable
+#     (rs2v_tests) with a single main() in TestMain.cpp — one process / one
+#     console for the whole suite, not one executable per file. Each source's
+#     RS2V_TEST_MAIN() expands to nothing under RS2V_TESTS_UNIFIED; tests
+#     self-register into a global registry so the single main() runs them all.
+#     (-DRS2V_TESTS_INDIVIDUAL=ON restores one-executable-per-file for isolating
+#     a single suite while debugging.) See the target-creation block at the end.
 #   * The suite uses the RS2V NATIVE test framework (tests/TestFramework.h +
 #     tests/TestMock.h) — a self-contained, dependency-free reimplementation of
 #     the GoogleTest/GoogleMock subset these tests use. There is NO external
@@ -30,22 +35,42 @@
 # exist, it is EXCLUDED rather than rewritten (rewriting would mean inventing
 # new test behavior, which is out of scope).
 
-# Helper: add one test executable per source file, each with its own main().
-# The native framework is header-only, so tests just need the tests/ directory
-# on the include path (for "TestFramework.h" / "TestMock.h") plus rs2v_core.
-function(rs2v_add_test test_name)
-    add_executable(${test_name} ${test_name}.cpp)
-    target_link_libraries(${test_name} PRIVATE rs2v_core Threads::Threads)
-    target_include_directories(${test_name}
+# Test layout (consolidated single-binary runner, the default):
+#
+#   Every test source self-registers its TEST/TEST_F cases into a global
+#   ::native::Registry at static-init time, so they can all be linked into ONE
+#   executable (rs2v_tests) driven by a single main() in TestMain.cpp. That is
+#   one process / one console window for the whole suite, instead of one
+#   executable (and on Windows one console) per test file. Run a subset with
+#   `rs2v_tests --filter=<substr>`; list everything with `rs2v_tests --list`.
+#
+#   Under this build each per-file RS2V_TEST_MAIN() expands to nothing (gated by
+#   the RS2V_TESTS_UNIFIED compile definition) so there is exactly one main().
+#
+#   Set -DRS2V_TESTS_INDIVIDUAL=ON to instead build one standalone executable per
+#   test file (each with its own main via RS2V_TEST_MAIN()) — useful for running
+#   or debugging a single suite in isolation.
+#
+# rs2v_add_test(<name>) just records <name> in the allow-list below; the targets
+# are created once, after the list is complete.
+set(RS2V_TEST_NAMES "")
+macro(rs2v_add_test test_name)
+    list(APPEND RS2V_TEST_NAMES ${test_name})
+endmacro()
+
+# Settings shared by every test target (the consolidated binary or, in
+# individual mode, each per-file executable).
+function(rs2v_apply_test_settings tgt)
+    target_link_libraries(${tgt} PRIVATE rs2v_core Threads::Threads)
+    target_include_directories(${tgt}
         PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR})
     # TestMock.h's MOCK_METHOD relies on Gustedt's ISEMPTY trick to detect a
     # zero-argument arg-list. That requires a conformant preprocessor; MSVC's
     # legacy preprocessor miscounts () as one arg (emits a stray `a0`). Opt the
     # test TUs into the conformant preprocessor so 0-arg mocks compile.
     if(MSVC)
-        target_compile_options(${test_name} PRIVATE /Zc:preprocessor)
+        target_compile_options(${tgt} PRIVATE /Zc:preprocessor)
     endif()
-    add_test(NAME ${test_name} COMMAND ${test_name})
 endfunction()
 
 # -----------------------------------------------------------------------------
@@ -161,3 +186,33 @@ endif()
 #                            require rewriting the thresholds (inventing behavior).
 #                            Also slow (~75-90s). Excluded; build verified.
 # -----------------------------------------------------------------------------
+
+# -----------------------------------------------------------------------------
+# Create the test target(s) from the allow-list accumulated above.
+# -----------------------------------------------------------------------------
+option(RS2V_TESTS_INDIVIDUAL
+       "Build one standalone executable per test file instead of the consolidated rs2v_tests runner"
+       OFF)
+
+if(RS2V_TESTS_INDIVIDUAL)
+    # One executable per test file, each with its own RS2V_TEST_MAIN() entry.
+    foreach(_t IN LISTS RS2V_TEST_NAMES)
+        add_executable(${_t} ${_t}.cpp)
+        rs2v_apply_test_settings(${_t})
+        add_test(NAME ${_t} COMMAND ${_t})
+    endforeach()
+else()
+    # Consolidated single-binary runner: every test source + one shared main().
+    set(_rs2v_test_srcs TestMain.cpp)
+    foreach(_t IN LISTS RS2V_TEST_NAMES)
+        list(APPEND _rs2v_test_srcs ${_t}.cpp)
+    endforeach()
+    add_executable(rs2v_tests ${_rs2v_test_srcs})
+    rs2v_apply_test_settings(rs2v_tests)
+    target_compile_definitions(rs2v_tests PRIVATE RS2V_TESTS_UNIFIED)
+    # A single CTest entry runs the whole suite in one process. The binary still
+    # prints per-test [ OK ]/[ FAILED ] lines, and --output-on-failure surfaces
+    # them in CI. Use `ctest -R rs2v_tests` or run the exe directly with
+    # --filter=<substr> to scope to a subset.
+    add_test(NAME rs2v_tests COMMAND rs2v_tests)
+endif()
