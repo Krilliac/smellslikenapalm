@@ -525,6 +525,12 @@ public:
             .value_or(PacketCodec::kMaxChSequence);
     }
 
+    static size_t Ch2OutstandingCount(
+        const ConnectionManager& manager, uint32_t clientId) {
+        return manager.m_controlState.at(clientId)
+            .ch2Reliable.OutstandingCount();
+    }
+
     static std::vector<uint32_t> QueuedCh2ReliableSequences(
         const ConnectionManager& manager, uint32_t clientId) {
         std::vector<uint32_t> sequences;
@@ -3292,6 +3298,110 @@ TEST_F(ConnectionTravelCuChiRoleIntegrationTest,
     EXPECT_TRUE(Harness::Spawned(manager_, kClientId));
     EXPECT_TRUE(player->IsAlive());
     EXPECT_EQ(Harness::PendingReliableCount(manager_, kClientId), 1u);
+}
+
+TEST_F(ConnectionTravelCuChiRoleIntegrationTest,
+       TicketDepletionRecoveryNeedsTwoCh2SlotsAtomically) {
+    using Harness = ConnectionTravelLifecycleTestHarness;
+    constexpr uint32_t kClientId = 36u;
+    constexpr uint32_t kSouthTeam =
+        RoleSelectionRepl::kCuChiUsServerTeam;
+    constexpr uint32_t kNorthTeam =
+        RoleSelectionRepl::kCuChiNlfServerTeam;
+
+    const std::shared_ptr<ClientConnection> connection =
+        Connect(0u, kClientId, kSouthTeam);
+    ASSERT_TRUE(connection != nullptr);
+    TicketSystem* tickets = Harness::InstallTicketSystem(
+        server_, /*southTickets=*/1u, /*northTickets=*/1u);
+    ASSERT_TRUE(Harness::InstallActiveSupremacyMode(server_) != nullptr);
+    PlayerManager* players = server_.GetPlayerManager();
+    TeamManager* teams = server_.GetTeamManager();
+    ASSERT_TRUE(tickets != nullptr);
+    ASSERT_TRUE(players != nullptr);
+    ASSERT_TRUE(teams != nullptr);
+    const std::shared_ptr<Player> player = players->GetPlayer(kClientId);
+    ASSERT_TRUE(player != nullptr);
+
+    // Reach a real opposite-faction close barrier with a capture-grounded
+    // ChangedRole tuple available for the ticket-depletion UI recovery.
+    Harness::PrepareOwningPawnLifeForFactionSwitch(manager_, kClientId);
+    Harness::DeliverActorBunch(
+        manager_, kClientId, CuChiFinalRoleBunch(/*south=*/true));
+    (void)DrainDecodedPackets(0u);
+    Harness::AcknowledgeAllPendingReliables(manager_, kClientId);
+    Harness::DeliverActorBunch(manager_, kClientId, SpawnSelectBunch());
+    (void)DrainDecodedPackets(0u);
+    Harness::DeliverActorBunch(manager_, kClientId, ReadyBunch());
+    ASSERT_TRUE(Harness::Spawned(manager_, kClientId));
+    const std::optional<uint32_t> initialOpenPacket =
+        Harness::PendingOwningGraphPacket(
+            manager_, kClientId, 209u,
+            /*open=*/true, /*close=*/false);
+    ASSERT_TRUE(initialOpenPacket.has_value());
+    Harness::Acknowledge(manager_, kClientId, *initialOpenPacket);
+
+    Harness::DeliverActorBunch(
+        manager_, kClientId, MakeSelectTeamBunch(/*retail NLF=*/0u));
+    (void)DrainDecodedPackets(0u);
+    Harness::AcknowledgeAllPendingReliables(manager_, kClientId);
+    ASSERT_FALSE(player->IsAlive());
+    ASSERT_EQ(teams->GetPlayerTeam(kClientId), kNorthTeam);
+    Harness::DeliverActorBunch(
+        manager_, kClientId, CuChiFinalRoleBunch(/*south=*/false));
+    (void)DrainDecodedPackets(0u);
+    ASSERT_TRUE(Harness::RoleLedger(manager_, kClientId)
+                    .changedRole.has_value());
+    Harness::AcknowledgeAllPendingReliables(manager_, kClientId);
+    Harness::DeliverActorBunch(manager_, kClientId, SpawnSelectBunch());
+    (void)DrainDecodedPackets(0u);
+    Harness::DeliverActorBunch(manager_, kClientId, ReadyBunch());
+    ASSERT_EQ(Harness::PawnGraphPhase(manager_, kClientId),
+              Harness::OwningGraphPhase::Closing);
+    const std::optional<uint32_t> closePacket =
+        Harness::PendingOwningGraphPacket(
+            manager_, kClientId, 209u,
+            /*open=*/false, /*close=*/true);
+    ASSERT_TRUE(closePacket.has_value());
+
+    // h262 + h210 is one atomic two-sequence recovery. Leaving exactly one
+    // slot must not publish h59, consume a cursor, or emit half the pair.
+    const std::vector<uint32_t> occupied =
+        Harness::ReservePublishedCh2Reliables(
+            manager_, kClientId,
+            PacketCodec::OutboundReliableSequencer::kMaximumOutstanding -
+                1u);
+    ASSERT_EQ(
+        occupied.size(),
+        PacketCodec::OutboundReliableSequencer::kMaximumOutstanding - 1u);
+    const uint32_t ch2CursorBefore =
+        Harness::NextCh2Reliable(manager_, kClientId);
+    const size_t outstandingBefore =
+        Harness::Ch2OutstandingCount(manager_, kClientId);
+    const uint32_t packetBefore =
+        Harness::NextOutboundPacketId(manager_, kClientId);
+    (void)DrainDecodedPackets(0u);
+
+    tickets->SetTickets(kNorthTeam, 0u);
+    Harness::Acknowledge(manager_, kClientId, *closePacket);
+
+    EXPECT_TRUE(connection->IsDisconnected());
+    EXPECT_EQ(Harness::PawnGraphPhase(manager_, kClientId),
+              Harness::OwningGraphPhase::Closed);
+    EXPECT_FALSE(Harness::Spawned(manager_, kClientId));
+    EXPECT_FALSE(player->IsAlive());
+    EXPECT_EQ(Harness::NextCh2Reliable(manager_, kClientId),
+              ch2CursorBefore);
+    EXPECT_EQ(Harness::Ch2OutstandingCount(manager_, kClientId),
+              outstandingBefore);
+    EXPECT_EQ(Harness::NextOutboundPacketId(manager_, kClientId),
+              packetBefore);
+    EXPECT_TRUE(DrainDecodedPackets(0u).empty());
+    const auto depleted = Harness::DeploymentState(manager_, kClientId);
+    ASSERT_TRUE(depleted.has_value());
+    EXPECT_TRUE(depleted->roleFinalized);
+    EXPECT_FALSE(depleted->selectedSpawnId.has_value());
+    EXPECT_FALSE(depleted->deploymentAuthorized);
 }
 
 TEST_F(ConnectionTravelCuChiRoleIntegrationTest,

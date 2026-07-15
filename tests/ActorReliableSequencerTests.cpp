@@ -299,6 +299,30 @@ TEST(ActorReliableSequencer, RetirePendingAdvancesAcrossAckedOldGaps) {
                  ActorReliableSequenceStatus::Released);
 }
 
+TEST(ActorReliableSequencer, RetirePendingAdvancesAcrossSequenceWrap) {
+    ActorReliableSequencer sequencer;
+    constexpr uint32_t kLimit = PacketCodec::kMaxChSequence;
+    ASSERT_TRUE(sequencer.ResetChannel(44, kLimit - 2u));
+
+    ExpectStatus(sequencer.Push(MakeReliable(44, kLimit - 1u, 0xFE)),
+                 ActorReliableSequenceStatus::Buffered);
+    ExpectStatus(sequencer.Push(MakeReliable(44, 1u, 0x01)),
+                 ActorReliableSequenceStatus::Buffered);
+    ASSERT_EQ(sequencer.PendingBunchCount(44), 2u);
+
+    EXPECT_EQ(sequencer.RetirePending(44), 2u);
+    EXPECT_EQ(sequencer.PendingBunchCount(44), 0u);
+    EXPECT_EQ(sequencer.PendingPayloadBytes(), 0u);
+    EXPECT_EQ(sequencer.NextSequence(44), 2u);
+    for (const uint32_t stale :
+         {kLimit - 2u, kLimit - 1u, 0u, 1u}) {
+        ExpectStatus(sequencer.Push(MakeReliable(44, stale)),
+                     ActorReliableSequenceStatus::Stale);
+    }
+    ExpectStatus(sequencer.Push(MakeReliable(44, 2u, 0x02)),
+                 ActorReliableSequenceStatus::Released);
+}
+
 TEST(ActorReliableSequencer, ExactHalfCycleIsStaleLikeUe3MakeRelative) {
     ActorReliableSequencer sequencer;
     ExpectStatus(
