@@ -461,10 +461,16 @@ the 245-bit five-record h167 list, both h147 forms, and the active GRI h32(false
 18-bit payload. Run those gates after building; syntax-only Python validation is not a retail-client
 acceptance test.
 
-For the live installed Compound profile, run `python tools/mock_client.py spawn --profile compound`.
-That profile emits the source-grounded installed Compound h175 role request and validates the
-artifact-rebased pawn, loadout, inventory-manager, h167, and h147 static references instead of the
-canonical Resort-era values.
+For the live installed Compound profile, run
+`python tools/mock_client.py spawn --profile compound --artifact installed`.
+Installed Cu Chi uses
+`python tools/mock_client.py spawn --profile cu-chi --artifact installed`;
+canonical Cu Chi omits `--artifact installed`. The installed profiles validate
+the same artifact-specific pawn, loadout, inventory-manager, h167, and h147
+static-reference graph instead of the canonical Resort-era values. Cu Chi's
+installed h175 role references are source-exact constructions from current
+retail-client `ROGame.u` UClass NetIndices and the installed PackageMap base,
+not payloads observed in a live Cu Chi capture.
 
 **Remaining live-client uncertainty:** h167/h147 restore attachment/paper-doll state, but whether
 they also make the first-person weapon mesh appear is not proven. Validate the client view, weapon

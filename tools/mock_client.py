@@ -25,7 +25,8 @@ Usage:
   python tools/mock_client.py reconnect [--host 127.0.0.1] [--port 7777]
   python tools/mock_client.py spawn [--host 127.0.0.1] [--port 7777] [--linger 30]
   python tools/mock_client.py spawn --team 2
-  python tools/mock_client.py spawn --profile cu-chi  # canonical artifact only
+  python tools/mock_client.py spawn --profile cu-chi  # canonical artifact
+  python tools/mock_client.py spawn --profile cu-chi --artifact installed
   python tools/mock_client.py spawn --profile compound --artifact installed
 """
 import argparse
@@ -742,14 +743,21 @@ COMPOUND_ROLE_REQUESTS = {
     2: ("af94561500180000000080c3b300", 107),
 }
 
-# Source-grounded VNTE-CuChi Territories class-0 requests under the historical
-# role-registry base token 39479. The canonical ROGame package's actual
-# ObjectBase is 39478; do not conflate the two. These preserve the captured
-# 57-bit h175+h451 shape, but use Cu Chi's force-substituted US Grunt / NLF
-# Guerilla CDOs instead of Resort's Skirmish role objects.
+# Source-grounded VNTE-CuChi Territories class-0 requests. The canonical
+# references retain the historical role-registry token 39479. The installed
+# references use current retail-client ROGame.u UClass NetIndices 48013/47921
+# plus installed ObjectBase 39478, cross-validated by the adjacent live
+# Compound _SK references. All four payloads are source-exact constructions in
+# the grounded 57-bit h175+h451 shape, not Cu Chi live-capture payloads.
 CU_CHI_ROLE_REQUESTS = {
-    1: ("af265c150080c301", 57),
-    2: ("af6456150080c301", 57),
+    "canonical": {
+        1: ("af265c150080c301", 57),
+        2: ("af6456150080c301", 57),
+    },
+    "installed": {
+        1: ("af365c150080c301", 57),
+        2: ("af7456150080c301", 57),
+    },
 }
 
 # Source-grounded installed PackageMap layout. RetailBootstrapTests pins the
@@ -804,7 +812,10 @@ def resolve_spawn_wire_contract(team_id=1, profile="resort",
     """Resolve PackageMap-specific owning-pawn validation expectations."""
     contract = resolve_spawn_team(team_id)
     validate_role_spawn_support(profile, artifact_variant)
-    if profile == "compound":
+    if artifact_variant == "installed":
+        # Every supported installed role/spawn pair uses the same grounded
+        # PackageMap graph. Cu Chi changes h175 role identity, not the owning
+        # pawn/loadout/attachment refs used by the installed artifact.
         return COMPOUND_WIRE_CONTRACTS[contract.team_id]
     return SpawnWireContract(
         pawn_class_ref=contract.pawn_class_ref,
@@ -843,13 +854,14 @@ def build_team_selection_bits(team_id=1):
 
 def build_role_selection_bits(team_id=1, profile="resort",
                               artifact_variant="canonical"):
-    """Return the profile- and faction-exact captured final role request."""
+    """Return the grounded profile-, artifact-, and faction-exact request."""
     contract = resolve_spawn_team(team_id)
     validate_role_spawn_support(profile, artifact_variant)
     if profile == "compound":
         payload_hex, payload_bits = COMPOUND_ROLE_REQUESTS[contract.team_id]
     elif profile == "cu-chi":
-        payload_hex, payload_bits = CU_CHI_ROLE_REQUESTS[contract.team_id]
+        payload_hex, payload_bits = CU_CHI_ROLE_REQUESTS[artifact_variant][
+            contract.team_id]
     else:
         payload_hex, payload_bits = contract.role_payload_hex, 57
     return packed_bits(payload_hex, payload_bits)
@@ -933,6 +945,7 @@ ACTOR_BOOTSTRAP_SUPPORT = frozenset(
 ROLE_SPAWN_SUPPORT = frozenset({
     ("resort", "canonical"),
     ("cu-chi", "canonical"),
+    ("cu-chi", "installed"),
     ("compound", "installed"),
 })
 
@@ -1239,11 +1252,12 @@ def spawn(host, port, deployment_wait, expected_objective_values,
         f"SelectTeam(170, retail={team_contract.retail_team_id}, "
         f"server={team_contract.team_id})", team_bits)
 
-    # 6. Pick a role and request deployment. This is a retail-captured,
+    # 6. Pick a role and request deployment. This is a grounded,
     # semantically complete h175 payload whose final optional bCloseMenu bit is
     # true. A bare handle is not a valid SelectRoleByClass call and must not
     # authorize an early spawn. Resort preserves the frame-2533 h175+h451
-    # request; Compound uses its installed live profile's exact role object.
+    # request; Compound uses its installed live profile's exact role object;
+    # Cu Chi uses the artifact-specific source-constructed request above.
     final_role_payload = build_role_selection_bits(
         team_contract.team_id, profile, artifact_variant)
     role_got = ch2_rpc(

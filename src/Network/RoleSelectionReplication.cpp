@@ -168,6 +168,15 @@ GroundedRoleProfile ClassifyGroundedRoleProfile(
   }
 
   if (artifactVariant == kInstalledArtifactVariant &&
+      profileRoleRegistryObjectBase ==
+          RetailBootstrap::kCapturedRoGameObjectBase &&
+      artifactRoGameObjectBase == kInstalledRoGameObjectBase &&
+      EqualsInsensitive(mapUrl, "VNTE-CuChi") &&
+      EqualsInsensitive(modeName, "Territories")) {
+    return GroundedRoleProfile::InstalledCuChi;
+  }
+
+  if (artifactVariant == kInstalledArtifactVariant &&
       profileRoleRegistryObjectBase == 0u &&
       artifactRoGameObjectBase == kInstalledRoGameObjectBase &&
       EqualsInsensitive(mapUrl, "VNSK-Compound") &&
@@ -444,7 +453,8 @@ GroundingResult ResolveGroundedResortInfantry(const SelectRoleByClass &rpc,
 
 GroundingResult ResolveGroundedCuChiInfantry(
     const SelectRoleByClass &rpc, std::string_view mapUrl,
-    std::string_view modeName, uint32_t roGameObjectBase,
+    std::string_view modeName, uint32_t profileRoleRegistryObjectBase,
+    std::string_view artifactVariant, uint32_t artifactRoGameObjectBase,
     uint32_t serverTeamId) {
   GroundingResult result;
   if (!EqualsInsensitive(mapUrl, "VNTE-CuChi")) {
@@ -455,7 +465,21 @@ GroundingResult ResolveGroundedCuChiInfantry(
     result.error = GroundingError::UnsupportedMode;
     return result;
   }
-  if (roGameObjectBase != RetailBootstrap::kCapturedRoGameObjectBase) {
+  if (profileRoleRegistryObjectBase !=
+      RetailBootstrap::kCapturedRoGameObjectBase) {
+    result.error = GroundingError::UnsupportedPackageMapBase;
+    return result;
+  }
+  const bool canonicalArtifact = artifactVariant == kCanonicalArtifactVariant;
+  const bool installedArtifact = artifactVariant == kInstalledArtifactVariant;
+  if (!canonicalArtifact && !installedArtifact) {
+    result.error = GroundingError::UnsupportedArtifactVariant;
+    return result;
+  }
+  const uint32_t expectedArtifactBase =
+      canonicalArtifact ? kCanonicalRoGameObjectBase
+                        : kInstalledRoGameObjectBase;
+  if (artifactRoGameObjectBase != expectedArtifactBase) {
     result.error = GroundingError::UnsupportedPackageMapBase;
     return result;
   }
@@ -470,9 +494,11 @@ GroundingResult ResolveGroundedCuChiInfantry(
     result.error = GroundingError::TeamIntentMismatch;
     return result;
   }
-  const uint32_t expectedObjectRef =
-      southTeam ? kCuChiSouthGruntRoleInfoObjectRef
-                : kCuChiNorthGuerillaRoleInfoObjectRef;
+  const uint32_t expectedObjectRef = installedArtifact
+      ? (southTeam ? kInstalledCuChiSouthGruntRoleInfoObjectRef
+                   : kInstalledCuChiNorthGuerillaRoleInfoObjectRef)
+      : (southTeam ? kCuChiSouthGruntRoleInfoObjectRef
+                   : kCuChiNorthGuerillaRoleInfoObjectRef);
   if (rpc.roleInfoClass.isDynamic ||
       rpc.roleInfoClass.index != expectedObjectRef) {
     result.error = GroundingError::UnsupportedRoleInfoObject;

@@ -97,7 +97,7 @@ class SpawnProfileTests(unittest.TestCase):
             with self.subTest(invalid=invalid), self.assertRaises(ValueError):
                 mock_client.resolve_spawn_team(invalid)
 
-    def test_team_and_role_request_builders_are_capture_exact(self):
+    def test_team_and_role_request_builders_are_grounding_exact(self):
         self.assertEqual(
             self._bits_hex(mock_client.build_team_selection_bits()), "aa0600")
         self.assertEqual(
@@ -124,17 +124,18 @@ class SpawnProfileTests(unittest.TestCase):
             "af94561500180000000080c3b300")
         self.assertEqual(len(compound_north), 107)
 
-        cu_chi_south = mock_client.build_role_selection_bits(
-            1, profile="cu-chi")
-        self.assertEqual(self._bits_hex(cu_chi_south),
-                         "af265c150080c301")
-        self.assertEqual(len(cu_chi_south), 57)
-
-        cu_chi_north = mock_client.build_role_selection_bits(
-            2, profile="cu-chi")
-        self.assertEqual(self._bits_hex(cu_chi_north),
-                         "af6456150080c301")
-        self.assertEqual(len(cu_chi_north), 57)
+        cu_chi_requests = {
+            ("canonical", 1): "af265c150080c301",
+            ("canonical", 2): "af6456150080c301",
+            ("installed", 1): "af365c150080c301",
+            ("installed", 2): "af7456150080c301",
+        }
+        for (artifact, team), expected_hex in cu_chi_requests.items():
+            with self.subTest(profile="cu-chi", artifact=artifact, team=team):
+                request = mock_client.build_role_selection_bits(
+                    team, profile="cu-chi", artifact_variant=artifact)
+                self.assertEqual(self._bits_hex(request), expected_hex)
+                self.assertEqual(len(request), 57)
 
         # Resort's h211(2,3) values are a captured occupancy snapshot. A clean
         # Compound server allocates its first North player to runtime slot 0/0.
@@ -148,6 +149,10 @@ class SpawnProfileTests(unittest.TestCase):
         self.assertEqual(
             mock_client.resolve_north_role_transition_contract("cu-chi"),
             (32, "d2fe731a"))
+        self.assertEqual(
+            mock_client.resolve_north_role_transition_contract(
+                "cu-chi", "installed"),
+            (32, "d2fe731a"))
         with self.assertRaises(ValueError):
             mock_client.resolve_north_role_transition_contract("unknown")
 
@@ -158,7 +163,7 @@ class SpawnProfileTests(unittest.TestCase):
                 mock_client.build_role_selection_bits(
                     1, profile="hue-city", artifact_variant=artifact)
 
-    def test_compound_wire_contracts_pin_installed_package_map_graph(self):
+    def test_installed_wire_contracts_pin_package_map_graph(self):
         south = mock_client.resolve_spawn_wire_contract(
             1, "compound", "installed")
         self.assertEqual(south.pawn_class_ref, 286156)
@@ -252,6 +257,34 @@ class SpawnProfileTests(unittest.TestCase):
             resort.current_attachment_payload_hex,
             mock_client.SOUTH_SPAWN_TEAM.current_attachment_payload_hex)
 
+        for team, compound_wire in ((1, south), (2, north)):
+            with self.subTest(profile="cu-chi", artifact="installed", team=team):
+                self.assertIs(
+                    mock_client.resolve_spawn_wire_contract(
+                        team, "cu-chi", "installed"),
+                    compound_wire)
+
+        for team in (1, 2):
+            with self.subTest(profile="cu-chi", artifact="canonical", team=team):
+                canonical_cu_chi = mock_client.resolve_spawn_wire_contract(
+                    team, "cu-chi", "canonical")
+                canonical_team = mock_client.resolve_spawn_team(team)
+                self.assertEqual(
+                    canonical_cu_chi.pawn_class_ref,
+                    canonical_team.pawn_class_ref)
+                self.assertEqual(
+                    canonical_cu_chi.loadout_class_map,
+                    canonical_team.loadout_class_map)
+                self.assertEqual(
+                    canonical_cu_chi.attachments,
+                    canonical_team.attachments)
+                self.assertEqual(
+                    canonical_cu_chi.attachment_payload_hex,
+                    canonical_team.attachment_payload_hex)
+                self.assertEqual(
+                    canonical_cu_chi.current_attachment_class_ref,
+                    canonical_team.current_attachment_class_ref)
+
     def test_north_attachment_and_tail_literals_decode_semantically(self):
         north = mock_client.NORTH_SPAWN_TEAM
         reader = mock_client.BitReader(
@@ -321,6 +354,7 @@ class SpawnProfileTests(unittest.TestCase):
         expected = frozenset({
             ("resort", "canonical"),
             ("cu-chi", "canonical"),
+            ("cu-chi", "installed"),
             ("compound", "installed"),
         })
         self.assertEqual(mock_client.ROLE_SPAWN_SUPPORT, expected)
@@ -395,6 +429,15 @@ class SpawnProfileTests(unittest.TestCase):
 
         with mock.patch.object(
                 sys, "argv", ["mock_client.py", "spawn", "--profile",
+                              "cu-chi", "--artifact", "installed"]), \
+                mock.patch.object(mock_client, "spawn", return_value=0) as spawn:
+            self.assertEqual(mock_client.main(), 0)
+        spawn.assert_called_once_with(
+            "127.0.0.1", 7777, 35.0, [2, 3, 4, 7, 5, 10, 9], 3,
+            {2, 3, 4, 5, 26}, 0.0, 1, "cu-chi", "installed")
+
+        with mock.patch.object(
+                sys, "argv", ["mock_client.py", "spawn", "--profile",
                               "compound", "--artifact", "installed"]), \
                 mock.patch.object(mock_client, "spawn", return_value=0) as spawn:
             self.assertEqual(mock_client.main(), 0)
@@ -404,7 +447,6 @@ class SpawnProfileTests(unittest.TestCase):
 
         unsupported = (
             ("resort", "installed"),
-            ("cu-chi", "installed"),
             ("hue-city", "canonical"),
             ("hue-city", "installed"),
             ("compound", "canonical"),

@@ -38,6 +38,7 @@ enum class GroundedRoleProfile : uint8_t {
   Unsupported,
   CanonicalResort,
   CanonicalCuChi,
+  InstalledCuChi,
   InstalledCompound,
 };
 
@@ -56,10 +57,14 @@ constexpr uint32_t kResortNorthRiflemanRoleInfoObjectRef = 87396;
 constexpr uint32_t kCuChiSouthGruntRoleInfoObjectRef = 87490;
 constexpr uint32_t kCuChiNorthGuerillaRoleInfoObjectRef = 87398;
 
-// Installed ROGame.u, actual ObjectBase 39478. VNSK-Compound's Skirmish role
+// Installed ROGame.u, actual ObjectBase 39478. The two Cu Chi Territories
+// class-0 UClass references are independently grounded without treating the
+// package's full role registry as proven. VNSK-Compound's Skirmish role
 // registry carries UClass references in the h175 RoleInfoClass parameter.
 constexpr uint32_t kInstalledRoGameObjectBase = 39478;
 constexpr std::string_view kInstalledArtifactVariant = "installed";
+constexpr uint32_t kInstalledCuChiSouthGruntRoleInfoObjectRef = 87491;
+constexpr uint32_t kInstalledCuChiNorthGuerillaRoleInfoObjectRef = 87399;
 constexpr uint8_t kCompoundUsServerTeam = 1;
 constexpr uint8_t kCompoundNlfServerTeam = 2;
 
@@ -67,9 +72,9 @@ constexpr uint8_t kCompoundNlfServerTeam = 2;
 // follow UE profile matching and are case-insensitive; artifact variants are
 // process-policy tokens and therefore exact/case-sensitive. Canonical role
 // profiles additionally require the artifact's global role registry gate.
-// Installed Compound is independently grounded by its exact ten-class table,
-// so its known installed layout remains supported while that global gate is
-// false.
+// Installed Cu Chi's exact class-0 pair and Installed Compound's exact
+// ten-class table are independently grounded, so those bounded installed
+// layouts remain supported while that global gate is false.
 GroundedRoleProfile ClassifyGroundedRoleProfile(
     std::string_view mapUrl, std::string_view modeName,
     uint32_t profileRoleRegistryObjectBase,
@@ -244,13 +249,16 @@ GroundingResult ResolveGroundedResortInfantry(const SelectRoleByClass &rpc,
                                               uint32_t serverTeamId);
 
 // Bind only Cu Chi's source-grounded first-round Territories class-0 role refs.
-// This intentionally does not manufacture ChangedRole or PRI squad/role values:
-// those are live occupancy results, not cooked-map metadata.  The caller must
-// keep the selection fail-closed until it can allocate them from exact runtime
-// squad state.
+// Profile provenance and actual PackageMap layout are separate inputs: the
+// exact artifact variant selects canonical legacy object refs versus installed
+// UClass refs, and a ref from the other layout fails closed. This intentionally
+// does not manufacture ChangedRole or PRI squad/role values: those are live occupancy
+// results, not cooked-map metadata. The caller must keep the selection
+// fail-closed until it can allocate them from exact runtime squad state.
 GroundingResult ResolveGroundedCuChiInfantry(
     const SelectRoleByClass &rpc, std::string_view mapUrl,
-    std::string_view modeName, uint32_t roGameObjectBase,
+    std::string_view modeName, uint32_t profileRoleRegistryObjectBase,
+    std::string_view artifactVariant, uint32_t artifactRoGameObjectBase,
     uint32_t serverTeamId);
 
 // Bind the installed VNSK-Compound Skirmish h175 request to its exact

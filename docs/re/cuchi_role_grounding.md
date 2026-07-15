@@ -6,14 +6,15 @@ value into gameplay solely because nearby indices look plausible.
 
 ## Inputs and read-only provenance
 
-Validated installed inputs on 2026-07-14:
+Validated read-only inputs on 2026-07-14 and 2026-07-15:
 
 | package | bytes | SHA-256 | package GUID |
 |---|---:|---|---|
 | `Maps\CuChi\VNTE-CuChi.roe` | 283,465,712 | `0410B83DB9E34FB145E0418EE634BA924E3BE41A8570502A8717DE19CEA5E2E2` | `1BE145E5457B54A941963282D62E012B` |
-| `BrewedPC\ROGame.u` | 40,986,800 | `34093C828DBB9DA9E709C2845BB9AFF0ED747A7BC954FEC4D76970FF4832305F` | `33EE724F43F851351795FD975E8D5AC1` |
+| capture-compatible `BrewedPCServer\ROGame.u` | 40,986,800 | `34093C828DBB9DA9E709C2845BB9AFF0ED747A7BC954FEC4D76970FF4832305F` | `33EE724F43F851351795FD975E8D5AC1` |
+| current retail-client `BrewedPC\ROGame.u` | 40,989,134 | `AED4E60D406880D048EB579A082F4A44BE3D0B39CFEC47F9FCEF828A40C44961` | `16A6CC8D446C4A9FD5B688B3210DCC82` |
 
-Both before/after hashes remained identical. The map has one `ROMapInfo`
+Read-only inspection left all input hashes unchanged. The map has one `ROMapInfo`
 export: linker index 10022, serial offset 36,844,352, serial size 3,002.
 
 Reproduce the exact two role arrays with:
@@ -74,19 +75,21 @@ This substitution comes from the exact `NorthAltRoleClasses[0]` and
 `SouthAltRoleClasses[0]` defaults in the installed `ROMapInfo.uc`, not from
 numeric adjacency.
 
-## Exact linker identities and conditional wire identities
+## Exact linker identities and artifact-specific wire identities
 
-The installed `ROGame.u` export table gives these class-default-object exports:
+The capture-compatible server package has these relevant class-default-object
+exports:
 
-| role CDO | export / NetIndex |
+| role CDO | export index |
 |---|---:|
 | `Default__RORoleInfoNorthernRifleman` | 47917 |
 | `Default__RORoleInfoNorthernGuerilla` | 47919 |
 | `Default__RORoleInfoSouthernGrunt` | 48011 |
 | `Default__RORoleInfoSouthernGrunt_SK` | 48013 |
 
-The current capture proves `ROGame` PackageMap object base 39479 because both
-known pairs reconcile exactly:
+The canonical compatibility profile remains frozen to those capture-era role
+object indices and historical role-registry token 39479. Both known capture
+pairs reconcile exactly:
 
 ```text
 39479 + 47917 = 87396  (captured Northern Rifleman)
@@ -94,20 +97,38 @@ known pairs reconcile exactly:
 ```
 
 Therefore, **when role grounding uses the same historical +1 registry token**
-recovered from the captured bootstrap, Cu Chi class-0 role objects are exactly:
+recovered from the captured bootstrap, canonical Cu Chi class-0 legacy role
+object references are exactly:
 
 ```text
 North / NLF / Guerilla: 39479 + 47919 = 87398
 South / US / Grunt:     39479 + 48011 = 87490
 ```
 
-The registry-token condition matters. A map import `FPackageIndex` such as
-`-92` is not the wire object reference, and a linker export index alone is not
-the wire object reference. The canonical package's actual `ROGame.ObjectBase`
-is 39478; 39479 is the separately pinned historical +1 token against which the
-role decoder was grounded. The frozen retail profile must retain that token,
-and semantic role grounding rejects every other or unknown value. Do not
-replace it with an artifact layout base without migrating the registry.
+The current retail-client `ROGame.u` has different UClass NetIndices for the
+same two non-Skirmish role classes. The installed PackageMap uses actual
+`ROGame.ObjectBase` 39478:
+
+| role UClass | current NetIndex | installed wire reference |
+|---|---:|---:|
+| `RORoleInfoNorthernGuerilla` | 47921 | 87399 |
+| `RORoleInfoSouthernGrunt` | 48013 | 87491 |
+
+These installed identities are not justified by arithmetic alone. The same
+base maps the adjacent live Compound `_SK` role references at NetIndices
+47923/48015 to 87401/87493, matching the already grounded installed Compound
+h175 requests. Cu Chi source independently selects the non-`_SK` Guerilla and
+Grunt classes for Territories. Together, source selection, exact current
+UClass NetIndices, the frozen installed base, and those adjacent live refs
+ground 87399/87491. The resulting h175 payloads are source-exact constructions,
+not Cu Chi live-capture observations.
+
+The identity source is artifact-specific. A map import `FPackageIndex` such as
+`-92` is not a wire object reference, and a linker NetIndex without the frozen
+PackageMap base is not one either. The canonical package's actual
+`ROGame.ObjectBase` is also 39478, but its legacy 39479 role-registry token must
+not be silently migrated. Semantic grounding requires the exact
+map/mode/team/artifact combination and rejects cross-layout or unknown values.
 
 ## Squads are runtime state, not cooked definitions
 
@@ -149,19 +170,21 @@ prevented Cu Chi and other maps from working correctly:
    map/team/artifact/role authorization remains a separate semantic grounding
    step, so unknown values still fail before authority mutation.
 2. `ResolveGroundedResortInfantry` binds only `VNTE-Resort` and hard-codes both
-   the role object and final PRI squad/role state. The latter is live squad
+   the legacy role object and final PRI squad/role state. The latter is live squad
    state, not map metadata.
-3. The Resort South object is `SouthernGrunt_SK`. That is a Skirmish role CDO;
+3. The Resort South object is `Default__RORoleInfoSouthernGrunt_SK`. That is a
+   Skirmish role class-default object;
    it must not be generalized to a Territories profile without proving the
    actual game-type context that produced the capture.
 
-The bounded canonical C++ path now carries the request through live squad and
-spawn-selection authority:
+The bounded artifact-specific C++ path now carries the request through live
+squad and spawn-selection authority:
 
 1. the decoder structurally admits a nonzero static role object reference, then
    the semantic resolver admits only an exact grounded Resort/Cu Chi identity;
 2. `ResolveGroundedCuChiInfantry` requires exact Cu Chi, Territories, server
-   team/intent, class-0 CDO, and historical role-registry token 39479 inputs;
+   team/intent, class-0 artifact identity, and either canonical historical-token or
+   installed PackageMap provenance;
 3. map activation derives the active 2/4/8/10 squad prefix from the configured
    maximum players while retaining ten stable replication entries per team;
 4. `AutoAssignRetailSquad` transactionally chooses the most populated active,
@@ -176,9 +199,11 @@ spawn-selection authority:
    then recreates the map-local bot manager so reconnects cannot inherit stale
    occupancy.
 
-The exact empty-roster Cu Chi final requests are 57-bit
+The canonical empty-roster Cu Chi final requests are exact 57-bit
 `af265c150080c301` (South/US Grunt, object 87490) and
-`af6456150080c301` (North/NLF Guerilla, object 87398). The first live assignment
+`af6456150080c301` (North/NLF Guerilla, object 87398). The installed
+source-constructed forms are exact 57-bit `af365c150080c301` (South, object
+87491) and `af7456150080c301` (North, object 87399). The first live assignment
 is squad 0, slot 0, so its combined ChangedRole/ChangedSquad payload is the
 32-bit `d2fe731a`; Resort's captured 8/5 and 2/3 occupancy values are never
 reused.
@@ -193,12 +218,13 @@ shared squad occupancy only. Headless bots still lack the cooked
 `bBotSelectable` role tables and AI role-choice policy, so it does not claim a
 source-exact bot class or commander assignment.
 
-This path is deliberately **canonical-only**. Leave
-`RS2V_REPLICATION_BOOTSTRAP_VARIANT` unset when exercising Cu Chi. The installed
-artifact currently advertises `roleRegistryGrounded=false`, so an installed
-Cu Chi h175 request fails closed before role, squad, PRI, or deployment state
-changes. Installed support requires an independently grounded PackageMap role
-registry; export-index arithmetic alone is not sufficient evidence.
+Leave `RS2V_REPLICATION_BOOTSTRAP_VARIANT` unset for canonical compatibility or
+set it to exact `installed` for the current retail-client layout. The installed
+artifact's broad `roleRegistryGrounded` flag remains false: this narrow Cu Chi
+class-0 exception does not claim that a complete installed role registry is
+known. Installed Resort, both Hue City layouts, canonical Compound, non-class-0
+Cu Chi roles, and cross-layout role references still fail before role, squad,
+PRI, or deployment state changes.
 
 ## Canonical live verification (pre-bot-occupancy correction)
 
@@ -224,7 +250,8 @@ owners. Current deterministic coverage pins the default filled-roster result at
 1/1 and separately keeps the empty-roster 0/0 fixture for wire encoding.
 
 Remaining evidence work for full role coverage is mechanical but must stay
-exact: extract all `ROGame.u` role CDO exports, apply the source force/game-mode
-substitution tables, and confirm each connection's PackageMap base. Vehicle and
-pilot roles additionally need tank-selection and spawn-class evidence and are
-not unlocked by the infantry table alone.
+exact: extract the artifact-appropriate `ROGame.u` role UClass or CDO exports,
+apply the source force/game-mode substitution tables, and confirm each
+connection's PackageMap base. Vehicle and pilot roles additionally need
+tank-selection and spawn-class evidence and are not unlocked by the infantry
+table alone.

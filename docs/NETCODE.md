@@ -488,18 +488,20 @@ are separate gates:
 | Exact profile | Canonical actor bootstrap | Installed actor bootstrap | Canonical h175 + spawn | Installed h175 + spawn |
 |---|---:|---:|---:|---:|
 | Resort / Territories | yes | yes | **yes** | no |
-| Cu Chi / Territories | yes | yes | **yes** | no |
+| Cu Chi / Territories | yes | yes | **yes** | **yes** |
 | Hue City / Supremacy | yes | yes | no | no |
 | Compound / Skirmish | yes | yes | no | **yes** |
 
 Thus actor-bootstrap validation remains a full 4x2 matrix, while role/spawn validation
-accepts only canonical Resort, canonical Cu Chi, and installed Compound. Every other pair
-is decoded and rejected by the server before role, squad, PRI, or deployment authority
-can mutate; in particular, Hue City never falls through to Resort's captured role object.
-The mock client fails unsupported pairs even earlier, before opening a socket or authoring
-h175. It exposes the pairing explicitly as `--profile` plus `--artifact`, which must match
-the server's `RS2V_REPLICATION_BOOTSTRAP_VARIANT`; for example
-`spawn --profile cu-chi --artifact canonical` or
+accepts canonical Resort, canonical and installed Cu Chi, and installed Compound. Installed
+Resort, both Hue City layouts, and canonical Compound remain unsupported. They are decoded
+and rejected by the server before role, squad, PRI, or deployment authority can mutate; in
+particular, Hue City never falls through to Resort's captured role object. The mock client
+fails unsupported pairs even earlier, before opening a socket or authoring h175. It exposes
+the pairing explicitly as `--profile` plus `--artifact`, which must match the server's
+`RS2V_REPLICATION_BOOTSTRAP_VARIANT`; for example
+`spawn --profile cu-chi --artifact canonical`,
+`spawn --profile cu-chi --artifact installed`, or
 `spawn --profile compound --artifact installed`.
 
 ### 4.3 Open-bunch (SerializeNewActor) payload layout
@@ -731,14 +733,26 @@ Full RPC timeline (chSeq order, capture-verified): `docs/re/pc_ch2_postjoin_time
 **ClientShowTeamSelect(206) → ClientGotoState(41)**. ChangedTeams/ClientSetHUD/ClientRestart
 are never sent in the menu phase.
 
-### 6.6 Cu Chi h175 uses live squad authority (canonical artifact only)
+### 6.6 Cu Chi h175 uses live squad authority across both artifact layouts
 
-`VNTE-CuChi` Territories accepts only the source-grounded class-0 role CDO for
-the selected server team: object 87490 for South/US Army Grunt and object 87398
-for North/NLF Guerilla under historical role-registry token 39479. The
-canonical ROGame package's actual ObjectBase is 39478; these values are
-deliberately distinct. The final h175 close must be followed by
+`VNTE-CuChi` Territories accepts only the artifact-exact, source-grounded
+class-0 role identity for the selected server team. Canonical compatibility
+keeps object 87490 for South/US Army Grunt and object 87398 for North/NLF
+Guerilla under historical role-registry token 39479. Those legacy references
+align to capture-era class-default-object exports; the canonical package's
+actual ObjectBase remains 39478, so they are deliberately not reinterpreted as
+current UClass references. The installed layout instead uses UClass objects
+87491 and 87399. They are constructed from current retail-client `ROGame.u`
+UClass NetIndices 48013 and 47921 plus installed ObjectBase 39478, and are
+cross-validated by the adjacent live Compound `_SK` role references.
+Cross-layout role objects fail closed. The final h175 close must be followed by
 `ServerAutoSelectSquad` in the same bunch.
+
+The canonical final requests remain 57-bit `af265c150080c301` (South) and
+`af6456150080c301` (North). Installed requests are the exact 57-bit
+`af365c150080c301` and `af7456150080c301`. The installed values are
+source-exact constructions in the already grounded h175+h451 wire shape, not a
+claim that a live Cu Chi exchange was captured.
 
 The server allocates the most populated active, unlocked, non-full retail squad
 and its first free one of six role slots. It then derives h210+h211 and owner-PRI
@@ -747,10 +761,13 @@ On a clean session, squad/slot 0/0 produces the exact 32-bit transition
 `d2fe731a`. A live pawn, wrong faction/team/object, locked/full squad set, or
 publication failure leaves deployment unauthorized.
 
-This Cu Chi path requires the canonical artifact. Leave
-`RS2V_REPLICATION_BOOTSTRAP_VARIANT` unset. The installed candidate still has
-`roleRegistryGrounded=false` and therefore rejects Cu Chi role selection before
-role, squad, PRI, or deployment mutation.
+Leave `RS2V_REPLICATION_BOOTSTRAP_VARIANT` unset for canonical compatibility or
+set it to the exact value `installed` for the current retail-client layout. The
+installed artifact's broad `roleRegistryGrounded` flag remains false because a
+complete general role registry is not proven; the exact Cu Chi
+map/mode/artifact/class-0 pair is admitted through its narrower grounded
+profile. That exception does not unlock installed Resort, either Hue City
+layout, canonical Compound, or any other role class.
 
 ---
 

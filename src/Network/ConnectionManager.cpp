@@ -9524,7 +9524,9 @@ void ConnectionManager::DecodeInboundActorBunch(uint32_t clientId,
             RoleSelectionRepl::GroundedRoleProfile::InstalledCompound;
         const bool isCuChiRoleProfile =
             roleProfile ==
-            RoleSelectionRepl::GroundedRoleProfile::CanonicalCuChi;
+                RoleSelectionRepl::GroundedRoleProfile::CanonicalCuChi ||
+            roleProfile ==
+                RoleSelectionRepl::GroundedRoleProfile::InstalledCuChi;
 
         // Runtime-squad h175 paths apply the role immediately. Accepting one
         // from a pawn already in play would mutate authority while deliberately
@@ -9557,9 +9559,11 @@ void ConnectionManager::DecodeInboundActorBunch(uint32_t clientId,
                 decoded.rpc, profile.mapUrl, serverTeam);
             break;
         case RoleSelectionRepl::GroundedRoleProfile::CanonicalCuChi:
+        case RoleSelectionRepl::GroundedRoleProfile::InstalledCuChi:
             grounded = RoleSelectionRepl::ResolveGroundedCuChiInfantry(
                 decoded.rpc, profile.mapUrl, profile.modeName,
-                profile.roGameObjectBase, serverTeam);
+                profile.roGameObjectBase, selectedArtifact->variant,
+                selectedArtifact->roGame.actualObjectBase, serverTeam);
             break;
         case RoleSelectionRepl::GroundedRoleProfile::InstalledCompound:
             grounded = RoleSelectionRepl::ResolveGroundedCompoundRole(

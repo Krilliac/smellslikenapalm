@@ -94,7 +94,7 @@ TEST(RoleSelectionReplication, ClassifiesOnlyGroundedFourByTwoProfiles) {
        Profile::CanonicalResort, Profile::Unsupported},
       {"VNTE-CuChi", "Territories",
        RetailBootstrap::kCapturedRoGameObjectBase,
-       Profile::CanonicalCuChi, Profile::Unsupported},
+       Profile::CanonicalCuChi, Profile::InstalledCuChi},
       {"VNSU-HueCity", "Supremacy", 0u, Profile::Unsupported,
        Profile::Unsupported},
       {"VNSK-Compound", "Skirmish", 0u, Profile::Unsupported,
@@ -183,6 +183,27 @@ TEST(RoleSelectionReplication, GroundedProfileClassifierRejectsLayoutDrift) {
             Profile::Unsupported);
   EXPECT_EQ(RoleSelectionRepl::ClassifyGroundedRoleProfile(
                 "VNSK-Compound", "Skirmish", 0u, "installed",
+                RoleSelectionRepl::kInstalledRoGameObjectBase + 1u, false),
+            Profile::Unsupported);
+
+  EXPECT_EQ(RoleSelectionRepl::ClassifyGroundedRoleProfile(
+                "VNTE-CuChi", "Territories",
+                RetailBootstrap::kCapturedRoGameObjectBase, "installed",
+                RoleSelectionRepl::kInstalledRoGameObjectBase, false),
+            Profile::InstalledCuChi);
+  EXPECT_EQ(RoleSelectionRepl::ClassifyGroundedRoleProfile(
+                "VNTE-CuChi", "Territories",
+                RetailBootstrap::kCapturedRoGameObjectBase + 1u, "installed",
+                RoleSelectionRepl::kInstalledRoGameObjectBase, false),
+            Profile::Unsupported);
+  EXPECT_EQ(RoleSelectionRepl::ClassifyGroundedRoleProfile(
+                "VNTE-CuChi", "Territories",
+                RetailBootstrap::kCapturedRoGameObjectBase, "Installed",
+                RoleSelectionRepl::kInstalledRoGameObjectBase, false),
+            Profile::Unsupported);
+  EXPECT_EQ(RoleSelectionRepl::ClassifyGroundedRoleProfile(
+                "VNTE-CuChi", "Territories",
+                RetailBootstrap::kCapturedRoGameObjectBase, "installed",
                 RoleSelectionRepl::kInstalledRoGameObjectBase + 1u, false),
             Profile::Unsupported);
 }
@@ -298,6 +319,48 @@ TEST(RoleSelectionReplication, DecodesSourceGroundedCuChiFinalRequests) {
     EXPECT_EQ(decoded.rpc.roleInfoClass.index, entry.roleObjectRef);
     EXPECT_FALSE(decoded.rpc.weaponSelection.presentOnWire);
     EXPECT_TRUE(decoded.rpc.closeMenu);
+  }
+}
+
+TEST(RoleSelectionReplication,
+     DecodesAndGroundsSourceExactInstalledCuChiFinalRequests) {
+  struct InstalledCuChiCase {
+    const char *hex;
+    bool south;
+    uint32_t serverTeam;
+    uint32_t roleObjectRef;
+  };
+  const InstalledCuChiCase cases[] = {
+      {"af365c150080c301", true, RoleSelectionRepl::kCuChiUsServerTeam,
+       RoleSelectionRepl::kInstalledCuChiSouthGruntRoleInfoObjectRef},
+      {"af7456150080c301", false, RoleSelectionRepl::kCuChiNlfServerTeam,
+       RoleSelectionRepl::kInstalledCuChiNorthGuerillaRoleInfoObjectRef},
+  };
+
+  for (const InstalledCuChiCase &entry : cases) {
+    const std::vector<uint8_t> payload = Hex(entry.hex);
+    const auto decoded = RoleSelectionRepl::DecodeRoleSelectionBunch(
+        payload.data(), payload.size(), 57u);
+
+    ASSERT_TRUE(decoded.valid());
+    EXPECT_EQ(decoded.following,
+              RoleSelectionRepl::FollowingRpcPattern::FinalAutoSelectSquad);
+    EXPECT_EQ(decoded.rpc.consumedBits, 48u);
+    EXPECT_EQ(decoded.rpc.southDesired, entry.south);
+    EXPECT_FALSE(decoded.rpc.roleInfoClass.isDynamic);
+    EXPECT_EQ(decoded.rpc.roleInfoClass.index, entry.roleObjectRef);
+    EXPECT_FALSE(decoded.rpc.weaponSelection.presentOnWire);
+    EXPECT_TRUE(decoded.rpc.closeMenu);
+
+    const auto grounded = RoleSelectionRepl::ResolveGroundedCuChiInfantry(
+        decoded.rpc, "VNTE-CuChi", "Territories",
+        RetailBootstrap::kCapturedRoGameObjectBase,
+        RoleSelectionRepl::kInstalledArtifactVariant,
+        RoleSelectionRepl::kInstalledRoGameObjectBase, entry.serverTeam);
+    ASSERT_TRUE(grounded.valid());
+    EXPECT_EQ(grounded.role.roleInfoObjectRef, entry.roleObjectRef);
+    EXPECT_EQ(grounded.role.classIndex,
+              RoleSelectionRepl::kCuChiInfantryClassIndex);
   }
 }
 
@@ -614,6 +677,8 @@ TEST(RoleSelectionReplication,
   EXPECT_EQ(RoleSelectionRepl::ResolveGroundedCuChiInfantry(
                 adjacentDecoded.rpc, "VNTE-CuChi", "Territories",
                 RetailBootstrap::kCapturedRoGameObjectBase,
+                RoleSelectionRepl::kCanonicalArtifactVariant,
+                RoleSelectionRepl::kCanonicalRoGameObjectBase,
                 RoleSelectionRepl::kCuChiUsServerTeam)
                 .error,
             RoleSelectionRepl::GroundingError::UnsupportedRoleInfoObject);
@@ -663,6 +728,8 @@ TEST(RoleSelectionReplication,
       RoleSelectionRepl::ResolveGroundedCuChiInfantry(
           south, "VNTE-CuChi", "Territories",
           RetailBootstrap::kCapturedRoGameObjectBase,
+          RoleSelectionRepl::kCanonicalArtifactVariant,
+          RoleSelectionRepl::kCanonicalRoGameObjectBase,
           RoleSelectionRepl::kCuChiUsServerTeam);
   ASSERT_TRUE(groundedSouth.valid());
   EXPECT_EQ(groundedSouth.role.roleInfoObjectRef,
@@ -680,6 +747,8 @@ TEST(RoleSelectionReplication,
       RoleSelectionRepl::ResolveGroundedCuChiInfantry(
           north, "vnte-cuchi", "territories",
           RetailBootstrap::kCapturedRoGameObjectBase,
+          RoleSelectionRepl::kCanonicalArtifactVariant,
+          RoleSelectionRepl::kCanonicalRoGameObjectBase,
           RoleSelectionRepl::kCuChiNlfServerTeam);
   ASSERT_TRUE(groundedNorth.valid());
   EXPECT_EQ(groundedNorth.role.roleInfoObjectRef,
@@ -688,6 +757,98 @@ TEST(RoleSelectionReplication,
   EXPECT_FALSE(groundedNorth.role.changedRole.has_value());
   EXPECT_EQ(groundedNorth.role.squadIndex, 255u);
   EXPECT_EQ(groundedNorth.role.roleIndex, 255u);
+}
+
+TEST(RoleSelectionReplication,
+     CuChiGroundingRejectsCrossArtifactRoleRefsAndLayoutDrift) {
+  auto requestFor = [](bool south, uint32_t roleObjectRef) {
+    RoleSelectionRepl::SelectRoleByClass rpc;
+    rpc.southDesired = south;
+    rpc.roleInfoClass = {false, roleObjectRef};
+    return rpc;
+  };
+  auto resolve = [&](const RoleSelectionRepl::SelectRoleByClass& rpc,
+                     std::string_view artifactVariant,
+                     uint32_t profileObjectBase,
+                     uint32_t artifactObjectBase,
+                     uint32_t serverTeam) {
+    return RoleSelectionRepl::ResolveGroundedCuChiInfantry(
+        rpc, "VNTE-CuChi", "Territories", profileObjectBase,
+        artifactVariant, artifactObjectBase, serverTeam);
+  };
+
+  struct ArtifactRoleCase {
+    bool south;
+    uint32_t serverTeam;
+    uint32_t canonicalRoleObjectRef;
+    uint32_t installedRoleObjectRef;
+  };
+  const ArtifactRoleCase cases[] = {
+      {true, RoleSelectionRepl::kCuChiUsServerTeam,
+       RoleSelectionRepl::kCuChiSouthGruntRoleInfoObjectRef,
+       RoleSelectionRepl::kInstalledCuChiSouthGruntRoleInfoObjectRef},
+      {false, RoleSelectionRepl::kCuChiNlfServerTeam,
+       RoleSelectionRepl::kCuChiNorthGuerillaRoleInfoObjectRef,
+       RoleSelectionRepl::kInstalledCuChiNorthGuerillaRoleInfoObjectRef},
+  };
+  for (const ArtifactRoleCase &entry : cases) {
+    const auto canonical =
+        requestFor(entry.south, entry.canonicalRoleObjectRef);
+    const auto installed =
+        requestFor(entry.south, entry.installedRoleObjectRef);
+
+    ASSERT_TRUE(resolve(canonical,
+                        RoleSelectionRepl::kCanonicalArtifactVariant,
+                        RetailBootstrap::kCapturedRoGameObjectBase,
+                        RoleSelectionRepl::kCanonicalRoGameObjectBase,
+                        entry.serverTeam)
+                    .valid());
+    EXPECT_EQ(resolve(installed,
+                      RoleSelectionRepl::kCanonicalArtifactVariant,
+                      RetailBootstrap::kCapturedRoGameObjectBase,
+                      RoleSelectionRepl::kCanonicalRoGameObjectBase,
+                      entry.serverTeam)
+                  .error,
+              RoleSelectionRepl::GroundingError::UnsupportedRoleInfoObject);
+
+    ASSERT_TRUE(resolve(installed,
+                        RoleSelectionRepl::kInstalledArtifactVariant,
+                        RetailBootstrap::kCapturedRoGameObjectBase,
+                        RoleSelectionRepl::kInstalledRoGameObjectBase,
+                        entry.serverTeam)
+                    .valid());
+    EXPECT_EQ(resolve(canonical,
+                      RoleSelectionRepl::kInstalledArtifactVariant,
+                      RetailBootstrap::kCapturedRoGameObjectBase,
+                      RoleSelectionRepl::kInstalledRoGameObjectBase,
+                      entry.serverTeam)
+                  .error,
+              RoleSelectionRepl::GroundingError::UnsupportedRoleInfoObject);
+  }
+
+  const auto installedSouth = requestFor(
+      true, RoleSelectionRepl::kInstalledCuChiSouthGruntRoleInfoObjectRef);
+
+  EXPECT_EQ(resolve(installedSouth,
+                    RoleSelectionRepl::kInstalledArtifactVariant,
+                    RetailBootstrap::kCapturedRoGameObjectBase + 1u,
+                    RoleSelectionRepl::kInstalledRoGameObjectBase,
+                    RoleSelectionRepl::kCuChiUsServerTeam)
+                .error,
+            RoleSelectionRepl::GroundingError::UnsupportedPackageMapBase);
+  EXPECT_EQ(resolve(installedSouth,
+                    RoleSelectionRepl::kInstalledArtifactVariant,
+                    RetailBootstrap::kCapturedRoGameObjectBase,
+                    RoleSelectionRepl::kInstalledRoGameObjectBase + 1u,
+                    RoleSelectionRepl::kCuChiUsServerTeam)
+                .error,
+            RoleSelectionRepl::GroundingError::UnsupportedPackageMapBase);
+  EXPECT_EQ(resolve(installedSouth, "Installed",
+                    RetailBootstrap::kCapturedRoGameObjectBase,
+                    RoleSelectionRepl::kInstalledRoGameObjectBase,
+                    RoleSelectionRepl::kCuChiUsServerTeam)
+                .error,
+            RoleSelectionRepl::GroundingError::UnsupportedArtifactVariant);
 }
 
 TEST(RoleSelectionReplication,
@@ -701,7 +862,9 @@ TEST(RoleSelectionReplication,
                      std::string_view map, std::string_view mode,
                      uint32_t objectBase, uint32_t team) {
     return RoleSelectionRepl::ResolveGroundedCuChiInfantry(
-        request, map, mode, objectBase, team);
+        request, map, mode, objectBase,
+        RoleSelectionRepl::kCanonicalArtifactVariant,
+        RoleSelectionRepl::kCanonicalRoGameObjectBase, team);
   };
 
   EXPECT_EQ(resolve(rpc, "VNTE-Resort", "Territories",

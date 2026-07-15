@@ -1702,6 +1702,18 @@ protected:
             57u);
     }
 
+    static PacketCodec::Bunch InstalledCuChiFinalRoleBunch(bool south) {
+        // Source-exact h175 + h451 construction for the installed ROGame.u
+        // class refs. This is grounded package evidence, not a live capture.
+        return MakeCapturedPcBunch(
+            south
+                ? std::vector<uint8_t>{
+                      0xaf, 0x36, 0x5c, 0x15, 0x00, 0x80, 0xc3, 0x01}
+                : std::vector<uint8_t>{
+                      0xaf, 0x74, 0x56, 0x15, 0x00, 0x80, 0xc3, 0x01},
+            57u);
+    }
+
     static PacketCodec::Bunch ResortSouthFinalRoleBunch() {
         // rs2_realserver_capture.pcapng frame 2533, reliable ch2 seq31.
         return MakeCapturedPcBunch(
@@ -1866,11 +1878,25 @@ protected:
         return bunch;
     }
 
-    bool PublishCuChiSpawnSelection(size_t receiverIndex,
-                                    uint32_t clientId,
-                                    bool south) {
+    enum class CuChiArtifactRequest : uint8_t {
+        Canonical,
+        Installed,
+    };
+
+    bool PublishCuChiSpawnSelection(
+        size_t receiverIndex, uint32_t clientId, bool south,
+        CuChiArtifactRequest artifactRequest =
+            CuChiArtifactRequest::Canonical) {
+        if (artifactRequest == CuChiArtifactRequest::Installed &&
+            !ConnectionTravelLifecycleTestHarness::FreezeInstalledCuChiSession(
+                manager_, clientId)) {
+            return false;
+        }
         ConnectionTravelLifecycleTestHarness::DeliverActorBunch(
-            manager_, clientId, CuChiFinalRoleBunch(south));
+            manager_, clientId,
+            artifactRequest == CuChiArtifactRequest::Installed
+                ? InstalledCuChiFinalRoleBunch(south)
+                : CuChiFinalRoleBunch(south));
         (void)DrainDecodedPackets(receiverIndex);
         ConnectionTravelLifecycleTestHarness::AcknowledgeAllPendingReliables(
             manager_, clientId);
@@ -4093,19 +4119,22 @@ TEST_F(ConnectionTravelCuChiRoleIntegrationTest,
 TEST_F(ConnectionTravelCuChiRoleIntegrationTest,
        ExactProfileArtifactMatrixKeepsUnsupportedH175FailureAtomic) {
     using Harness = ConnectionTravelLifecycleTestHarness;
-    enum class CapturedRoleRequest : uint8_t {
+    enum class GroundedRoleRequest : uint8_t {
         ResortSouth,
-        CuChiSouth,
+        CanonicalCuChiSouth,
+        InstalledCuChiSouth,
         InstalledCompoundSouth,
     };
     struct ProfileCase {
         std::string_view mapUrl;
         std::string_view mode;
-        CapturedRoleRequest request;
+        GroundedRoleRequest canonicalRequest;
+        GroundedRoleRequest installedRequest;
         Faction southFaction;
         bool canonicalAccepted;
         bool installedAccepted;
-        uint32_t expectedRoleInfoRef;
+        uint32_t canonicalExpectedRoleInfoRef;
+        uint32_t installedExpectedRoleInfoRef;
         uint8_t expectedClassIndex;
         uint8_t expectedSquadIndex;
         uint8_t expectedRoleIndex;
@@ -4113,27 +4142,32 @@ TEST_F(ConnectionTravelCuChiRoleIntegrationTest,
     };
     const std::array<ProfileCase, 4> profiles{{
         {"VNTE-Resort", "Territories",
-         CapturedRoleRequest::ResortSouth, Faction::USArmy,
-         true, false,
-         RoleSelectionRepl::kResortSouthGruntRoleInfoObjectRef,
+         GroundedRoleRequest::ResortSouth,
+         GroundedRoleRequest::ResortSouth,
+         Faction::USArmy, true, false,
+         RoleSelectionRepl::kResortSouthGruntRoleInfoObjectRef, 0u,
          RoleSelectionRepl::kResortSouthGruntClassIndex,
          RoleSelectionRepl::kResortSouthGruntSquadIndex,
          RoleSelectionRepl::kResortSouthGruntRoleIndex, false},
         {"VNTE-CuChi", "Territories",
-         CapturedRoleRequest::CuChiSouth, Faction::USArmy,
-         true, false,
+         GroundedRoleRequest::CanonicalCuChiSouth,
+         GroundedRoleRequest::InstalledCuChiSouth,
+         Faction::USArmy, true, true,
          RoleSelectionRepl::kCuChiSouthGruntRoleInfoObjectRef,
+         RoleSelectionRepl::kInstalledCuChiSouthGruntRoleInfoObjectRef,
          RoleSelectionRepl::kCuChiInfantryClassIndex, 0u, 0u, true},
         // No Hue City h175 role capture or grounded role registry exists yet.
         // A source-exact, syntactically valid Resort final request is used only
         // to prove that both exact Hue profile/layout cells fail closed before
         // any Resort authority can leak through the generic decoder.
         {"VNSU-HueCity", "Supremacy",
-         CapturedRoleRequest::ResortSouth, Faction::USArmy,
-         false, false, 0u, 0u, 0u, 0u, false},
+         GroundedRoleRequest::ResortSouth,
+         GroundedRoleRequest::ResortSouth,
+         Faction::USArmy, false, false, 0u, 0u, 0u, 0u, 0u, false},
         {"VNSK-Compound", "Skirmish",
-         CapturedRoleRequest::InstalledCompoundSouth, Faction::USMC,
-         false, true,
+         GroundedRoleRequest::InstalledCompoundSouth,
+         GroundedRoleRequest::InstalledCompoundSouth,
+         Faction::USMC, false, true, 0u,
          RoleSelectionRepl::kCompoundSouthGruntRoleClassRef,
          RoleSelectionRepl::kCompoundRiflemanClassIndex, 0u, 0u, true},
     }};
@@ -4206,14 +4240,20 @@ TEST_F(ConnectionTravelCuChiRoleIntegrationTest,
             const bool playerReadyBefore = player->IsReadyToSpawn();
 
             PacketCodec::Bunch request;
-            switch (profile.request) {
-                case CapturedRoleRequest::ResortSouth:
+            const GroundedRoleRequest requestKind = artifact.canonical
+                ? profile.canonicalRequest
+                : profile.installedRequest;
+            switch (requestKind) {
+                case GroundedRoleRequest::ResortSouth:
                     request = ResortSouthFinalRoleBunch();
                     break;
-                case CapturedRoleRequest::CuChiSouth:
+                case GroundedRoleRequest::CanonicalCuChiSouth:
                     request = CuChiFinalRoleBunch(/*south=*/true);
                     break;
-                case CapturedRoleRequest::InstalledCompoundSouth:
+                case GroundedRoleRequest::InstalledCuChiSouth:
+                    request = InstalledCuChiFinalRoleBunch(/*south=*/true);
+                    break;
+                case GroundedRoleRequest::InstalledCompoundSouth:
                     request = InstalledCompoundSouthFinalRoleBunch();
                     break;
             }
@@ -4239,6 +4279,9 @@ TEST_F(ConnectionTravelCuChiRoleIntegrationTest,
             const bool expectedAccepted = artifact.canonical
                 ? profile.canonicalAccepted
                 : profile.installedAccepted;
+            const uint32_t expectedRoleInfoRef = artifact.canonical
+                ? profile.canonicalExpectedRoleInfoRef
+                : profile.installedExpectedRoleInfoRef;
 
             EXPECT_FALSE(connection->IsDisconnected()) << caseLabel;
             EXPECT_EQ(teams->GetPlayerTeam(clientId), teamBefore) << caseLabel;
@@ -4247,7 +4290,7 @@ TEST_F(ConnectionTravelCuChiRoleIntegrationTest,
                 EXPECT_TRUE(ledgerAfter.finalized) << caseLabel;
                 EXPECT_TRUE(ledgerAfter.priClassReplicated) << caseLabel;
                 EXPECT_EQ(ledgerAfter.roleInfoObjectRef,
-                          profile.expectedRoleInfoRef) << caseLabel;
+                          expectedRoleInfoRef) << caseLabel;
                 EXPECT_EQ(ledgerAfter.classIndex,
                           profile.expectedClassIndex) << caseLabel;
                 EXPECT_EQ(ledgerAfter.squadIndex,
@@ -5969,42 +6012,422 @@ TEST_F(ConnectionTravelCuChiRoleIntegrationTest,
 }
 
 TEST_F(ConnectionTravelCuChiRoleIntegrationTest,
-       InstalledArtifactRejectsFinalRoleBeforeAnyAuthorityMutation) {
+       InstalledArtifactSouthAndNorthFinalRequestsCommitRuntimeRoleState) {
     using Harness = ConnectionTravelLifecycleTestHarness;
-    constexpr uint32_t kClientId = 7u;
-    constexpr uint32_t kTeamId = RoleSelectionRepl::kCuChiUsServerTeam;
-    ASSERT_TRUE(Connect(0u, kClientId, kTeamId) != nullptr);
-    ASSERT_TRUE(Harness::FreezeInstalledCuChiSession(manager_, kClientId));
-
+    struct RoleCase {
+        uint32_t clientId;
+        uint32_t teamId;
+        bool south;
+        uint32_t roleInfoRef;
+    };
+    const std::array<RoleCase, 2> cases{{
+        {7u, RoleSelectionRepl::kCuChiUsServerTeam, true,
+         RoleSelectionRepl::kInstalledCuChiSouthGruntRoleInfoObjectRef},
+        {8u, RoleSelectionRepl::kCuChiNlfServerTeam, false,
+         RoleSelectionRepl::kInstalledCuChiNorthGuerillaRoleInfoObjectRef},
+    }};
     RoleSystem* roles = server_.GetRoleSystem();
     ASSERT_TRUE(roles != nullptr);
-    const Harness::RoleLedgerSnapshot before =
-        Harness::RoleLedger(manager_, kClientId);
-    const uint32_t nextReliableBefore =
-        Harness::NextCh2Reliable(manager_, kClientId);
-    const size_t pendingBefore =
-        Harness::PendingReliableCount(manager_, kClientId);
+    for (size_t index = 0u; index < cases.size(); ++index) {
+        const RoleCase& entry = cases[index];
+        const std::shared_ptr<ClientConnection> connection =
+            Connect(index, entry.clientId, entry.teamId);
+        ASSERT_TRUE(connection != nullptr);
+        ASSERT_TRUE(Harness::FreezeInstalledCuChiSession(
+            manager_, entry.clientId));
+        const uint32_t nextReliableBefore =
+            Harness::NextCh2Reliable(manager_, entry.clientId);
 
-    Harness::DeliverActorBunch(
-        manager_, kClientId, CuChiFinalRoleBunch(true));
+        Harness::DeliverActorBunch(
+            manager_, entry.clientId,
+            InstalledCuChiFinalRoleBunch(entry.south));
 
-    EXPECT_TRUE(DrainDecodedPackets(0u).empty());
-    EXPECT_FALSE(roles->GetRetailSquadAssignment(kClientId).has_value());
-    EXPECT_EQ(roles->GetRoleCount(kTeamId, CombatRole::Rifleman), 0);
-    const Harness::RoleLedgerSnapshot after =
-        Harness::RoleLedger(manager_, kClientId);
-    EXPECT_EQ(after.accepted, before.accepted);
-    EXPECT_EQ(after.finalized, before.finalized);
-    EXPECT_EQ(after.priClassReplicated, before.priClassReplicated);
-    EXPECT_EQ(after.roleInfoObjectRef, before.roleInfoObjectRef);
-    EXPECT_EQ(after.classIndex, before.classIndex);
-    EXPECT_EQ(after.squadIndex, before.squadIndex);
-    EXPECT_EQ(after.roleIndex, before.roleIndex);
-    EXPECT_EQ(after.changedRole.has_value(), before.changedRole.has_value());
-    EXPECT_EQ(Harness::NextCh2Reliable(manager_, kClientId),
-              nextReliableBefore);
-    EXPECT_EQ(Harness::PendingReliableCount(manager_, kClientId),
-              pendingBefore);
+        const std::vector<PacketCodec::Packet> packets =
+            DrainDecodedPackets(index);
+        ASSERT_FALSE(packets.empty());
+        for (const PacketCodec::Packet& packet : packets) {
+            ASSERT_TRUE(packet.ok);
+        }
+        const std::vector<PacketCodec::Bunch> wireBunches =
+            FlattenBunches(packets);
+        const PacketCodec::Bunch expectedClass = ExpectedOwnerPriClass(
+            RoleSelectionRepl::kCuChiInfantryClassIndex);
+        const PacketCodec::Bunch expectedTransition = ExpectedChangedRole(
+            RoleSelectionRepl::ChangedRoleEvidence{
+                255u, RoleSelectionRepl::kCuChiInfantryClassIndex,
+                false, true,
+                RoleSelectionRepl::ChangedSquadEvidence{0u, 0u}});
+        const PacketCodec::Bunch expectedAssignment =
+            ExpectedOwnerPriAssignment(0u, 0u);
+        const size_t classPosition =
+            FindWireBunch(wireBunches, expectedClass);
+        const size_t transitionPosition =
+            FindWireBunch(wireBunches, expectedTransition);
+        const size_t assignmentPosition =
+            FindWireBunch(wireBunches, expectedAssignment);
+        ASSERT_LT(classPosition, wireBunches.size());
+        ASSERT_LT(transitionPosition, wireBunches.size());
+        ASSERT_LT(assignmentPosition, wireBunches.size());
+        EXPECT_LT(classPosition, transitionPosition);
+        EXPECT_LT(transitionPosition, assignmentPosition);
+        EXPECT_EQ(wireBunches[transitionPosition].chSequence,
+                  nextReliableBefore);
+
+        const std::optional<RetailSquadAssignment> assignment =
+            roles->GetRetailSquadAssignment(entry.clientId);
+        ASSERT_TRUE(assignment.has_value());
+        EXPECT_EQ(assignment->teamId, entry.teamId);
+        EXPECT_EQ(assignment->squadIndex, 0u);
+        EXPECT_EQ(assignment->roleIndex, 0u);
+        EXPECT_EQ(roles->GetRoleCount(
+                      entry.teamId, CombatRole::Rifleman),
+                  1);
+
+        const Harness::RoleLedgerSnapshot ledger =
+            Harness::RoleLedger(manager_, entry.clientId);
+        EXPECT_TRUE(ledger.accepted);
+        EXPECT_TRUE(ledger.finalized);
+        EXPECT_TRUE(ledger.priClassReplicated);
+        EXPECT_EQ(ledger.roleInfoObjectRef, entry.roleInfoRef);
+        EXPECT_EQ(ledger.classIndex,
+                  RoleSelectionRepl::kCuChiInfantryClassIndex);
+        EXPECT_EQ(ledger.squadIndex, 0u);
+        EXPECT_EQ(ledger.roleIndex, 0u);
+        ASSERT_TRUE(ledger.changedRole.has_value());
+        EXPECT_EQ(ledger.changedRole->squadIndex, 255u);
+        EXPECT_EQ(ledger.changedRole->classIndex,
+                  RoleSelectionRepl::kCuChiInfantryClassIndex);
+        EXPECT_FALSE(ledger.changedRole->showLobby);
+        EXPECT_TRUE(ledger.changedRole->showSpawnSelect);
+        ASSERT_TRUE(ledger.changedRole->followingChangedSquad.has_value());
+        EXPECT_EQ(ledger.changedRole->followingChangedSquad->squadIndex, 0u);
+        EXPECT_EQ(ledger.changedRole->followingChangedSquad->roleIndex, 0u);
+
+        const auto deployment =
+            Harness::DeploymentState(manager_, entry.clientId);
+        ASSERT_TRUE(deployment.has_value());
+        EXPECT_TRUE(deployment->roleFinalized);
+        EXPECT_FALSE(deployment->deploymentAuthorized);
+        EXPECT_EQ(Harness::NextCh2Reliable(manager_, entry.clientId),
+                  nextReliableBefore + 1u);
+        EXPECT_EQ(Harness::PendingReliableCount(manager_, entry.clientId),
+                  static_cast<size_t>(1));
+
+        Harness::RemoveClientSession(manager_, connection);
+        (void)DrainDecodedPackets(index);
+    }
+}
+
+TEST_F(ConnectionTravelCuChiRoleIntegrationTest,
+       InstalledArtifactSouthAndNorthCompleteOwningPawnLifecycle) {
+    using Harness = ConnectionTravelLifecycleTestHarness;
+    struct SpawnCase {
+        uint32_t clientId;
+        uint32_t teamId;
+        bool south;
+        uint32_t roleInfoRef;
+        uint32_t pawnClassRef;
+    };
+    const std::array<SpawnCase, 2> cases{{
+        {9u, RoleSelectionRepl::kCuChiUsServerTeam, true,
+         RoleSelectionRepl::kInstalledCuChiSouthGruntRoleInfoObjectRef,
+         286156u},
+        {10u, RoleSelectionRepl::kCuChiNlfServerTeam, false,
+         RoleSelectionRepl::kInstalledCuChiNorthGuerillaRoleInfoObjectRef,
+         286152u},
+    }};
+    constexpr uint32_t kInstalledInventoryManagerClassRef = 82737u;
+
+    RoleSystem* roles = server_.GetRoleSystem();
+    PlayerManager* players = server_.GetPlayerManager();
+    TeamManager* teams = server_.GetTeamManager();
+    ASSERT_TRUE(roles != nullptr);
+    ASSERT_TRUE(players != nullptr);
+    ASSERT_TRUE(teams != nullptr);
+    ASSERT_TRUE(Harness::InstallActiveSupremacyMode(server_) != nullptr);
+
+    for (size_t index = 0u; index < cases.size(); ++index) {
+        const SpawnCase& entry = cases[index];
+        const std::shared_ptr<ClientConnection> connection = Connect(
+            index, entry.clientId, entry.teamId);
+        ASSERT_TRUE(connection != nullptr);
+        const std::shared_ptr<Player> player =
+            players->GetPlayer(entry.clientId);
+        ASSERT_TRUE(player != nullptr);
+        ASSERT_FALSE(player->IsAlive());
+        const uint32_t ch2BeforeRole =
+            Harness::NextCh2Reliable(manager_, entry.clientId);
+
+        // This detached fixture has no GameServer-owned NetworkManager callback
+        // to advance the manager's life boundary when SpawnSystem commits. Model
+        // that boundary before driving source-exact installed h175 -> ACK ->
+        // h261 spawn-select. The helper freezes the installed artifact and pairs
+        // it with the installed Cu Chi role request.
+        Harness::PrepareOwningPawnLifeForFactionSwitch(
+            manager_, entry.clientId);
+        ASSERT_TRUE(PublishCuChiSpawnSelection(
+            index, entry.clientId, entry.south,
+            CuChiArtifactRequest::Installed));
+
+        EXPECT_FALSE(connection->IsDisconnected());
+        EXPECT_EQ(teams->GetPlayerTeam(entry.clientId), entry.teamId);
+        const Harness::RoleLedgerSnapshot role =
+            Harness::RoleLedger(manager_, entry.clientId);
+        EXPECT_TRUE(role.accepted);
+        EXPECT_TRUE(role.finalized);
+        EXPECT_TRUE(role.priClassReplicated);
+        EXPECT_EQ(role.roleInfoObjectRef, entry.roleInfoRef);
+        EXPECT_EQ(role.classIndex,
+                  RoleSelectionRepl::kCuChiInfantryClassIndex);
+        EXPECT_EQ(role.squadIndex, 0u);
+        EXPECT_EQ(role.roleIndex, 0u);
+        ASSERT_TRUE(role.changedRole.has_value());
+        EXPECT_EQ(role.changedRole->squadIndex, 255u);
+        EXPECT_EQ(role.changedRole->classIndex,
+                  RoleSelectionRepl::kCuChiInfantryClassIndex);
+        ASSERT_TRUE(role.changedRole->followingChangedSquad.has_value());
+        EXPECT_EQ(role.changedRole->followingChangedSquad->squadIndex, 0u);
+        EXPECT_EQ(role.changedRole->followingChangedSquad->roleIndex, 0u);
+
+        const std::optional<RetailSquadAssignment> assignment =
+            roles->GetRetailSquadAssignment(entry.clientId);
+        ASSERT_TRUE(assignment.has_value());
+        EXPECT_EQ(assignment->teamId, entry.teamId);
+        EXPECT_EQ(assignment->squadIndex, 0u);
+        EXPECT_EQ(assignment->roleIndex, 0u);
+
+        auto deployment = Harness::DeploymentState(
+            manager_, entry.clientId);
+        ASSERT_TRUE(deployment.has_value());
+        ASSERT_EQ(deployment->selectedSlot, std::optional<uint8_t>{0u});
+        ASSERT_TRUE(deployment->selectedSpawnId.has_value());
+        const uint32_t selectedSpawnId = *deployment->selectedSpawnId;
+        EXPECT_TRUE(deployment->roleFinalized);
+        EXPECT_EQ(deployment->readyStatus,
+                  DeploymentCoordinator::ReadyStatus::ForceOnly);
+        EXPECT_FALSE(deployment->deploymentAuthorized);
+        EXPECT_FALSE(Harness::DeploymentPrepared(
+            manager_, entry.clientId));
+        EXPECT_EQ(Harness::NextCh2Reliable(manager_, entry.clientId),
+                  ch2BeforeRole + 1u);
+        EXPECT_EQ(Harness::PendingReliableCount(manager_, entry.clientId),
+                  0u);
+
+        // h434 Ready completes authority and publishes the full installed
+        // owning-pawn graph. Inspect the reliable ledger before its graph ACK.
+        const uint32_t ch2BeforeReady =
+            Harness::NextCh2Reliable(manager_, entry.clientId);
+        Harness::DeliverActorBunch(
+            manager_, entry.clientId, ReadyBunch());
+        const std::vector<PacketCodec::Packet> readyPackets =
+            DrainDecodedPackets(index);
+        ASSERT_FALSE(readyPackets.empty());
+        for (const PacketCodec::Packet& packet : readyPackets) {
+            ASSERT_TRUE(packet.ok);
+        }
+
+        EXPECT_FALSE(connection->IsDisconnected());
+        EXPECT_EQ(teams->GetPlayerTeam(entry.clientId), entry.teamId);
+        EXPECT_TRUE(player->IsAlive());
+        EXPECT_TRUE(player->IsReadyToSpawn());
+        EXPECT_TRUE(Harness::Spawned(manager_, entry.clientId));
+        EXPECT_TRUE(Harness::OwningPawnAlive(manager_, entry.clientId));
+        EXPECT_EQ(Harness::PawnGraphPhase(manager_, entry.clientId),
+                  Harness::OwningGraphPhase::Open);
+        EXPECT_EQ(Harness::PawnGraphTeam(manager_, entry.clientId),
+                  entry.teamId);
+
+        deployment = Harness::DeploymentState(manager_, entry.clientId);
+        ASSERT_TRUE(deployment.has_value());
+        EXPECT_TRUE(deployment->roleFinalized);
+        EXPECT_EQ(deployment->selectedSlot, std::optional<uint8_t>{0u});
+        EXPECT_EQ(deployment->selectedSpawnId,
+                  std::optional<uint32_t>{selectedSpawnId});
+        EXPECT_EQ(deployment->readyStatus,
+                  DeploymentCoordinator::ReadyStatus::Ready);
+        EXPECT_TRUE(deployment->deploymentAuthorized);
+        EXPECT_TRUE(Harness::DeploymentPrepared(
+            manager_, entry.clientId));
+
+        ASSERT_EQ(Harness::PendingReliableCount(manager_, entry.clientId),
+                  1u);
+        const std::optional<uint32_t> graphPacket =
+            Harness::PendingOwningGraphPacket(
+                manager_, entry.clientId, 209u,
+                /*open=*/true, /*close=*/false);
+        ASSERT_TRUE(graphPacket.has_value());
+        const std::vector<PacketCodec::Bunch> graph =
+            Harness::QueuedReliableBunches(manager_, entry.clientId);
+        const PacketCodec::Bunch* pawnOpen = FindQueuedOpen(graph, 209u);
+        const PacketCodec::Bunch* inventoryOpen = FindQueuedOpen(graph, 219u);
+        ASSERT_TRUE(pawnOpen != nullptr);
+        ASSERT_TRUE(inventoryOpen != nullptr);
+        bool pawnOverflowed = false;
+        const ActorRepl::NetGUIDRef pawnClass = DecodeLiveOpenClass(
+            *pawnOpen, /*playerController=*/false, pawnOverflowed);
+        EXPECT_FALSE(pawnOverflowed);
+        EXPECT_FALSE(pawnClass.isDynamic);
+        EXPECT_EQ(pawnClass.index, entry.pawnClassRef);
+        bool inventoryOverflowed = false;
+        const ActorRepl::NetGUIDRef inventoryClass = DecodeLiveOpenClass(
+            *inventoryOpen, /*playerController=*/false,
+            inventoryOverflowed);
+        EXPECT_FALSE(inventoryOverflowed);
+        EXPECT_FALSE(inventoryClass.isDynamic);
+        EXPECT_EQ(inventoryClass.index,
+                  kInstalledInventoryManagerClassRef);
+        EXPECT_EQ(Harness::NextOwningGraphReliable(
+                      manager_, entry.clientId, 209u),
+                  6u);
+        EXPECT_EQ(Harness::NextOwningGraphReliable(
+                      manager_, entry.clientId, 219u),
+                  2u);
+        EXPECT_GT(Harness::NextCh2Reliable(manager_, entry.clientId),
+                  ch2BeforeReady);
+
+        Harness::AcknowledgeAllPendingReliables(
+            manager_, entry.clientId);
+        EXPECT_EQ(Harness::PendingReliableCount(manager_, entry.clientId),
+                  0u);
+        EXPECT_FALSE(connection->IsDisconnected());
+        EXPECT_TRUE(Harness::Spawned(manager_, entry.clientId));
+        EXPECT_EQ(Harness::PawnGraphPhase(manager_, entry.clientId),
+                  Harness::OwningGraphPhase::Open);
+        EXPECT_EQ(Harness::PawnGraphTeam(manager_, entry.clientId),
+                  entry.teamId);
+
+        const std::optional<RetailSquadAssignment> assignmentAfterAck =
+            roles->GetRetailSquadAssignment(entry.clientId);
+        ASSERT_TRUE(assignmentAfterAck.has_value());
+        EXPECT_EQ(assignmentAfterAck->teamId, assignment->teamId);
+        EXPECT_EQ(assignmentAfterAck->squadIndex, assignment->squadIndex);
+        EXPECT_EQ(assignmentAfterAck->roleIndex, assignment->roleIndex);
+        EXPECT_EQ(assignmentAfterAck->generation, assignment->generation);
+
+        Harness::RemoveClientSession(manager_, connection);
+        (void)DrainDecodedPackets(index);
+    }
+}
+
+TEST_F(ConnectionTravelCuChiRoleIntegrationTest,
+       CrossArtifactCuChiRoleRequestsFailAtomically) {
+    using Harness = ConnectionTravelLifecycleTestHarness;
+    struct LayoutCase {
+        uint32_t clientId;
+        uint32_t teamId;
+        bool south;
+        bool installedSession;
+    };
+    const std::array<LayoutCase, 4> cases{{
+        {17u, RoleSelectionRepl::kCuChiUsServerTeam, true, false},
+        {18u, RoleSelectionRepl::kCuChiNlfServerTeam, false, false},
+        {19u, RoleSelectionRepl::kCuChiUsServerTeam, true, true},
+        {20u, RoleSelectionRepl::kCuChiNlfServerTeam, false, true},
+    }};
+    RoleSystem* roles = server_.GetRoleSystem();
+    PlayerManager* players = server_.GetPlayerManager();
+    TeamManager* teams = server_.GetTeamManager();
+    ASSERT_TRUE(roles != nullptr);
+    ASSERT_TRUE(players != nullptr);
+    ASSERT_TRUE(teams != nullptr);
+
+    for (size_t index = 0u; index < cases.size(); ++index) {
+        const LayoutCase& entry = cases[index];
+        const size_t receiverIndex = index % 2u;
+        const std::shared_ptr<ClientConnection> connection = Connect(
+            receiverIndex, entry.clientId, entry.teamId);
+        ASSERT_TRUE(connection != nullptr);
+        if (entry.installedSession) {
+            ASSERT_TRUE(Harness::FreezeInstalledCuChiSession(
+                manager_, entry.clientId));
+        }
+        const std::shared_ptr<Player> player =
+            players->GetPlayer(entry.clientId);
+        ASSERT_TRUE(player != nullptr);
+        const uint32_t teamBefore = teams->GetPlayerTeam(entry.clientId);
+        const bool playerAliveBefore = player->IsAlive();
+        const bool playerReadyBefore = player->IsReadyToSpawn();
+        const Harness::RoleLedgerSnapshot before =
+            Harness::RoleLedger(manager_, entry.clientId);
+        const std::optional<RetailSquadAssignment> assignmentBefore =
+            roles->GetRetailSquadAssignment(entry.clientId);
+        const int roleCountBefore = roles->GetRoleCount(
+            entry.teamId, CombatRole::Rifleman);
+        const uint32_t nextReliableBefore =
+            Harness::NextCh2Reliable(manager_, entry.clientId);
+        const size_t pendingBefore =
+            Harness::PendingReliableCount(manager_, entry.clientId);
+        const uint32_t packetIdBefore =
+            Harness::NextOutboundPacketId(manager_, entry.clientId);
+        const auto deploymentBefore =
+            Harness::DeploymentState(manager_, entry.clientId);
+
+        // Each request is source-exact for the opposite frozen artifact. Both
+        // team intents must fail before any transport or gameplay authority can
+        // move: canonical sessions receive installed refs and vice versa.
+        Harness::DeliverActorBunch(
+            manager_, entry.clientId,
+            entry.installedSession
+                ? CuChiFinalRoleBunch(entry.south)
+                : InstalledCuChiFinalRoleBunch(entry.south));
+
+        EXPECT_TRUE(DrainDecodedPackets(receiverIndex).empty());
+        EXPECT_FALSE(connection->IsDisconnected());
+        EXPECT_EQ(teams->GetPlayerTeam(entry.clientId), teamBefore);
+        EXPECT_EQ(player->IsAlive(), playerAliveBefore);
+        EXPECT_EQ(player->IsReadyToSpawn(), playerReadyBefore);
+        EXPECT_EQ(roles->GetRoleCount(
+                      entry.teamId, CombatRole::Rifleman),
+                  roleCountBefore);
+        const std::optional<RetailSquadAssignment> assignmentAfter =
+            roles->GetRetailSquadAssignment(entry.clientId);
+        EXPECT_EQ(assignmentAfter.has_value(), assignmentBefore.has_value());
+        if (assignmentBefore && assignmentAfter) {
+            EXPECT_EQ(assignmentAfter->teamId, assignmentBefore->teamId);
+            EXPECT_EQ(assignmentAfter->squadIndex,
+                      assignmentBefore->squadIndex);
+            EXPECT_EQ(assignmentAfter->roleIndex,
+                      assignmentBefore->roleIndex);
+            EXPECT_EQ(assignmentAfter->generation,
+                      assignmentBefore->generation);
+        }
+        const Harness::RoleLedgerSnapshot after =
+            Harness::RoleLedger(manager_, entry.clientId);
+        EXPECT_EQ(after.accepted, before.accepted);
+        EXPECT_EQ(after.finalized, before.finalized);
+        EXPECT_EQ(after.priClassReplicated, before.priClassReplicated);
+        EXPECT_EQ(after.roleInfoObjectRef, before.roleInfoObjectRef);
+        EXPECT_EQ(after.classIndex, before.classIndex);
+        EXPECT_EQ(after.squadIndex, before.squadIndex);
+        EXPECT_EQ(after.roleIndex, before.roleIndex);
+        EXPECT_EQ(after.changedRole.has_value(), before.changedRole.has_value());
+        EXPECT_EQ(Harness::NextCh2Reliable(manager_, entry.clientId),
+                  nextReliableBefore);
+        EXPECT_EQ(Harness::PendingReliableCount(manager_, entry.clientId),
+                  pendingBefore);
+        EXPECT_EQ(Harness::NextOutboundPacketId(manager_, entry.clientId),
+                  packetIdBefore);
+        const auto deploymentAfter =
+            Harness::DeploymentState(manager_, entry.clientId);
+        EXPECT_EQ(deploymentAfter.has_value(), deploymentBefore.has_value());
+        if (deploymentBefore && deploymentAfter) {
+            EXPECT_EQ(deploymentAfter->generation,
+                      deploymentBefore->generation);
+            EXPECT_EQ(deploymentAfter->roleFinalized,
+                      deploymentBefore->roleFinalized);
+            EXPECT_EQ(deploymentAfter->selectedSlot,
+                      deploymentBefore->selectedSlot);
+            EXPECT_EQ(deploymentAfter->selectedSpawnId,
+                      deploymentBefore->selectedSpawnId);
+            EXPECT_EQ(deploymentAfter->readyStatus,
+                      deploymentBefore->readyStatus);
+            EXPECT_EQ(deploymentAfter->deploymentAuthorized,
+                      deploymentBefore->deploymentAuthorized);
+        }
+
+        Harness::RemoveClientSession(manager_, connection);
+        (void)DrainDecodedPackets(receiverIndex);
+    }
 }
 
 TEST_F(ConnectionTravelCuChiRoleIntegrationTest,

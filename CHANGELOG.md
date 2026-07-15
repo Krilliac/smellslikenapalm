@@ -12,6 +12,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Comprehensive wiki-style documentation (Home, Configuration Reference, Admin Commands, Game Modes, Maps, FAQ)
 - CONTRIBUTING.md with development workflow and coding standards
 - Full CHANGELOG.md and CONTRIBUTORS.md
+- Installed-artifact Cu Chi role/spawn support for both factions. Its exact
+  57-bit h175 requests are source-constructed from the current retail-client
+  `ROGame.u` role UClass NetIndices and installed PackageMap base, and the mock
+  validator uses the installed pawn/loadout/attachment graph; this is not a
+  claim of a live Cu Chi role-selection capture.
 
 ### Changed
 - **Breaking configuration validation:** `[General].server_name` now follows the
