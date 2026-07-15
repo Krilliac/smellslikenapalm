@@ -4,6 +4,7 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
 #include <functional>
 #include <optional>
 #include <string>
@@ -13,6 +14,8 @@
 #include "Math/Vector3.h"
 
 class GameServer;
+class Player;
+class PlayerManager;
 
 enum class SpawnType : uint8_t {
     BaseSpawn,          // Team base spawn (always available)
@@ -81,10 +84,56 @@ public:
     using SquadLeaderEligibilityResolver =
         std::function<bool(uint32_t playerId, const SpawnLocation& location)>;
 
+    // Immutable value token for the gap between authorizing a spawn and
+    // publishing the corresponding owning actor graph. Copies and moves retain
+    // the exact player identity, access state, selected location, and one
+    // precomputed spawn transform captured by PreparePlayerSpawn. Copies are
+    // safe to retain, but the authoritative Dead -> Alive transition makes
+    // the operation one-shot: every replay fails lifecycle validation.
+    class PreparedPlayerSpawn {
+    public:
+        PreparedPlayerSpawn(const PreparedPlayerSpawn&) = default;
+        PreparedPlayerSpawn(PreparedPlayerSpawn&&) noexcept = default;
+        PreparedPlayerSpawn& operator=(const PreparedPlayerSpawn&) = default;
+        PreparedPlayerSpawn& operator=(PreparedPlayerSpawn&&) noexcept = default;
+        ~PreparedPlayerSpawn() = default;
+
+        uint32_t GetPlayerId() const noexcept { return m_playerId; }
+        uint32_t GetSpawnLocationId() const noexcept {
+            return m_spawnLocationId;
+        }
+        const Vector3& GetPosition() const noexcept { return m_position; }
+        const Vector3& GetRotation() const noexcept { return m_rotation; }
+        SpawnType GetSpawnType() const noexcept { return m_location.type; }
+
+    private:
+        friend class SpawnSystem;
+
+        PreparedPlayerSpawn(
+            const SpawnSystem* owner, uint32_t playerId,
+            uint32_t spawnLocationId, std::weak_ptr<Player> playerIdentity,
+            SpawnAccessContext access, SpawnLocation location,
+            Vector3 position, uint64_t playerLifecycleGeneration) noexcept;
+
+        const SpawnSystem* m_owner = nullptr;
+        uint32_t m_playerId = 0;
+        uint32_t m_spawnLocationId = 0;
+        std::weak_ptr<Player> m_playerIdentity;
+        SpawnAccessContext m_access;
+        SpawnLocation m_location;
+        Vector3 m_position;
+        Vector3 m_rotation;
+        uint64_t m_playerLifecycleGeneration = 0;
+    };
+
     explicit SpawnSystem(GameServer* server,
                          AccessContextResolver accessContextResolver = {},
                          SquadLeaderEligibilityResolver
-                             squadLeaderEligibilityResolver = {});
+                             squadLeaderEligibilityResolver = {},
+                         // Explicit dependency-injection seam for detached
+                         // subsystem hosts. Production leaves this null and
+                         // resolves PlayerManager through GameServer.
+                         PlayerManager* playerManagerOverride = nullptr);
     ~SpawnSystem();
 
     void Initialize();
@@ -120,7 +169,16 @@ public:
     // cadence (used when Skirmish objective capture moves its retail schedule).
     void SetWaveTimeRemaining(uint32_t teamId, float seconds);
 
-    // Spawn a player at a chosen location
+    // Prepare performs every fallible identity/access/location check and
+    // chooses the random offset without mutating player, combat, or cooldown
+    // state. Both phases require the authoritative player to remain Dead;
+    // commit revalidates every snapshot before applying the transform and
+    // ordinary PlayerManager spawn transition.
+    std::optional<PreparedPlayerSpawn> PreparePlayerSpawn(
+        uint32_t playerId, uint32_t spawnLocationId) const;
+    bool CommitPreparedPlayerSpawn(const PreparedPlayerSpawn& prepared);
+
+    // Compatibility wrapper for callers that do not need a publication gap.
     bool SpawnPlayer(uint32_t playerId, uint32_t spawnLocationId);
     bool SpawnPlayerAtDefault(uint32_t playerId);
 
@@ -161,6 +219,8 @@ private:
         const SpawnAccessContext& context) const;
     bool IsSquadLeaderInCombat(uint32_t leaderId) const;
     Vector3 GetSpawnOffset(const SpawnLocation& loc) const;
+    PlayerManager* ResolvePlayerManager() const;
     AccessContextResolver m_accessContextResolver;
     SquadLeaderEligibilityResolver m_squadLeaderEligibilityResolver;
+    PlayerManager* m_playerManagerOverride = nullptr;
 };

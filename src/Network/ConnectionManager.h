@@ -162,6 +162,30 @@ public:
 private:
     friend class ConnectionTravelLifecycleTestHarness;
 
+    // UE3 owns one reliable cursor per connection/channel and does not reset it
+    // when an actor channel closes. The whole-graph barrier below is an emulator
+    // coherence policy for switching between the capture-grounded South/North
+    // loadouts; the captures do not contain a same-connection faction switch.
+    enum class OwningPawnGraphPhase : uint8_t {
+        Unopened,
+        Open,
+        Closing,
+        Closed,
+        Broken,
+    };
+    enum class OwningPawnGraphGateResult : uint8_t {
+        Ready,
+        Deferred,
+        Failed,
+    };
+    struct DeferredOwningPawnGraphDeployment {
+        uint64_t deploymentGeneration = 0;
+        uint32_t spawnId = 0;
+        uint32_t teamId = 0;
+    };
+    static constexpr std::array<uint32_t, 7> kOwningPawnGraphChannels{
+        209u, 210u, 211u, 212u, 213u, 214u, 219u};
+
     static bool EvaluateRetailRoundClockPolicy(
         DeploymentCountdown::Phase phase, bool waitForReadyPlayer,
         bool hasJoinedRetailClient, bool hasReadyRetailClient);
@@ -229,8 +253,31 @@ private:
         uint8_t  selectedRoleIndex = 255;
         bool     menuResent = false;   // re-sent ClientShowTeamSelect on client proof-of-life
         bool     spawned = false;      // sent the pawn-spawn + possession once (SelectRoleByClass)
-        bool     pawnGraphOpen = false; // owning pawn/loadout channels may be reused next round
+        bool     pawnGraphOpen = false; // true only while the owning graph is reusable/open
         uint32_t pawnGraphTeamId = 0;  // immutable faction of the open ch209..219 graph
+        OwningPawnGraphPhase pawnGraphPhase = OwningPawnGraphPhase::Unopened;
+        std::array<PacketCodec::OutboundReliableSequencer,
+                   kOwningPawnGraphChannels.size()>
+            owningPawnGraphReliable;
+        std::bitset<ActorRepl::kDynamicChannelMax>
+            owningPawnGraphActiveChannels;
+        std::bitset<ActorRepl::kDynamicChannelMax>
+            owningPawnGraphClosingChannels;
+        std::bitset<ActorRepl::kDynamicChannelMax>
+            owningPawnGraphCloseAcknowledged;
+        std::optional<DeferredOwningPawnGraphDeployment>
+            deferredOwningPawnGraphDeployment;
+        // ACK processing precedes bunch dispatch inside one UE3 packet. Defer
+        // graph completion until packet tail so a later ready/team RPC can
+        // revoke the deployment before authority commits. The ACK-bearing
+        // client PacketId then fences delayed prior-incarnation actor RPCs.
+        bool inboundPacketDispatchActive = false;
+        bool owningPawnGraphCompletionDeferred = false;
+        bool owningPawnGraphInboundPacketFloorValid = false;
+        uint32_t owningPawnGraphInboundPacketFloor = 0u;
+        std::array<std::bitset<PacketCodec::kMaxChSequence>,
+                   kOwningPawnGraphChannels.size()>
+            owningPawnGraphSuppressedInboundReliable;
         // The fixed owning actor channels can survive multiple pawn lives. Keep
         // the authoritative life and the graph/recovery binding explicit so a
         // delayed possession request cannot revive stale per-life state.
@@ -433,12 +480,36 @@ private:
         ControlState& state, uint64_t expectedPawnGeneration,
         uint64_t nowMs);
     static uint64_t AdvanceOwningPawnGeneration(ControlState& state);
+    static uint64_t AnticipatedOwningPawnGeneration(
+        const ControlState& state) noexcept;
     static bool HasLiveOwningPawnGeneration(
         const ControlState& state, uint64_t expectedPawnGeneration);
     static void BindPossessionRecovery(
         ControlState& state, uint64_t pawnGeneration);
     static void InvalidatePossessionRecovery(ControlState& state);
     static void ResetPossessionRecovery(ControlState& state);
+    static std::optional<size_t> OwningPawnGraphChannelIndex(
+        uint32_t channel);
+    static PacketCodec::OutboundReliableSequencer*
+    OwningPawnGraphSequencer(ControlState& state, uint32_t channel);
+    static const PacketCodec::OutboundReliableSequencer*
+    OwningPawnGraphSequencer(const ControlState& state, uint32_t channel);
+    bool EnsureOwningPawnGraphSequencers(uint32_t clientId,
+                                         ControlState& state);
+    bool QueueOwningPawnGraphClose(uint32_t clientId);
+    OwningPawnGraphGateResult GateOwningPawnGraphForDeployment(
+        uint32_t clientId, uint32_t teamId, uint32_t spawnId);
+    void CompleteOwningPawnGraphClose(
+        uint32_t clientId,
+        std::optional<uint32_t> inboundBarrierPacketId = std::nullopt);
+    void FailOwningPawnGraph(uint32_t clientId, const char* context);
+    bool PreflightPawnSpawn(uint32_t clientId,
+                            uint64_t expectedPawnGeneration,
+                            const Vector3& spawnLocation);
+    bool ProcessPawnSpawn(uint32_t clientId,
+                          uint64_t expectedPawnGeneration,
+                          const Vector3& spawnLocation,
+                          bool preflightOnly);
 
     std::unordered_map<uint32_t, ControlState> m_controlState;
     uint32_t m_nextClientId{1};
@@ -530,6 +601,9 @@ private:
     };
 
     DeploymentPhaseState GetDeploymentPhaseState() const;
+    static bool IsDeploymentWindowOpen(
+        const DeploymentPhaseState& state) noexcept;
+    void RevokePreparedDeploymentAuthorization(uint32_t clientId);
     std::vector<uint32_t> GetAvailableSpawnIds(uint32_t clientId) const;
     std::vector<uint32_t> GetCurrentAdvertisedSpawnIds(uint32_t clientId) const;
     std::vector<uint32_t> GetAdvertisedSpawnIds(uint32_t clientId) const;
@@ -543,7 +617,8 @@ private:
         const RoleSelectionRepl::ChangedSquadEvidence& evidence);
     void SynchronizeRetailSquadAssignments();
     bool SendChangedRoleSpawnSelect(uint32_t clientId,
-                                    bool includeOwnerPriAssignment = false);
+                                    bool includeOwnerPriAssignment = false,
+                                    bool includeTempStopAutoSpawn = false);
     void SendPriSpawnSelection(uint32_t clientId, uint8_t encodedSelection);
     bool SendShowRoundStartScreen(uint32_t clientId, uint32_t displaySeconds);
     bool SendHideRoundStartScreen(uint32_t clientId);
@@ -555,6 +630,7 @@ private:
         Failed,
         AlreadyOpen,
         OpenQueued,
+        UpdateQueued,
     };
 
     bool BuildRemoteParticipantInitialState(
@@ -620,8 +696,10 @@ private:
     // Dispatch one non-control-channel bunch. Reliable actor bunches are ordered
     // and deduplicated per channel before DecodeInboundActorBunch; unreliable
     // traffic retains datagram order and is never held behind a reliable gap.
-    void DispatchInboundActorBunch(uint32_t clientId,
-                                   const PacketCodec::Bunch& bunch);
+    void DispatchInboundActorBunch(
+        uint32_t clientId, const PacketCodec::Bunch& bunch,
+        bool suppressOwningGraphSemantics = false,
+        bool suppressReleasedCohort = false);
 
     // ---- Reliable retransmission ------------------------------------------------
     // Build ONE packet from `bunches`, send it, and record any reliable bunches for

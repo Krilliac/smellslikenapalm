@@ -18,6 +18,7 @@
 #include "Game/SpawnSystem.h"
 #include "Game/SupremacyMode.h"
 #include "Game/TeamManager.h"
+#include "Game/TicketSystem.h"
 #include "TelemetryManager.h"
 #include "Utils/Logger.h"
 
@@ -92,6 +93,8 @@ public:
     }
 
     static void ResetRoleSelectionRuntime(GameServer& server) {
+        server.m_supremacyMode.reset();
+        server.m_ticketSystem.reset();
         server.m_botManager.reset();
         server.m_spawnSystem.reset();
         server.m_roleSystem.reset();
@@ -102,6 +105,24 @@ public:
 
     static void InstallProductionBotFill(GameServer& server) {
         server.InitializeBotsForCurrentMap();
+    }
+
+    static SupremacyMode* InstallActiveSupremacyMode(GameServer& server) {
+        server.m_supremacyMode = std::make_unique<SupremacyMode>(&server);
+        server.m_supremacyMode->Initialize();
+        server.m_supremacyMode->StartRound();
+        server.m_supremacyMode->Update(
+            server.m_supremacyMode->GetPhaseTimeRemaining());
+        return server.m_supremacyMode.get();
+    }
+
+    static TicketSystem* InstallTicketSystem(
+        GameServer& server, uint32_t southTickets,
+        uint32_t northTickets) {
+        server.m_ticketSystem = std::make_unique<TicketSystem>(&server);
+        server.m_ticketSystem->Initialize(
+            southTickets, northTickets);
+        return server.m_ticketSystem.get();
     }
 
     static bool AttachRoleSelectionPlayer(
@@ -371,9 +392,130 @@ public:
         return manager.m_controlState.at(clientId).spawned;
     }
 
+    enum class OwningGraphPhase : uint8_t {
+        Unopened,
+        Open,
+        Closing,
+        Closed,
+        Broken,
+    };
+
+    static OwningGraphPhase PawnGraphPhase(
+        const ConnectionManager& manager, uint32_t clientId) {
+        return static_cast<OwningGraphPhase>(static_cast<uint8_t>(
+            manager.m_controlState.at(clientId).pawnGraphPhase));
+    }
+
+    static uint32_t PawnGraphTeam(
+        const ConnectionManager& manager, uint32_t clientId) {
+        return manager.m_controlState.at(clientId).pawnGraphTeamId;
+    }
+
+    static uint32_t NextOwningGraphReliable(
+        const ConnectionManager& manager, uint32_t clientId,
+        uint32_t channel) {
+        const auto* sequencer = ConnectionManager::OwningPawnGraphSequencer(
+            manager.m_controlState.at(clientId), channel);
+        return sequencer
+            ? sequencer->NextSequence().value_or(
+                  PacketCodec::kMaxChSequence)
+            : PacketCodec::kMaxChSequence;
+    }
+
+    static std::vector<uint32_t> PendingOwningGraphSequences(
+        const ConnectionManager& manager, uint32_t clientId,
+        uint32_t channel, bool openOnly = false, bool closeOnly = false) {
+        std::vector<uint32_t> sequences;
+        for (const auto& pending :
+             manager.m_controlState.at(clientId).pendingReliable) {
+            for (const PacketCodec::Bunch& bunch : pending.bunches) {
+                if (!bunch.bReliable || bunch.chIndex != channel ||
+                    (openOnly && !bunch.bOpen) ||
+                    (closeOnly && !bunch.bClose)) {
+                    continue;
+                }
+                sequences.push_back(bunch.chSequence);
+            }
+        }
+        return sequences;
+    }
+
+    static std::optional<uint32_t> PendingOwningGraphPacket(
+        const ConnectionManager& manager, uint32_t clientId,
+        uint32_t channel, bool open, bool close) {
+        for (const auto& pending :
+             manager.m_controlState.at(clientId).pendingReliable) {
+            const bool matches = std::any_of(
+                pending.bunches.begin(), pending.bunches.end(),
+                [channel, open, close](const PacketCodec::Bunch& bunch) {
+                    return bunch.bReliable && bunch.chIndex == channel &&
+                           (!open || bunch.bOpen) &&
+                           (!close || bunch.bClose);
+                });
+            if (matches && !pending.packetIds.empty()) {
+                return pending.packetIds.front();
+            }
+        }
+        return std::nullopt;
+    }
+
+    static void PrepareOwningPawnLifeForFactionSwitch(
+        ConnectionManager& manager, uint32_t clientId) {
+        auto& state = manager.m_controlState.at(clientId);
+        state.spawned = false;
+        state.owningPawnAlive = false;
+        state.deferredOwningPawnGraphDeployment.reset();
+        ConnectionManager::InvalidatePossessionRecovery(state);
+        (void)ConnectionManager::AdvanceOwningPawnGeneration(state);
+        state.owningPawnAlive = true;
+    }
+
+    static void ModelOwningPawnSpawnCallback(
+        ConnectionManager& manager, uint32_t clientId) {
+        auto& state = manager.m_controlState.at(clientId);
+        state.owningPawnAlive = false;
+        (void)ConnectionManager::AdvanceOwningPawnGeneration(state);
+        state.owningPawnAlive = true;
+    }
+
+    static std::optional<uint32_t> PrepareDeploymentForCurrentTeam(
+        ConnectionManager& manager, uint32_t clientId) {
+        const std::vector<uint32_t> available =
+            manager.GetAvailableSpawnIds(clientId);
+        if (available.empty()) return std::nullopt;
+        manager.m_deploymentCoordinator.ResetClient(clientId);
+        manager.m_deploymentCoordinator.FinalizeRole(clientId);
+        if (manager.m_deploymentCoordinator.SelectSpawn(
+                clientId, 128u, available) !=
+            DeploymentCoordinator::SelectionResult::Accepted) {
+            return std::nullopt;
+        }
+        const auto ready = manager.m_deploymentCoordinator.SetReadyStatus(
+            clientId, DeploymentCoordinator::ReadyStatus::Ready,
+            available);
+        return ready.IsNewAuthorization() ? ready.spawnId : std::nullopt;
+    }
+
+    static bool ExecutePreparedDeployment(ConnectionManager& manager,
+                                          uint32_t clientId,
+                                          uint32_t spawnId) {
+        return manager.ExecutePreparedDeployment(clientId, spawnId);
+    }
+
     static uint64_t OwningPawnGeneration(
         const ConnectionManager& manager, uint32_t clientId) {
         return manager.m_controlState.at(clientId).owningPawnGeneration;
+    }
+
+    static bool OwningPawnAlive(const ConnectionManager& manager,
+                                uint32_t clientId) {
+        return manager.m_controlState.at(clientId).owningPawnAlive;
+    }
+
+    static bool HasDeferredOwningPawnDeployment(
+        const ConnectionManager& manager, uint32_t clientId) {
+        return manager.m_controlState.at(clientId)
+            .deferredOwningPawnGraphDeployment.has_value();
     }
 
     static uint32_t NextCh2Reliable(
@@ -403,6 +545,15 @@ public:
 
     static void BeginDeploymentGeneration(ConnectionManager& manager) {
         manager.BeginDeploymentGeneration();
+    }
+
+    static void ResetDetachedDeploymentClient(ConnectionManager& manager,
+                                              uint32_t clientId) {
+        // Handler-only fixtures have no RoleSystem evidence from which the
+        // production round-generation path can republish ChangedRole. Reset
+        // just the coordinator so these tests isolate h261/h434 wire order.
+        manager.m_deploymentCoordinator.ResetClient(clientId);
+        manager.m_deploymentCoordinator.FinalizeRole(clientId);
     }
 
     static std::optional<DeploymentCoordinator::ClientStateSnapshot>
@@ -533,6 +684,14 @@ public:
         manager.OnClientAck(clientId, packetId);
     }
 
+    static void AcknowledgeAllPendingReliables(
+        ConnectionManager& manager, uint32_t clientId) {
+        auto& pending = manager.m_controlState.at(clientId).pendingReliable;
+        while (!pending.empty() && !pending.front().packetIds.empty()) {
+            manager.OnClientAck(clientId, pending.front().packetIds.front());
+        }
+    }
+
     static DeploymentRepl::RetailParticipantInitialState RemoteParticipant(
         const ParticipantId& participant, uint8_t serverTeamId = 1) {
         DeploymentRepl::RetailParticipantInitialState state;
@@ -574,6 +733,84 @@ public:
                                   .remoteParticipants.Find(participant);
         if (!binding || !binding->priDeadWireValid) return std::nullopt;
         return binding->priDeadWireValue;
+    }
+
+    static void SynchronizeRemoteParticipantPris(
+        ConnectionManager& manager, uint32_t viewerClientId) {
+        manager.SynchronizeRemoteParticipantPris(viewerClientId);
+    }
+
+    static std::optional<uint32_t> RemotePawnChannel(
+        const ConnectionManager& manager, uint32_t viewerClientId,
+        const ParticipantId& participant) {
+        const auto* binding = manager.m_controlState.at(viewerClientId)
+                                  .remoteParticipants.Find(participant);
+        if (!binding) return std::nullopt;
+        return binding->pawnChannel;
+    }
+
+    static std::optional<uint32_t> RemotePriTeamInfoChannel(
+        const ConnectionManager& manager, uint32_t viewerClientId,
+        const ParticipantId& participant) {
+        const auto* binding = manager.m_controlState.at(viewerClientId)
+                                  .remoteParticipants.Find(participant);
+        if (!binding || !binding->priTeamWireValid) return std::nullopt;
+        return binding->priTeamInfoChannel;
+    }
+
+    static std::optional<uint32_t> RemotePawnServerTeam(
+        const ConnectionManager& manager, uint32_t viewerClientId,
+        const ParticipantId& participant) {
+        const auto* binding = manager.m_controlState.at(viewerClientId)
+                                  .remoteParticipants.Find(participant);
+        if (!binding || !binding->pawnServerTeamValid) return std::nullopt;
+        return binding->pawnServerTeamId;
+    }
+
+    static std::optional<uint32_t> SeedRemotePawnBindingOpen(
+        ConnectionManager& manager, uint32_t viewerClientId,
+        const ParticipantId& participant, uint32_t serverTeamId) {
+        auto& remotes = manager.m_controlState.at(viewerClientId)
+                            .remoteParticipants;
+        ParticipantActorChannelBinding* binding = remotes.Find(participant);
+        if (!binding || binding->priState != ParticipantActorOpenState::Open ||
+            binding->pawnState != ParticipantActorOpenState::Unopened) {
+            return std::nullopt;
+        }
+        const std::optional<uint32_t> openingSequence =
+            remotes.NextPawnReliableSequence(participant);
+        if (!openingSequence) return std::nullopt;
+        const uint32_t generation = binding->pawnGeneration;
+        if (!remotes.MarkPawnOpen(participant, generation)) return std::nullopt;
+        binding = remotes.Find(participant);
+        if (!binding) return std::nullopt;
+        binding->pawnServerTeamValid = true;
+        binding->pawnServerTeamId = serverTeamId;
+        return openingSequence;
+    }
+
+    static uint32_t NextInboundActorReliable(
+        const ConnectionManager& manager, uint32_t clientId,
+        uint32_t channel) {
+        return manager.m_controlState.at(clientId)
+            .actorReliableInbound.NextSequence(channel);
+    }
+
+    static bool MantlePawnStarted(const ConnectionManager& manager,
+                                  uint32_t clientId) {
+        return manager.m_controlState.at(clientId).mantlePawnStarted;
+    }
+
+    static bool WeaponFiring(const ConnectionManager& manager,
+                             uint32_t clientId, uint32_t channel) {
+        if (channel < 210u || channel > 214u) return false;
+        return manager.m_controlState.at(clientId)
+            .weaponIntent[channel - 210u].firing;
+    }
+
+    static uint32_t ActiveWeaponChannel(const ConnectionManager& manager,
+                                        uint32_t clientId) {
+        return manager.m_controlState.at(clientId).activeWeaponChannel;
     }
 
     static void DeliverActorBunch(ConnectionManager& manager,
@@ -1031,6 +1268,19 @@ protected:
             writer.GetBytes(), static_cast<uint32_t>(writer.NumBits()));
     }
 
+    static PacketCodec::Bunch ForceOnlyBunch() {
+        BitWriter writer;
+        writer.SerializeInt(
+            DeploymentRepl::kServerSetReadyToSpawnHandle,
+            DeploymentRepl::kRoPlayerControllerMaxHandle);
+        writer.WriteBit(true);
+        writer.WriteBits(static_cast<uint8_t>(
+            DeploymentCoordinator::ReadyStatus::ForceOnly),
+            DeploymentRepl::kReadyStatusBits);
+        return MakeCapturedPcBunch(
+            writer.GetBytes(), static_cast<uint32_t>(writer.NumBits()));
+    }
+
     std::vector<PacketCodec::Packet> DrainDecodedPackets(
         size_t receiverIndex) {
         UDPSocket* receiver = Receiver(receiverIndex);
@@ -1092,6 +1342,18 @@ protected:
         bunch.chIndex = 2u;
         bunch.payload = RoleSelectionRepl::EncodeChangedRoleTransition(
             evidence, bunch.payloadBits);
+        return bunch;
+    }
+
+    static PacketCodec::Bunch ExpectedTempStopAutoSpawn() {
+        BitWriter writer;
+        writer.SerializeInt(262u,
+                            DeploymentRepl::kRoPlayerControllerMaxHandle);
+        PacketCodec::Bunch bunch;
+        bunch.bReliable = true;
+        bunch.chIndex = 2u;
+        bunch.payload = writer.GetBytes();
+        bunch.payloadBits = static_cast<uint32_t>(writer.NumBits());
         return bunch;
     }
 
@@ -2192,6 +2454,1173 @@ TEST_F(ConnectionTravelCuChiRoleIntegrationTest,
 }
 
 TEST_F(ConnectionTravelCuChiRoleIntegrationTest,
+       SameConnectionFactionSwitchDrainsGraphAndPreservesReliableCursors) {
+    using Harness = ConnectionTravelLifecycleTestHarness;
+    constexpr uint32_t kClientId = 31u;
+    constexpr uint32_t kSouthTeam =
+        RoleSelectionRepl::kCuChiUsServerTeam;
+    constexpr uint32_t kNorthTeam =
+        RoleSelectionRepl::kCuChiNlfServerTeam;
+
+    ASSERT_TRUE(Connect(0u, kClientId, kSouthTeam) != nullptr);
+    PlayerManager* players = server_.GetPlayerManager();
+    TeamManager* teams = server_.GetTeamManager();
+    ASSERT_TRUE(players != nullptr);
+    ASSERT_TRUE(teams != nullptr);
+    SupremacyMode* supremacy =
+        Harness::InstallActiveSupremacyMode(server_);
+    ASSERT_TRUE(supremacy != nullptr);
+    ASSERT_EQ(supremacy->GetPhase(), SupremacyMode::Phase::Active);
+    const std::shared_ptr<Player> player = players->GetPlayer(kClientId);
+    ASSERT_TRUE(player != nullptr);
+    EXPECT_FALSE(player->IsAlive());
+
+    Harness::PrepareOwningPawnLifeForFactionSwitch(
+        manager_, kClientId);
+    const std::optional<uint32_t> initialSouthSpawn =
+        Harness::PrepareDeploymentForCurrentTeam(
+            manager_, kClientId);
+    ASSERT_TRUE(initialSouthSpawn.has_value());
+    ASSERT_TRUE(Harness::ExecutePreparedDeployment(
+        manager_, kClientId, *initialSouthSpawn));
+    EXPECT_EQ(Harness::PawnGraphPhase(manager_, kClientId),
+              Harness::OwningGraphPhase::Open);
+    EXPECT_EQ(Harness::PawnGraphTeam(manager_, kClientId), kSouthTeam);
+    EXPECT_TRUE(Harness::Spawned(manager_, kClientId));
+    EXPECT_TRUE(player->IsAlive());
+
+    const auto expectPendingSequences =
+        [this](uint32_t channel,
+               std::initializer_list<uint32_t> expected) {
+            EXPECT_EQ(
+                ConnectionTravelLifecycleTestHarness::
+                    PendingOwningGraphSequences(
+                        manager_, kClientId, channel),
+                std::vector<uint32_t>(expected));
+        };
+    const auto expectPendingClose =
+        [this](uint32_t channel,
+               std::initializer_list<uint32_t> expected) {
+            EXPECT_EQ(
+                ConnectionTravelLifecycleTestHarness::
+                    PendingOwningGraphSequences(
+                        manager_, kClientId, channel,
+                        /*openOnly=*/false, /*closeOnly=*/true),
+                std::vector<uint32_t>(expected));
+        };
+
+    // Current-emitter oracle: these values are derived from the persistent
+    // per-channel sequencers. They are emulator invariants, not constants
+    // copied from a retail same-connection faction switch (none was captured).
+    expectPendingSequences(209u, {1u, 2u, 3u, 4u, 5u});
+    for (const uint32_t channel :
+         std::array<uint32_t, 5>{210u, 211u, 212u, 213u, 214u}) {
+        expectPendingSequences(channel, {1u, 2u});
+        EXPECT_EQ(Harness::NextOwningGraphReliable(
+                      manager_, kClientId, channel),
+                  3u);
+    }
+    expectPendingSequences(219u, {1u});
+    EXPECT_EQ(Harness::NextOwningGraphReliable(
+                  manager_, kClientId, 209u),
+              6u);
+    EXPECT_EQ(Harness::NextOwningGraphReliable(
+                  manager_, kClientId, 219u),
+              2u);
+    const std::optional<uint32_t> southOpenPacket =
+        Harness::PendingOwningGraphPacket(
+            manager_, kClientId, 209u,
+            /*open=*/true, /*close=*/false);
+    ASSERT_TRUE(southOpenPacket.has_value());
+    ASSERT_EQ(Harness::PendingReliableCount(manager_, kClientId), 1u);
+
+    players->OnPlayerDeath(kClientId);
+    ASSERT_FALSE(player->IsAlive());
+    teams->AddPlayerToTeam(kClientId, kNorthTeam);
+    Harness::PrepareOwningPawnLifeForFactionSwitch(
+        manager_, kClientId);
+    const std::optional<uint32_t> northSpawn =
+        Harness::PrepareDeploymentForCurrentTeam(
+            manager_, kClientId);
+    ASSERT_TRUE(northSpawn.has_value());
+
+    // The opposite graph cannot mutate authoritative spawn state until every
+    // prior reliable and every close in the South cohort has drained.
+    EXPECT_FALSE(Harness::ExecutePreparedDeployment(
+        manager_, kClientId, *northSpawn));
+    EXPECT_EQ(Harness::PawnGraphPhase(manager_, kClientId),
+              Harness::OwningGraphPhase::Closing);
+    EXPECT_EQ(Harness::PawnGraphTeam(manager_, kClientId), kSouthTeam);
+    EXPECT_FALSE(Harness::Spawned(manager_, kClientId));
+    ASSERT_EQ(Harness::PendingReliableCount(manager_, kClientId), 2u);
+    expectPendingClose(209u, {6u});
+    for (const uint32_t channel :
+         std::array<uint32_t, 5>{210u, 211u, 212u, 213u, 214u}) {
+        expectPendingClose(channel, {3u});
+    }
+    expectPendingClose(219u, {2u});
+    const std::optional<uint32_t> southClosePacket =
+        Harness::PendingOwningGraphPacket(
+            manager_, kClientId, 209u,
+            /*open=*/false, /*close=*/true);
+    ASSERT_TRUE(southClosePacket.has_value());
+    EXPECT_NE(*southClosePacket, *southOpenPacket);
+
+    // ACKing the newer close datagram first records the close receipt, but the
+    // older open ledger still pins every per-channel issuance window.
+    Harness::Acknowledge(manager_, kClientId, *southClosePacket);
+    EXPECT_EQ(Harness::PawnGraphPhase(manager_, kClientId),
+              Harness::OwningGraphPhase::Closing);
+    EXPECT_FALSE(Harness::Spawned(manager_, kClientId));
+    EXPECT_EQ(Harness::PendingReliableCount(manager_, kClientId), 1u);
+    EXPECT_EQ(Harness::PendingOwningGraphSequences(
+                  manager_, kClientId, 209u,
+                  /*openOnly=*/true, /*closeOnly=*/false),
+              (std::vector<uint32_t>{1u}));
+
+    // The older ACK completes the whole barrier and resumes the deferred North
+    // deployment exactly once.
+    Harness::Acknowledge(manager_, kClientId, *southOpenPacket);
+    EXPECT_EQ(Harness::PawnGraphPhase(manager_, kClientId),
+              Harness::OwningGraphPhase::Open);
+    EXPECT_EQ(Harness::PawnGraphTeam(manager_, kClientId), kNorthTeam);
+    EXPECT_TRUE(Harness::Spawned(manager_, kClientId));
+    EXPECT_TRUE(player->IsAlive());
+    ASSERT_EQ(Harness::PendingReliableCount(manager_, kClientId), 1u);
+    const std::optional<uint32_t> northOpenPacket =
+        Harness::PendingOwningGraphPacket(
+            manager_, kClientId, 209u,
+            /*open=*/true, /*close=*/false);
+    ASSERT_TRUE(northOpenPacket.has_value());
+    EXPECT_NE(*northOpenPacket, *southOpenPacket);
+    EXPECT_NE(*northOpenPacket, *southClosePacket);
+
+    expectPendingSequences(209u, {7u, 8u, 9u, 10u, 11u});
+    expectPendingSequences(210u, {4u, 5u});
+    expectPendingSequences(212u, {4u, 5u});
+    expectPendingSequences(214u, {4u, 5u});
+    expectPendingSequences(219u, {3u});
+    expectPendingSequences(211u, {});
+    expectPendingSequences(213u, {});
+    EXPECT_EQ(Harness::NextOwningGraphReliable(
+                  manager_, kClientId, 211u),
+              4u);
+    EXPECT_EQ(Harness::NextOwningGraphReliable(
+                  manager_, kClientId, 213u),
+              4u);
+
+    const size_t northPendingBeforeDuplicate =
+        Harness::PendingReliableCount(manager_, kClientId);
+    Harness::Acknowledge(manager_, kClientId, *southClosePacket);
+    EXPECT_EQ(Harness::PendingReliableCount(manager_, kClientId),
+              northPendingBeforeDuplicate);
+    EXPECT_EQ(Harness::PendingOwningGraphPacket(
+                  manager_, kClientId, 209u,
+                  /*open=*/true, /*close=*/false),
+              northOpenPacket);
+
+    Harness::Acknowledge(manager_, kClientId, *northOpenPacket);
+    EXPECT_EQ(Harness::PendingReliableCount(manager_, kClientId), 0u);
+
+    // North deliberately omits ch211/ch213. Switching back to South proves
+    // those dormant cursors continue at four while active North channels have
+    // advanced through their own close generation.
+    players->OnPlayerDeath(kClientId);
+    ASSERT_FALSE(player->IsAlive());
+    teams->AddPlayerToTeam(kClientId, kSouthTeam);
+    Harness::PrepareOwningPawnLifeForFactionSwitch(
+        manager_, kClientId);
+    const std::optional<uint32_t> southSpawn =
+        Harness::PrepareDeploymentForCurrentTeam(
+            manager_, kClientId);
+    ASSERT_TRUE(southSpawn.has_value());
+    EXPECT_FALSE(Harness::ExecutePreparedDeployment(
+        manager_, kClientId, *southSpawn));
+    EXPECT_EQ(Harness::PawnGraphPhase(manager_, kClientId),
+              Harness::OwningGraphPhase::Closing);
+    EXPECT_EQ(Harness::PendingReliableCount(manager_, kClientId), 1u);
+    expectPendingClose(209u, {12u});
+    expectPendingClose(210u, {6u});
+    expectPendingClose(212u, {6u});
+    expectPendingClose(214u, {6u});
+    expectPendingClose(219u, {4u});
+    expectPendingClose(211u, {});
+    expectPendingClose(213u, {});
+    const std::optional<uint32_t> northClosePacket =
+        Harness::PendingOwningGraphPacket(
+            manager_, kClientId, 209u,
+            /*open=*/false, /*close=*/true);
+    ASSERT_TRUE(northClosePacket.has_value());
+
+    Harness::Acknowledge(manager_, kClientId, *northClosePacket);
+    EXPECT_EQ(Harness::PawnGraphPhase(manager_, kClientId),
+              Harness::OwningGraphPhase::Open);
+    EXPECT_EQ(Harness::PawnGraphTeam(manager_, kClientId), kSouthTeam);
+    EXPECT_TRUE(Harness::Spawned(manager_, kClientId));
+    EXPECT_TRUE(player->IsAlive());
+    ASSERT_EQ(Harness::PendingReliableCount(manager_, kClientId), 1u);
+    const std::optional<uint32_t> southReopenPacket =
+        Harness::PendingOwningGraphPacket(
+            manager_, kClientId, 209u,
+            /*open=*/true, /*close=*/false);
+    ASSERT_TRUE(southReopenPacket.has_value());
+
+    expectPendingSequences(209u, {13u, 14u, 15u, 16u, 17u});
+    expectPendingSequences(210u, {7u, 8u});
+    expectPendingSequences(211u, {4u, 5u});
+    expectPendingSequences(212u, {7u, 8u});
+    expectPendingSequences(213u, {4u, 5u});
+    expectPendingSequences(214u, {7u, 8u});
+    expectPendingSequences(219u, {5u});
+
+    Harness::Acknowledge(manager_, kClientId, *northClosePacket);
+    EXPECT_EQ(Harness::PendingReliableCount(manager_, kClientId), 1u);
+    EXPECT_EQ(Harness::PendingOwningGraphPacket(
+                  manager_, kClientId, 209u,
+                  /*open=*/true, /*close=*/false),
+              southReopenPacket);
+    Harness::Acknowledge(manager_, kClientId, *southReopenPacket);
+    EXPECT_EQ(Harness::PendingReliableCount(manager_, kClientId), 0u);
+    EXPECT_EQ(Harness::PawnGraphPhase(manager_, kClientId),
+              Harness::OwningGraphPhase::Open);
+}
+
+TEST_F(ConnectionTravelCuChiRoleIntegrationTest,
+       LiveH170UpdatesRemotePriAndRetiresSeededPawnBeforeNorthRedeploy) {
+    using Harness = ConnectionTravelLifecycleTestHarness;
+    constexpr uint32_t kViewerId = 51u;
+    constexpr uint32_t kSwitcherId = 52u;
+    constexpr uint32_t kSouthTeam =
+        RoleSelectionRepl::kCuChiUsServerTeam;
+    constexpr uint32_t kNorthTeam =
+        RoleSelectionRepl::kCuChiNlfServerTeam;
+
+    const std::shared_ptr<ClientConnection> viewer =
+        Connect(0u, kViewerId, kSouthTeam);
+    const std::shared_ptr<ClientConnection> switcher =
+        Connect(1u, kSwitcherId, kSouthTeam);
+    ASSERT_TRUE(viewer != nullptr);
+    ASSERT_TRUE(switcher != nullptr);
+    ASSERT_TRUE(Harness::InstallActiveSupremacyMode(server_) != nullptr);
+    PlayerManager* players = server_.GetPlayerManager();
+    TeamManager* teams = server_.GetTeamManager();
+    ASSERT_TRUE(players != nullptr);
+    ASSERT_TRUE(teams != nullptr);
+    const std::shared_ptr<Player> player = players->GetPlayer(kSwitcherId);
+    ASSERT_TRUE(player != nullptr);
+
+    Harness::PrepareOwningPawnLifeForFactionSwitch(manager_, kSwitcherId);
+    const std::optional<uint32_t> southSpawn =
+        Harness::PrepareDeploymentForCurrentTeam(manager_, kSwitcherId);
+    ASSERT_TRUE(southSpawn.has_value());
+    ASSERT_TRUE(Harness::ExecutePreparedDeployment(
+        manager_, kSwitcherId, *southSpawn));
+    const std::optional<uint32_t> southOpenPacket =
+        Harness::PendingOwningGraphPacket(
+            manager_, kSwitcherId, 209u,
+            /*open=*/true, /*close=*/false);
+    ASSERT_TRUE(southOpenPacket.has_value());
+    Harness::Acknowledge(manager_, kSwitcherId, *southOpenPacket);
+    player->SetReadyToSpawn(true);
+    ASSERT_TRUE(player->IsAlive());
+    ASSERT_TRUE(player->IsReadyToSpawn());
+
+    const ParticipantId remoteSwitcher = ParticipantId::Human(kSwitcherId);
+    Harness::SynchronizeRemoteParticipantPris(manager_, kViewerId);
+    (void)DrainDecodedPackets(0u);
+    (void)DrainDecodedPackets(1u);
+    const std::optional<uint32_t> priChannel =
+        Harness::RemotePriChannel(manager_, kViewerId, remoteSwitcher);
+    const std::optional<uint32_t> pawnChannel =
+        Harness::RemotePawnChannel(manager_, kViewerId, remoteSwitcher);
+    ASSERT_TRUE(priChannel.has_value());
+    ASSERT_TRUE(pawnChannel.has_value());
+    // Remote pawn visuals remain deliberately gated until their complete
+    // templates are grounded. Seed the already-open binding state to exercise
+    // the h170 retirement path that becomes reachable when that gate is enabled.
+    const std::optional<uint32_t> seededPawnOpenSequence =
+        Harness::SeedRemotePawnBindingOpen(
+            manager_, kViewerId, remoteSwitcher, kSouthTeam);
+    ASSERT_TRUE(seededPawnOpenSequence.has_value());
+    ASSERT_EQ(Harness::RemotePawnState(
+                  manager_, kViewerId, remoteSwitcher),
+              ParticipantActorOpenState::Open);
+    EXPECT_EQ(Harness::RemotePriTeamInfoChannel(
+                  manager_, kViewerId, remoteSwitcher),
+              std::optional<uint32_t>{5u});
+    EXPECT_EQ(Harness::RemotePawnServerTeam(
+                  manager_, kViewerId, remoteSwitcher),
+              std::optional<uint32_t>{kSouthTeam});
+
+    Harness::DeliverActorBunch(
+        manager_, kSwitcherId, MakeSelectTeamBunch(/*retail NLF=*/0u));
+
+    EXPECT_FALSE(switcher->IsDisconnected());
+    EXPECT_EQ(teams->GetPlayerTeam(kSwitcherId), kNorthTeam);
+    EXPECT_EQ(player->GetTeam(), kNorthTeam);
+    EXPECT_FALSE(player->IsAlive());
+    EXPECT_EQ(player->GetHealth(), 0);
+    EXPECT_FALSE(player->IsReadyToSpawn());
+    EXPECT_FALSE(Harness::Spawned(manager_, kSwitcherId));
+    EXPECT_EQ(Harness::RemotePawnState(
+                  manager_, kViewerId, remoteSwitcher),
+              ParticipantActorOpenState::Closing);
+    EXPECT_EQ(Harness::RemotePriTeamInfoChannel(
+                  manager_, kViewerId, remoteSwitcher),
+              std::optional<uint32_t>{4u});
+    // A stale ready bit must not let PlayerManager bypass the fresh h175/h261/
+    // h434 transaction while the old graph is still present.
+    players->Update();
+    EXPECT_FALSE(player->IsAlive());
+    EXPECT_FALSE(player->IsReadyToSpawn());
+
+    const std::vector<PacketCodec::Bunch> viewerUpdates =
+        FlattenBunches(DrainDecodedPackets(0u));
+    BitWriter northTeamWriter;
+    ASSERT_TRUE(DeploymentRepl::WriteRemotePriTeam(
+        northTeamWriter, /*North TeamInfo ch=*/4u));
+    const auto teamDelta = std::find_if(
+        viewerUpdates.begin(), viewerUpdates.end(),
+        [&](const PacketCodec::Bunch& bunch) {
+            return bunch.bReliable && bunch.chIndex == *priChannel &&
+                   bunch.payloadBits == northTeamWriter.NumBits() &&
+                   bunch.payload == northTeamWriter.GetBytes();
+        });
+    const auto pawnClose = std::find_if(
+        viewerUpdates.begin(), viewerUpdates.end(),
+        [&](const PacketCodec::Bunch& bunch) {
+            return bunch.bReliable && bunch.bControl && bunch.bClose &&
+                   bunch.chIndex == *pawnChannel;
+        });
+    ASSERT_TRUE(teamDelta != viewerUpdates.end());
+    ASSERT_TRUE(pawnClose != viewerUpdates.end());
+    EXPECT_EQ(pawnClose->chSequence,
+              (*seededPawnOpenSequence + 1u) % PacketCodec::kMaxChSequence);
+    EXPECT_LT(std::distance(viewerUpdates.begin(), teamDelta),
+              std::distance(viewerUpdates.begin(), pawnClose));
+
+    Harness::DeliverActorBunch(
+        manager_, kSwitcherId, CuChiFinalRoleBunch(/*south=*/false));
+    (void)DrainDecodedPackets(1u);
+    Harness::DeliverActorBunch(manager_, kSwitcherId, SpawnSelectBunch());
+    (void)DrainDecodedPackets(1u);
+    Harness::DeliverActorBunch(manager_, kSwitcherId, ReadyBunch());
+
+    EXPECT_EQ(Harness::PawnGraphPhase(manager_, kSwitcherId),
+              Harness::OwningGraphPhase::Closing);
+    EXPECT_FALSE(Harness::Spawned(manager_, kSwitcherId));
+    EXPECT_FALSE(player->IsAlive());
+    const std::optional<uint32_t> southClosePacket =
+        Harness::PendingOwningGraphPacket(
+            manager_, kSwitcherId, 209u,
+            /*open=*/false, /*close=*/true);
+    ASSERT_TRUE(southClosePacket.has_value());
+
+    // This detached fixture has no GameServer-owned NetworkManager to relay
+    // SpawnSystem's OnPlayerSpawn callback back into this ConnectionManager.
+    // Model that production callback boundary before the deferred commit.
+    Harness::ModelOwningPawnSpawnCallback(manager_, kSwitcherId);
+    Harness::Acknowledge(manager_, kSwitcherId, *southClosePacket);
+    EXPECT_EQ(Harness::PawnGraphPhase(manager_, kSwitcherId),
+              Harness::OwningGraphPhase::Open);
+    EXPECT_EQ(Harness::PawnGraphTeam(manager_, kSwitcherId), kNorthTeam);
+    EXPECT_TRUE(Harness::Spawned(manager_, kSwitcherId));
+    EXPECT_TRUE(player->IsAlive());
+    EXPECT_FALSE(switcher->IsDisconnected());
+}
+
+TEST_F(ConnectionTravelCuChiRoleIntegrationTest,
+       CloseAckPacketRunsForceOnlyButSuppressesRetiringPawnRpc) {
+    using Harness = ConnectionTravelLifecycleTestHarness;
+    constexpr uint32_t kClientId = 53u;
+    constexpr uint32_t kSouthTeam =
+        RoleSelectionRepl::kCuChiUsServerTeam;
+    constexpr uint32_t kNorthTeam =
+        RoleSelectionRepl::kCuChiNlfServerTeam;
+
+    const std::shared_ptr<ClientConnection> connection =
+        Connect(0u, kClientId, kSouthTeam);
+    ASSERT_TRUE(connection != nullptr);
+    ASSERT_TRUE(Harness::InstallActiveSupremacyMode(server_) != nullptr);
+    PlayerManager* players = server_.GetPlayerManager();
+    TeamManager* teams = server_.GetTeamManager();
+    ASSERT_TRUE(players != nullptr);
+    ASSERT_TRUE(teams != nullptr);
+    const std::shared_ptr<Player> player = players->GetPlayer(kClientId);
+    ASSERT_TRUE(player != nullptr);
+
+    Harness::PrepareOwningPawnLifeForFactionSwitch(manager_, kClientId);
+    const std::optional<uint32_t> southSpawn =
+        Harness::PrepareDeploymentForCurrentTeam(manager_, kClientId);
+    ASSERT_TRUE(southSpawn.has_value());
+    ASSERT_TRUE(Harness::ExecutePreparedDeployment(
+        manager_, kClientId, *southSpawn));
+    const std::optional<uint32_t> openPacket =
+        Harness::PendingOwningGraphPacket(
+            manager_, kClientId, 209u,
+            /*open=*/true, /*close=*/false);
+    ASSERT_TRUE(openPacket.has_value());
+    Harness::Acknowledge(manager_, kClientId, *openPacket);
+
+    players->OnPlayerDeath(kClientId);
+    teams->AddPlayerToTeam(kClientId, kNorthTeam);
+    Harness::PrepareOwningPawnLifeForFactionSwitch(manager_, kClientId);
+    const std::optional<uint32_t> northSpawn =
+        Harness::PrepareDeploymentForCurrentTeam(manager_, kClientId);
+    ASSERT_TRUE(northSpawn.has_value());
+    EXPECT_FALSE(Harness::ExecutePreparedDeployment(
+        manager_, kClientId, *northSpawn));
+    const std::optional<uint32_t> closePacket =
+        Harness::PendingOwningGraphPacket(
+            manager_, kClientId, 209u,
+            /*open=*/false, /*close=*/true);
+    ASSERT_TRUE(closePacket.has_value());
+
+    PacketCodec::Bunch bufferedMantle;
+    bufferedMantle.bReliable = true;
+    bufferedMantle.chIndex = 209u;
+    bufferedMantle.chType = 2u;
+    bufferedMantle.chSequence = 2u;
+    bufferedMantle.payload = {0x55u};
+    bufferedMantle.payloadBits = 7u;
+    PacketCodec::Packet beforeBarrier;
+    beforeBarrier.packetId = 90u;
+    beforeBarrier.bunches.push_back(std::move(bufferedMantle));
+    Harness::Deliver(manager_, EncodeClientPacket(beforeBarrier),
+                     connection->GetIP(), connection->GetPort());
+    ASSERT_EQ(Harness::NextInboundActorReliable(
+                  manager_, kClientId, 209u),
+              1u);
+
+    PacketCodec::Bunch mantle;
+    mantle.bReliable = true;
+    mantle.chIndex = 209u;
+    mantle.chType = 2u;
+    mantle.chSequence = 1u;
+    mantle.payload = {0x55u};
+    mantle.payloadBits = 7u;
+    PacketCodec::Bunch forceOnly = ForceOnlyBunch();
+    forceOnly.chSequence = 1u;
+    PacketCodec::Packet inbound;
+    inbound.packetId = 100u;
+    inbound.acks.push_back(*closePacket);
+    inbound.bunches.push_back(std::move(mantle));
+    inbound.bunches.push_back(std::move(forceOnly));
+    Harness::Deliver(manager_, EncodeClientPacket(inbound),
+                     connection->GetIP(), connection->GetPort());
+
+    EXPECT_FALSE(connection->IsDisconnected());
+    EXPECT_FALSE(Harness::MantlePawnStarted(manager_, kClientId));
+    EXPECT_EQ(Harness::NextInboundActorReliable(
+                  manager_, kClientId, 209u),
+              3u);
+    EXPECT_EQ(Harness::PawnGraphPhase(manager_, kClientId),
+              Harness::OwningGraphPhase::Closed);
+    EXPECT_FALSE(Harness::Spawned(manager_, kClientId));
+    EXPECT_FALSE(player->IsAlive());
+    const auto deployment = Harness::DeploymentState(manager_, kClientId);
+    ASSERT_TRUE(deployment.has_value());
+    EXPECT_EQ(deployment->readyStatus,
+              DeploymentCoordinator::ReadyStatus::ForceOnly);
+    EXPECT_FALSE(deployment->deploymentAuthorized);
+}
+
+TEST_F(ConnectionTravelCuChiRoleIntegrationTest,
+       PacketFloorRetiresOldReliableAndAcceptsEmptyGapFillSuccessor) {
+    using Harness = ConnectionTravelLifecycleTestHarness;
+    constexpr uint32_t kClientId = 54u;
+    constexpr uint32_t kSouthTeam =
+        RoleSelectionRepl::kCuChiUsServerTeam;
+    constexpr uint32_t kNorthTeam =
+        RoleSelectionRepl::kCuChiNlfServerTeam;
+
+    const std::shared_ptr<ClientConnection> connection =
+        Connect(0u, kClientId, kSouthTeam);
+    ASSERT_TRUE(connection != nullptr);
+    ASSERT_TRUE(Harness::InstallActiveSupremacyMode(server_) != nullptr);
+    PlayerManager* players = server_.GetPlayerManager();
+    TeamManager* teams = server_.GetTeamManager();
+    ASSERT_TRUE(players != nullptr);
+    ASSERT_TRUE(teams != nullptr);
+
+    Harness::PrepareOwningPawnLifeForFactionSwitch(manager_, kClientId);
+    const std::optional<uint32_t> southSpawn =
+        Harness::PrepareDeploymentForCurrentTeam(manager_, kClientId);
+    ASSERT_TRUE(southSpawn.has_value());
+    ASSERT_TRUE(Harness::ExecutePreparedDeployment(
+        manager_, kClientId, *southSpawn));
+    const std::optional<uint32_t> openPacket =
+        Harness::PendingOwningGraphPacket(
+            manager_, kClientId, 209u,
+            /*open=*/true, /*close=*/false);
+    ASSERT_TRUE(openPacket.has_value());
+    Harness::Acknowledge(manager_, kClientId, *openPacket);
+
+    players->OnPlayerDeath(kClientId);
+    teams->AddPlayerToTeam(kClientId, kNorthTeam);
+    Harness::PrepareOwningPawnLifeForFactionSwitch(manager_, kClientId);
+    const std::optional<uint32_t> northSpawn =
+        Harness::PrepareDeploymentForCurrentTeam(manager_, kClientId);
+    ASSERT_TRUE(northSpawn.has_value());
+    EXPECT_FALSE(Harness::ExecutePreparedDeployment(
+        manager_, kClientId, *northSpawn));
+    const std::optional<uint32_t> closePacket =
+        Harness::PendingOwningGraphPacket(
+            manager_, kClientId, 209u,
+            /*open=*/false, /*close=*/true);
+    ASSERT_TRUE(closePacket.has_value());
+
+    PacketCodec::Packet barrier;
+    barrier.packetId = 200u;
+    barrier.acks.push_back(*closePacket);
+    Harness::Deliver(manager_, EncodeClientPacket(barrier),
+                     connection->GetIP(), connection->GetPort());
+    ASSERT_EQ(Harness::PawnGraphPhase(manager_, kClientId),
+              Harness::OwningGraphPhase::Open);
+    ASSERT_EQ(Harness::PawnGraphTeam(manager_, kClientId), kNorthTeam);
+    ASSERT_EQ(Harness::NextInboundActorReliable(
+                  manager_, kClientId, 212u),
+              1u);
+
+    PacketCodec::Bunch oldStart;
+    oldStart.bReliable = true;
+    oldStart.chIndex = 212u;
+    oldStart.chType = 2u;
+    oldStart.chSequence = 1u;
+    oldStart.payload = {0x1du};
+    oldStart.payloadBits = 8u;
+    PacketCodec::Packet delayedOld;
+    delayedOld.packetId = 199u;
+    delayedOld.bunches.push_back(std::move(oldStart));
+    Harness::Deliver(manager_, EncodeClientPacket(delayedOld),
+                     connection->GetIP(), connection->GetPort());
+    EXPECT_FALSE(Harness::WeaponFiring(manager_, kClientId, 212u));
+    EXPECT_EQ(Harness::NextInboundActorReliable(
+                  manager_, kClientId, 212u),
+              2u);
+
+    // UE3 SetChannelActor fills PendingOutRec sequence gaps with empty reliable
+    // bunches when the actor index is reused. The successor must advance the
+    // persistent cursor without reviving old-faction semantics.
+    PacketCodec::Bunch gapFill;
+    gapFill.bReliable = true;
+    gapFill.chIndex = 212u;
+    gapFill.chType = 2u;
+    gapFill.chSequence = 2u;
+    PacketCodec::Packet successor;
+    successor.packetId = 201u;
+    successor.bunches.push_back(std::move(gapFill));
+    Harness::Deliver(manager_, EncodeClientPacket(successor),
+                     connection->GetIP(), connection->GetPort());
+    EXPECT_FALSE(connection->IsDisconnected());
+    EXPECT_EQ(Harness::NextInboundActorReliable(
+                  manager_, kClientId, 212u),
+              3u);
+    EXPECT_FALSE(Harness::WeaponFiring(manager_, kClientId, 212u));
+    EXPECT_EQ(Harness::PawnGraphPhase(manager_, kClientId),
+              Harness::OwningGraphPhase::Open);
+}
+
+TEST_F(ConnectionTravelCuChiRoleIntegrationTest,
+       PeerFixedCloseStopsLaterH170AndWeaponRpcInSamePacket) {
+    using Harness = ConnectionTravelLifecycleTestHarness;
+    constexpr uint32_t kClientId = 55u;
+    constexpr uint32_t kSouthTeam =
+        RoleSelectionRepl::kCuChiUsServerTeam;
+
+    const std::shared_ptr<ClientConnection> connection =
+        Connect(0u, kClientId, kSouthTeam);
+    ASSERT_TRUE(connection != nullptr);
+    ASSERT_TRUE(Harness::InstallActiveSupremacyMode(server_) != nullptr);
+    PlayerManager* players = server_.GetPlayerManager();
+    TeamManager* teams = server_.GetTeamManager();
+    ASSERT_TRUE(players != nullptr);
+    ASSERT_TRUE(teams != nullptr);
+    const std::shared_ptr<Player> player = players->GetPlayer(kClientId);
+    ASSERT_TRUE(player != nullptr);
+
+    Harness::PrepareOwningPawnLifeForFactionSwitch(manager_, kClientId);
+    const std::optional<uint32_t> spawn =
+        Harness::PrepareDeploymentForCurrentTeam(manager_, kClientId);
+    ASSERT_TRUE(spawn.has_value());
+    ASSERT_TRUE(Harness::ExecutePreparedDeployment(
+        manager_, kClientId, *spawn));
+    ASSERT_TRUE(player->IsAlive());
+
+    PacketCodec::Bunch peerClose;
+    peerClose.bControl = true;
+    peerClose.bClose = true;
+    peerClose.bReliable = true;
+    peerClose.chIndex = 209u;
+    peerClose.chType = 2u;
+    peerClose.chSequence = 1u;
+    PacketCodec::Bunch h170 = MakeSelectTeamBunch(/*retail NLF=*/0u);
+    h170.chSequence = 1u;
+    PacketCodec::Bunch oldStart;
+    oldStart.bReliable = true;
+    oldStart.chIndex = 212u;
+    oldStart.chType = 2u;
+    oldStart.chSequence = 1u;
+    oldStart.payload = {0x1du};
+    oldStart.payloadBits = 8u;
+    PacketCodec::Packet inbound;
+    inbound.packetId = 300u;
+    inbound.bunches.push_back(std::move(peerClose));
+    inbound.bunches.push_back(std::move(h170));
+    inbound.bunches.push_back(std::move(oldStart));
+    Harness::Deliver(manager_, EncodeClientPacket(inbound),
+                     connection->GetIP(), connection->GetPort());
+
+    EXPECT_TRUE(connection->IsDisconnected());
+    EXPECT_EQ(Harness::PawnGraphPhase(manager_, kClientId),
+              Harness::OwningGraphPhase::Broken);
+    EXPECT_FALSE(Harness::Spawned(manager_, kClientId));
+    EXPECT_EQ(Harness::ActiveWeaponChannel(manager_, kClientId), 0u);
+    EXPECT_FALSE(Harness::WeaponFiring(manager_, kClientId, 212u));
+    // The terminal close was the first bunch; the later team RPC must not run.
+    EXPECT_EQ(teams->GetPlayerTeam(kClientId), kSouthTeam);
+    EXPECT_EQ(player->GetTeam(), kSouthTeam);
+    EXPECT_TRUE(player->IsAlive());
+}
+
+TEST_F(ConnectionTravelCuChiRoleIntegrationTest,
+       DeferredFactionSwitchExpiresWhenRoundEndsBeforeCloseAck) {
+    using Harness = ConnectionTravelLifecycleTestHarness;
+    constexpr uint32_t kClientId = 32u;
+    constexpr uint32_t kSouthTeam =
+        RoleSelectionRepl::kCuChiUsServerTeam;
+    constexpr uint32_t kNorthTeam =
+        RoleSelectionRepl::kCuChiNlfServerTeam;
+
+    ASSERT_TRUE(Connect(0u, kClientId, kSouthTeam) != nullptr);
+    PlayerManager* players = server_.GetPlayerManager();
+    TeamManager* teams = server_.GetTeamManager();
+    SupremacyMode* supremacy =
+        Harness::InstallActiveSupremacyMode(server_);
+    ASSERT_TRUE(players != nullptr);
+    ASSERT_TRUE(teams != nullptr);
+    ASSERT_TRUE(supremacy != nullptr);
+    ASSERT_EQ(supremacy->GetPhase(), SupremacyMode::Phase::Active);
+    const std::shared_ptr<Player> player = players->GetPlayer(kClientId);
+    ASSERT_TRUE(player != nullptr);
+
+    Harness::PrepareOwningPawnLifeForFactionSwitch(
+        manager_, kClientId);
+    const std::optional<uint32_t> initialSpawn =
+        Harness::PrepareDeploymentForCurrentTeam(
+            manager_, kClientId);
+    ASSERT_TRUE(initialSpawn.has_value());
+    ASSERT_TRUE(Harness::ExecutePreparedDeployment(
+        manager_, kClientId, *initialSpawn));
+    const std::optional<uint32_t> initialOpenPacket =
+        Harness::PendingOwningGraphPacket(
+            manager_, kClientId, 209u,
+            /*open=*/true, /*close=*/false);
+    ASSERT_TRUE(initialOpenPacket.has_value());
+    Harness::Acknowledge(manager_, kClientId, *initialOpenPacket);
+    ASSERT_EQ(Harness::PendingReliableCount(manager_, kClientId), 0u);
+
+    players->OnPlayerDeath(kClientId);
+    ASSERT_FALSE(player->IsAlive());
+    teams->AddPlayerToTeam(kClientId, kNorthTeam);
+    Harness::PrepareOwningPawnLifeForFactionSwitch(
+        manager_, kClientId);
+    const std::optional<uint32_t> northSpawn =
+        Harness::PrepareDeploymentForCurrentTeam(
+            manager_, kClientId);
+    ASSERT_TRUE(northSpawn.has_value());
+    EXPECT_FALSE(Harness::ExecutePreparedDeployment(
+        manager_, kClientId, *northSpawn));
+    const std::optional<uint32_t> closePacket =
+        Harness::PendingOwningGraphPacket(
+            manager_, kClientId, 209u,
+            /*open=*/false, /*close=*/true);
+    ASSERT_TRUE(closePacket.has_value());
+    ASSERT_EQ(Harness::PawnGraphPhase(manager_, kClientId),
+              Harness::OwningGraphPhase::Closing);
+
+    supremacy->EndRound();
+    ASSERT_EQ(supremacy->GetPhase(), SupremacyMode::Phase::PostRound);
+    Harness::Acknowledge(manager_, kClientId, *closePacket);
+
+    EXPECT_EQ(Harness::PawnGraphPhase(manager_, kClientId),
+              Harness::OwningGraphPhase::Closed);
+    EXPECT_EQ(Harness::PawnGraphTeam(manager_, kClientId), 0u);
+    EXPECT_FALSE(Harness::Spawned(manager_, kClientId));
+    EXPECT_FALSE(player->IsAlive());
+    EXPECT_EQ(Harness::PendingReliableCount(manager_, kClientId), 0u);
+    EXPECT_FALSE(Harness::PendingOwningGraphPacket(
+        manager_, kClientId, 209u,
+        /*open=*/true, /*close=*/false).has_value());
+    const auto expired = Harness::DeploymentState(manager_, kClientId);
+    ASSERT_TRUE(expired.has_value());
+    EXPECT_TRUE(expired->roleFinalized);
+    EXPECT_FALSE(expired->selectedSpawnId.has_value());
+    EXPECT_FALSE(expired->deploymentAuthorized);
+
+    // A later legal window requires a fresh spawn selection + Ready and opens
+    // from the already-drained Closed state exactly once.
+    supremacy->StartRound();
+    supremacy->Update(supremacy->GetPhaseTimeRemaining());
+    ASSERT_EQ(supremacy->GetPhase(), SupremacyMode::Phase::Active);
+    Harness::PrepareOwningPawnLifeForFactionSwitch(
+        manager_, kClientId);
+    const std::optional<uint32_t> retrySpawn =
+        Harness::PrepareDeploymentForCurrentTeam(
+            manager_, kClientId);
+    ASSERT_TRUE(retrySpawn.has_value());
+    EXPECT_TRUE(Harness::ExecutePreparedDeployment(
+        manager_, kClientId, *retrySpawn));
+    EXPECT_EQ(Harness::PawnGraphPhase(manager_, kClientId),
+              Harness::OwningGraphPhase::Open);
+    EXPECT_EQ(Harness::PawnGraphTeam(manager_, kClientId), kNorthTeam);
+    EXPECT_TRUE(Harness::Spawned(manager_, kClientId));
+    EXPECT_TRUE(player->IsAlive());
+    EXPECT_EQ(Harness::PendingReliableCount(manager_, kClientId), 1u);
+}
+
+TEST_F(ConnectionTravelCuChiRoleIntegrationTest,
+       TicketDepletionAtCloseAckLeavesFreshAuthorizationRetry) {
+    using Harness = ConnectionTravelLifecycleTestHarness;
+    constexpr uint32_t kClientId = 33u;
+    constexpr uint32_t kSouthTeam =
+        RoleSelectionRepl::kCuChiUsServerTeam;
+    constexpr uint32_t kNorthTeam =
+        RoleSelectionRepl::kCuChiNlfServerTeam;
+
+    const std::shared_ptr<ClientConnection> connection =
+        Connect(0u, kClientId, kSouthTeam);
+    ASSERT_TRUE(connection != nullptr);
+    TicketSystem* tickets = Harness::InstallTicketSystem(
+        server_, /*southTickets=*/1u, /*northTickets=*/1u);
+    SupremacyMode* supremacy =
+        Harness::InstallActiveSupremacyMode(server_);
+    PlayerManager* players = server_.GetPlayerManager();
+    TeamManager* teams = server_.GetTeamManager();
+    ASSERT_TRUE(tickets != nullptr);
+    ASSERT_TRUE(supremacy != nullptr);
+    ASSERT_TRUE(players != nullptr);
+    ASSERT_TRUE(teams != nullptr);
+    const std::shared_ptr<Player> player = players->GetPlayer(kClientId);
+    ASSERT_TRUE(player != nullptr);
+
+    // Drive the retail h175/h261/h434 path so the captured ChangedRole tuple is
+    // available when deferred ticket depletion must recover the client UI.
+    Harness::PrepareOwningPawnLifeForFactionSwitch(manager_, kClientId);
+    Harness::DeliverActorBunch(
+        manager_, kClientId, CuChiFinalRoleBunch(/*south=*/true));
+    (void)DrainDecodedPackets(0u);
+    Harness::AcknowledgeAllPendingReliables(manager_, kClientId);
+    Harness::DeliverActorBunch(manager_, kClientId, SpawnSelectBunch());
+    (void)DrainDecodedPackets(0u);
+    Harness::DeliverActorBunch(manager_, kClientId, ReadyBunch());
+    ASSERT_TRUE(Harness::Spawned(manager_, kClientId));
+    const std::optional<uint32_t> initialOpenPacket =
+        Harness::PendingOwningGraphPacket(
+            manager_, kClientId, 209u,
+            /*open=*/true, /*close=*/false);
+    ASSERT_TRUE(initialOpenPacket.has_value());
+    Harness::Acknowledge(manager_, kClientId, *initialOpenPacket);
+
+    Harness::DeliverActorBunch(
+        manager_, kClientId, MakeSelectTeamBunch(/*retail NLF=*/0u));
+    (void)DrainDecodedPackets(0u);
+    Harness::AcknowledgeAllPendingReliables(manager_, kClientId);
+    ASSERT_FALSE(player->IsAlive());
+    ASSERT_EQ(teams->GetPlayerTeam(kClientId), kNorthTeam);
+    Harness::DeliverActorBunch(
+        manager_, kClientId, CuChiFinalRoleBunch(/*south=*/false));
+    (void)DrainDecodedPackets(0u);
+    const Harness::RoleLedgerSnapshot northRole =
+        Harness::RoleLedger(manager_, kClientId);
+    ASSERT_TRUE(northRole.changedRole.has_value());
+    Harness::AcknowledgeAllPendingReliables(manager_, kClientId);
+    Harness::DeliverActorBunch(manager_, kClientId, SpawnSelectBunch());
+    (void)DrainDecodedPackets(0u);
+    Harness::DeliverActorBunch(manager_, kClientId, ReadyBunch());
+    EXPECT_EQ(Harness::PawnGraphPhase(manager_, kClientId),
+              Harness::OwningGraphPhase::Closing);
+    const std::optional<uint32_t> closePacket =
+        Harness::PendingOwningGraphPacket(
+            manager_, kClientId, 209u,
+            /*open=*/false, /*close=*/true);
+    ASSERT_TRUE(closePacket.has_value());
+
+    tickets->SetTickets(kNorthTeam, 0u);
+    ASSERT_FALSE(tickets->HasTickets(kNorthTeam));
+    (void)DrainDecodedPackets(0u);
+    Harness::Acknowledge(manager_, kClientId, *closePacket);
+
+    EXPECT_EQ(Harness::PawnGraphPhase(manager_, kClientId),
+              Harness::OwningGraphPhase::Closed);
+    EXPECT_FALSE(Harness::Spawned(manager_, kClientId));
+    EXPECT_FALSE(player->IsAlive());
+    EXPECT_FALSE(connection->IsDisconnected());
+    EXPECT_EQ(Harness::PendingReliableCount(manager_, kClientId), 1u);
+    const auto depleted = Harness::DeploymentState(manager_, kClientId);
+    ASSERT_TRUE(depleted.has_value());
+    EXPECT_TRUE(depleted->roleFinalized);
+    EXPECT_FALSE(depleted->selectedSpawnId.has_value());
+    EXPECT_FALSE(depleted->deploymentAuthorized);
+
+    const std::vector<PacketCodec::Bunch> recovery =
+        FlattenBunches(DrainDecodedPackets(0u));
+    const PacketCodec::Bunch expectedStopAutoSpawn =
+        ExpectedTempStopAutoSpawn();
+    const PacketCodec::Bunch expectedRecovery =
+        ExpectedChangedRole(*northRole.changedRole);
+    const size_t stopIndex =
+        FindWireBunch(recovery, expectedStopAutoSpawn);
+    const size_t changedRoleIndex =
+        FindWireBunch(recovery, expectedRecovery);
+    ASSERT_TRUE(stopIndex < changedRoleIndex);
+    ASSERT_TRUE(changedRoleIndex < recovery.size());
+    EXPECT_EQ(recovery[changedRoleIndex].chSequence,
+              recovery[stopIndex].chSequence + 1u);
+    Harness::AcknowledgeAllPendingReliables(manager_, kClientId);
+    EXPECT_EQ(Harness::PendingReliableCount(manager_, kClientId), 0u);
+
+    tickets->AddTickets(kNorthTeam, 1u);
+    ASSERT_TRUE(tickets->HasTickets(kNorthTeam));
+    Harness::DeliverActorBunch(manager_, kClientId, SpawnSelectBunch());
+    (void)DrainDecodedPackets(0u);
+    Harness::ModelOwningPawnSpawnCallback(manager_, kClientId);
+    Harness::DeliverActorBunch(manager_, kClientId, ReadyBunch());
+    EXPECT_EQ(Harness::PawnGraphPhase(manager_, kClientId),
+              Harness::OwningGraphPhase::Open);
+    EXPECT_EQ(Harness::PawnGraphTeam(manager_, kClientId), kNorthTeam);
+    EXPECT_TRUE(Harness::Spawned(manager_, kClientId));
+    EXPECT_TRUE(player->IsAlive());
+    EXPECT_EQ(Harness::PendingReliableCount(manager_, kClientId), 1u);
+}
+
+TEST_F(ConnectionTravelCuChiRoleIntegrationTest,
+       Ch2BackpressurePreflightCannotMutateAuthoritativeSpawn) {
+    using Harness = ConnectionTravelLifecycleTestHarness;
+    constexpr uint32_t kClientId = 34u;
+    constexpr uint32_t kSouthTeam =
+        RoleSelectionRepl::kCuChiUsServerTeam;
+
+    const std::shared_ptr<ClientConnection> connection =
+        Connect(0u, kClientId, kSouthTeam);
+    ASSERT_TRUE(connection != nullptr);
+    ASSERT_TRUE(Harness::InstallActiveSupremacyMode(server_) != nullptr);
+    PlayerManager* players = server_.GetPlayerManager();
+    SpawnSystem* spawns = server_.GetSpawnSystem();
+    ASSERT_TRUE(players != nullptr);
+    ASSERT_TRUE(spawns != nullptr);
+    const std::shared_ptr<Player> player = players->GetPlayer(kClientId);
+    ASSERT_TRUE(player != nullptr);
+
+    Harness::PrepareOwningPawnLifeForFactionSwitch(
+        manager_, kClientId);
+    const std::optional<uint32_t> selectedSpawn =
+        Harness::PrepareDeploymentForCurrentTeam(
+            manager_, kClientId);
+    ASSERT_TRUE(selectedSpawn.has_value());
+    SpawnLocation* location = spawns->GetSpawnLocation(*selectedSpawn);
+    ASSERT_TRUE(location != nullptr);
+
+    const Vector3 positionBefore = player->GetPosition();
+    const Vector3 orientationBefore = player->GetOrientation();
+    const PlayerState stateBefore = player->GetState();
+    const int healthBefore = player->GetHealth();
+    const bool readyBefore = player->IsReadyToSpawn();
+    const float cooldownBefore = location->spawnCooldown;
+    const uint32_t graphCursorBefore =
+        Harness::NextOwningGraphReliable(
+            manager_, kClientId, 209u);
+
+    ASSERT_EQ(
+        Harness::ReservePublishedCh2Reliables(
+            manager_, kClientId,
+            PacketCodec::OutboundReliableSequencer::
+                kMaximumOutstanding).size(),
+        PacketCodec::OutboundReliableSequencer::kMaximumOutstanding);
+    const uint32_t ch2CursorBefore =
+        Harness::NextCh2Reliable(manager_, kClientId);
+    const size_t pendingBefore =
+        Harness::PendingReliableCount(manager_, kClientId);
+
+    EXPECT_FALSE(Harness::ExecutePreparedDeployment(
+        manager_, kClientId, *selectedSpawn));
+
+    EXPECT_TRUE(connection->IsDisconnected());
+    EXPECT_EQ(player->GetState(), stateBefore);
+    EXPECT_EQ(player->GetHealth(), healthBefore);
+    EXPECT_EQ(player->IsReadyToSpawn(), readyBefore);
+    EXPECT_FLOAT_EQ(player->GetPosition().x, positionBefore.x);
+    EXPECT_FLOAT_EQ(player->GetPosition().y, positionBefore.y);
+    EXPECT_FLOAT_EQ(player->GetPosition().z, positionBefore.z);
+    EXPECT_FLOAT_EQ(player->GetOrientation().x, orientationBefore.x);
+    EXPECT_FLOAT_EQ(player->GetOrientation().y, orientationBefore.y);
+    EXPECT_FLOAT_EQ(player->GetOrientation().z, orientationBefore.z);
+    EXPECT_FLOAT_EQ(location->spawnCooldown, cooldownBefore);
+    EXPECT_EQ(Harness::PawnGraphPhase(manager_, kClientId),
+              Harness::OwningGraphPhase::Unopened);
+    EXPECT_EQ(Harness::NextOwningGraphReliable(
+                  manager_, kClientId, 209u),
+              graphCursorBefore);
+    EXPECT_EQ(Harness::NextCh2Reliable(manager_, kClientId),
+              ch2CursorBefore);
+    EXPECT_EQ(Harness::PendingReliableCount(manager_, kClientId),
+              pendingBefore);
+    EXPECT_FALSE(Harness::Spawned(manager_, kClientId));
+}
+
+TEST_F(ConnectionTravelCuChiRoleIntegrationTest,
+       ReusedGraphNeedsSixCh2SlotsBeforeAuthoritativeRespawn) {
+    using Harness = ConnectionTravelLifecycleTestHarness;
+    constexpr uint32_t kClientId = 56u;
+    constexpr uint32_t kSouthTeam =
+        RoleSelectionRepl::kCuChiUsServerTeam;
+
+    const std::shared_ptr<ClientConnection> connection =
+        Connect(0u, kClientId, kSouthTeam);
+    ASSERT_TRUE(connection != nullptr);
+    ASSERT_TRUE(Harness::InstallActiveSupremacyMode(server_) != nullptr);
+    PlayerManager* players = server_.GetPlayerManager();
+    ASSERT_TRUE(players != nullptr);
+    const std::shared_ptr<Player> player = players->GetPlayer(kClientId);
+    ASSERT_TRUE(player != nullptr);
+
+    Harness::PrepareOwningPawnLifeForFactionSwitch(manager_, kClientId);
+    const std::optional<uint32_t> initialSpawn =
+        Harness::PrepareDeploymentForCurrentTeam(manager_, kClientId);
+    ASSERT_TRUE(initialSpawn.has_value());
+    ASSERT_TRUE(Harness::ExecutePreparedDeployment(
+        manager_, kClientId, *initialSpawn));
+    const std::optional<uint32_t> graphOpenPacket =
+        Harness::PendingOwningGraphPacket(
+            manager_, kClientId, 209u,
+            /*open=*/true, /*close=*/false);
+    ASSERT_TRUE(graphOpenPacket.has_value());
+    Harness::Acknowledge(manager_, kClientId, *graphOpenPacket);
+
+    players->OnPlayerDeath(kClientId);
+    manager_.ReplicateRetailParticipantCombatState(
+        ParticipantId::Human(kClientId), 0, 0, 1, 0,
+        /*isDead=*/true, /*sendHealth=*/false, /*sendDeathRpc=*/true);
+    ASSERT_FALSE(player->IsAlive());
+    ASSERT_FALSE(Harness::Spawned(manager_, kClientId));
+    if (Harness::PendingReliableCount(manager_, kClientId) != 0u) {
+        Harness::Acknowledge(
+            manager_, kClientId,
+            Harness::FirstPendingPacketId(manager_, kClientId));
+    }
+
+    const std::optional<uint32_t> respawn =
+        Harness::PrepareDeploymentForCurrentTeam(manager_, kClientId);
+    ASSERT_TRUE(respawn.has_value());
+    const Vector3 positionBefore = player->GetPosition();
+    const uint32_t graphCursorBefore =
+        Harness::NextOwningGraphReliable(manager_, kClientId, 209u);
+    ASSERT_EQ(
+        Harness::ReservePublishedCh2Reliables(
+            manager_, kClientId,
+            PacketCodec::OutboundReliableSequencer::kMaximumOutstanding -
+                5u).size(),
+        PacketCodec::OutboundReliableSequencer::kMaximumOutstanding - 5u);
+    const uint32_t ch2CursorBefore =
+        Harness::NextCh2Reliable(manager_, kClientId);
+
+    EXPECT_FALSE(Harness::ExecutePreparedDeployment(
+        manager_, kClientId, *respawn));
+
+    EXPECT_FALSE(player->IsAlive());
+    EXPECT_EQ(player->GetHealth(), 0);
+    EXPECT_FLOAT_EQ(player->GetPosition().x, positionBefore.x);
+    EXPECT_FLOAT_EQ(player->GetPosition().y, positionBefore.y);
+    EXPECT_FLOAT_EQ(player->GetPosition().z, positionBefore.z);
+    EXPECT_EQ(Harness::PawnGraphPhase(manager_, kClientId),
+              Harness::OwningGraphPhase::Open);
+    EXPECT_EQ(Harness::PawnGraphTeam(manager_, kClientId), kSouthTeam);
+    EXPECT_EQ(Harness::NextOwningGraphReliable(
+                  manager_, kClientId, 209u),
+              graphCursorBefore);
+    EXPECT_EQ(Harness::NextCh2Reliable(manager_, kClientId),
+              ch2CursorBefore);
+    EXPECT_FALSE(Harness::Spawned(manager_, kClientId));
+}
+
+TEST_F(ConnectionTravelCuChiRoleIntegrationTest,
+       DisconnectedTransportRejectsPreparedDeploymentWithoutMutation) {
+    using Harness = ConnectionTravelLifecycleTestHarness;
+    constexpr uint32_t kClientId = 57u;
+    constexpr uint32_t kSouthTeam =
+        RoleSelectionRepl::kCuChiUsServerTeam;
+
+    const std::shared_ptr<ClientConnection> connection =
+        Connect(0u, kClientId, kSouthTeam);
+    ASSERT_TRUE(connection != nullptr);
+    ASSERT_TRUE(Harness::InstallActiveSupremacyMode(server_) != nullptr);
+    PlayerManager* players = server_.GetPlayerManager();
+    ASSERT_TRUE(players != nullptr);
+    const std::shared_ptr<Player> player = players->GetPlayer(kClientId);
+    ASSERT_TRUE(player != nullptr);
+    const std::optional<uint32_t> spawn =
+        Harness::PrepareDeploymentForCurrentTeam(manager_, kClientId);
+    ASSERT_TRUE(spawn.has_value());
+
+    const Vector3 positionBefore = player->GetPosition();
+    const uint64_t lifeBefore = player->GetLifecycleGeneration();
+    const uint32_t graphCursorBefore =
+        Harness::NextOwningGraphReliable(manager_, kClientId, 209u);
+    connection->MarkDisconnected();
+
+    EXPECT_FALSE(Harness::ExecutePreparedDeployment(
+        manager_, kClientId, *spawn));
+    EXPECT_TRUE(connection->IsDisconnected());
+    EXPECT_FALSE(player->IsAlive());
+    EXPECT_EQ(player->GetLifecycleGeneration(), lifeBefore);
+    EXPECT_FLOAT_EQ(player->GetPosition().x, positionBefore.x);
+    EXPECT_FLOAT_EQ(player->GetPosition().y, positionBefore.y);
+    EXPECT_FLOAT_EQ(player->GetPosition().z, positionBefore.z);
+    EXPECT_EQ(Harness::PawnGraphPhase(manager_, kClientId),
+              Harness::OwningGraphPhase::Unopened);
+    EXPECT_EQ(Harness::NextOwningGraphReliable(
+                  manager_, kClientId, 209u),
+              graphCursorBefore);
+    EXPECT_FALSE(Harness::Spawned(manager_, kClientId));
+}
+
+TEST_F(ConnectionTravelCuChiRoleIntegrationTest,
+       InvalidTeamAtCommitFailsClosedWithoutAuthoritativeSpawn) {
+    using Harness = ConnectionTravelLifecycleTestHarness;
+    constexpr uint32_t kClientId = 60u;
+    constexpr uint32_t kSouthTeam =
+        RoleSelectionRepl::kCuChiUsServerTeam;
+
+    const std::shared_ptr<ClientConnection> connection =
+        Connect(0u, kClientId, kSouthTeam);
+    ASSERT_TRUE(connection != nullptr);
+    ASSERT_TRUE(Harness::InstallActiveSupremacyMode(server_) != nullptr);
+    PlayerManager* players = server_.GetPlayerManager();
+    TeamManager* teams = server_.GetTeamManager();
+    ASSERT_TRUE(players != nullptr);
+    ASSERT_TRUE(teams != nullptr);
+    const std::shared_ptr<Player> player = players->GetPlayer(kClientId);
+    ASSERT_TRUE(player != nullptr);
+    const std::optional<uint32_t> spawn =
+        Harness::PrepareDeploymentForCurrentTeam(manager_, kClientId);
+    ASSERT_TRUE(spawn.has_value());
+    const Vector3 positionBefore = player->GetPosition();
+    const uint64_t lifeBefore = player->GetLifecycleGeneration();
+    teams->RemovePlayer(kClientId);
+    ASSERT_EQ(teams->GetPlayerTeam(kClientId), 0u);
+
+    EXPECT_FALSE(Harness::ExecutePreparedDeployment(
+        manager_, kClientId, *spawn));
+
+    EXPECT_TRUE(connection->IsDisconnected());
+    EXPECT_FALSE(player->IsAlive());
+    EXPECT_EQ(player->GetLifecycleGeneration(), lifeBefore);
+    EXPECT_FLOAT_EQ(player->GetPosition().x, positionBefore.x);
+    EXPECT_FLOAT_EQ(player->GetPosition().y, positionBefore.y);
+    EXPECT_FLOAT_EQ(player->GetPosition().z, positionBefore.z);
+    EXPECT_EQ(Harness::PawnGraphPhase(manager_, kClientId),
+              Harness::OwningGraphPhase::Broken);
+    EXPECT_FALSE(Harness::Spawned(manager_, kClientId));
+}
+
+TEST_F(ConnectionTravelCuChiRoleIntegrationTest,
+       NegativeCombatScoreCannotSuppressAuthoritativeSpawnLifecycle) {
+    using Harness = ConnectionTravelLifecycleTestHarness;
+    constexpr uint32_t kClientId = 58u;
+    constexpr uint32_t kSouthTeam =
+        RoleSelectionRepl::kCuChiUsServerTeam;
+
+    const std::shared_ptr<ClientConnection> connection =
+        Connect(0u, kClientId, kSouthTeam);
+    ASSERT_TRUE(connection != nullptr);
+    PlayerManager* players = server_.GetPlayerManager();
+    ASSERT_TRUE(players != nullptr);
+    const std::shared_ptr<Player> player = players->GetPlayer(kClientId);
+    ASSERT_TRUE(player != nullptr);
+    ASSERT_FALSE(player->IsAlive());
+    const uint64_t generationBefore =
+        Harness::OwningPawnGeneration(manager_, kClientId);
+    players->SetPlayerScore(kClientId, -1);
+    players->OnPlayerSpawn(kClientId);
+    ASSERT_TRUE(player->IsAlive());
+
+    manager_.ReplicateRetailParticipantCombatState(
+        ParticipantId::Human(kClientId), player->GetHealth(), 0, 0, -1,
+        /*isDead=*/false, /*sendHealth=*/true, /*sendDeathRpc=*/true);
+
+    EXPECT_FALSE(connection->IsDisconnected());
+    EXPECT_TRUE(Harness::OwningPawnAlive(manager_, kClientId));
+    EXPECT_GT(Harness::OwningPawnGeneration(manager_, kClientId),
+              generationBefore);
+}
+
+TEST_F(ConnectionTravelCuChiRoleIntegrationTest,
+       DuplicateDeathWhileGraphClosingPreservesDeferredToken) {
+    using Harness = ConnectionTravelLifecycleTestHarness;
+    constexpr uint32_t kClientId = 59u;
+    constexpr uint32_t kSouthTeam =
+        RoleSelectionRepl::kCuChiUsServerTeam;
+    constexpr uint32_t kNorthTeam =
+        RoleSelectionRepl::kCuChiNlfServerTeam;
+
+    const std::shared_ptr<ClientConnection> connection =
+        Connect(0u, kClientId, kSouthTeam);
+    ASSERT_TRUE(connection != nullptr);
+    ASSERT_TRUE(Harness::InstallActiveSupremacyMode(server_) != nullptr);
+    PlayerManager* players = server_.GetPlayerManager();
+    TeamManager* teams = server_.GetTeamManager();
+    ASSERT_TRUE(players != nullptr);
+    ASSERT_TRUE(teams != nullptr);
+    const std::shared_ptr<Player> player = players->GetPlayer(kClientId);
+    ASSERT_TRUE(player != nullptr);
+
+    Harness::PrepareOwningPawnLifeForFactionSwitch(manager_, kClientId);
+    const std::optional<uint32_t> southSpawn =
+        Harness::PrepareDeploymentForCurrentTeam(manager_, kClientId);
+    ASSERT_TRUE(southSpawn.has_value());
+    ASSERT_TRUE(Harness::ExecutePreparedDeployment(
+        manager_, kClientId, *southSpawn));
+    const std::optional<uint32_t> openPacket =
+        Harness::PendingOwningGraphPacket(
+            manager_, kClientId, 209u,
+            /*open=*/true, /*close=*/false);
+    ASSERT_TRUE(openPacket.has_value());
+    Harness::Acknowledge(manager_, kClientId, *openPacket);
+
+    players->OnPlayerDeath(kClientId);
+    manager_.ReplicateRetailParticipantCombatState(
+        ParticipantId::Human(kClientId), 0, 0, 1, 0,
+        /*isDead=*/true, /*sendHealth=*/false, /*sendDeathRpc=*/true);
+    teams->AddPlayerToTeam(kClientId, kNorthTeam);
+    const std::optional<uint32_t> northSpawn =
+        Harness::PrepareDeploymentForCurrentTeam(manager_, kClientId);
+    ASSERT_TRUE(northSpawn.has_value());
+    EXPECT_FALSE(Harness::ExecutePreparedDeployment(
+        manager_, kClientId, *northSpawn));
+    const std::optional<uint32_t> closePacket =
+        Harness::PendingOwningGraphPacket(
+            manager_, kClientId, 209u,
+            /*open=*/false, /*close=*/true);
+    ASSERT_TRUE(closePacket.has_value());
+    ASSERT_FALSE(Harness::OwningPawnAlive(manager_, kClientId));
+    ASSERT_TRUE(Harness::HasDeferredOwningPawnDeployment(
+        manager_, kClientId));
+
+    manager_.ReplicateRetailParticipantCombatState(
+        ParticipantId::Human(kClientId), 0, 0, 1, 0,
+        /*isDead=*/true, /*sendHealth=*/false, /*sendDeathRpc=*/true);
+
+    EXPECT_FALSE(connection->IsDisconnected());
+    EXPECT_EQ(Harness::PawnGraphPhase(manager_, kClientId),
+              Harness::OwningGraphPhase::Closing);
+    EXPECT_TRUE(Harness::HasDeferredOwningPawnDeployment(
+        manager_, kClientId));
+    EXPECT_FALSE(Harness::OwningPawnAlive(manager_, kClientId));
+    EXPECT_FALSE(Harness::Spawned(manager_, kClientId));
+    EXPECT_FALSE(player->IsAlive());
+}
+
+TEST_F(ConnectionTravelCuChiRoleIntegrationTest,
        FreshFinalAfterDeathResetsAuthorizationAndRequiresFreshReady) {
     using Harness = ConnectionTravelLifecycleTestHarness;
     constexpr uint32_t kClientId = 41u;
@@ -2740,11 +4169,17 @@ TEST(ConnectionTravelLifecycle,
 TEST(ConnectionTravelLifecycle,
      SpawnVolumeDeploymentHandlerIsTransactionalAndAppliesWireOrder) {
     ConnectionManager manager(nullptr);
-    ConnectionTravelLifecycleTestHarness::AddClient(
+    const std::shared_ptr<ClientConnection> connection =
+        ConnectionTravelLifecycleTestHarness::AddClient(
         manager, 1, "127.0.0.1", 30140, true, 7, false);
+    ASSERT_TRUE(connection != nullptr);
+    // Establish the production generation while the detached fixture has no
+    // role-finalized state that would require a ChangedRole publication.
+    ConnectionTravelLifecycleTestHarness::BeginDeploymentGeneration(manager);
     ConnectionTravelLifecycleTestHarness::SetPublishedSpawnSelectionState(
         manager, 1);
-    ConnectionTravelLifecycleTestHarness::BeginDeploymentGeneration(manager);
+    ConnectionTravelLifecycleTestHarness::ResetDetachedDeploymentClient(
+        manager, 1);
     ASSERT_TRUE(ConnectionTravelLifecycleTestHarness::AuthorizePublishedSpawn(
         manager, 1));
 
@@ -2779,7 +4214,9 @@ TEST(ConnectionTravelLifecycle,
     // intentionally detached test manager, current spawn revalidation is empty:
     // the h261 emits one PRI confirmation packet, then h434 fail-closes and
     // clears the selection rather than authorizing against stale h59 state.
-    ConnectionTravelLifecycleTestHarness::BeginDeploymentGeneration(manager);
+    ConnectionTravelLifecycleTestHarness::ResetDetachedDeploymentClient(
+        manager, 1);
+    ASSERT_FALSE(connection->IsDisconnected());
     const uint32_t packetBefore =
         ConnectionTravelLifecycleTestHarness::NextOutboundPacketId(manager, 1);
     ConnectionTravelLifecycleTestHarness::DeliverActorBunch(
@@ -2797,6 +4234,7 @@ TEST(ConnectionTravelLifecycle,
     EXPECT_FALSE(state->deploymentAuthorized);
     EXPECT_EQ(state->readyStatus,
               DeploymentCoordinator::ReadyStatus::ForceOnly);
+    EXPECT_TRUE(connection->IsDisconnected());
 }
 
 TEST(ConnectionTravelLifecycle,

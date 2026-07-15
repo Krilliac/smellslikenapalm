@@ -17,17 +17,77 @@
 #include <cstdlib>
 #include <utility>
 
+namespace {
+
+bool SameAccessContext(const SpawnAccessContext& left,
+                       const SpawnAccessContext& right) noexcept {
+    return left.playerTeam == right.playerTeam &&
+        left.territoryActive == right.territoryActive &&
+        left.attackingTeam == right.attackingTeam &&
+        left.defendingTeam == right.defendingTeam &&
+        left.territoryPhase == right.territoryPhase;
+}
+
+bool SameVector(const Vector3& left, const Vector3& right) noexcept {
+    return left.x == right.x && left.y == right.y && left.z == right.z;
+}
+
+bool IsFiniteVector(const Vector3& value) noexcept {
+    return std::isfinite(value.x) && std::isfinite(value.y) &&
+        std::isfinite(value.z);
+}
+
+bool SameSpawnLocation(const SpawnLocation& left,
+                       const SpawnLocation& right) noexcept {
+    return left.id == right.id && left.type == right.type &&
+        left.name == right.name && SameVector(left.position, right.position) &&
+        SameVector(left.rotation, right.rotation) &&
+        left.teamId == right.teamId && left.isActive == right.isActive &&
+        left.isDestroyed == right.isDestroyed &&
+        left.minTerritoryPhase == right.minTerritoryPhase &&
+        left.maxTerritoryPhase == right.maxTerritoryPhase &&
+        left.retailSpawnVolumeRef == right.retailSpawnVolumeRef &&
+        left.squadLeaderId == right.squadLeaderId &&
+        left.objectiveId == right.objectiveId &&
+        left.tunnelHealth == right.tunnelHealth &&
+        left.spawnCooldown == right.spawnCooldown;
+}
+
+} // namespace
+
+SpawnSystem::PreparedPlayerSpawn::PreparedPlayerSpawn(
+    const SpawnSystem* owner, uint32_t playerId, uint32_t spawnLocationId,
+    std::weak_ptr<Player> playerIdentity, SpawnAccessContext access,
+    SpawnLocation location, Vector3 position,
+    uint64_t playerLifecycleGeneration) noexcept
+    : m_owner(owner),
+      m_playerId(playerId),
+      m_spawnLocationId(spawnLocationId),
+      m_playerIdentity(std::move(playerIdentity)),
+      m_access(std::move(access)),
+      m_location(std::move(location)),
+      m_position(position),
+      m_rotation(m_location.rotation),
+      m_playerLifecycleGeneration(playerLifecycleGeneration) {}
+
 SpawnSystem::SpawnSystem(GameServer* server,
                          AccessContextResolver accessContextResolver,
                          SquadLeaderEligibilityResolver
-                             squadLeaderEligibilityResolver)
+                             squadLeaderEligibilityResolver,
+                         PlayerManager* playerManagerOverride)
     : m_server(server),
       m_accessContextResolver(std::move(accessContextResolver)),
       m_squadLeaderEligibilityResolver(
-          std::move(squadLeaderEligibilityResolver))
+          std::move(squadLeaderEligibilityResolver)),
+      m_playerManagerOverride(playerManagerOverride)
 {
     Logger::Trace("[SpawnSystem::SpawnSystem] Entry, server=%p", static_cast<void*>(server));
     Logger::Trace("[SpawnSystem::SpawnSystem] Exit");
+}
+
+PlayerManager* SpawnSystem::ResolvePlayerManager() const {
+    if (m_playerManagerOverride) return m_playerManagerOverride;
+    return m_server ? m_server->GetPlayerManager() : nullptr;
 }
 
 SpawnSystem::~SpawnSystem() {
@@ -432,49 +492,231 @@ void SpawnSystem::SetWaveTimeRemaining(uint32_t teamId, float seconds) {
     Logger::Trace("[SpawnSystem::SetWaveTimeRemaining] Exit");
 }
 
-bool SpawnSystem::SpawnPlayer(uint32_t playerId, uint32_t spawnLocationId) {
-    Logger::Trace("[SpawnSystem::SpawnPlayer] Entry, playerId=%u, spawnLocationId=%u", playerId, spawnLocationId);
-    auto* loc = GetSpawnLocation(spawnLocationId);
-    if (!loc || !CanPlayerSpawnAt(playerId, spawnLocationId)) {
-        Logger::Warn("Cannot spawn player %u at location %u (not currently authorized)", playerId, spawnLocationId);
-        Logger::Trace("[SpawnSystem::SpawnPlayer] Exit, return false (unauthorized location)");
-        return false;
-    }
+std::optional<SpawnSystem::PreparedPlayerSpawn>
+SpawnSystem::PreparePlayerSpawn(uint32_t playerId,
+                                uint32_t spawnLocationId) const {
+    Logger::Trace(
+        "[SpawnSystem::PreparePlayerSpawn] Entry, playerId=%u, "
+        "spawnLocationId=%u",
+        playerId, spawnLocationId);
 
-    auto* pm = m_server ? m_server->GetPlayerManager() : nullptr;
-    if (!pm) {
-        Logger::Error("[SpawnSystem::SpawnPlayer] PlayerManager unavailable, cannot spawn player %u", playerId);
-        Logger::Trace("[SpawnSystem::SpawnPlayer] Exit, return false (no PlayerManager)");
-        return false;
-    }
-    auto player = pm->GetPlayer(playerId);
+    PlayerManager* players = ResolvePlayerManager();
+    const std::shared_ptr<Player> player =
+        players ? players->GetPlayer(playerId) : nullptr;
     if (!player) {
-        Logger::Warn("[SpawnSystem::SpawnPlayer] Player %u not found", playerId);
-        Logger::Trace("[SpawnSystem::SpawnPlayer] Exit, return false (player not found)");
+        Logger::Warn(
+            "[SpawnSystem::PreparePlayerSpawn] Player %u has no current "
+            "authoritative identity",
+            playerId);
+        return std::nullopt;
+    }
+    if (player->GetState() != PlayerState::Dead) {
+        Logger::Warn(
+            "[SpawnSystem::PreparePlayerSpawn] Player %u is not in the "
+            "authoritative Dead state",
+            playerId);
+        return std::nullopt;
+    }
+
+    const std::optional<SpawnAccessContext> access =
+        ResolveAccessContext(playerId);
+    if (!access) {
+        Logger::Warn(
+            "[SpawnSystem::PreparePlayerSpawn] Player %u has no current "
+            "spawn access context",
+            playerId);
+        return std::nullopt;
+    }
+
+    auto location = m_spawnLocations.find(spawnLocationId);
+    if (location == m_spawnLocations.end() ||
+        !IsSpawnAvailableToPlayer(playerId, location->second, *access)) {
+        Logger::Warn(
+            "[SpawnSystem::PreparePlayerSpawn] Player %u is not authorized "
+            "for spawn %u",
+            playerId, spawnLocationId);
+        return std::nullopt;
+    }
+
+    // Eligibility callbacks are deliberately injectable and may be reentrant.
+    // Reacquire the selected row after all callbacks before copying the token's
+    // immutable location snapshot.
+    location = m_spawnLocations.find(spawnLocationId);
+    if (location == m_spawnLocations.end()) return std::nullopt;
+    const SpawnLocation snapshot = location->second;
+    if (!IsFiniteVector(snapshot.position) ||
+        !IsFiniteVector(snapshot.rotation)) {
+        Logger::Warn(
+            "[SpawnSystem::PreparePlayerSpawn] Spawn %u has a non-finite "
+            "transform",
+            spawnLocationId);
+        return std::nullopt;
+    }
+
+    const Vector3 position = snapshot.position + GetSpawnOffset(snapshot);
+    if (!IsFiniteVector(position)) {
+        Logger::Warn(
+            "[SpawnSystem::PreparePlayerSpawn] Spawn %u produced a "
+            "non-finite offset position",
+            spawnLocationId);
+        return std::nullopt;
+    }
+
+    Logger::Trace(
+        "[SpawnSystem::PreparePlayerSpawn] Exit, prepared player %u at "
+        "spawn %u without authoritative mutation",
+        playerId, spawnLocationId);
+    return PreparedPlayerSpawn(
+        this, playerId, spawnLocationId, player, *access, snapshot, position,
+        player->GetLifecycleGeneration());
+}
+
+bool SpawnSystem::CommitPreparedPlayerSpawn(
+    const PreparedPlayerSpawn& prepared) {
+    Logger::Trace(
+        "[SpawnSystem::CommitPreparedPlayerSpawn] Entry, playerId=%u, "
+        "spawnLocationId=%u",
+        prepared.m_playerId, prepared.m_spawnLocationId);
+
+    if (prepared.m_owner != this) {
+        Logger::Warn(
+            "[SpawnSystem::CommitPreparedPlayerSpawn] Rejected token owned "
+            "by a different SpawnSystem");
+        return false;
+    }
+    auto location = m_spawnLocations.find(prepared.m_spawnLocationId);
+    if (location == m_spawnLocations.end() ||
+        !SameSpawnLocation(location->second, prepared.m_location)) {
+        Logger::Warn(
+            "[SpawnSystem::CommitPreparedPlayerSpawn] Spawn %u changed "
+            "after preparation",
+            prepared.m_spawnLocationId);
         return false;
     }
 
-    Vector3 spawnPos = loc->position + GetSpawnOffset(*loc);
-    player->SetPosition(spawnPos);
-    player->SetOrientation(loc->rotation);
-    pm->OnPlayerSpawn(playerId);
-    Logger::Debug("[SpawnSystem::SpawnPlayer] Player %u position set to (%.1f, %.1f, %.1f)", playerId, spawnPos.x, spawnPos.y, spawnPos.z);
-
-    // Apply spawn cooldown to prevent spawn-camping
-    if (loc->type == SpawnType::SquadLeader) {
-        loc->spawnCooldown = m_squadSpawnCooldown;
-        Logger::Debug("[SpawnSystem::SpawnPlayer] Applied squad spawn cooldown: %.1fs", m_squadSpawnCooldown);
-    } else if (loc->type == SpawnType::Tunnel) {
-        loc->spawnCooldown = m_tunnelSpawnCooldown;
-        Logger::Debug("[SpawnSystem::SpawnPlayer] Applied tunnel spawn cooldown: %.1fs", m_tunnelSpawnCooldown);
-    } else {
-        Logger::Debug("[SpawnSystem::SpawnPlayer] No cooldown applied for spawn type %d", static_cast<int>(loc->type));
+    const std::optional<SpawnAccessContext> access =
+        ResolveAccessContext(prepared.m_playerId);
+    if (!access || !SameAccessContext(*access, prepared.m_access)) {
+        Logger::Warn(
+            "[SpawnSystem::CommitPreparedPlayerSpawn] Player %u access "
+            "changed after preparation",
+            prepared.m_playerId);
+        return false;
     }
 
-    Logger::Debug("Player %u spawned at '%s' (%.1f, %.1f, %.1f)",
-                  playerId, loc->name.c_str(), spawnPos.x, spawnPos.y, spawnPos.z);
-    Logger::Trace("[SpawnSystem::SpawnPlayer] Exit, return true");
+    // Access resolution is injectable and may be reentrant. Never retain a
+    // map iterator across it: the callback may remove or replace the selected
+    // row while returning an otherwise unchanged context.
+    location = m_spawnLocations.find(prepared.m_spawnLocationId);
+    if (location == m_spawnLocations.end() ||
+        !SameSpawnLocation(location->second, prepared.m_location)) {
+        Logger::Warn(
+            "[SpawnSystem::CommitPreparedPlayerSpawn] Spawn %u changed "
+            "during access validation",
+            prepared.m_spawnLocationId);
+        return false;
+    }
+
+    // The ordinary availability predicate includes the selected squad
+    // leader's current liveness/combat state. It is intentionally run again at
+    // the last fallible boundary rather than trusting preparation-time state.
+    if (!IsSpawnAvailableToPlayer(
+            prepared.m_playerId, location->second, *access)) {
+        Logger::Warn(
+            "[SpawnSystem::CommitPreparedPlayerSpawn] Spawn %u is no "
+            "longer available to player %u",
+            prepared.m_spawnLocationId, prepared.m_playerId);
+        return false;
+    }
+
+    // Squad-leader eligibility is injectable and may be reentrant. Resolve
+    // access again after that callback so a team/territory change cannot pass
+    // the earlier snapshot check and then commit under stale authority.
+    const std::optional<SpawnAccessContext> finalAccess =
+        ResolveAccessContext(prepared.m_playerId);
+    if (!finalAccess ||
+        !SameAccessContext(*finalAccess, prepared.m_access)) {
+        Logger::Warn(
+            "[SpawnSystem::CommitPreparedPlayerSpawn] Player %u access "
+            "changed during final eligibility validation",
+            prepared.m_playerId);
+        return false;
+    }
+
+    PlayerManager* players = ResolvePlayerManager();
+    const std::shared_ptr<Player> currentPlayer =
+        players ? players->GetPlayer(prepared.m_playerId) : nullptr;
+    const std::shared_ptr<Player> preparedPlayer =
+        prepared.m_playerIdentity.lock();
+    if (!currentPlayer || !preparedPlayer ||
+        currentPlayer.get() != preparedPlayer.get() ||
+        currentPlayer->GetState() != PlayerState::Dead ||
+        currentPlayer->GetLifecycleGeneration() !=
+            prepared.m_playerLifecycleGeneration) {
+        Logger::Warn(
+            "[SpawnSystem::CommitPreparedPlayerSpawn] Player %u identity "
+            "or Dead lifecycle state changed after preparation",
+            prepared.m_playerId);
+        return false;
+    }
+
+    // Reacquire and compare once more after every injected callback and live
+    // identity lookup. No fallible validation remains below this line.
+    location = m_spawnLocations.find(prepared.m_spawnLocationId);
+    if (location == m_spawnLocations.end() ||
+        !SameSpawnLocation(location->second, prepared.m_location)) {
+        Logger::Warn(
+            "[SpawnSystem::CommitPreparedPlayerSpawn] Spawn %u changed at "
+            "the commit boundary",
+            prepared.m_spawnLocationId);
+        return false;
+    }
+    SpawnLocation& committedLocation = location->second;
+
+    currentPlayer->SetPosition(prepared.m_position);
+    currentPlayer->SetOrientation(prepared.m_rotation);
+    players->OnPlayerSpawn(prepared.m_playerId);
+    Logger::Debug(
+        "[SpawnSystem::CommitPreparedPlayerSpawn] Player %u position set "
+        "to (%.1f, %.1f, %.1f)",
+        prepared.m_playerId, prepared.m_position.x, prepared.m_position.y,
+        prepared.m_position.z);
+
+    if (committedLocation.type == SpawnType::SquadLeader) {
+        committedLocation.spawnCooldown = m_squadSpawnCooldown;
+        Logger::Debug(
+            "[SpawnSystem::CommitPreparedPlayerSpawn] Applied squad spawn "
+            "cooldown: %.1fs",
+            m_squadSpawnCooldown);
+    } else if (committedLocation.type == SpawnType::Tunnel) {
+        committedLocation.spawnCooldown = m_tunnelSpawnCooldown;
+        Logger::Debug(
+            "[SpawnSystem::CommitPreparedPlayerSpawn] Applied tunnel spawn "
+            "cooldown: %.1fs",
+            m_tunnelSpawnCooldown);
+    }
+
+    Logger::Debug(
+        "Player %u spawned at '%s' (%.1f, %.1f, %.1f)",
+        prepared.m_playerId, committedLocation.name.c_str(),
+        prepared.m_position.x, prepared.m_position.y, prepared.m_position.z);
+    Logger::Trace(
+        "[SpawnSystem::CommitPreparedPlayerSpawn] Exit, return true");
     return true;
+}
+
+bool SpawnSystem::SpawnPlayer(uint32_t playerId, uint32_t spawnLocationId) {
+    Logger::Trace(
+        "[SpawnSystem::SpawnPlayer] Entry, playerId=%u, spawnLocationId=%u",
+        playerId, spawnLocationId);
+    std::optional<PreparedPlayerSpawn> prepared =
+        PreparePlayerSpawn(playerId, spawnLocationId);
+    const bool committed =
+        prepared && CommitPreparedPlayerSpawn(*prepared);
+    Logger::Trace(
+        "[SpawnSystem::SpawnPlayer] Exit, return %s",
+        committed ? "true" : "false");
+    return committed;
 }
 
 bool SpawnSystem::SpawnPlayerAtDefault(uint32_t playerId) {

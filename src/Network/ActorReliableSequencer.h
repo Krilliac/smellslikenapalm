@@ -37,7 +37,11 @@ struct ActorReliableSequenceResult {
 class ActorReliableSequencer {
 public:
     static constexpr uint32_t kDefaultFirstSequence = 1;
-    static constexpr uint32_t kDefaultReorderWindow = 64;
+    // UE3's RELIABLE_BUFFER is 128 entries (UnNet.h).  A receiver must retain
+    // every legal successor at distance 1..127; ACKing and dropping one of
+    // those bunches would stop retransmission and permanently strand the
+    // channel behind its missing sequence.
+    static constexpr uint32_t kDefaultReorderWindow = 127;
     // Modular ordering is unambiguous only inside half of the sequence space.
     static constexpr uint32_t kMaximumReorderWindow =
         (kMaxChSequence / 2u) - 1u;
@@ -75,6 +79,13 @@ public:
     // Channel reuse continues the sequence space; only a new connection Clear()
     // or an explicit ResetChannel() may reseed it.
     bool DiscardPending(uint32_t channelIndex);
+
+    // At a proven actor-incarnation boundary, semantically retire every
+    // buffered sequence through the farthest known successor (including any
+    // missing gaps) and advance the persistent receive cursor beyond it.
+    // Packet-level ACK may already have stopped retransmission of those old
+    // bunches, so merely discarding the payloads would strand the next actor.
+    size_t RetirePending(uint32_t channelIndex);
 
     uint32_t NextSequence(uint32_t channelIndex) const;
     size_t PendingBunchCount(uint32_t channelIndex) const;

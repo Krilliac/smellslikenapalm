@@ -143,6 +143,36 @@ TEST(OutboundReliableSequencer, EmptyBatchFailureDoesNotMutateState) {
     EXPECT_EQ(sequencer.OutstandingCount(), 0u);
 }
 
+TEST(OutboundReliableSequencer,
+     CapacityPreflightMatchesReservationWithoutMutatingCursor) {
+    OutboundReliableSequencer sequencer;
+    ExpectError(sequencer.CanReserveBatch(1u),
+                OutboundReliableSequenceError::Uninitialized);
+    ASSERT_TRUE(sequencer.Seed(100u).has_value());
+
+    const auto nextBefore = sequencer.NextSequence();
+    const size_t outstandingBefore = sequencer.OutstandingCount();
+    const size_t windowBefore = sequencer.IssuanceWindowSize();
+    EXPECT_TRUE(sequencer.CanReserveBatch(3u).has_value());
+    EXPECT_EQ(sequencer.NextSequence(), nextBefore);
+    EXPECT_EQ(sequencer.OutstandingCount(), outstandingBefore);
+    EXPECT_EQ(sequencer.IssuanceWindowSize(), windowBefore);
+
+    const auto reservation = sequencer.ReserveBatch(3u);
+    ASSERT_TRUE(reservation.has_value());
+    EXPECT_EQ(reservation->front(), 101u);
+    ExpectError(sequencer.CanReserveBatch(1u),
+                OutboundReliableSequenceError::UnpublishedReservation);
+    ASSERT_TRUE(sequencer.CancelBatch(*reservation).has_value());
+    EXPECT_EQ(sequencer.NextSequence(), nextBefore);
+
+    ExpectError(
+        sequencer.CanReserveBatch(
+            OutboundReliableSequencer::kMaximumOutstanding + 1u),
+        OutboundReliableSequenceError::OutstandingLimit);
+    EXPECT_EQ(sequencer.NextSequence(), nextBefore);
+}
+
 TEST(OutboundReliableSequencer, OldGapCapsForwardIssuanceAtHalfCycle) {
     OutboundReliableSequencer sequencer;
     ASSERT_TRUE(sequencer.Seed(0u).has_value());

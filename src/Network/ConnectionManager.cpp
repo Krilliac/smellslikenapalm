@@ -2596,6 +2596,17 @@ uint64_t ConnectionManager::AdvanceOwningPawnGeneration(ControlState& state) {
     return state.owningPawnGeneration;
 }
 
+uint64_t ConnectionManager::AnticipatedOwningPawnGeneration(
+    const ControlState& state) noexcept {
+    if (state.owningPawnAlive && state.owningPawnGeneration != 0u) {
+        return state.owningPawnGeneration;
+    }
+    return state.owningPawnGeneration ==
+            std::numeric_limits<uint64_t>::max()
+        ? 1u
+        : std::max<uint64_t>(1u, state.owningPawnGeneration + 1u);
+}
+
 bool ConnectionManager::HasLiveOwningPawnGeneration(
     const ControlState& state, uint64_t expectedPawnGeneration) {
     return expectedPawnGeneration != 0u && state.owningPawnAlive &&
@@ -2624,6 +2635,316 @@ void ConnectionManager::ResetPossessionRecovery(ControlState& state) {
     state.possessionRecoveryResponses = 0;
     state.lastPossessionRecoveryResponseMs = 0;
     state.possessionRecoveryLimitLogged = false;
+}
+
+std::optional<size_t> ConnectionManager::OwningPawnGraphChannelIndex(
+    uint32_t channel) {
+    const auto found = std::find(
+        kOwningPawnGraphChannels.begin(), kOwningPawnGraphChannels.end(),
+        channel);
+    if (found == kOwningPawnGraphChannels.end()) return std::nullopt;
+    return static_cast<size_t>(
+        std::distance(kOwningPawnGraphChannels.begin(), found));
+}
+
+PacketCodec::OutboundReliableSequencer*
+ConnectionManager::OwningPawnGraphSequencer(ControlState& state,
+                                             uint32_t channel) {
+    const auto index = OwningPawnGraphChannelIndex(channel);
+    return index ? &state.owningPawnGraphReliable[*index] : nullptr;
+}
+
+const PacketCodec::OutboundReliableSequencer*
+ConnectionManager::OwningPawnGraphSequencer(const ControlState& state,
+                                             uint32_t channel) {
+    const auto index = OwningPawnGraphChannelIndex(channel);
+    return index ? &state.owningPawnGraphReliable[*index] : nullptr;
+}
+
+void ConnectionManager::FailOwningPawnGraph(uint32_t clientId,
+                                             const char* context) {
+    ControlState& state = GetControlState(clientId);
+    state.pawnGraphPhase = OwningPawnGraphPhase::Broken;
+    state.pawnGraphOpen = false;
+    state.spawned = false;
+    state.owningPawnAlive = false;
+    state.deferredOwningPawnGraphDeployment.reset();
+    state.activeWeaponChannel = 0u;
+    state.weaponIntent.fill({});
+    state.movementInputValid = false;
+    state.useHeld = false;
+    state.mantleAttemptPending = false;
+    state.mantlePawnStarted = false;
+    state.specialMoveActive = false;
+    state.specialMove = 0u;
+    InvalidatePossessionRecovery(state);
+    if (m_server) m_server->CancelRetailGrenadeCook(clientId);
+    const std::shared_ptr<ClientConnection> connection =
+        GetConnection(clientId);
+    if (connection && !connection->IsDisconnected()) {
+        connection->MarkDisconnected();
+    }
+    Logger::Error(
+        "[OwningPawnGraph] client %u fail-closed after %s",
+        clientId, context ? context : "an inconsistent graph transition");
+}
+
+bool ConnectionManager::EnsureOwningPawnGraphSequencers(
+    uint32_t clientId, ControlState& state) {
+    for (size_t index = 0; index < kOwningPawnGraphChannels.size(); ++index) {
+        auto& sequencer = state.owningPawnGraphReliable[index];
+        if (sequencer.IsInitialized()) continue;
+        const auto seeded = sequencer.Seed(0u);
+        if (!seeded) {
+            Logger::Error(
+                "[OwningPawnGraph] client %u could not seed ch%u reliable "
+                "cursor (error=%u)",
+                clientId, kOwningPawnGraphChannels[index],
+                static_cast<unsigned>(seeded.error()));
+            FailOwningPawnGraph(clientId, "fixed-channel cursor seed");
+            return false;
+        }
+    }
+    return true;
+}
+
+bool ConnectionManager::QueueOwningPawnGraphClose(uint32_t clientId) {
+    ControlState& state = GetControlState(clientId);
+    if (state.pawnGraphPhase != OwningPawnGraphPhase::Open ||
+        !state.pawnGraphOpen ||
+        state.owningPawnGraphActiveChannels.none() ||
+        !EnsureOwningPawnGraphSequencers(clientId, state)) {
+        return false;
+    }
+
+    using Reservation =
+        PacketCodec::OutboundReliableSequencer::Reservation;
+    struct ReservedClose {
+        uint32_t channel = 0;
+        Reservation reservation;
+    };
+    std::vector<ReservedClose> reserved;
+    reserved.reserve(kOwningPawnGraphChannels.size());
+
+    // Close inventory leaves before their manager and pawn. This deterministic
+    // whole-graph barrier is an emulator safety policy, not a captured retail
+    // faction-switch order.
+    static constexpr std::array<uint32_t, 7> kCloseOrder{
+        210u, 211u, 212u, 213u, 214u, 219u, 209u};
+    for (const uint32_t channel : kCloseOrder) {
+        if (!state.owningPawnGraphActiveChannels.test(channel)) continue;
+        auto* sequencer = OwningPawnGraphSequencer(state, channel);
+        auto reservation = sequencer
+            ? sequencer->ReserveBatch(1u)
+            : PacketCodec::OutboundReliableSequencer::ReservationResult(
+                  std::unexpected(
+                      PacketCodec::OutboundReliableSequenceError::
+                          Uninitialized));
+        if (!reservation) {
+            for (auto prior = reserved.rbegin(); prior != reserved.rend();
+                 ++prior) {
+                if (auto* priorSequencer =
+                        OwningPawnGraphSequencer(state, prior->channel)) {
+                    (void)priorSequencer->CancelBatch(prior->reservation);
+                }
+            }
+            Logger::Warn(
+                "[OwningPawnGraph] client %u could not reserve close on ch%u "
+                "(error=%u)",
+                clientId, channel,
+                static_cast<unsigned>(reservation.error()));
+            return false;
+        }
+        reserved.push_back({channel, std::move(*reservation)});
+    }
+    if (reserved.empty()) return false;
+
+    std::vector<PacketCodec::Bunch> closes;
+    closes.reserve(reserved.size());
+    for (const ReservedClose& item : reserved) {
+        PacketCodec::Bunch close;
+        close.bControl = true;
+        close.bClose = true;
+        close.bReliable = true;
+        close.chIndex = item.channel;
+        close.chType = 2u;
+        close.chSequence = item.reservation.front();
+        closes.push_back(std::move(close));
+    }
+
+    const size_t pendingBefore = state.pendingReliable.size();
+    (void)SendReliableBunches(clientId, closes);
+    if (state.pendingReliable.size() == pendingBefore) {
+        for (auto item = reserved.rbegin(); item != reserved.rend(); ++item) {
+            if (auto* sequencer =
+                    OwningPawnGraphSequencer(state, item->channel)) {
+                (void)sequencer->CancelBatch(item->reservation);
+            }
+        }
+        return false;
+    }
+
+    for (const ReservedClose& item : reserved) {
+        auto* sequencer = OwningPawnGraphSequencer(state, item.channel);
+        const auto committed = sequencer
+            ? sequencer->CommitBatch(item.reservation)
+            : PacketCodec::OutboundReliableSequencer::MutationResult(
+                  std::unexpected(
+                      PacketCodec::OutboundReliableSequenceError::
+                          Uninitialized));
+        if (!committed) {
+            Logger::Error(
+                "[OwningPawnGraph] client %u queued close ch%u seq%u but "
+                "could not commit it (error=%u)",
+                clientId, item.channel, item.reservation.front(),
+                static_cast<unsigned>(committed.error()));
+            FailOwningPawnGraph(clientId,
+                                "published close reservation commit");
+            return false;
+        }
+    }
+
+    state.pawnGraphPhase = OwningPawnGraphPhase::Closing;
+    state.pawnGraphOpen = false;
+    state.owningPawnGraphClosingChannels =
+        state.owningPawnGraphActiveChannels;
+    state.owningPawnGraphCloseAcknowledged.reset();
+    InvalidatePossessionRecovery(state);
+    Logger::Info(
+        "[OwningPawnGraph] client %u queued %zu empty reliable close(s) "
+        "for team %u graph",
+        clientId, closes.size(), state.pawnGraphTeamId);
+    return true;
+}
+
+ConnectionManager::OwningPawnGraphGateResult
+ConnectionManager::GateOwningPawnGraphForDeployment(
+    uint32_t clientId, uint32_t teamId, uint32_t spawnId) {
+    ControlState& state = GetControlState(clientId);
+    if (!TeamMapping::IsPlayableServerTeam(teamId) || spawnId == 0u) {
+        return OwningPawnGraphGateResult::Failed;
+    }
+
+    switch (state.pawnGraphPhase) {
+        case OwningPawnGraphPhase::Unopened:
+        case OwningPawnGraphPhase::Closed:
+            state.deferredOwningPawnGraphDeployment.reset();
+            return OwningPawnGraphGateResult::Ready;
+        case OwningPawnGraphPhase::Open:
+            if (state.pawnGraphOpen && state.pawnGraphTeamId == teamId) {
+                state.deferredOwningPawnGraphDeployment.reset();
+                return OwningPawnGraphGateResult::Ready;
+            }
+            if (!QueueOwningPawnGraphClose(clientId)) {
+                FailOwningPawnGraph(clientId,
+                                    "opposite-faction close publication");
+                return OwningPawnGraphGateResult::Failed;
+            }
+            break;
+        case OwningPawnGraphPhase::Closing:
+            break;
+        case OwningPawnGraphPhase::Broken:
+            return OwningPawnGraphGateResult::Failed;
+    }
+
+    state.deferredOwningPawnGraphDeployment =
+        DeferredOwningPawnGraphDeployment{
+            m_deploymentGeneration, spawnId, teamId};
+    return OwningPawnGraphGateResult::Deferred;
+}
+
+void ConnectionManager::CompleteOwningPawnGraphClose(
+    uint32_t clientId,
+    std::optional<uint32_t> inboundBarrierPacketId) {
+    auto stateIt = m_controlState.find(clientId);
+    if (stateIt == m_controlState.end()) return;
+    ControlState& state = stateIt->second;
+    if (state.pawnGraphPhase != OwningPawnGraphPhase::Closing) return;
+
+    for (const uint32_t channel : kOwningPawnGraphChannels) {
+        if (!state.owningPawnGraphClosingChannels.test(channel) ||
+            !state.owningPawnGraphCloseAcknowledged.test(channel)) {
+            continue;
+        }
+        const bool channelStillPending = std::any_of(
+            state.pendingReliable.begin(), state.pendingReliable.end(),
+            [channel](const ControlState::SentReliable& reliable) {
+                return std::any_of(
+                    reliable.bunches.begin(), reliable.bunches.end(),
+                    [channel](const PacketCodec::Bunch& bunch) {
+                        return bunch.bReliable &&
+                               bunch.chIndex == channel;
+                    });
+            });
+        const auto* sequencer = OwningPawnGraphSequencer(state, channel);
+        if (channelStillPending || !sequencer ||
+            sequencer->OutstandingCount() != 0u ||
+            sequencer->IssuanceWindowSize() != 0u) {
+            continue;
+        }
+
+        state.outboundActorChannels.reset(channel);
+        state.owningPawnGraphActiveChannels.reset(channel);
+        state.owningPawnGraphClosingChannels.reset(channel);
+        state.owningPawnGraphCloseAcknowledged.reset(channel);
+    }
+    if (state.owningPawnGraphClosingChannels.any()) return;
+
+    // Packet ACKs may already have stopped retransmission of old reliable RPCs
+    // that were buffered behind a missing sequence. Retire the entire known
+    // old range before opening another actor incarnation; delayed missing
+    // predecessors are then stale, while later old packets are semantically
+    // suppressed as they advance the persistent receive cursor.
+    for (size_t index = 0;
+         index < kOwningPawnGraphChannels.size(); ++index) {
+        const uint32_t channel = kOwningPawnGraphChannels[index];
+        const size_t retired =
+            state.actorReliableInbound.RetirePending(channel);
+        state.owningPawnGraphSuppressedInboundReliable[index].reset();
+        if (retired != 0u) {
+            Logger::Info(
+                "[OwningPawnGraph] client %u retired %zu buffered old "
+                "inbound reliable(s) on ch%u at close boundary",
+                clientId, retired, channel);
+        }
+    }
+
+    state.pawnGraphPhase = OwningPawnGraphPhase::Closed;
+    state.pawnGraphOpen = false;
+    state.pawnGraphTeamId = 0u;
+    state.owningPawnGraphActiveChannels.reset();
+    InvalidatePossessionRecovery(state);
+    if (inboundBarrierPacketId &&
+        *inboundBarrierPacketId < static_cast<uint32_t>(kMaxPacketId)) {
+        state.owningPawnGraphInboundPacketFloorValid = true;
+        state.owningPawnGraphInboundPacketFloor =
+            *inboundBarrierPacketId;
+    }
+
+    const auto deferred = state.deferredOwningPawnGraphDeployment;
+    state.deferredOwningPawnGraphDeployment.reset();
+    Logger::Info(
+        "[OwningPawnGraph] client %u close cohort fully ACKed/drained",
+        clientId);
+    if (!deferred ||
+        deferred->deploymentGeneration != m_deploymentGeneration ||
+        state.mapTravelPending || state.spawned) {
+        return;
+    }
+
+    const auto connection = GetConnection(clientId);
+    const auto deployment = m_deploymentCoordinator.GetClientState(clientId);
+    const TeamManager* teams = m_server ? m_server->GetTeamManager() : nullptr;
+    if (!connection || connection->IsDisconnected() || !deployment ||
+        !deployment->deploymentAuthorized ||
+        deployment->generation != deferred->deploymentGeneration ||
+        deployment->selectedSpawnId !=
+            std::optional<uint32_t>{deferred->spawnId} ||
+        !teams || teams->GetPlayerTeam(clientId) != deferred->teamId) {
+        return;
+    }
+
+    (void)ExecutePreparedDeployment(clientId, deferred->spawnId);
 }
 
 void ConnectionManager::TransportKeepAliveTick() {
@@ -2662,7 +2983,7 @@ void ConnectionManager::TransportKeepAliveTick() {
 bool ConnectionManager::SendReliableBunches(
     uint32_t clientId, const std::vector<PacketCodec::Bunch>& bunches) {
     auto conn = GetConnection(clientId);
-    if (!conn || bunches.empty()) return false;
+    if (!conn || conn->IsDisconnected() || bunches.empty()) return false;
     ControlState& cs = GetControlState(clientId);
     // Once ClientTravel is queued this incarnation is drain-only. Earlier
     // reliable actor bunches remain in pendingReliable because ch2 ordering
@@ -2840,6 +3161,28 @@ void ConnectionManager::OnClientAck(uint32_t clientId, uint32_t ackedPacketId) {
                         static_cast<unsigned>(released.error()));
                 }
             }
+            if (bunch.bReliable) {
+                if (auto* sequencer =
+                        OwningPawnGraphSequencer(cs, bunch.chIndex);
+                    sequencer &&
+                    sequencer->IsInFlight(bunch.chSequence)) {
+                    const auto released = sequencer->Release(
+                        bunch.chSequence);
+                    if (!released) {
+                        Logger::Warn(
+                            "[OwningPawnGraph] client %u ACKed untracked "
+                            "ch%u sequence %u (error=%u)",
+                            clientId, bunch.chIndex, bunch.chSequence,
+                            static_cast<unsigned>(released.error()));
+                    }
+                }
+            }
+            if (bunch.bReliable && bunch.bClose &&
+                cs.pawnGraphPhase == OwningPawnGraphPhase::Closing &&
+                bunch.chIndex < ActorRepl::kDynamicChannelMax &&
+                cs.owningPawnGraphClosingChannels.test(bunch.chIndex)) {
+                cs.owningPawnGraphCloseAcknowledged.set(bunch.chIndex);
+            }
             if (bunch.bReliable && bunch.bClose &&
                 bunch.chIndex < ActorRepl::kDynamicChannelMax &&
                 cs.m61Visuals.IsCloseQueued(bunch.chIndex)) {
@@ -2904,6 +3247,14 @@ void ConnectionManager::OnClientAck(uint32_t clientId, uint32_t ackedPacketId) {
         if (cs.remoteParticipants.AcknowledgePawnClose(channel)) {
             cs.outboundActorChannels.reset(channel);
             cs.participantPawnCloseAcknowledged.reset(channel);
+        }
+    }
+
+    if (cs.pawnGraphPhase == OwningPawnGraphPhase::Closing) {
+        if (cs.inboundPacketDispatchActive) {
+            cs.owningPawnGraphCompletionDeferred = true;
+        } else {
+            CompleteOwningPawnGraphClose(clientId);
         }
     }
 }
@@ -3166,6 +3517,7 @@ size_t ConnectionManager::BroadcastRetailClientTravel(
         recipient.state->mapTravelPending = true;
         recipient.state->mapTravelStartedMs = travelStartedAt;
         recipient.state->spawned = false;
+        recipient.state->deferredOwningPawnGraphDeployment.reset();
         recipient.state->owningPawnAlive = false;
         InvalidatePossessionRecovery(*recipient.state);
         // ClientTravel keeps the transport/reliable ledger alive, but every
@@ -3270,6 +3622,47 @@ ConnectionManager::GetDeploymentPhaseState() const {
         }
     }
     return state;
+}
+
+bool ConnectionManager::IsDeploymentWindowOpen(
+    const DeploymentPhaseState& state) noexcept {
+    if (state.phase == DeploymentCountdown::Phase::Active) return true;
+    return state.phase == DeploymentCountdown::Phase::Preparation &&
+        std::isfinite(state.remainingSeconds) &&
+        state.remainingSeconds >= 0.0f &&
+        state.remainingSeconds <= static_cast<float>(
+            DeploymentCountdown::kRoundStartScreenSeconds);
+}
+
+void ConnectionManager::RevokePreparedDeploymentAuthorization(
+    uint32_t clientId) {
+    const auto deployment =
+        m_deploymentCoordinator.GetClientState(clientId);
+    const bool roleWasFinalized =
+        deployment.has_value() && deployment->roleFinalized;
+    auto stateIt = m_controlState.find(clientId);
+    if (stateIt != m_controlState.end()) {
+        ControlState& state = stateIt->second;
+        state.spawned = false;
+        state.deferredOwningPawnGraphDeployment.reset();
+        state.owningPawnAlive = false;
+        InvalidatePossessionRecovery(state);
+    }
+
+    m_deploymentCoordinator.ResetClient(clientId);
+    if (roleWasFinalized ||
+        (stateIt != m_controlState.end() &&
+         stateIt->second.roleFinalized)) {
+        m_deploymentCoordinator.FinalizeRole(clientId);
+    }
+    if (m_server) {
+        if (PlayerManager* players = m_server->GetPlayerManager()) {
+            if (const std::shared_ptr<Player> player =
+                    players->GetPlayer(clientId)) {
+                player->SetReadyToSpawn(false);
+            }
+        }
+    }
 }
 
 std::vector<uint32_t> ConnectionManager::GetAvailableSpawnIds(uint32_t clientId) const {
@@ -3549,7 +3942,8 @@ void ConnectionManager::SynchronizeRetailSquadAssignments() {
 }
 
 bool ConnectionManager::SendChangedRoleSpawnSelect(
-    uint32_t clientId, bool includeOwnerPriAssignment) {
+    uint32_t clientId, bool includeOwnerPriAssignment,
+    bool includeTempStopAutoSpawn) {
     ControlState& cs = GetControlState(clientId);
     if (!cs.selectedChangedRole.has_value()) {
         Logger::Warn(
@@ -3561,7 +3955,10 @@ bool ConnectionManager::SendChangedRoleSpawnSelect(
     const RoleSelectionRepl::ChangedRoleEvidence& evidence =
         *cs.selectedChangedRole;
     const auto reservation = ReserveCh2Reliable(
-        cs, clientId, 1u, "ChangedRole");
+        cs, clientId, includeTempStopAutoSpawn ? 2u : 1u,
+        includeTempStopAutoSpawn
+            ? "ClientTempStopAutoSpawn + ChangedRole"
+            : "ChangedRole");
     if (!reservation) return false;
 
     // Freeze the exact normal-slot order before the UI opens. h261 is decoded
@@ -3592,15 +3989,36 @@ bool ConnectionManager::SendChangedRoleSpawnSelect(
         RoleSelectionRepl::EncodeChangedRoleTransition(evidence,
                                                        changedRoleBits);
 
+    size_t reservationIndex = 0u;
+    std::vector<PacketCodec::Bunch> ordered;
+    ordered.reserve(1u + (includeTempStopAutoSpawn ? 1u : 0u) +
+                    (includeOwnerPriAssignment ? 1u : 0u));
+    if (includeTempStopAutoSpawn) {
+        // ROPlayerController.uc ClientTempStopAutoSpawn sets the client's
+        // SpawnReadyStatus to ESRS_NotReady. Without this source-grounded RPC,
+        // a prior h434 Ready can make ChangedRole's ShowSpawnSelect early-out.
+        BitWriter stopAutoSpawn;
+        stopAutoSpawn.SerializeInt(262u, kRoPcMaxHandle);
+
+        PacketCodec::Bunch stop;
+        stop.bReliable = true;
+        stop.chIndex = 2u;
+        stop.chType = cs.actorChType;
+        stop.chSequence = (*reservation)[reservationIndex++];
+        stop.payload = stopAutoSpawn.GetBytes();
+        stop.payloadBits = static_cast<uint32_t>(stopAutoSpawn.NumBits());
+        ordered.push_back(std::move(stop));
+    }
+
     PacketCodec::Bunch changedRoleBunch;
     changedRoleBunch.bReliable = true;
     changedRoleBunch.chIndex = 2;
     changedRoleBunch.chType = cs.actorChType;
-    changedRoleBunch.chSequence = reservation->front();
+    changedRoleBunch.chSequence = (*reservation)[reservationIndex++];
     changedRoleBunch.payload = changedRole;
     changedRoleBunch.payloadBits = changedRoleBits;
 
-    std::vector<PacketCodec::Bunch> ordered{changedRoleBunch};
+    ordered.push_back(changedRoleBunch);
     if (includeOwnerPriAssignment) {
         BitWriter assignment;
         RoleSelectionRepl::WriteOwnerPriRoleAssignment(
@@ -3672,7 +4090,68 @@ bool ConnectionManager::SendHideRoundStartScreen(uint32_t clientId) {
 bool ConnectionManager::ExecutePreparedDeployment(uint32_t clientId,
                                                    uint32_t spawnId) {
     ControlState& cs = GetControlState(clientId);
-    if (cs.spawned || !m_server) return cs.spawned;
+    if (!m_server) return false;
+    const std::shared_ptr<ClientConnection> connection =
+        GetConnection(clientId);
+    if (!connection || connection->IsDisconnected() ||
+        !connection->IsUE3Client() ||
+        !connection->IsHandshakeComplete() || cs.mapTravelPending) {
+        Logger::Info(
+            "[Deployment] client %u no longer owns a live joined retail "
+            "publication session",
+            clientId);
+        cs.deferredOwningPawnGraphDeployment.reset();
+        return false;
+    }
+    if (cs.spawned) return true;
+
+    const DeploymentPhaseState phase = GetDeploymentPhaseState();
+    if (!IsDeploymentWindowOpen(phase)) {
+        Logger::Info(
+            "[Deployment] client %u authorization expired outside the "
+            "active/final-preparation deployment window",
+            clientId);
+        RevokePreparedDeploymentAuthorization(clientId);
+        return false;
+    }
+
+    const TeamManager* teams = m_server->GetTeamManager();
+    const uint32_t deploymentTeam =
+        teams ? teams->GetPlayerTeam(clientId) : 0u;
+    if (!TeamMapping::IsPlayableServerTeam(deploymentTeam)) {
+        Logger::Warn(
+            "[Deployment] client %u has no playable team at commit time",
+            clientId);
+        RevokePreparedDeploymentAuthorization(clientId);
+        FailOwningPawnGraph(
+            clientId, "invalid authoritative deployment team");
+        return false;
+    }
+    if (TicketSystem* tickets = m_server->GetTicketSystem()) {
+        const bool depleted =
+            tickets->GetInitialTickets(deploymentTeam) > 0u &&
+            !tickets->HasTickets(deploymentTeam);
+        if (depleted) {
+            Logger::Info(
+                "[Deployment] client %u team %u has no reinforcement "
+                "tickets; revoking this authorization for a fresh retry",
+                clientId, deploymentTeam);
+            RevokePreparedDeploymentAuthorization(clientId);
+            // The retail client still believes its last h434 Ready was
+            // accepted. Resetting only the server coordinator strands it in a
+            // Ready state that will not automatically reopen spawn selection
+            // when tickets recover. Publish the same capture-grounded h210/h59
+            // recovery used by other precommit failures.
+            if (!SendChangedRoleSpawnSelect(
+                    clientId, /*includeOwnerPriAssignment=*/false,
+                    /*includeTempStopAutoSpawn=*/true)) {
+                FailCloseCh2Publication(
+                    clientId,
+                    "ticket-depletion ChangedRole recovery");
+            }
+            return false;
+        }
+    }
 
     const std::vector<uint32_t> available = GetAvailableSpawnIds(clientId);
     if (std::find(available.begin(), available.end(), spawnId) == available.end()) {
@@ -3707,15 +4186,75 @@ bool ConnectionManager::ExecutePreparedDeployment(uint32_t clientId,
             }
         }
     }
-    if (!spawns || !spawns->SpawnPlayer(clientId, resolvedSpawnId)) {
-        Logger::Warn("[Deployment] client %u failed authoritative spawn %u; "
-                     "reopening spawn selection", clientId, spawnId);
-        m_deploymentCoordinator.ResetClient(clientId);
-        m_deploymentCoordinator.FinalizeRole(clientId);
+
+    const OwningPawnGraphGateResult graphGate =
+        GateOwningPawnGraphForDeployment(
+            clientId, deploymentTeam, spawnId);
+    if (graphGate == OwningPawnGraphGateResult::Deferred) {
+        Logger::Info(
+            "[Deployment] client %u deferred spawn %u until the prior "
+            "faction graph close cohort drains",
+            clientId, spawnId);
+        return false;
+    }
+    if (graphGate == OwningPawnGraphGateResult::Failed) {
+        Logger::Error(
+            "[Deployment] client %u could not prepare the owning pawn "
+            "graph for team %u",
+            clientId, deploymentTeam);
+        return false;
+    }
+
+    const auto reopenAfterPrecommitFailure =
+        [&](const char* context) {
+        RevokePreparedDeploymentAuthorization(clientId);
         if (!SendChangedRoleSpawnSelect(clientId)) {
             FailCloseCh2Publication(
-                clientId, "failed-spawn ChangedRole recovery");
+                clientId, context);
         }
+    };
+
+    if (!spawns) {
+        Logger::Warn(
+            "[Deployment] client %u has no SpawnSystem at commit time",
+            clientId);
+        reopenAfterPrecommitFailure(
+            "missing-spawn-system ChangedRole recovery");
+        return false;
+    }
+    const auto preparedSpawn =
+        spawns->PreparePlayerSpawn(clientId, resolvedSpawnId);
+    if (!preparedSpawn) {
+        Logger::Warn(
+            "[Deployment] client %u could not prepare authoritative spawn "
+            "%u; reopening spawn selection",
+            clientId, spawnId);
+        reopenAfterPrecommitFailure(
+            "failed-spawn-plan ChangedRole recovery");
+        return false;
+    }
+
+    const uint64_t anticipatedPawnGeneration =
+        AnticipatedOwningPawnGeneration(cs);
+    if (!PreflightPawnSpawn(
+            clientId, anticipatedPawnGeneration,
+            preparedSpawn->GetPosition())) {
+        Logger::Warn(
+            "[Deployment] client %u could not preflight the owning pawn "
+            "publication before spawn %u; authority remains unmodified",
+            clientId, spawnId);
+        reopenAfterPrecommitFailure(
+            "pawn-graph-preflight ChangedRole recovery");
+        return false;
+    }
+
+    if (!spawns->CommitPreparedPlayerSpawn(*preparedSpawn)) {
+        Logger::Warn(
+            "[Deployment] client %u spawn %u changed after publication "
+            "preflight; authority remains unmodified",
+            clientId, spawnId);
+        reopenAfterPrecommitFailure(
+            "stale-spawn-plan ChangedRole recovery");
         return false;
     }
 
@@ -3723,34 +4262,20 @@ bool ConnectionManager::ExecutePreparedDeployment(uint32_t clientId,
                  "at authoritative PlayerStart %u", clientId, spawnId,
                  resolvedSpawnId);
     const uint64_t pawnGeneration = cs.owningPawnGeneration;
-    if (pawnGeneration == 0u || !cs.owningPawnAlive ||
+    if (pawnGeneration != anticipatedPawnGeneration ||
+        !cs.owningPawnAlive ||
         !SendPawnSpawn(clientId, pawnGeneration)) {
-        // SpawnSystem has already moved the authoritative Player and invoked
-        // the ordinary alive/combat transition. A replication-graph failure is
-        // not a gameplay death: unwind it directly without PlayerManager death
-        // notifications, ticket debit, score, or death-stat side effects.
-        cs.spawned = false;
-        cs.owningPawnAlive = false;
-        InvalidatePossessionRecovery(cs);
-        cs.activeWeaponChannel = 0;
-        cs.weaponIntent.fill({});
-        if (auto* players = m_server->GetPlayerManager()) {
-            if (auto player = players->GetPlayer(clientId)) {
-                player->SetReadyToSpawn(false);
-                player->SetState(PlayerState::Dead);
-            }
-        }
-        m_server->RemoveCombatParticipant(clientId);
-        m_deploymentCoordinator.ResetClient(clientId);
-        m_deploymentCoordinator.FinalizeRole(clientId);
-        if (!SendChangedRoleSpawnSelect(clientId)) {
-            FailCloseCh2Publication(
-                clientId, "pawn-graph ChangedRole recovery");
-        }
+        // Every ordinary fallible step completed in preflight. A failure after
+        // SpawnSystem commit is therefore an internal publication invariant,
+        // not a recoverable gameplay death. The client may have observed part
+        // of the reliable cohort, so fail the connection closed instead of
+        // fabricating a rollback that cannot retract wire state.
+        FailOwningPawnGraph(
+            clientId, "post-commit pawn publication invariant");
         Logger::Error(
-            "[Deployment] client %u could not construct the owning pawn graph; "
-            "authoritative spawn rolled back and spawn selection reopened",
-            clientId);
+            "[Deployment] client %u committed spawn %u but could not publish "
+            "the preflighted owning graph; session retired",
+            clientId, spawnId);
         return false;
     }
 
@@ -3783,6 +4308,7 @@ void ConnectionManager::BeginDeploymentGeneration() {
         }
         ControlState& cs = stateIt->second;
         cs.spawned = false;
+        cs.deferredOwningPawnGraphDeployment.reset();
         cs.owningPawnAlive = false;
         cs.possessionAckedGeneration = 0u;
         cs.possessionRecoveryGeneration = 0u;
@@ -3948,8 +4474,17 @@ bool ConnectionManager::ResolveObjectiveConnectedToBase(
 
 bool ConnectionManager::IsRetailGameplayActive(uint32_t clientId) const {
     const auto it = m_controlState.find(clientId);
-    if (it == m_controlState.end() || it->second.mapTravelPending ||
-        !it->second.spawned) {
+    if (it == m_controlState.end()) return false;
+    const ControlState& state = it->second;
+    const std::shared_ptr<ClientConnection> connection =
+        GetConnection(clientId);
+    if (!connection || connection->IsDisconnected() ||
+        !connection->IsUE3Client() ||
+        !connection->IsHandshakeComplete() || state.mapTravelPending ||
+        !state.spawned || !state.pawnGraphOpen ||
+        state.pawnGraphPhase != OwningPawnGraphPhase::Open ||
+        !HasLiveOwningPawnGeneration(
+            state, state.owningPawnGeneration)) {
         return false;
     }
     return GetDeploymentPhaseState().phase == DeploymentCountdown::Phase::Active;
@@ -4077,13 +4612,6 @@ ConnectionManager::QueueRemoteParticipantPriOpen(
             participant.combat.participant.value);
         return RemotePriOpenResult::Failed;
     }
-    if (binding->priState == ParticipantActorOpenState::Open) {
-        return RemotePriOpenResult::AlreadyOpen;
-    }
-    if (binding->priState == ParticipantActorOpenState::Closed) {
-        return RemotePriOpenResult::Failed;
-    }
-
     const uint8_t retailTeam =
         TeamMapping::ServerToRetail(participant.serverTeamId);
     if (retailTeam > TeamMapping::kRetailUs) {
@@ -4093,6 +4621,33 @@ ConnectionManager::QueueRemoteParticipantPriOpen(
     BitWriter teamProperties;
     if (!DeploymentRepl::WriteRemotePriTeam(
             teamProperties, teamInfoChannel)) {
+        return RemotePriOpenResult::Failed;
+    }
+
+    if (binding->priState == ParticipantActorOpenState::Open) {
+        if (binding->priTeamWireValid &&
+            binding->priTeamInfoChannel == teamInfoChannel) {
+            return RemotePriOpenResult::AlreadyOpen;
+        }
+
+        const std::optional<uint32_t> teamSequence =
+            cs.remoteParticipants.NextPriReliableSequence(
+                participant.combat.participant);
+        if (!teamSequence) return RemotePriOpenResult::Failed;
+
+        PacketCodec::Bunch team;
+        team.bReliable = true;
+        team.chIndex = binding->priChannel;
+        team.chType = cs.actorChType;
+        team.chSequence = *teamSequence;
+        team.payload = teamProperties.GetBytes();
+        team.payloadBits = static_cast<uint32_t>(teamProperties.NumBits());
+        output.push_back(std::move(team));
+        binding->priTeamWireValid = true;
+        binding->priTeamInfoChannel = teamInfoChannel;
+        return RemotePriOpenResult::UpdateQueued;
+    }
+    if (binding->priState == ParticipantActorOpenState::Closed) {
         return RemotePriOpenResult::Failed;
     }
 
@@ -4136,6 +4691,8 @@ ConnectionManager::QueueRemoteParticipantPriOpen(
     // combat snapshots must publish h61 only when its value transitions.
     binding->priDeadWireValid = true;
     binding->priDeadWireValue = participant.combat.dead;
+    binding->priTeamWireValid = true;
+    binding->priTeamInfoChannel = teamInfoChannel;
     return RemotePriOpenResult::OpenQueued;
 }
 
@@ -4150,10 +4707,6 @@ ConnectionManager::QueueRemoteParticipantPawnOpen(
         !connection->IsUE3Client() || !connection->IsHandshakeComplete() ||
         stateIt == m_controlState.end() || stateIt->second.mapTravelPending ||
         !stateIt->second.teamSelected ||
-        participant.combat.dead || !participant.pawnPresent ||
-        !DeploymentRepl::kRemotePawnVisualTemplatesGrounded ||
-        !DeploymentRepl::RemotePawnArchetypeForServerTeam(
-            participant.serverTeamId) ||
         !DeploymentRepl::IsValidRetailParticipantInitialState(participant) ||
         (participant.combat.participant.IsHuman() &&
          participant.combat.participant.value == viewerClientId)) {
@@ -4168,7 +4721,35 @@ ConnectionManager::QueueRemoteParticipantPawnOpen(
         return RemotePriOpenResult::Failed;
     }
     if (binding->pawnState == ParticipantActorOpenState::Open) {
-        return RemotePriOpenResult::AlreadyOpen;
+        if (binding->pawnServerTeamValid &&
+            binding->pawnServerTeamId == participant.serverTeamId) {
+            return RemotePriOpenResult::AlreadyOpen;
+        }
+
+        const std::optional<uint32_t> closeSequence =
+            cs.remoteParticipants.NextPawnReliableSequence(
+                participant.combat.participant);
+        if (!closeSequence) return RemotePriOpenResult::Failed;
+        std::optional<PacketCodec::Bunch> close =
+            DeploymentRepl::MakeRemotePawnCloseBunch(
+                binding->pawnChannel, *closeSequence);
+        if (!close || !cs.remoteParticipants.MarkPawnClosing(
+                          participant.combat.participant)) {
+            return RemotePriOpenResult::Failed;
+        }
+
+        (void)cs.remoteParticipants.SetDead(
+            participant.combat.participant, true);
+        output.push_back(std::move(*close));
+        return RemotePriOpenResult::UpdateQueued;
+    }
+    if (participant.combat.dead || !participant.pawnPresent) {
+        return RemotePriOpenResult::Failed;
+    }
+    if (!DeploymentRepl::kRemotePawnVisualTemplatesGrounded ||
+        !DeploymentRepl::RemotePawnArchetypeForServerTeam(
+            participant.serverTeamId)) {
+        return RemotePriOpenResult::Failed;
     }
     if (binding->pawnState != ParticipantActorOpenState::Unopened) {
         return RemotePriOpenResult::Failed;
@@ -4209,6 +4790,8 @@ ConnectionManager::QueueRemoteParticipantPawnOpen(
     view.deathCoreSent = false;
     (void)cs.remoteParticipants.SetDead(
         participant.combat.participant, false);
+    binding->pawnServerTeamValid = true;
+    binding->pawnServerTeamId = participant.serverTeamId;
     return RemotePriOpenResult::OpenQueued;
 }
 
@@ -4681,7 +5264,6 @@ void ConnectionManager::ReplicateRetailParticipantCombatState(
     int score, bool isDead, bool sendHealth, bool sendDeathRpc) {
     DeploymentRepl::RetailParticipantCombatState combat{
         participant, health, kills, deaths, score, isDead};
-    if (!DeploymentRepl::IsValidRetailParticipantCombatState(combat)) return;
 
     // A death/respawn RPC marks an authoritative pawn-lifecycle boundary in
     // both directions. Re-anchor even when the current SpawnSystem still uses
@@ -4704,11 +5286,21 @@ void ConnectionManager::ReplicateRetailParticipantCombatState(
         if (ownerState != m_controlState.end()) {
             ControlState& owner = ownerState->second;
             if (isDead) {
-                owner.spawned = false;
-                owner.owningPawnAlive = false;
-                owner.possessionAckedGeneration = 0u;
-                owner.possessionRecoveryGeneration = 0u;
-                ResetPossessionRecovery(owner);
+                if (owner.owningPawnAlive) {
+                    owner.spawned = false;
+                    owner.deferredOwningPawnGraphDeployment.reset();
+                    owner.owningPawnAlive = false;
+                    owner.possessionAckedGeneration = 0u;
+                    owner.possessionRecoveryGeneration = 0u;
+                    ResetPossessionRecovery(owner);
+                } else {
+                    Logger::Trace(
+                        "[PawnLifecycle] client %u ignored duplicate dead "
+                        "callback while generation %llu was already dead",
+                        participant.value,
+                        static_cast<unsigned long long>(
+                            owner.owningPawnGeneration));
+                }
             } else if (!owner.owningPawnAlive) {
                 const uint64_t generation =
                     AdvanceOwningPawnGeneration(owner);
@@ -4739,6 +5331,18 @@ void ConnectionManager::ReplicateRetailParticipantCombatState(
             ownerState->second.weaponIntent.fill({});
         }
         if (m_server) m_server->CancelRetailGrenadeCook(participant.value);
+    }
+
+    // Lifecycle advancement is authoritative and must not depend on whether
+    // optional scoreboard fields are currently wire-encodable. A negative
+    // script-adjusted score, for example, suppresses this delta but cannot
+    // prevent the Dead -> Alive pawn generation from advancing after spawn.
+    if (!DeploymentRepl::IsValidRetailParticipantCombatState(combat)) {
+        Logger::Warn(
+            "[PawnLifecycle] suppressed invalid retail combat delta for %s "
+            "%u after applying its authoritative life boundary",
+            participant.IsHuman() ? "client" : "bot", participant.value);
+        return;
     }
 
     for (const auto& entry : m_clients) {
@@ -5112,21 +5716,57 @@ static std::vector<PacketCodec::Bunch> BuildGivePawnBunches(
             std::move(onDead)};
 }
 
+bool ConnectionManager::PreflightPawnSpawn(
+    uint32_t clientId, uint64_t expectedPawnGeneration,
+    const Vector3& spawnLocation) {
+    return ProcessPawnSpawn(
+        clientId, expectedPawnGeneration, spawnLocation,
+        /*preflightOnly=*/true);
+}
+
 bool ConnectionManager::SendPawnSpawn(uint32_t clientId,
                                       uint64_t expectedPawnGeneration) {
+    PlayerManager* players =
+        m_server ? m_server->GetPlayerManager() : nullptr;
+    const std::shared_ptr<Player> player =
+        players ? players->GetPlayer(clientId) : nullptr;
+    if (!player) {
+        Logger::Error(
+            "[ConnectionManager::SendPawnSpawn] client %u has no "
+            "authoritative Player position; captured coordinates are not a "
+            "valid spawn fallback",
+            clientId);
+        return false;
+    }
+    return ProcessPawnSpawn(
+        clientId, expectedPawnGeneration, player->GetPosition(),
+        /*preflightOnly=*/false);
+}
+
+bool ConnectionManager::ProcessPawnSpawn(
+    uint32_t clientId, uint64_t expectedPawnGeneration,
+    const Vector3& spawnLocation, bool preflightOnly) {
     ControlState& cs = GetControlState(clientId);
     constexpr uint32_t kPawnMaxHandle = 168; // netfields_u_ROPawn handles 0..167
     constexpr uint32_t kPawnCh = kLocalPawnChannel; // fresh channel above bootstrap range
 
-    if (expectedPawnGeneration == 0u || !cs.owningPawnAlive ||
-        cs.owningPawnGeneration != expectedPawnGeneration) {
+    const bool generationMatches = preflightOnly
+        ? expectedPawnGeneration != 0u &&
+            AnticipatedOwningPawnGeneration(cs) ==
+                expectedPawnGeneration
+        : expectedPawnGeneration != 0u && cs.owningPawnAlive &&
+            cs.owningPawnGeneration == expectedPawnGeneration;
+    if (!generationMatches) {
         Logger::Warn(
             "[ConnectionManager::SendPawnSpawn] client %u owning-pawn "
-            "generation changed before graph publication (expected=%llu, "
-            "current=%llu, alive=%s)",
+            "generation changed before graph %s (expected=%llu, "
+            "current=%llu, anticipated=%llu, alive=%s)",
             clientId,
+            preflightOnly ? "preflight" : "publication",
             static_cast<unsigned long long>(expectedPawnGeneration),
             static_cast<unsigned long long>(cs.owningPawnGeneration),
+            static_cast<unsigned long long>(
+                AnticipatedOwningPawnGeneration(cs)),
             cs.owningPawnAlive ? "true" : "false");
         return false;
     }
@@ -5217,34 +5857,26 @@ bool ConnectionManager::SendPawnSpawn(uint32_t clientId,
             return found == wireWeaponRefs.end() ? nullptr : &*found;
         };
 
-    // Actor classes cannot change underneath already-open channels. A team
-    // switch therefore needs an explicit close/reopen generation; until that
-    // lifecycle is implemented, fail closed instead of reusing the other
-    // faction's pawn and silently presenting the wrong loadout.
+    // ExecutePreparedDeployment must pass the explicit graph gate before world
+    // mutation. Reaching this point with the opposite graph still open means a
+    // caller bypassed that lifecycle; never reuse actor classes in place.
     if (cs.pawnGraphOpen && cs.pawnGraphTeamId != graphTeamId) {
-        Logger::Warn(
+        Logger::Error(
             "[ConnectionManager::SendPawnSpawn] client %u changed from team %u "
-            "to %u while owning graph ch209..219 remains open; deployment "
-            "requires a channel close/reopen generation",
+            "to %u without draining the owning graph close generation",
             clientId, cs.pawnGraphTeamId, graphTeamId);
+        return false;
+    }
+    if (cs.pawnGraphPhase == OwningPawnGraphPhase::Closing ||
+        cs.pawnGraphPhase == OwningPawnGraphPhase::Broken) {
         return false;
     }
 
     // SpawnSystem is authoritative for the gameplay position. Relocate every
-    // captured actor-open below to that same point so the retail pawn, inventory
-    // graph, movement authority and objective-zone checks begin in one place.
-    PlayerManager* players = m_server ? m_server->GetPlayerManager() : nullptr;
-    const std::shared_ptr<Player> player =
-        players ? players->GetPlayer(clientId) : nullptr;
-    if (!player) {
-        Logger::Error(
-            "[ConnectionManager::SendPawnSpawn] client %u has no "
-            "authoritative Player position; captured coordinates are not a "
-            "valid spawn fallback",
-            clientId);
-        return false;
-    }
-    const Vector3 spawnLocation = player->GetPosition();
+    // captured actor-open below to that same planned point so the retail pawn,
+    // inventory graph, movement authority and objective-zone checks begin in
+    // one place. Preflight receives the exact immutable SpawnSystem plan;
+    // publication receives the committed Player position.
     const auto validSpawnComponent = [](float value) {
         if (!std::isfinite(value)) return false;
         const double rounded = std::floor(static_cast<double>(value) + 0.5);
@@ -5259,27 +5891,27 @@ bool ConnectionManager::SendPawnSpawn(uint32_t clientId,
             clientId, spawnLocation.x, spawnLocation.y, spawnLocation.z);
         return false;
     }
-    // SpawnSystem has already committed this authoritative discontinuity. The
-    // first client ServerMove must be measured from the actual PlayerStart, not
-    // from a prior life or a missing validator baseline.
-    (void)ResetRetailMovementValidation(clientId, spawnLocation);
+    if (!preflightOnly) {
+        // SpawnSystem has committed this authoritative discontinuity. The first
+        // client ServerMove must be measured from the actual PlayerStart, not
+        // from a prior life or a missing validator baseline.
+        (void)ResetRetailMovementValidation(clientId, spawnLocation);
 
-    // Every deployment starts on the faction primary at stable ch210. The
-    // faction grenade is stable ch212 and remains inactive until the inventory
-    // manager selects it. This also clears an interrupted cook from the prior
-    // life.
-    cs.activeWeaponChannel = 0;
-    const OwnedWeaponChannelMetadata* primaryMetadata =
-        FindOwnedWeaponChannel(210u, northGraph);
-    if (m_server && primaryMetadata &&
-        m_server->SelectCombatWeaponChannel(
-            clientId, 210u, primaryMetadata->classRef)) {
-        cs.activeWeaponChannel = 210u;
-    } else {
-        Logger::Warn(
-            "[CombatAuthority] client %u could not activate faction primary "
-            "for pawn spawn",
-            clientId);
+        // Every deployment starts on the faction primary at stable ch210. The
+        // faction grenade is stable ch212 and remains inactive until selected.
+        cs.activeWeaponChannel = 0;
+        const OwnedWeaponChannelMetadata* primaryMetadata =
+            FindOwnedWeaponChannel(210u, northGraph);
+        if (m_server && primaryMetadata &&
+            m_server->SelectCombatWeaponChannel(
+                clientId, 210u, primaryMetadata->classRef)) {
+            cs.activeWeaponChannel = 210u;
+        } else {
+            Logger::Warn(
+                "[CombatAuthority] client %u could not activate faction "
+                "primary for pawn spawn",
+                clientId);
+        }
     }
 
     // The first deployment opens the owning pawn/inventory graph. Later round
@@ -5287,6 +5919,22 @@ bool ConnectionManager::SendPawnSpawn(uint32_t clientId,
     // pawn and run the stock GivePawn/ClientRestart recovery path instead of
     // illegally opening ch209..219 a second time.
     if (cs.pawnGraphOpen) {
+        if (preflightOnly) {
+            // The synchronous SpawnPlayer callback publishes one reliable
+            // ClientOnDead(false) on a reused live graph before the five-bunch
+            // redeploy cohort. Validate both without holding an unpublished
+            // reservation across that callback.
+            if (!cs.outboundActorChannels.test(2u)) return false;
+            const auto capacity = cs.ch2Reliable.CanReserveBatch(6u);
+            if (!capacity) {
+                Logger::Warn(
+                    "[OwningPawnGraph] client %u cannot preflight six ch2 "
+                    "reliables for respawn callback + graph reuse (error=%u)",
+                    clientId, static_cast<unsigned>(capacity.error()));
+                return false;
+            }
+            return true;
+        }
         const auto reservation = ReserveCh2Reliable(
             cs, clientId, 5u, "owning-pawn redeploy");
         if (!reservation) return false;
@@ -5538,13 +6186,130 @@ bool ConnectionManager::SendPawnSpawn(uint32_t clientId,
         preparedInventoryOpens.push_back(std::move(prepared));
     }
 
-    // Reserve every reliable PlayerController bunch in the first owning-pawn
-    // graph before publishing any actor open. The graph contains one possession
-    // burst plus one weapon-selection/tail bunch per owned weapon.
+    if (preflightOnly) {
+        if (!cs.outboundActorChannels.test(2u)) return false;
+        const auto ch2Capacity = cs.ch2Reliable.CanReserveBatch(
+            1u + weaponChannels.count);
+        if (!ch2Capacity) {
+            Logger::Warn(
+                "[OwningPawnGraph] client %u cannot preflight %zu ch2 "
+                "reliables for initial/reopened graph (error=%u)",
+                clientId, 1u + weaponChannels.count,
+                static_cast<unsigned>(ch2Capacity.error()));
+            return false;
+        }
+    }
+
+    if ((cs.pawnGraphPhase != OwningPawnGraphPhase::Unopened &&
+         cs.pawnGraphPhase != OwningPawnGraphPhase::Closed) ||
+        !EnsureOwningPawnGraphSequencers(clientId, cs)) {
+        Logger::Error(
+            "[OwningPawnGraph] client %u cannot open a graph from phase %u",
+            clientId, static_cast<unsigned>(cs.pawnGraphPhase));
+        return false;
+    }
+
+    if (preflightOnly) {
+        const auto canReserveGraph =
+            [&](uint32_t channel, size_t count) {
+                const auto* sequencer =
+                    OwningPawnGraphSequencer(cs, channel);
+                const auto capacity = sequencer
+                    ? sequencer->CanReserveBatch(count)
+                    : PacketCodec::OutboundReliableSequencer::MutationResult(
+                          std::unexpected(
+                              PacketCodec::OutboundReliableSequenceError::
+                                  Uninitialized));
+                if (capacity) return true;
+                Logger::Warn(
+                    "[OwningPawnGraph] client %u cannot preflight %zu "
+                    "sequence(s) on ch%u (error=%u)",
+                    clientId, count, channel,
+                    static_cast<unsigned>(capacity.error()));
+                return false;
+            };
+        if (!canReserveGraph(kPawnCh, 5u)) return false;
+        for (const OwnedWeaponChannelMetadata& metadata : weaponChannels) {
+            if (!canReserveGraph(metadata.channel, 2u)) return false;
+        }
+        if (!canReserveGraph(219u, 1u)) return false;
+        return true;
+    }
+
+    using GraphReservation =
+        PacketCodec::OutboundReliableSequencer::Reservation;
+    struct ReservedGraphChannel {
+        uint32_t channel = 0;
+        GraphReservation reservation;
+    };
+    std::vector<ReservedGraphChannel> graphReservations;
+    graphReservations.reserve(2u + weaponChannels.count);
+    auto cancelGraphReservations = [&]() {
+        for (auto item = graphReservations.rbegin();
+             item != graphReservations.rend(); ++item) {
+            if (auto* sequencer =
+                    OwningPawnGraphSequencer(cs, item->channel)) {
+                (void)sequencer->CancelBatch(item->reservation);
+            }
+        }
+    };
+    auto reserveGraphChannel = [&](uint32_t channel, size_t count) {
+        auto* sequencer = OwningPawnGraphSequencer(cs, channel);
+        if (!sequencer) return false;
+        auto reservation = sequencer->ReserveBatch(count);
+        if (!reservation) {
+            Logger::Warn(
+                "[OwningPawnGraph] client %u could not reserve %zu "
+                "sequence(s) on ch%u (error=%u)",
+                clientId, count, channel,
+                static_cast<unsigned>(reservation.error()));
+            return false;
+        }
+        graphReservations.push_back(
+            {channel, std::move(*reservation)});
+        return true;
+    };
+    if (!reserveGraphChannel(kPawnCh, 5u)) {
+        cancelGraphReservations();
+        return false;
+    }
+    for (const OwnedWeaponChannelMetadata& metadata : weaponChannels) {
+        if (!reserveGraphChannel(metadata.channel, 2u)) {
+            cancelGraphReservations();
+            return false;
+        }
+    }
+    if (!reserveGraphChannel(219u, 1u)) {
+        cancelGraphReservations();
+        return false;
+    }
+    const auto graphReservation =
+        [&graphReservations](uint32_t channel)
+            -> const GraphReservation* {
+            const auto found = std::find_if(
+                graphReservations.begin(), graphReservations.end(),
+                [channel](const ReservedGraphChannel& item) {
+                    return item.channel == channel;
+                });
+            return found == graphReservations.end()
+                ? nullptr : &found->reservation;
+        };
+    const GraphReservation* pawnReservation = graphReservation(kPawnCh);
+    if (!pawnReservation) {
+        cancelGraphReservations();
+        return false;
+    }
+
+    // Reserve every reliable PlayerController bunch before publishing any
+    // actor open. The graph contains one possession burst plus one weapon-
+    // selection/tail bunch per owned weapon.
     const auto graphCh2Reservation = ReserveCh2Reliable(
         cs, clientId, 1u + weaponChannels.count,
         "initial owning-pawn graph");
-    if (!graphCh2Reservation) return false;
+    if (!graphCh2Reservation) {
+        cancelGraphReservations();
+        return false;
+    }
     size_t graphCh2ReservationIndex = 0u;
 
     auto pawnDelta = [&](std::vector<uint8_t> bytes, uint32_t bits, uint32_t sequence) {
@@ -5574,7 +6339,8 @@ bool ConnectionManager::SendPawnSpawn(uint32_t clientId,
 
         PacketCodec::Bunch open;
         open.bControl = true; open.bOpen = true; open.bReliable = true;
-        open.chIndex = kPawnCh; open.chType = 2; open.chSequence = 1;
+        open.chIndex = kPawnCh; open.chType = 2;
+        open.chSequence = (*pawnReservation)[0];
         open.payload = pawnOpen; open.payloadBits = pawnOpenBits;
         openPkt.push_back(std::move(open));
         // Never hand-pack these fields. SerializeInt is value-dependent: h52 consumes
@@ -5584,20 +6350,23 @@ bool ConnectionManager::SendPawnSpawn(uint32_t clientId,
         ActorRepl::WritePropObject(controllerRef, 52, kPawnMaxHandle,
                                    ActorRepl::NetGUIDRef{/*isDynamic=*/true, 2u});
         openPkt.push_back(pawnDelta(controllerRef.GetBytes(),
-                                    static_cast<uint32_t>(controllerRef.NumBits()), 2));
+                                    static_cast<uint32_t>(controllerRef.NumBits()),
+                                    (*pawnReservation)[1]));
 
         BitWriter priRef;
         ActorRepl::WritePropObject(priRef, 32, kPawnMaxHandle,
                                    ActorRepl::NetGUIDRef{/*isDynamic=*/true, 26u});
         openPkt.push_back(pawnDelta(priRef.GetBytes(),
-                                    static_cast<uint32_t>(priRef.NumBits()), 3));
+                                    static_cast<uint32_t>(priRef.NumBits()),
+                                    (*pawnReservation)[2]));
 
         // ROPawn.PossessedBy sends this no-parameter client RPC for pawn-specific
         // local setup (trap arrays, mesh/role state). It belongs on the pawn channel.
         BitWriter clientPossessed;
         clientPossessed.SerializeInt(57, kPawnMaxHandle);
         openPkt.push_back(pawnDelta(clientPossessed.GetBytes(),
-                                    static_cast<uint32_t>(clientPossessed.NumBits()), 4));
+                                    static_cast<uint32_t>(clientPossessed.NumBits()),
+                                    (*pawnReservation)[3]));
 
         // Capture-exact retail possession sequence (official f27394/f33544), authored
         // structurally so channel references remain correct. The six official RPCs
@@ -5664,7 +6433,8 @@ bool ConnectionManager::SendPawnSpawn(uint32_t clientId,
             inventoryOpen.bReliable = true;
             inventoryOpen.chIndex = prepared.channel;
             inventoryOpen.chType = 2;
-            inventoryOpen.chSequence = 1;
+            inventoryOpen.chSequence =
+                graphReservation(prepared.channel)->front();
             inventoryOpen.payload = prepared.payload;
             inventoryOpen.payloadBits = prepared.payloadBits;
             openPkt.push_back(std::move(inventoryOpen));
@@ -5677,7 +6447,8 @@ bool ConnectionManager::SendPawnSpawn(uint32_t clientId,
         ActorRepl::WritePropObject(pawnInvManager, 27, kPawnMaxHandle,
                                    ActorRepl::NetGUIDRef{/*isDynamic=*/true, 219u});
         openPkt.push_back(pawnDelta(pawnInvManager.GetBytes(),
-                                    static_cast<uint32_t>(pawnInvManager.NumBits()), 5));
+                                    static_cast<uint32_t>(pawnInvManager.NumBits()),
+                                    (*pawnReservation)[4]));
 
         for (size_t i = 0; i < weaponChannels.count; ++i) {
             const OwnedWeaponChannelMetadata& metadata =
@@ -5711,7 +6482,8 @@ bool ConnectionManager::SendPawnSpawn(uint32_t clientId,
             graphBunch.bReliable = true;
             graphBunch.chIndex = weaponCh;
             graphBunch.chType = 2;
-            graphBunch.chSequence = 2;
+            graphBunch.chSequence =
+                (*graphReservation(weaponCh))[1];
             graphBunch.payload = weaponGraph.GetBytes();
             graphBunch.payloadBits = static_cast<uint32_t>(weaponGraph.NumBits());
             openPkt.push_back(std::move(graphBunch));
@@ -5757,11 +6529,46 @@ bool ConnectionManager::SendPawnSpawn(uint32_t clientId,
                                        static_cast<uint32_t>(switchBestWeapon.NumBits()),
                                        /*reliable=*/true));
         }
-        if (!SendReservedCh2Bunches(
-                clientId, openPkt, *graphCh2Reservation,
-                "initial owning-pawn graph")) {
+        const size_t pendingBefore = cs.pendingReliable.size();
+        const bool queuedCh2 = SendReservedCh2Bunches(
+            clientId, openPkt, *graphCh2Reservation,
+            "initial owning-pawn graph");
+        const bool graphPublished =
+            cs.pendingReliable.size() > pendingBefore;
+        if (!graphPublished) {
+            cancelGraphReservations();
             return false;
         }
+
+        for (const ReservedGraphChannel& item : graphReservations) {
+            auto* sequencer =
+                OwningPawnGraphSequencer(cs, item.channel);
+            const auto committed = sequencer
+                ? sequencer->CommitBatch(item.reservation)
+                : PacketCodec::OutboundReliableSequencer::MutationResult(
+                      std::unexpected(
+                          PacketCodec::OutboundReliableSequenceError::
+                              Uninitialized));
+            if (!committed) {
+                Logger::Error(
+                    "[OwningPawnGraph] client %u queued open ch%u but could "
+                    "not commit its reliable reservation (error=%u)",
+                    clientId, item.channel,
+                    static_cast<unsigned>(committed.error()));
+                FailOwningPawnGraph(
+                    clientId, "published open reservation commit");
+                return false;
+            }
+        }
+        if (!queuedCh2) return false;
+
+        cs.owningPawnGraphActiveChannels.reset();
+        for (const ReservedGraphChannel& item : graphReservations) {
+            cs.owningPawnGraphActiveChannels.set(item.channel);
+        }
+        cs.owningPawnGraphClosingChannels.reset();
+        cs.owningPawnGraphCloseAcknowledged.reset();
+        cs.pawnGraphPhase = OwningPawnGraphPhase::Open;
         cs.pawnGraphOpen = true;
         cs.pawnGraphTeamId = graphTeamId;
 
@@ -5961,7 +6768,9 @@ static const char* RoPcHandleName(uint32_t h) {
 }
 
 void ConnectionManager::DispatchInboundActorBunch(
-    uint32_t clientId, const PacketCodec::Bunch& bunch) {
+    uint32_t clientId, const PacketCodec::Bunch& bunch,
+    bool suppressOwningGraphSemantics,
+    bool suppressReleasedCohort) {
     // ch0 has different semantics: ControlReassembler concatenates ordered
     // reliable fragments into complete NMT messages. Never let it enter the
     // actor sequencer, even if a future caller bypasses ParseIncomingControl.
@@ -5987,6 +6796,17 @@ void ConnectionManager::DispatchInboundActorBunch(
         // otherwise a buffered close plus a historical reliable cursor could
         // pass map-travel preflight on a channel that cannot accept the RPC.
         cs.outboundActorChannels.reset(2u);
+    }
+    if (!suppressOwningGraphSemantics && bunch.bClose &&
+        OwningPawnGraphChannelIndex(bunch.chIndex).has_value() &&
+        (cs.pawnGraphPhase == OwningPawnGraphPhase::Open ||
+         cs.pawnGraphPhase == OwningPawnGraphPhase::Closing)) {
+        // A peer actor close is rejection/failure, not acknowledgement of the
+        // server's close bunch. The fixed channel cannot be reused safely in
+        // this connection after the client has independently torn it down.
+        FailOwningPawnGraph(clientId, "peer-originated fixed-channel close");
+        cs.actorReliableInbound.DiscardPending(bunch.chIndex);
+        return;
     }
     auto suppressM61VisualChannel = [&cs](uint32_t channel) {
         if (!cs.m61Visuals.SuppressChannel(channel)) return false;
@@ -6019,6 +6839,13 @@ void ConnectionManager::DispatchInboundActorBunch(
     // Unreliable actor traffic intentionally retains packet/datagram order. It
     // must never wait behind a missing reliable bunch on the same actor channel.
     if (!bunch.bReliable) {
+        if (suppressOwningGraphSemantics) {
+            Logger::Info(
+                "[OwningPawnGraph] client %u suppressed delayed unreliable "
+                "ch%u semantics from a prior incarnation",
+                clientId, bunch.chIndex);
+            return;
+        }
         DecodeInboundActorBunch(clientId, bunch);
         if (bunch.bClose) {
             if (cs.remoteParticipants.MarkChannelClosed(bunch.chIndex)) {
@@ -6056,6 +6883,24 @@ void ConnectionManager::DispatchInboundActorBunch(
 
     PacketCodec::ActorReliableSequenceResult result =
         cs.actorReliableInbound.Push(bunch);
+    const std::optional<size_t> owningGraphIndex =
+        OwningPawnGraphChannelIndex(bunch.chIndex);
+    const auto failAckedReliableReceiveHole =
+        [&](const char* context) {
+            if (owningGraphIndex) {
+                FailOwningPawnGraph(clientId, context);
+                return;
+            }
+            const std::shared_ptr<ClientConnection> connection =
+                GetConnection(clientId);
+            if (connection && !connection->IsDisconnected()) {
+                connection->MarkDisconnected();
+            }
+            Logger::Error(
+                "[ActorReliable] client %u fail-closed after %s; its packet "
+                "was ACKed and the reliable receive cursor cannot recover",
+                clientId, context ? context : "an inbound receive hole");
+        };
     using Status = PacketCodec::ActorReliableSequenceStatus;
     switch (result.status) {
         case Status::Released: {
@@ -6069,6 +6914,29 @@ void ConnectionManager::DispatchInboundActorBunch(
 
             for (size_t i = 0; i < result.released.size(); ++i) {
                 const PacketCodec::Bunch& ready = result.released[i];
+                bool suppressReady =
+                    suppressOwningGraphSemantics &&
+                    (suppressReleasedCohort ||
+                     (ready.chIndex == bunch.chIndex &&
+                      ready.chSequence == bunch.chSequence));
+                if (const std::optional<size_t> readyIndex =
+                        OwningPawnGraphChannelIndex(ready.chIndex);
+                    readyIndex &&
+                    ready.chSequence < PacketCodec::kMaxChSequence &&
+                    cs.owningPawnGraphSuppressedInboundReliable[*readyIndex]
+                        .test(ready.chSequence)) {
+                    suppressReady = true;
+                    cs.owningPawnGraphSuppressedInboundReliable[*readyIndex]
+                        .reset(ready.chSequence);
+                }
+                if (suppressReady) {
+                    Logger::Info(
+                        "[OwningPawnGraph] client %u retired delayed "
+                        "prior-incarnation ch%u reliable seq%u without "
+                        "semantic dispatch",
+                        clientId, ready.chIndex, ready.chSequence);
+                    continue;
+                }
                 DecodeInboundActorBunch(clientId, ready);
                 if (!ready.bClose) continue;
 
@@ -6102,6 +6970,11 @@ void ConnectionManager::DispatchInboundActorBunch(
             return;
         }
         case Status::Buffered:
+            if (suppressOwningGraphSemantics && owningGraphIndex &&
+                bunch.chSequence < PacketCodec::kMaxChSequence) {
+                cs.owningPawnGraphSuppressedInboundReliable[
+                    *owningGraphIndex].set(bunch.chSequence);
+            }
             Logger::Trace(
                 "[ActorReliable] client %u: buffered ch%u sequence %u (next %u, "
                 "pending %zu)",
@@ -6122,6 +6995,10 @@ void ConnectionManager::DispatchInboundActorBunch(
                 cs.actorReliableInbound.NextSequence(bunch.chIndex));
             return;
         case Status::GapOverflow:
+            failAckedReliableReceiveHole(
+                suppressOwningGraphSemantics
+                    ? "prior-incarnation inbound reliable gap"
+                    : "inbound reliable gap beyond UE3 RELIABLE_BUFFER");
             Logger::Warn(
                 "[ActorReliable] client %u: dropped ch%u sequence %u beyond the "
                 "bounded reorder window (next %u, window %u)",
@@ -6130,6 +7007,10 @@ void ConnectionManager::DispatchInboundActorBunch(
                 cs.actorReliableInbound.ReorderWindow());
             return;
         case Status::CapacityExceeded:
+            failAckedReliableReceiveHole(
+                suppressOwningGraphSemantics
+                    ? "prior-incarnation inbound reliable capacity"
+                    : "inbound reliable reorder capacity exhaustion");
             Logger::Warn(
                 "[ActorReliable] client %u: dropped ch%u sequence %u because "
                 "the connection reorder buffer is full (%zu/%zu bunches, "
@@ -6141,6 +7022,10 @@ void ConnectionManager::DispatchInboundActorBunch(
                 cs.actorReliableInbound.MaximumPendingPayloadBytes());
             return;
         case Status::InvalidBunch:
+            failAckedReliableReceiveHole(
+                suppressOwningGraphSemantics
+                    ? "malformed prior-incarnation reliable"
+                    : "malformed inbound reliable actor bunch");
             Logger::Warn(
                 "[ActorReliable] client %u: dropped malformed reliable actor "
                 "bunch ch%u sequence %u",
@@ -6248,6 +7133,10 @@ void ConnectionManager::DecodeInboundActorBunch(uint32_t clientId,
     }
 
     if (bunch.chIndex == kLocalPawnChannel) {
+        if (!gameplayActive) {
+            gameplay.mantlePawnStarted = false;
+            return;
+        }
         const auto decoded = GameplayRpc::DecodePawn(
             bunch.payload.data(), bunch.payload.size(), bunch.payloadBits);
         if (decoded.complete && !decoded.events.empty()) {
@@ -6498,6 +7387,12 @@ void ConnectionManager::DecodeInboundActorBunch(uint32_t clientId,
             Logger::Warn(
                 "[GameplayRPC] client %u sent inventory RPC on unopened ch219",
                 clientId);
+            return;
+        }
+        if (!gameplayActive) {
+            gameplay.activeWeaponChannel = 0u;
+            gameplay.weaponIntent.fill({});
+            if (m_server) m_server->CancelRetailGrenadeCook(clientId);
             return;
         }
         const auto decoded = GameplayRpc::DecodeInventoryManager(
@@ -7210,6 +8105,7 @@ void ConnectionManager::DecodeInboundActorBunch(uint32_t clientId,
         cs.selectedRoleSquadIndex = 255;
         cs.selectedRoleIndex = 255;
         cs.spawned = false;
+        cs.deferredOwningPawnGraphDeployment.reset();
         cs.owningPawnAlive = false;
         InvalidatePossessionRecovery(cs);
         cs.activeWeaponChannel = 0;
@@ -7224,6 +8120,28 @@ void ConnectionManager::DecodeInboundActorBunch(uint32_t clientId,
         // uses 1=US and 2=NVA. Never convert with +1: that swaps the factions.
         if (m_server) {
             TeamManager* teamManager = m_server->GetTeamManager();
+            // Team selection starts a new deployment life. Do not leave the
+            // authoritative Player alive while the old faction graph drains:
+            // OnPlayerSpawn would then reject the later Dead -> Alive boundary
+            // and the post-commit pawn generation could not advance. This is a
+            // menu transition, not a combat kill, so no score/ticket callbacks
+            // run. Remove the old combat participant until deployment rebuilds
+            // it with the newly selected immutable team.
+            if (PlayerManager* players = m_server->GetPlayerManager()) {
+                if (const std::shared_ptr<Player> player =
+                        players->GetPlayer(clientId);
+                    player) {
+                    player->SetReadyToSpawn(false);
+                    if (player->GetState() != PlayerState::Dead) {
+                        if (player->GetState() == PlayerState::Alive) {
+                            players->OnPlayerDeath(clientId);
+                        } else {
+                            player->SetHealth(0);
+                        }
+                    }
+                }
+            }
+            m_server->RemoveCombatParticipant(clientId);
             if (auto* roleSystem = m_server->GetRoleSystem()) {
                 roleSystem->ReleaseRetailSquadAssignment(clientId);
             }
@@ -7774,12 +8692,7 @@ void ConnectionManager::DecodeInboundActorBunch(uint32_t clientId,
                 return;
             }
             const DeploymentPhaseState phase = GetDeploymentPhaseState();
-            const bool mayDeployNow =
-                phase.phase == DeploymentCountdown::Phase::Active ||
-                (phase.phase == DeploymentCountdown::Phase::Preparation &&
-                 phase.remainingSeconds <= static_cast<float>(
-                     DeploymentCountdown::kRoundStartScreenSeconds));
-            if (mayDeployNow) {
+            if (IsDeploymentWindowOpen(phase)) {
                 ExecutePreparedDeployment(clientId, *newlyAuthorizedSpawn);
             }
         };
@@ -8019,6 +8932,31 @@ bool ConnectionManager::ParseIncomingControl(uint32_t clientId, const std::vecto
     }
 
     ControlState& cs = GetControlState(clientId);
+    cs.inboundPacketDispatchActive = true;
+
+    // Keep a bounded modular PacketId floor for the current fixed-channel
+    // incarnation. The close-ACK packet establishes the initial floor. As
+    // newer traffic advances, retain a normal reordering window while making
+    // progress across PacketId wrap without ever admitting packets from the
+    // prior incarnation.
+    constexpr uint32_t kOwningGraphInboundPacketReorderWindow = 64u;
+    constexpr uint32_t kPacketIdModulus =
+        static_cast<uint32_t>(kMaxPacketId);
+    const auto packetForwardDistance = [](uint32_t from, uint32_t to) {
+        constexpr uint32_t modulus = static_cast<uint32_t>(kMaxPacketId);
+        return (to + modulus - from) % modulus;
+    };
+    if (cs.owningPawnGraphInboundPacketFloorValid) {
+        const uint32_t distance = packetForwardDistance(
+            cs.owningPawnGraphInboundPacketFloor, pkt.packetId);
+        if (distance > kOwningGraphInboundPacketReorderWindow &&
+            distance < kPacketIdModulus / 2u) {
+            cs.owningPawnGraphInboundPacketFloor =
+                (pkt.packetId + kPacketIdModulus -
+                 kOwningGraphInboundPacketReorderWindow) %
+                kPacketIdModulus;
+        }
+    }
 
     // Acknowledge this received packet ONLY if it carried bunch data. Acking a
     // pure-ack packet would make the peer ack our ack, and us ack that, forever
@@ -8051,6 +8989,40 @@ bool ConnectionManager::ParseIncomingControl(uint32_t clientId, const std::vecto
                          clientId, pkt.packetId, pkt.bunches.size(), kMaxBunchesPerPacket);
             break;
         }
+        const bool fixedGraphChannel =
+            OwningPawnGraphChannelIndex(b.chIndex).has_value();
+        const uint32_t graphPacketDistance =
+            cs.owningPawnGraphInboundPacketFloorValid
+            ? packetForwardDistance(
+                  cs.owningPawnGraphInboundPacketFloor, pkt.packetId)
+            : 1u;
+        const bool fixedGraphSemanticsRetiredInThisPacket =
+            fixedGraphChannel && cs.owningPawnGraphCompletionDeferred;
+        const bool fixedGraphPacketAtOrBeforeFloor =
+            fixedGraphChannel &&
+            cs.owningPawnGraphInboundPacketFloorValid &&
+            (graphPacketDistance == 0u ||
+             graphPacketDistance >= kPacketIdModulus / 2u);
+        if (fixedGraphSemanticsRetiredInThisPacket ||
+            fixedGraphPacketAtOrBeforeFloor) {
+            if (b.bReliable) {
+                DispatchInboundActorBunch(
+                    clientId, b,
+                    /*suppressOwningGraphSemantics=*/true,
+                    /*suppressReleasedCohort=*/
+                        fixedGraphSemanticsRetiredInThisPacket);
+            } else {
+                Logger::Info(
+                    "[OwningPawnGraph] client %u dropped retired-incarnation "
+                    "unreliable ch%u bunch from packet %u (floor %u, "
+                    "close ACK in packet=%u)",
+                    clientId, b.chIndex, pkt.packetId,
+                    cs.owningPawnGraphInboundPacketFloor,
+                    fixedGraphSemanticsRetiredInThisPacket ? 1u : 0u);
+            }
+            if (conn && conn->IsDisconnected()) break;
+            continue;
+        }
         if (b.chIndex == 0) {
             cs.reassembler->OnBunch(b);          // control channel (handshake/NMT)
         } else if (cs.mapTravelPending) {
@@ -8071,6 +9043,16 @@ bool ConnectionManager::ParseIncomingControl(uint32_t clientId, const std::vecto
         } else {
             DispatchInboundActorBunch(clientId, b); // ch>=2 actor-channel RPCs
         }
+        // Fail-closed handlers deliberately invalidate the entire session. Do
+        // not let later bunches in the same datagram commit unrelated menu,
+        // team, role, or combat mutations after that terminal boundary.
+        if (conn && conn->IsDisconnected()) break;
+    }
+
+    cs.inboundPacketDispatchActive = false;
+    if (cs.owningPawnGraphCompletionDeferred) {
+        cs.owningPawnGraphCompletionDeferred = false;
+        CompleteOwningPawnGraphClose(clientId, pkt.packetId);
     }
 
     // NOTE: acks are NOT flushed here per-packet (that produced an S2C ack-storm that

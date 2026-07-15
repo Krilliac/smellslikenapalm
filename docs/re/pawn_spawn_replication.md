@@ -342,9 +342,110 @@ not prove the capture-era Type67 projectile CDO NetIndex/schema, so neither the 
 current-package-derived class reference is substituted. Punji intent remains explicitly
 unidentified/fail-closed.
 
-An already-open ch209..219 graph cannot change actor classes in place. Switching faction while that
-graph remains open therefore fails deployment until an explicit actor-channel close/reopen generation
-is implemented; it never silently reuses the other faction's pawn.
+An already-open ch209..219 graph cannot change actor classes in place. Opposite-faction deployment
+therefore enters an explicit close/drain/reopen generation before `SpawnSystem` mutates the
+authoritative player. It never silently reuses the other faction's pawn or loadout classes.
+
+### Same-connection faction-switch policy
+
+The capture set contains independently grounded South and North pawn graphs, but **no retail
+South-to-North transition on one UE3 connection**: f27394 is UDP stream 125/client port 57867,
+whereas f63525 is a new connection on stream 130/client port 56400. Consequently, the emulator's
+whole-graph barrier and deterministic close order are coherence policies, not claims of
+capture-exact retail faction-switch timing.
+
+The supporting UE3 rules are capture/source grounded:
+
+- outbound reliable sequence state belongs to a connection/channel and survives an actor-channel
+  close/recreate cycle. The North connection itself shows its capture ch94 progressing through
+  open1, close2, reopen3, close4, and the North pawn open5;
+- an actor close is an empty reliable control bunch. ACKing its packet does not make the channel
+  reusable while an older reliable record on that channel remains unresolved;
+- `UnNet.h:32` defines `RELIABLE_BUFFER=128`; the receive-side actor sequencer therefore retains
+  every legal forward successor at distances 1..127. Because the packet ACK is queued before actor
+  dispatch, an unretainable reliable (gap, capacity exhaustion, or malformed expected sequence)
+  fail-closes the session instead of ACKing a receive hole and continuing;
+- North opens only stable ch209, ch210, ch212, ch214, and ch219. Stable ch211/ch213 stay dormant,
+  and their cursors do not reset.
+
+`ConnectionManager` therefore keeps persistent reliable sequencers for stable channels
+209/210/211/212/213/214/219. An opposite-team deployment closes every channel active in the old
+graph in deterministic emulator order 210..214, 219, 209, defers the deployment token without
+spawning, and waits for both the close ACK and the complete preceding reliable ledger to drain on
+every member. The final drain retires the cohort and consumes the still-authorized deferred token
+exactly once. Authorization, phase, team, map-travel state, connection health, spawn identity,
+deployment generation, and ticket availability are revalidated before reopening. A peer-originated
+close of a fixed owning channel is rejection, not an ACK, and fail-closes the connection.
+
+### Spawn transaction and switch-side authority
+
+Faction switching first clears `Player::ReadyToSpawn`, moves a live authoritative player to Dead
+without scoring a combat kill, removes the old combat participant, and only then commits the new
+team. A later h175/h261/h434 path is required; `PlayerManager::Update` cannot auto-respawn the stale
+life while the menu transaction is incomplete.
+
+`SpawnSystem::PreparePlayerSpawn` is read-only. Its prepared token captures the exact player,
+location/access result, resolved transform, team, and persistent `Player::lifecycleGeneration` while
+the player is Dead. `ConnectionManager` validates the live transport/travel state and preflights the
+entire graph plus reliable-publication capacity before `CommitPreparedPlayerSpawn` revalidates that
+token and mutates authority. Replaying a copied token after any intervening spawn is rejected even
+if the player later dies again. A post-commit publication failure cannot be rolled back safely and
+therefore disconnects; preflight failures leave player state, transform, location cooldown, graph
+cursors, and lifecycle generation unchanged. Optional invalid combat-wire fields such as a negative
+score may suppress that optional delta, but never suppress the authoritative Dead-to-Alive lifecycle
+transition. An invalid authoritative team discovered at commit is a terminal protocol inconsistency:
+the emulator revokes the prepared authorization and fail-closes instead of spawning a partial graph.
+
+If ticket exhaustion is discovered when a deferred deployment reaches its close barrier, stale
+Ready authorization is revoked and the current h59 slot table is published first. The emulator then
+queues ordered reliable ch2 h262 `ClientTempStopAutoSpawn` (which restores NotReady) followed by the
+captured h210 `ChangedRole` with `bShowSpawnSelect`; failure to publish that recovery fail-closes.
+Tickets returning does not consume the old token: the client must send a fresh h261/h434 transaction.
+
+### Inbound close/reuse quarantine
+
+The ACK-bearing packet is a semantic barrier. ACK processing may prove the outbound graph close
+complete before the packet's actor bunches are walked, so fixed ch209..ch219 semantics are suppressed
+for the remainder of that packet while ch2 menu/team/readiness RPCs still run. Completion occurs at
+packet tail, after a same-packet h434 can revoke the deferred deployment. A fail-closed handler stops
+the bunch loop immediately; later h170/h175/combat bunches in that datagram cannot mutate a terminal
+session.
+
+The barrier PacketId becomes a modular floor for the new incarnation. Fixed-channel unreliable
+traffic at or before it is dropped. Reliable traffic is still fed through the persistent per-channel
+receive sequencer so its ChSequence is retired, but its old semantic payload is not dispatched. At
+the close boundary `RetirePending` advances across any already-ACKed buffered old gaps before the new
+graph opens.
+
+This policy is grounded in UE3 channel reuse rather than a same-connection RSV2 faction-switch
+capture. `UnChan.cpp:91-123` preserves the first unacknowledged sequence in `PendingOutRec` while
+deleting the old actor payload records during cleanup; `UnChan.cpp:261-281` invokes conditional
+cleanup for a received close; and `UnChan.cpp:1271-1293` emits empty reliable bunches through the
+remembered sequence gap when `SetChannelActor` reuses the channel. Consequently an old semantic
+payload cannot be retransmitted under a fresh PacketId after cleanup, while an empty reliable
+successor is expected and must advance the persistent cursor.
+
+### Existing remote viewers during h170
+
+A continuing remote PRI keeps its actor identity. When its participant changes faction, each viewer
+first receives a reliable h35 `Team` delta to the already-open faction `TeamInfo`; the viewer-local
+team cache is advanced only when that delta is queued. This PRI update is live today; remote visual
+pawn opens remain fail-closed behind `kRemotePawnVisualTemplatesGrounded == false`.
+
+Once capture-grounded remote pawn templates enable that gate, an already-open remote pawn cannot
+change its faction archetype in place. The same batch will queue a reliable pawn close and mark that
+binding Closing/dead; its close ACK plus reliable-ledger drain must reach Closed before
+`BeginPawnIncarnation` can reopen the channel with the new faction class and persistent cursor. The
+seeded state-machine regression pins this future-gated h35-before-close behavior without claiming
+that remote pawn visuals are currently enabled. That ordering prevents a surviving old-team
+PRI/pawn mismatch while the owner completes the fresh deployment transaction.
+
+With no intervening reliable gameplay on these actor channels, the current emitter's regression
+oracle is: South open ch209 `1..5`, ch210..214 `1..2`, ch219 `1`; South close `6`, `3`, `2`;
+North reopen ch209 `7..11`, ch210/ch212/ch214 `4..5`, ch219 `3`; North close `12`, `6`, `4`;
+South reopen ch209 `13..17`, ch210/ch212/ch214 `7..8`, dormant ch211/ch213 `4..5`, ch219 `5`.
+These are implementation-derived test values, not retail constants; production always allocates
+from each sequencer's live cursor.
 
 Do **not** author ch2 h392 `ShowInitialWorldWidget` as a HUD bootstrap. The retail source resets the
 HUD flag and hides the tactical display on that path, and the official capture has no spawn h392.

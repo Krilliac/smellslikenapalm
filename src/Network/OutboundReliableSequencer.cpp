@@ -88,32 +88,15 @@ OutboundReliableSequencer::Adopt(uint32_t sequence) {
 
 OutboundReliableSequencer::ReservationResult
 OutboundReliableSequencer::ReserveBatch(size_t count) {
-    if (!m_initialized) {
-        return std::unexpected(
-            OutboundReliableSequenceError::Uninitialized);
-    }
-    if (m_latestReservation.has_value()) {
-        return std::unexpected(
-            OutboundReliableSequenceError::UnpublishedReservation);
-    }
-    if (count == 0u) {
-        return std::unexpected(
-            OutboundReliableSequenceError::InvalidBatchSize);
-    }
-    // Subtraction avoids overflowing size_t for a hostile/direct huge count.
-    if (count > kMaximumOutstanding - m_issuanceWindow.size()) {
-        return std::unexpected(
-            OutboundReliableSequenceError::OutstandingLimit);
+    const MutationResult canReserve = CanReserveBatch(count);
+    if (!canReserve) {
+        return std::unexpected(canReserve.error());
     }
 
     std::vector<uint32_t> sequences;
     sequences.reserve(count);
     uint32_t sequence = m_nextSequence;
     for (size_t index = 0; index < count; ++index) {
-        if (m_inFlight.test(sequence)) {
-            return std::unexpected(
-                OutboundReliableSequenceError::SequenceInFlight);
-        }
         sequences.push_back(sequence);
         sequence = Following(sequence);
     }
@@ -139,6 +122,37 @@ OutboundReliableSequencer::ReserveBatch(size_t count) {
     m_latestReservation =
         BatchRecord{reservation.m_id, reservation.front(), reservation.size()};
     return reservation;
+}
+
+OutboundReliableSequencer::MutationResult
+OutboundReliableSequencer::CanReserveBatch(size_t count) const {
+    if (!m_initialized) {
+        return std::unexpected(
+            OutboundReliableSequenceError::Uninitialized);
+    }
+    if (m_latestReservation.has_value()) {
+        return std::unexpected(
+            OutboundReliableSequenceError::UnpublishedReservation);
+    }
+    if (count == 0u) {
+        return std::unexpected(
+            OutboundReliableSequenceError::InvalidBatchSize);
+    }
+    // Subtraction avoids overflowing size_t for a hostile/direct huge count.
+    if (count > kMaximumOutstanding - m_issuanceWindow.size()) {
+        return std::unexpected(
+            OutboundReliableSequenceError::OutstandingLimit);
+    }
+
+    uint32_t sequence = m_nextSequence;
+    for (size_t index = 0; index < count; ++index) {
+        if (m_inFlight.test(sequence)) {
+            return std::unexpected(
+                OutboundReliableSequenceError::SequenceInFlight);
+        }
+        sequence = Following(sequence);
+    }
+    return {};
 }
 
 OutboundReliableSequencer::MutationResult

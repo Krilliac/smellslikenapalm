@@ -265,6 +265,40 @@ TEST(ActorReliableSequencer, ChannelClosePreservesCursorAcrossReuse) {
     EXPECT_EQ(sequencer.NextSequence(41), 3u);
 }
 
+TEST(ActorReliableSequencer, DefaultWindowMatchesUe3ReliableBuffer) {
+    ActorReliableSequencer sequencer;
+    EXPECT_EQ(sequencer.ReorderWindow(), 127u);
+
+    // With next==1, seq128 is the final legal successor retained by UE3's
+    // 128-entry reliable ring. Seq129 is one entry beyond that contract.
+    ExpectStatus(sequencer.Push(MakeReliable(16, 128u)),
+                 ActorReliableSequenceStatus::Buffered);
+    ExpectStatus(sequencer.Push(MakeReliable(16, 129u)),
+                 ActorReliableSequenceStatus::GapOverflow);
+    EXPECT_EQ(sequencer.PendingBunchCount(16), 1u);
+}
+
+TEST(ActorReliableSequencer, RetirePendingAdvancesAcrossAckedOldGaps) {
+    ActorReliableSequencer sequencer;
+    ExpectStatus(sequencer.Push(MakeReliable(43, 2, 0x22)),
+                 ActorReliableSequenceStatus::Buffered);
+    ExpectStatus(sequencer.Push(MakeReliable(43, 4, 0x44)),
+                 ActorReliableSequenceStatus::Buffered);
+    ASSERT_EQ(sequencer.PendingBunchCount(43), 2u);
+    ASSERT_NE(sequencer.PendingPayloadBytes(), 0u);
+
+    EXPECT_EQ(sequencer.RetirePending(43), 2u);
+    EXPECT_EQ(sequencer.PendingBunchCount(43), 0u);
+    EXPECT_EQ(sequencer.PendingPayloadBytes(), 0u);
+    EXPECT_EQ(sequencer.NextSequence(43), 5u);
+    ExpectStatus(sequencer.Push(MakeReliable(43, 1, 0x11)),
+                 ActorReliableSequenceStatus::Stale);
+    ExpectStatus(sequencer.Push(MakeReliable(43, 4, 0x44)),
+                 ActorReliableSequenceStatus::Stale);
+    ExpectStatus(sequencer.Push(MakeReliable(43, 5, 0x55)),
+                 ActorReliableSequenceStatus::Released);
+}
+
 TEST(ActorReliableSequencer, ExactHalfCycleIsStaleLikeUe3MakeRelative) {
     ActorReliableSequencer sequencer;
     ExpectStatus(

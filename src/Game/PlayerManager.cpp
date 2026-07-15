@@ -61,7 +61,7 @@ void PlayerManager::OnPlayerConnect(std::shared_ptr<ClientConnection> conn)
     }
 
     uint32_t id = conn->GetClientId();
-    auto player = std::make_shared<Player>(id, conn);
+    std::shared_ptr<Player> player = std::make_shared<Player>(id, conn);
     player->Initialize(conn->GetPlayerName(), conn->GetTeamId());
     m_players[id] = player;
     if (m_server) m_server->RegisterCombatParticipant(id);

@@ -108,6 +108,12 @@ public:
     // the cursor nor the in-flight/window state is changed.
     [[nodiscard]] ReservationResult ReserveBatch(size_t count);
 
+    // Apply ReserveBatch's complete validation without allocating a token or
+    // mutating the cursor/window. This is used to preflight a synchronous
+    // authority callback that may itself consume a known number of sequences
+    // before the caller performs its real reservation.
+    [[nodiscard]] MutationResult CanReserveBatch(size_t count) const;
+
     // Roll back the latest successful ReserveBatch call before its values are
     // published. Only the exact, still-in-flight batch at the current cursor
     // can be cancelled; failure leaves all allocator state unchanged.

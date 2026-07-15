@@ -31,6 +31,9 @@ public:
     // State
     void SetState(PlayerState state);
     PlayerState GetState() const;
+    uint64_t GetLifecycleGeneration() const noexcept {
+        return m_lifecycleGeneration;
+    }
 
     // Position & movement
     void SetPosition(const Vector3& pos);
@@ -81,6 +84,9 @@ private:
     std::shared_ptr<ClientConnection> m_connection;
 
     PlayerState m_state;
+    // Advances on every accepted transition into Alive and never resets on
+    // death. Transactional spawn plans use it to reject stale prior-life work.
+    uint64_t    m_lifecycleGeneration = 0;
     Vector3     m_position;
     Vector3     m_orientation;
     int         m_health;

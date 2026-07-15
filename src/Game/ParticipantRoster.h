@@ -121,6 +121,14 @@ struct ParticipantActorChannelBinding {
     // repeating unchanged h61 makes retail answer with h152 indefinitely.
     bool priDeadWireValid = false;
     bool priDeadWireValue = false;
+    // Viewer-local class/team identity already published for the continuing
+    // participant.  PRI identity survives a faction switch, so h35 is updated
+    // in place; a pawn's archetype does not, so team drift closes that actor
+    // incarnation before the channel can be reused.
+    bool priTeamWireValid = false;
+    std::uint32_t priTeamInfoChannel = 0;
+    bool pawnServerTeamValid = false;
+    std::uint32_t pawnServerTeamId = 0;
 };
 
 class ParticipantActorChannelMap {

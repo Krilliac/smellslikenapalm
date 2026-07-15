@@ -189,6 +189,29 @@ bool ActorReliableSequencer::DiscardPending(uint32_t channelIndex) {
     return true;
 }
 
+size_t ActorReliableSequencer::RetirePending(uint32_t channelIndex) {
+    if (!IsValidChannel(channelIndex)) return 0u;
+    const auto channelIt = m_channels.find(channelIndex);
+    if (channelIt == m_channels.end() || channelIt->second.pending.empty()) {
+        return 0u;
+    }
+
+    ChannelState& state = channelIt->second;
+    uint32_t farthestDistance = 0u;
+    for (const auto& [sequence, bunch] : state.pending) {
+        (void)bunch;
+        farthestDistance = std::max(
+            farthestDistance,
+            ForwardDistance(state.nextSequence, sequence));
+    }
+    const size_t retired = state.pending.size();
+    RemoveChannelPendingAccounting(state);
+    state.pending.clear();
+    state.nextSequence =
+        (state.nextSequence + farthestDistance + 1u) % kMaxChSequence;
+    return retired;
+}
+
 uint32_t ActorReliableSequencer::NextSequence(uint32_t channelIndex) const {
     const auto it = m_channels.find(channelIndex);
     return it == m_channels.end() ? m_firstSequence : it->second.nextSequence;
