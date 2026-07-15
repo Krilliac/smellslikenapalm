@@ -519,6 +519,11 @@ aware release check permits the final wave exactly at the replicated close time
 without allowing a loaded tick to release it afterward. Capturing an objective
 can move only the capturing team's next wave and close time.
 
+Supremacy uses retail's single signed score and counts only objectives connected
+to their team's home base when both valid HQ markers exist. If either marker is
+missing or malformed, supply lines are disabled globally and every controlled
+objective scores, matching `ROGameInfoSupremacy.Reset` and `UpdatePointsHeld`.
+
 ### Key Source Files
 
 | File | Responsibility |

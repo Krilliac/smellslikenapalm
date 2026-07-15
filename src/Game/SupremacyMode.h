@@ -63,6 +63,7 @@ public:
     int GetTeamObjectiveValue(uint32_t teamId) const;
     int GetSouthConnectedObjectiveValue() const;
     int GetNorthConnectedObjectiveValue() const;
+    bool UsesSupplyLines() const;
     bool IsObjectiveLinked(uint32_t objectiveId, uint32_t teamId) const;
     bool HasObjective(uint32_t objectiveId) const;
     uint32_t GetObjectiveControllingTeam(uint32_t objectiveId) const;
@@ -82,8 +83,10 @@ public:
 
     // Objective supply chain. Configure initial ownership and point value for
     // every map objective, then provide adjacency lists and each team's HQ.
-    // A controlled objective scores only while connected to its own HQ through
-    // other objectives controlled by the same team.
+    // When both teams have a valid HQ, a controlled objective scores only while
+    // connected to its own HQ through objectives controlled by the same team.
+    // Maps without both HQs use retail's fallback and score every controlled
+    // objective without supply-line connectivity.
     void ClearObjectives();
     void SetObjectiveMetadata(uint32_t objectiveId,
                               uint32_t controllingTeam,
@@ -124,8 +127,7 @@ private:
     void SetPhase(Phase newPhase);
     void ProcessScoreFlow(float deltaSeconds);
     int64_t CalculateLinkedObjectiveValue(uint32_t teamId) const;
-    bool HasPathToHQ(uint32_t objectiveId, uint32_t teamId,
-                     std::vector<uint32_t>& visited) const;
+    bool HasPathFromHQ(uint32_t objectiveId, uint32_t teamId) const;
     void ResetObjectivesToInitialOwners();
     bool TeamHasLivingParticipant(uint32_t teamId) const;
     void CheckSuddenDeathElimination();

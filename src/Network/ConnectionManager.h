@@ -32,6 +32,7 @@
 #include "Physics/MovementValidator.h"
 
 class GameServer;
+class SupremacyMode;
 
 static_assert(ParticipantActorChannelMap::kLastChannel <
                   WeaponCombatRepl::kM61VisualFirstChannel,
@@ -164,6 +165,9 @@ private:
     static bool EvaluateRetailRoundClockPolicy(
         DeploymentCountdown::Phase phase, bool waitForReadyPlayer,
         bool hasJoinedRetailClient, bool hasReadyRetailClient);
+    static bool ResolveObjectiveConnectedToBase(
+        bool authoredConnectedToBase, const SupremacyMode* supremacy,
+        uint32_t objectiveId, uint32_t controllingTeam);
 
     GameServer* m_server;
     std::shared_ptr<UDPSocket> m_socket;

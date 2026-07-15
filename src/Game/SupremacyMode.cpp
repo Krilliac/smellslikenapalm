@@ -162,60 +162,88 @@ void SupremacyMode::ProcessScoreFlow(float deltaSeconds) {
     m_score = static_cast<int32_t>(finalScore);
 }
 
-int64_t SupremacyMode::CalculateLinkedObjectiveValue(uint32_t teamId) const {
-    const auto hq = GetTeamHQ(teamId);
-    if (!hq) return 0;
-
-    const auto hqIt = m_objectiveGraph.find(*hq);
-    if (hqIt == m_objectiveGraph.end() ||
-        hqIt->second.controllingTeam != teamId) {
-        return 0;
+bool SupremacyMode::UsesSupplyLines() const {
+    // ROGameInfoSupremacy.Reset enables bUseSupplyLines only after it finds one
+    // distinct HomeBaseForTeam marker for each team. A marker necessarily
+    // belongs to an objective in retail; reject API-created dangling aliases.
+    if (!m_southHQ || !m_northHQ || *m_southHQ == *m_northHQ) {
+        return false;
     }
 
+    return m_objectiveGraph.find(*m_southHQ) != m_objectiveGraph.end() &&
+           m_objectiveGraph.find(*m_northHQ) != m_objectiveGraph.end();
+}
+
+int64_t SupremacyMode::CalculateLinkedObjectiveValue(uint32_t teamId) const {
+    if (teamId != kSouthTeamId && teamId != kNorthTeamId) return 0;
+
+    const bool useSupplyLines = UsesSupplyLines();
     int64_t total = 0;
     for (const auto& [id, node] : m_objectiveGraph) {
         if (node.controllingTeam != teamId) continue;
 
-        std::vector<uint32_t> visited;
-        if (HasPathToHQ(id, teamId, visited)) {
-            const int64_t pointValue = static_cast<int64_t>(node.pointValue);
-            if (total > std::numeric_limits<int64_t>::max() - pointValue) {
-                total = std::numeric_limits<int64_t>::max();
-            } else {
-                total += pointValue;
-            }
+        if (useSupplyLines && !HasPathFromHQ(id, teamId)) continue;
+
+        const int64_t pointValue = static_cast<int64_t>(node.pointValue);
+        if (total > std::numeric_limits<int64_t>::max() - pointValue) {
+            total = std::numeric_limits<int64_t>::max();
+        } else {
+            total += pointValue;
         }
     }
     return total;
 }
 
-bool SupremacyMode::HasPathToHQ(uint32_t objectiveId,
-                                uint32_t teamId,
-                                std::vector<uint32_t>& visited) const {
+bool SupremacyMode::HasPathFromHQ(uint32_t objectiveId,
+                                  uint32_t teamId) const {
+    const auto objectiveIt = m_objectiveGraph.find(objectiveId);
+    if (objectiveIt == m_objectiveGraph.end() ||
+        objectiveIt->second.controllingTeam != teamId) {
+        return false;
+    }
+
+    // ROGameInfoSupremacy.UpdatePointsHeld explicitly marks objectives with no
+    // bordering objectives as connected. This applies even when the team's HQ
+    // is currently enemy-controlled.
+    if (objectiveIt->second.linkedTo.empty()) return true;
+
     const auto hq = GetTeamHQ(teamId);
     if (!hq) return false;
 
-    const auto it = m_objectiveGraph.find(objectiveId);
-    if (it == m_objectiveGraph.end() ||
-        it->second.controllingTeam != teamId) {
+    const auto hqIt = m_objectiveGraph.find(*hq);
+    if (hqIt == m_objectiveGraph.end() ||
+        hqIt->second.controllingTeam != teamId) {
         return false;
     }
-    if (objectiveId == *hq) return true;
 
-    visited.push_back(objectiveId);
-    for (uint32_t linked : it->second.linkedTo) {
-        if (std::find(visited.begin(), visited.end(), linked) !=
+    // Retail starts at the owned home base and follows BorderingObjectives
+    // outward. Do not reverse the authored edges by searching from the target.
+    std::vector<uint32_t> pending{*hq};
+    std::vector<uint32_t> visited;
+    while (!pending.empty()) {
+        const uint32_t current = pending.back();
+        pending.pop_back();
+
+        if (std::find(visited.begin(), visited.end(), current) !=
             visited.end()) {
             continue;
         }
+        visited.push_back(current);
+        if (current == objectiveId) return true;
 
-        const auto linkIt = m_objectiveGraph.find(linked);
-        if (linkIt == m_objectiveGraph.end() ||
-            linkIt->second.controllingTeam != teamId) {
+        const auto currentIt = m_objectiveGraph.find(current);
+        if (currentIt == m_objectiveGraph.end() ||
+            currentIt->second.controllingTeam != teamId) {
             continue;
         }
 
-        if (HasPathToHQ(linked, teamId, visited)) return true;
+        for (uint32_t linked : currentIt->second.linkedTo) {
+            const auto linkedIt = m_objectiveGraph.find(linked);
+            if (linkedIt != m_objectiveGraph.end() &&
+                linkedIt->second.controllingTeam == teamId) {
+                pending.push_back(linked);
+            }
+        }
     }
     return false;
 }
@@ -329,8 +357,8 @@ int SupremacyMode::GetNorthConnectedObjectiveValue() const {
 
 bool SupremacyMode::IsObjectiveLinked(uint32_t objectiveId,
                                       uint32_t teamId) const {
-    std::vector<uint32_t> visited;
-    return HasPathToHQ(objectiveId, teamId, visited);
+    if (!UsesSupplyLines()) return false;
+    return HasPathFromHQ(objectiveId, teamId);
 }
 
 bool SupremacyMode::HasObjective(uint32_t objectiveId) const {

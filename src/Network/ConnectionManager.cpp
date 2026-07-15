@@ -2034,12 +2034,9 @@ void ConnectionManager::SendRetailObjectiveState(uint32_t clientId, bool baselin
         ++mappedCount;
         repIndex[slot] = zone->cookedRepIndex;
         objectiveNames[slot] = zone->name;
-        connected[slot] = zone->connectedToBase ? 1u : 0u;
-        if (supremacy && zone->controllingTeam >= SupremacyMode::kSouthTeamId &&
-            zone->controllingTeam <= SupremacyMode::kNorthTeamId) {
-            connected[slot] = supremacy->IsObjectiveLinked(
-                zone->id, zone->controllingTeam) ? 1u : 0u;
-        }
+        connected[slot] = ResolveObjectiveConnectedToBase(
+            zone->connectedToBase, supremacy, zone->id,
+            zone->controllingTeam) ? 1u : 0u;
         capProgress[slot] = ObjectiveRepl::QuantizeProgress(zone->captureProgress);
 
         uint32_t team0Cappers = 0;
@@ -3917,6 +3914,21 @@ bool ConnectionManager::EvaluateRetailRoundClockPolicy(
     // the legacy headless bot-simulation behavior.
     if (hasJoinedRetailClient) return false;
     return !waitForReadyPlayer;
+}
+
+bool ConnectionManager::ResolveObjectiveConnectedToBase(
+    bool authoredConnectedToBase, const SupremacyMode* supremacy,
+    uint32_t objectiveId, uint32_t controllingTeam) {
+    // Retail skips its entire connectivity clear/recompute pass when either
+    // home-base marker is absent. Preserve the map-authored bit in that mode;
+    // it is ignored for scoring but remains part of the replicated objective
+    // state. With both bases present, publish the live supply-line result.
+    if (!supremacy || !supremacy->UsesSupplyLines() ||
+        (controllingTeam != SupremacyMode::kSouthTeamId &&
+         controllingTeam != SupremacyMode::kNorthTeamId)) {
+        return authoredConnectedToBase;
+    }
+    return supremacy->IsObjectiveLinked(objectiveId, controllingTeam);
 }
 
 bool ConnectionManager::IsRetailGameplayActive(uint32_t clientId) const {

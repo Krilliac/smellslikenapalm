@@ -151,6 +151,119 @@ TEST(SupremacyMode, HueCityTopologyCountsOnlyOwnedPathsToHQ) {
     EXPECT_EQ(mode.GetTeamObjectiveValue(SupremacyMode::kSouthTeamId), 3);
 }
 
+TEST(SupremacyMode, SupplyLinesFollowAuthoredEdgesOutwardFromHeadquarters) {
+    SupremacyMode mode(nullptr);
+    mode.ClearObjectives();
+    mode.SetObjectiveMetadata(0, SupremacyMode::kSouthTeamId, 1);
+    mode.SetObjectiveMetadata(1, SupremacyMode::kSouthTeamId, 2);
+    mode.SetObjectiveMetadata(2, SupremacyMode::kSouthTeamId, 4);
+    mode.SetObjectiveMetadata(3, SupremacyMode::kNorthTeamId, 1);
+    mode.SetObjectiveMetadata(9, 0, 1);
+    mode.SetObjectiveLinks({
+        {0, {1}},  // HQ can reach objective 1.
+        {1, {9}},  // Objective 1 has no reverse edge to HQ.
+        {2, {0}},  // A reverse-only edge must not connect objective 2.
+        {3, {}},
+        {9, {}},
+    });
+    mode.SetTeamHQ(SupremacyMode::kSouthTeamId, 0);
+    mode.SetTeamHQ(SupremacyMode::kNorthTeamId, 3);
+    BeginActiveRound(mode);
+
+    ASSERT_TRUE(mode.UsesSupplyLines());
+    EXPECT_TRUE(mode.IsObjectiveLinked(1, SupremacyMode::kSouthTeamId));
+    EXPECT_FALSE(mode.IsObjectiveLinked(2, SupremacyMode::kSouthTeamId));
+    EXPECT_EQ(mode.GetTeamObjectiveValue(SupremacyMode::kSouthTeamId), 3);
+}
+
+TEST(SupremacyMode, OwnedIsolatedObjectiveRemainsConnectedWithSupplyLines) {
+    SupremacyMode mode(nullptr);
+    mode.ClearObjectives();
+    mode.SetObjectiveMetadata(0, SupremacyMode::kSouthTeamId, 1);
+    mode.SetObjectiveMetadata(1, SupremacyMode::kNorthTeamId, 1);
+    mode.SetObjectiveMetadata(2, SupremacyMode::kSouthTeamId, 4);
+    mode.SetObjectiveLinks({
+        {0, {1}},
+        {1, {0}},
+        {2, {}},
+    });
+    mode.SetTeamHQ(SupremacyMode::kSouthTeamId, 0);
+    mode.SetTeamHQ(SupremacyMode::kNorthTeamId, 1);
+    BeginActiveRound(mode);
+
+    ASSERT_TRUE(mode.UsesSupplyLines());
+    EXPECT_TRUE(mode.IsObjectiveLinked(2, SupremacyMode::kSouthTeamId));
+    EXPECT_EQ(mode.GetTeamObjectiveValue(SupremacyMode::kSouthTeamId), 5);
+
+    // Retail's isolated-objective special case does not depend on the home
+    // base remaining under that team's control.
+    mode.OnObjectiveCaptured(0, SupremacyMode::kNorthTeamId);
+    EXPECT_TRUE(mode.IsObjectiveLinked(2, SupremacyMode::kSouthTeamId));
+    EXPECT_EQ(mode.GetTeamObjectiveValue(SupremacyMode::kSouthTeamId), 4);
+}
+
+TEST(SupremacyMode, NoHeadquartersScoresEveryControlledObjective) {
+    SupremacyMode mode(nullptr);
+    mode.ClearObjectives();
+    mode.SetObjectiveMetadata(0, SupremacyMode::kSouthTeamId, 2);
+    mode.SetObjectiveMetadata(1, SupremacyMode::kSouthTeamId, 3);
+    mode.SetObjectiveMetadata(2, SupremacyMode::kNorthTeamId, 1);
+    BeginActiveRound(mode);
+
+    EXPECT_EQ(mode.GetTeamObjectiveValue(SupremacyMode::kSouthTeamId), 5);
+    EXPECT_EQ(mode.GetTeamObjectiveValue(SupremacyMode::kNorthTeamId), 1);
+    EXPECT_EQ(mode.GetTeamObjectiveValue(99), 0);
+    EXPECT_FALSE(mode.IsObjectiveLinked(0, SupremacyMode::kSouthTeamId));
+
+    mode.Update(5.0f);
+    EXPECT_EQ(mode.GetScore(), 4);
+}
+
+TEST(SupremacyMode, OneHeadquartersDisablesSupplyLinesForBothTeams) {
+    SupremacyMode mode(nullptr);
+    mode.ClearObjectives();
+    mode.SetObjectiveMetadata(0, SupremacyMode::kSouthTeamId, 1);
+    mode.SetObjectiveMetadata(1, SupremacyMode::kSouthTeamId, 4);
+    mode.SetObjectiveMetadata(2, SupremacyMode::kNorthTeamId, 2);
+    mode.SetTeamHQ(SupremacyMode::kSouthTeamId, 0);
+    BeginActiveRound(mode);
+
+    EXPECT_EQ(mode.GetTeamObjectiveValue(SupremacyMode::kSouthTeamId), 5);
+    EXPECT_EQ(mode.GetTeamObjectiveValue(SupremacyMode::kNorthTeamId), 2);
+    EXPECT_FALSE(mode.IsObjectiveLinked(0, SupremacyMode::kSouthTeamId));
+
+    mode.Update(5.0f);
+    EXPECT_EQ(mode.GetScore(), 3);
+}
+
+TEST(SupremacyMode, MalformedHeadquartersFallsBackToAllControlledObjectives) {
+    SupremacyMode mode(nullptr);
+    mode.ClearObjectives();
+    mode.SetObjectiveMetadata(0, SupremacyMode::kSouthTeamId, 1);
+    mode.SetObjectiveMetadata(1, SupremacyMode::kSouthTeamId, 4);
+    mode.SetObjectiveMetadata(2, SupremacyMode::kNorthTeamId, 3);
+    mode.SetTeamHQ(SupremacyMode::kSouthTeamId, 0);
+    mode.SetTeamHQ(SupremacyMode::kNorthTeamId, 99);
+    BeginActiveRound(mode);
+
+    ASSERT_TRUE(mode.GetTeamHQ(SupremacyMode::kNorthTeamId).has_value());
+    EXPECT_EQ(*mode.GetTeamHQ(SupremacyMode::kNorthTeamId), 99u);
+    EXPECT_EQ(mode.GetTeamObjectiveValue(SupremacyMode::kSouthTeamId), 5);
+    EXPECT_EQ(mode.GetTeamObjectiveValue(SupremacyMode::kNorthTeamId), 3);
+    EXPECT_FALSE(mode.IsObjectiveLinked(0, SupremacyMode::kSouthTeamId));
+
+    mode.Update(5.0f);
+    EXPECT_EQ(mode.GetScore(), 2);
+
+    // One retail objective cannot carry both HomeBaseForTeam enum values.
+    // Treat the API-created alias as another malformed topology, not as two
+    // valid supply-line roots.
+    mode.SetTeamHQ(SupremacyMode::kNorthTeamId, 0);
+    EXPECT_EQ(mode.GetTeamObjectiveValue(SupremacyMode::kSouthTeamId), 5);
+    EXPECT_EQ(mode.GetTeamObjectiveValue(SupremacyMode::kNorthTeamId), 3);
+    EXPECT_FALSE(mode.IsObjectiveLinked(0, SupremacyMode::kSouthTeamId));
+}
+
 TEST(SupremacyMode, AddsConnectedValueDifferenceEveryFiveSeconds) {
     SupremacyMode mode(nullptr);
     ConfigureHueCity(mode);

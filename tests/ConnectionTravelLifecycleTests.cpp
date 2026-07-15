@@ -8,6 +8,7 @@
 #include "Network/ControlChannel.h"
 #include "Network/PacketCodec.h"
 #include "Network/SpawnReplication.h"
+#include "Game/SupremacyMode.h"
 #include "TelemetryManager.h"
 #include "Utils/Logger.h"
 
@@ -339,6 +340,13 @@ public:
         return ConnectionManager::EvaluateRetailRoundClockPolicy(
             phase, waitForReadyPlayer, hasJoinedRetailClient,
             hasReadyRetailClient);
+    }
+
+    static bool ResolveObjectiveConnectedToBase(
+        bool authoredConnectedToBase, const SupremacyMode* supremacy,
+        uint32_t objectiveId, uint32_t controllingTeam) {
+        return ConnectionManager::ResolveObjectiveConnectedToBase(
+            authoredConnectedToBase, supremacy, objectiveId, controllingTeam);
     }
 
     static size_t ExpirePendingTravelSessions(ConnectionManager& manager,
@@ -879,6 +887,36 @@ TEST(ConnectionTravelLifecycle,
 
     EXPECT_FALSE(Harness::EvaluateRetailRoundClockPolicy(
         Phase::Preparation, false, true, false));
+}
+
+TEST(ConnectionTravelLifecycle,
+     SupremacyConnectivityPreservesAuthoredBitsWithoutBothHeadquarters) {
+    using Harness = ConnectionTravelLifecycleTestHarness;
+
+    SupremacyMode mode(nullptr);
+    mode.ClearObjectives();
+    mode.SetObjectiveMetadata(0, SupremacyMode::kSouthTeamId, 1);
+    mode.SetObjectiveMetadata(1, SupremacyMode::kNorthTeamId, 1);
+    mode.SetObjectiveMetadata(2, SupremacyMode::kSouthTeamId, 3);
+    mode.SetObjectiveLinks({
+        {0, {1}},
+        {1, {0}},
+        {2, {1}}, // Non-isolated but unreachable outward from South HQ.
+    });
+
+    ASSERT_FALSE(mode.UsesSupplyLines());
+    EXPECT_TRUE(Harness::ResolveObjectiveConnectedToBase(
+        true, &mode, 2, SupremacyMode::kSouthTeamId));
+    EXPECT_FALSE(Harness::ResolveObjectiveConnectedToBase(
+        false, &mode, 2, SupremacyMode::kSouthTeamId));
+
+    mode.SetTeamHQ(SupremacyMode::kSouthTeamId, 0);
+    mode.SetTeamHQ(SupremacyMode::kNorthTeamId, 1);
+    ASSERT_TRUE(mode.UsesSupplyLines());
+    EXPECT_FALSE(Harness::ResolveObjectiveConnectedToBase(
+        true, &mode, 2, SupremacyMode::kSouthTeamId));
+    EXPECT_TRUE(Harness::ResolveObjectiveConnectedToBase(
+        false, &mode, 0, SupremacyMode::kSouthTeamId));
 }
 
 TEST(ConnectionTravelLifecycle, HeadlessAndCompleteRecipientSetsPreflight) {
