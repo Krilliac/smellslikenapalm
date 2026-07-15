@@ -25,6 +25,8 @@ TerritoryMode::~TerritoryMode() {
 
 void TerritoryMode::Initialize() {
     m_phase = Phase::WarmUp;
+    m_previousPhase = Phase::WarmUp;
+    m_previousPhaseRemainingAtTransition = 0.0f;
     m_attackingTeam = TeamMapping::kServerUs;
     m_defendingTeam = TeamMapping::kServerNva;
     m_currentRound = 0;
@@ -483,6 +485,9 @@ void TerritoryMode::SetTicketsOnCapture(uint32_t tickets) { m_ticketsOnCapture =
 
 void TerritoryMode::SetPhase(Phase newPhase) {
     if (m_phase == newPhase) return;
+    m_previousPhase = m_phase;
+    m_previousPhaseRemainingAtTransition =
+        std::max(0.0f, m_phaseTimer);
     m_phase = newPhase;
     switch (newPhase) {
         case Phase::WarmUp:       m_phaseTimer = 0.0f; break;

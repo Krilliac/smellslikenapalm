@@ -69,6 +69,12 @@ public:
     uint32_t GetWinningTeam() const { return m_winningTeam; }
     bool IsInOvertime() const { return m_phase == Phase::Overtime; }
     bool IsInSuddenDeath() const { return m_phase == Phase::SuddenDeath; }
+    // Connection replication uses the old countdown coordinate to preserve a
+    // partially served reinforcement delay when SetPhase installs a new one.
+    Phase GetPreviousPhase() const { return m_previousPhase; }
+    float GetPreviousPhaseRemainingAtTransition() const {
+        return m_previousPhaseRemainingAtTransition;
+    }
 
     struct RetailTimingState {
         int32_t nextLockdownTime = -1;
@@ -125,6 +131,8 @@ private:
     float m_postRoundTime = 15.0f;
     float m_overtimeMaxTime = 180.0f;        // Retail main-expiry overtime
     float m_phaseTimer = 0.0f;
+    Phase m_previousPhase = Phase::WarmUp;
+    float m_previousPhaseRemainingAtTransition = 0.0f;
     float m_lastCaptureTime = -1.0f;
     float m_lastCaptureAttempt = -1.0f;
     float m_nextLockdownTime = -1.0f;

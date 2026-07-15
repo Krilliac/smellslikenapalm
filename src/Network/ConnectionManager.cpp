@@ -334,6 +334,10 @@ void ConnectionManager::Shutdown() {
     // later Initialize cannot inherit stale reliable-channel state.
     m_handshakes.clear();
     m_controlState.clear();
+    m_lastDeploymentPhase.reset();
+    m_lastActiveDeploymentPhase = ActiveDeploymentPhase::None;
+    m_lastActiveDeploymentRemainingSeconds.reset();
+    m_lastActiveDeploymentScanSecond.reset();
     UpdateTelemetryPlayerCounts();
     if (m_movementValidator) {
         m_movementValidator->Clear();
@@ -2667,6 +2671,7 @@ void ConnectionManager::FailOwningPawnGraph(uint32_t clientId,
     state.pawnGraphPhase = OwningPawnGraphPhase::Broken;
     state.pawnGraphOpen = false;
     state.spawned = false;
+    ClearActiveDeploymentDeadline(state);
     state.owningPawnAlive = false;
     state.deferredOwningPawnGraphDeployment.reset();
     state.activeWeaponChannel = 0u;
@@ -2819,7 +2824,8 @@ bool ConnectionManager::QueueOwningPawnGraphClose(uint32_t clientId) {
 
 ConnectionManager::OwningPawnGraphGateResult
 ConnectionManager::GateOwningPawnGraphForDeployment(
-    uint32_t clientId, uint32_t teamId, uint32_t spawnId) {
+    uint32_t clientId, uint32_t teamId, uint32_t spawnId,
+    bool roundStartAuthorization) {
     ControlState& state = GetControlState(clientId);
     if (!TeamMapping::IsPlayableServerTeam(teamId) || spawnId == 0u) {
         return OwningPawnGraphGateResult::Failed;
@@ -2849,7 +2855,8 @@ ConnectionManager::GateOwningPawnGraphForDeployment(
 
     state.deferredOwningPawnGraphDeployment =
         DeferredOwningPawnGraphDeployment{
-            m_deploymentGeneration, spawnId, teamId};
+            m_deploymentGeneration, spawnId, teamId,
+            roundStartAuthorization};
     return OwningPawnGraphGateResult::Deferred;
 }
 
@@ -2944,7 +2951,9 @@ void ConnectionManager::CompleteOwningPawnGraphClose(
         return;
     }
 
-    (void)ExecutePreparedDeployment(clientId, deferred->spawnId);
+    (void)ExecutePreparedDeployment(
+        clientId, deferred->spawnId,
+        deferred->roundStartAuthorization);
 }
 
 void ConnectionManager::TransportKeepAliveTick() {
@@ -3517,6 +3526,7 @@ size_t ConnectionManager::BroadcastRetailClientTravel(
         recipient.state->mapTravelPending = true;
         recipient.state->mapTravelStartedMs = travelStartedAt;
         recipient.state->spawned = false;
+        ClearActiveDeploymentDeadline(*recipient.state);
         recipient.state->deferredOwningPawnGraphDeployment.reset();
         recipient.state->owningPawnAlive = false;
         InvalidatePossessionRecovery(*recipient.state);
@@ -3622,6 +3632,413 @@ ConnectionManager::GetDeploymentPhaseState() const {
         }
     }
     return state;
+}
+
+std::optional<int32_t> ConnectionManager::RetailRemainingSecond(
+    float remainingSeconds) noexcept {
+    if (!std::isfinite(remainingSeconds) || remainingSeconds < 0.0f) {
+        return std::nullopt;
+    }
+    const double rounded = std::ceil(static_cast<double>(remainingSeconds));
+    if (rounded > static_cast<double>(INT32_MAX)) return std::nullopt;
+    return static_cast<int32_t>(rounded);
+}
+
+std::optional<ConnectionManager::ActiveDeploymentPhaseState>
+ConnectionManager::GetActiveDeploymentPhaseState() const {
+    if (!m_server) return std::nullopt;
+    const TerritoryMode* territory = m_server->GetTerritoryMode();
+    if (!territory) return std::nullopt;
+
+    const auto mapPhase = [](TerritoryMode::Phase phase) {
+        switch (phase) {
+            case TerritoryMode::Phase::Active:
+                return ActiveDeploymentPhase::TerritoryActive;
+            case TerritoryMode::Phase::Overtime:
+                return ActiveDeploymentPhase::TerritoryOvertime;
+            case TerritoryMode::Phase::Lockdown:
+                return ActiveDeploymentPhase::TerritoryLockdown;
+            default:
+                return ActiveDeploymentPhase::None;
+        }
+    };
+
+    ActiveDeploymentPhaseState state;
+    state.phase = mapPhase(territory->GetPhase());
+    if (state.phase == ActiveDeploymentPhase::None) return std::nullopt;
+    const auto remaining =
+        RetailRemainingSecond(territory->GetRoundTimeRemaining());
+    if (!remaining.has_value()) return std::nullopt;
+    state.remainingSeconds = *remaining;
+    state.previousPhase = mapPhase(territory->GetPreviousPhase());
+    state.previousPhaseRemainingAtTransition = RetailRemainingSecond(
+        territory->GetPreviousPhaseRemainingAtTransition());
+    return state;
+}
+
+ConnectionManager::ActiveDeploymentPolicy
+ConnectionManager::GetActiveDeploymentPolicy(uint32_t clientId) const {
+    if (!m_server) return ActiveDeploymentPolicy::Closed;
+    const TerritoryMode* territory = m_server->GetTerritoryMode();
+    if (!territory) {
+        // Supremacy, Skirmish, and the legacy generic GameState retain their
+        // existing immediate active deployment behavior until their distinct
+        // retail reinforcement contracts are grounded end to end.
+        return ActiveDeploymentPolicy::Immediate;
+    }
+
+    switch (territory->GetPhase()) {
+        case TerritoryMode::Phase::SuddenDeath:
+            return ActiveDeploymentPolicy::Closed;
+        case TerritoryMode::Phase::Active:
+        case TerritoryMode::Phase::Overtime:
+        case TerritoryMode::Phase::Lockdown:
+            break;
+        default:
+            return ActiveDeploymentPolicy::Immediate;
+    }
+
+    const auto stateIt = m_controlState.find(clientId);
+    if (stateIt == m_controlState.end() ||
+        !stateIt->second.retailBootstrapProfile.has_value()) {
+        return ActiveDeploymentPolicy::Closed;
+    }
+    const RetailBootstrap::Profile& profile =
+        *stateIt->second.retailBootstrapProfile;
+    // ROMapInfo defaults are not universal: player-count bands, reversed
+    // roles, game type, map overrides, and enhanced logistics can all alter
+    // them.  The installed Cu Chi map is the bounded profile whose effective
+    // 15s South / 20s North values are currently source- and asset-grounded.
+    if (!profile.usedFallback && profile.mapUrl == "VNTE-CuChi" &&
+        profile.modeName == "Territories") {
+        return ActiveDeploymentPolicy::Timed;
+    }
+    // Preserve the emulator's established immediate active deployment for
+    // other supported Territory profiles until each map's interval inputs are
+    // available. SuddenDeath above remains closed for every profile.
+    return ActiveDeploymentPolicy::Immediate;
+}
+
+std::optional<int32_t>
+ConnectionManager::CalculateActiveDeploymentDeadline(
+    int32_t remainingSeconds, uint32_t serverTeamId) noexcept {
+    if (remainingSeconds < 0) return std::nullopt;
+    int32_t delaySeconds = 0;
+    if (serverTeamId == TeamMapping::kServerUs) {
+        delaySeconds = 15;
+    } else if (serverTeamId == TeamMapping::kServerNva) {
+        delaySeconds = 20;
+    } else {
+        return std::nullopt;
+    }
+    return remainingSeconds - delaySeconds;
+}
+
+bool ConnectionManager::HasReachedActiveDeploymentDeadline(
+    int32_t remainingSeconds,
+    int32_t deadlineRemainingSeconds) noexcept {
+    return remainingSeconds >= 0 &&
+           remainingSeconds <= deadlineRemainingSeconds;
+}
+
+std::optional<int32_t>
+ConnectionManager::RebaseActiveDeploymentDeadline(
+    int32_t previousRemainingSeconds,
+    int32_t previousDeadlineRemainingSeconds,
+    int32_t currentRemainingSeconds) noexcept {
+    if (previousRemainingSeconds < 0 || currentRemainingSeconds < 0) {
+        return std::nullopt;
+    }
+    const int64_t residual = std::max<int64_t>(
+        0, static_cast<int64_t>(previousRemainingSeconds) -
+               static_cast<int64_t>(previousDeadlineRemainingSeconds));
+    const int64_t rebased =
+        static_cast<int64_t>(currentRemainingSeconds) - residual;
+    if (rebased < static_cast<int64_t>(INT32_MIN) ||
+        rebased > static_cast<int64_t>(INT32_MAX)) {
+        return std::nullopt;
+    }
+    return static_cast<int32_t>(rebased);
+}
+
+bool ConnectionManager::SendOwnerNextRespawnTime(
+    uint32_t clientId, int32_t nextRespawnTime) {
+    const auto stateIt = m_controlState.find(clientId);
+    const std::shared_ptr<ClientConnection> connection =
+        GetConnection(clientId);
+    if (stateIt == m_controlState.end() || !connection ||
+        connection->IsDisconnected() || !connection->IsUE3Client() ||
+        !connection->IsHandshakeComplete() ||
+        stateIt->second.mapTravelPending ||
+        !stateIt->second.outboundActorChannels.test(2u)) {
+        Logger::Warn(
+            "[Deployment] client %u cannot publish owner h316 without a "
+            "live PlayerController channel",
+            clientId);
+        return false;
+    }
+
+    BitWriter writer;
+    DeploymentRepl::WriteOwnerNextRespawnTime(writer, nextRespawnTime);
+    PacketCodec::Bunch bunch;
+    bunch.bReliable = false;
+    bunch.chIndex = 2u;
+    bunch.chType = stateIt->second.actorChType;
+    bunch.payload = writer.GetBytes();
+    bunch.payloadBits = static_cast<uint32_t>(writer.NumBits());
+    return SendReliableBunches(clientId, {bunch});
+}
+
+void ConnectionManager::ClearActiveDeploymentDeadline(
+    ControlState& state) noexcept {
+    state.activeDeploymentDeadlineRemainingSeconds.reset();
+    state.activeDeploymentDeadlinePhase = ActiveDeploymentPhase::None;
+    state.publishedNextRespawnTime.reset();
+    state.nextRespawnLastPublishScanSecond.reset();
+}
+
+void ConnectionManager::ClearAndPublishActiveDeploymentDeadline(
+    uint32_t clientId) {
+    const auto stateIt = m_controlState.find(clientId);
+    if (stateIt == m_controlState.end()) return;
+    ControlState& state = stateIt->second;
+    const std::shared_ptr<ClientConnection> connection =
+        GetConnection(clientId);
+    if (!connection || connection->IsDisconnected() ||
+        !connection->IsUE3Client() ||
+        !connection->IsHandshakeComplete() || state.mapTravelPending ||
+        !state.outboundActorChannels.test(2u)) {
+        ClearActiveDeploymentDeadline(state);
+        return;
+    }
+    const bool alreadyPublished =
+        !state.activeDeploymentDeadlineRemainingSeconds.has_value() &&
+        state.activeDeploymentDeadlinePhase == ActiveDeploymentPhase::None &&
+        state.publishedNextRespawnTime ==
+            DeploymentRepl::kNoPendingRespawnTime;
+    state.activeDeploymentDeadlineRemainingSeconds.reset();
+    state.activeDeploymentDeadlinePhase = ActiveDeploymentPhase::None;
+    state.nextRespawnLastPublishScanSecond.reset();
+    if (alreadyPublished) return;
+    // h316 is an explicitly-unreliable actor property. Match the established
+    // PC->PRI/spectator-property delivery policy by emitting a small bounded
+    // set of independent datagrams at the life boundary; permanently
+    // deduplicating a single clear would let one dropped packet strand the
+    // owner's HUD on the old countdown.
+    constexpr int kClearRepeats = 3;
+    bool published = false;
+    for (int repeat = 0; repeat < kClearRepeats; ++repeat) {
+        published = SendOwnerNextRespawnTime(
+                        clientId,
+                        DeploymentRepl::kNoPendingRespawnTime) ||
+                    published;
+    }
+    if (published) {
+        state.publishedNextRespawnTime =
+            DeploymentRepl::kNoPendingRespawnTime;
+    }
+}
+
+bool ConnectionManager::ArmActiveDeploymentDeadline(
+    uint32_t clientId, bool replaceExisting) {
+    const auto stateIt = m_controlState.find(clientId);
+    if (stateIt == m_controlState.end()) return false;
+    ControlState& state = stateIt->second;
+    if (state.mapTravelPending || state.spawned || !state.teamSelected ||
+        GetActiveDeploymentPolicy(clientId) !=
+            ActiveDeploymentPolicy::Timed) {
+        if (replaceExisting) ClearActiveDeploymentDeadline(state);
+        return false;
+    }
+
+    const auto activePhase = GetActiveDeploymentPhaseState();
+    if (!activePhase.has_value()) {
+        if (replaceExisting) ClearActiveDeploymentDeadline(state);
+        return false;
+    }
+
+    if (!replaceExisting &&
+        state.activeDeploymentDeadlineRemainingSeconds.has_value() &&
+        state.activeDeploymentDeadlinePhase == activePhase->phase) {
+        const int32_t deadline =
+            *state.activeDeploymentDeadlineRemainingSeconds;
+        if (state.publishedNextRespawnTime == deadline) return true;
+        if (!SendOwnerNextRespawnTime(clientId, deadline)) return false;
+        state.publishedNextRespawnTime = deadline;
+        state.nextRespawnLastPublishScanSecond =
+            activePhase->remainingSeconds;
+        return true;
+    }
+
+    const TeamManager* teams = m_server ? m_server->GetTeamManager() : nullptr;
+    const uint32_t serverTeamId =
+        teams ? teams->GetPlayerTeam(clientId) : 0u;
+    const auto deadline = CalculateActiveDeploymentDeadline(
+        activePhase->remainingSeconds, serverTeamId);
+    if (!deadline.has_value()) {
+        ClearActiveDeploymentDeadline(state);
+        return false;
+    }
+
+    state.activeDeploymentDeadlineRemainingSeconds = *deadline;
+    state.activeDeploymentDeadlinePhase = activePhase->phase;
+    state.publishedNextRespawnTime.reset();
+    state.nextRespawnLastPublishScanSecond.reset();
+    if (!SendOwnerNextRespawnTime(clientId, *deadline)) return false;
+    state.publishedNextRespawnTime = *deadline;
+    state.nextRespawnLastPublishScanSecond =
+        activePhase->remainingSeconds;
+    Logger::Info(
+        "[Deployment] client %u team %u owner h316 armed at %d "
+        "RemainingTime (now %d)",
+        clientId, serverTeamId, *deadline, activePhase->remainingSeconds);
+    return true;
+}
+
+void ConnectionManager::UpdateRetailActiveDeployments() {
+    const auto activePhase = GetActiveDeploymentPhaseState();
+    if (!activePhase.has_value()) {
+        m_lastActiveDeploymentPhase = ActiveDeploymentPhase::None;
+        m_lastActiveDeploymentRemainingSeconds.reset();
+        m_lastActiveDeploymentScanSecond.reset();
+        for (auto& [clientId, state] : m_controlState) {
+            (void)state;
+            ClearAndPublishActiveDeploymentDeadline(clientId);
+        }
+        return;
+    }
+
+    const ActiveDeploymentPhase previousPhase =
+        m_lastActiveDeploymentPhase;
+    const std::optional<int32_t> previousRemaining =
+        m_lastActiveDeploymentRemainingSeconds;
+    const bool phaseChanged = previousPhase != activePhase->phase;
+    const bool coordinateIncreased =
+        !phaseChanged && previousRemaining.has_value() &&
+        activePhase->remainingSeconds > *previousRemaining;
+    if (phaseChanged || coordinateIncreased) {
+        m_lastActiveDeploymentPhase = activePhase->phase;
+        m_lastActiveDeploymentScanSecond.reset();
+
+        std::optional<int32_t> rebaseOrigin = previousRemaining;
+        if (phaseChanged && activePhase->previousPhase == previousPhase &&
+            activePhase->previousPhaseRemainingAtTransition.has_value()) {
+            rebaseOrigin =
+                activePhase->previousPhaseRemainingAtTransition;
+        }
+
+        for (const auto& connection : GetAllConnections()) {
+            if (!connection || connection->IsDisconnected() ||
+                !connection->IsUE3Client() ||
+                !connection->IsHandshakeComplete()) {
+                continue;
+            }
+            const uint32_t clientId = connection->GetClientId();
+            const auto stateIt = m_controlState.find(clientId);
+            if (stateIt == m_controlState.end()) continue;
+            ControlState& state = stateIt->second;
+            if (state.mapTravelPending || state.spawned ||
+                !state.teamSelected ||
+                GetActiveDeploymentPolicy(clientId) !=
+                    ActiveDeploymentPolicy::Timed) {
+                continue;
+            }
+
+            if (rebaseOrigin.has_value() &&
+                state.activeDeploymentDeadlineRemainingSeconds.has_value() &&
+                state.activeDeploymentDeadlinePhase == previousPhase) {
+                const auto rebased = RebaseActiveDeploymentDeadline(
+                    *rebaseOrigin,
+                    *state.activeDeploymentDeadlineRemainingSeconds,
+                    activePhase->remainingSeconds);
+                if (rebased.has_value()) {
+                    state.activeDeploymentDeadlineRemainingSeconds = *rebased;
+                    state.activeDeploymentDeadlinePhase = activePhase->phase;
+                    state.publishedNextRespawnTime.reset();
+                    state.nextRespawnLastPublishScanSecond.reset();
+                    if (SendOwnerNextRespawnTime(clientId, *rebased)) {
+                        state.publishedNextRespawnTime = *rebased;
+                        state.nextRespawnLastPublishScanSecond =
+                            activePhase->remainingSeconds;
+                    }
+                    Logger::Info(
+                        "[Deployment] client %u carried reinforcement "
+                        "deadline to %d RemainingTime after phase-clock reset",
+                        clientId, *rebased);
+                    continue;
+                }
+            }
+            (void)ArmActiveDeploymentDeadline(
+                clientId, /*replaceExisting=*/true);
+        }
+    }
+
+    m_lastActiveDeploymentPhase = activePhase->phase;
+    m_lastActiveDeploymentRemainingSeconds = activePhase->remainingSeconds;
+    if (m_lastActiveDeploymentScanSecond == activePhase->remainingSeconds) {
+        return;
+    }
+    m_lastActiveDeploymentScanSecond = activePhase->remainingSeconds;
+
+    // NextRespawnTime belongs to the owner life boundary, not to the later
+    // spawn-scene Ready transaction. Keep the unreliable property refreshed
+    // while a dead player is still selecting a role/spawn; execution below is
+    // the only part restricted to prepared coordinator entries.
+    for (auto& [clientId, state] : m_controlState) {
+        const std::shared_ptr<ClientConnection> connection =
+            GetConnection(clientId);
+        if (!connection || connection->IsDisconnected() ||
+            !connection->IsUE3Client() ||
+            !connection->IsHandshakeComplete()) {
+            continue;
+        }
+        if (state.mapTravelPending || state.spawned ||
+            !state.teamSelected ||
+            GetActiveDeploymentPolicy(clientId) !=
+                ActiveDeploymentPolicy::Timed) {
+            continue;
+        }
+        if (!state.activeDeploymentDeadlineRemainingSeconds.has_value() ||
+            state.activeDeploymentDeadlinePhase != activePhase->phase) {
+            (void)ArmActiveDeploymentDeadline(
+                clientId, /*replaceExisting=*/true);
+        }
+        if (!state.activeDeploymentDeadlineRemainingSeconds.has_value()) {
+            continue;
+        }
+        const int32_t deadline =
+            *state.activeDeploymentDeadlineRemainingSeconds;
+        if (state.publishedNextRespawnTime != deadline ||
+            state.nextRespawnLastPublishScanSecond !=
+                activePhase->remainingSeconds) {
+            if (!SendOwnerNextRespawnTime(clientId, deadline)) continue;
+            state.publishedNextRespawnTime = deadline;
+            state.nextRespawnLastPublishScanSecond =
+                activePhase->remainingSeconds;
+        }
+    }
+
+    for (const auto& [clientId, spawnId] :
+         m_deploymentCoordinator.GetPreparedDeployments()) {
+        const auto stateIt = m_controlState.find(clientId);
+        if (stateIt == m_controlState.end()) continue;
+        const ControlState& state = stateIt->second;
+        if (state.mapTravelPending || state.spawned ||
+            GetActiveDeploymentPolicy(clientId) !=
+                ActiveDeploymentPolicy::Timed ||
+            !state.activeDeploymentDeadlineRemainingSeconds.has_value() ||
+            state.activeDeploymentDeadlinePhase != activePhase->phase ||
+            state.publishedNextRespawnTime !=
+                state.activeDeploymentDeadlineRemainingSeconds) {
+            continue;
+        }
+        const int32_t deadline =
+            *state.activeDeploymentDeadlineRemainingSeconds;
+        if (HasReachedActiveDeploymentDeadline(
+                activePhase->remainingSeconds, deadline)) {
+            (void)ExecutePreparedDeployment(clientId, spawnId);
+        }
+    }
 }
 
 bool ConnectionManager::IsDeploymentWindowOpen(
@@ -4087,8 +4504,9 @@ bool ConnectionManager::SendHideRoundStartScreen(uint32_t clientId) {
                       "ClientHideRoundStartScreen");
 }
 
-bool ConnectionManager::ExecutePreparedDeployment(uint32_t clientId,
-                                                   uint32_t spawnId) {
+bool ConnectionManager::ExecutePreparedDeployment(
+    uint32_t clientId, uint32_t spawnId,
+    bool roundStartAuthorization) {
     ControlState& cs = GetControlState(clientId);
     if (!m_server) return false;
     const std::shared_ptr<ClientConnection> connection =
@@ -4113,6 +4531,50 @@ bool ConnectionManager::ExecutePreparedDeployment(uint32_t clientId,
             clientId);
         RevokePreparedDeploymentAuthorization(clientId);
         return false;
+    }
+    roundStartAuthorization =
+        roundStartAuthorization ||
+        phase.phase == DeploymentCountdown::Phase::Preparation;
+
+    if (phase.phase == DeploymentCountdown::Phase::Active) {
+        const ActiveDeploymentPolicy policy =
+            GetActiveDeploymentPolicy(clientId);
+        const auto activeDeploymentPhase =
+            GetActiveDeploymentPhaseState();
+        const bool groundedInitialRoundTransition =
+            roundStartAuthorization &&
+            activeDeploymentPhase.has_value() &&
+            activeDeploymentPhase->phase ==
+                ActiveDeploymentPhase::TerritoryActive;
+        if (policy == ActiveDeploymentPolicy::Closed &&
+            !groundedInitialRoundTransition) {
+            Logger::Info(
+                "[Deployment] client %u authorization cannot execute in "
+                "this active Territory phase/profile",
+                clientId);
+            RevokePreparedDeploymentAuthorization(clientId);
+            return false;
+        }
+        if (policy == ActiveDeploymentPolicy::Timed &&
+            !groundedInitialRoundTransition) {
+            const bool deadlineReached =
+                activeDeploymentPhase.has_value() &&
+                cs.activeDeploymentDeadlineRemainingSeconds.has_value() &&
+                cs.activeDeploymentDeadlinePhase ==
+                    activeDeploymentPhase->phase &&
+                cs.publishedNextRespawnTime ==
+                    cs.activeDeploymentDeadlineRemainingSeconds &&
+                HasReachedActiveDeploymentDeadline(
+                    activeDeploymentPhase->remainingSeconds,
+                    *cs.activeDeploymentDeadlineRemainingSeconds);
+            if (!deadlineReached) {
+                Logger::Trace(
+                    "[Deployment] client %u remains gated by owner "
+                    "NextRespawnTime",
+                    clientId);
+                return false;
+            }
+        }
     }
 
     const TeamManager* teams = m_server->GetTeamManager();
@@ -4189,7 +4651,8 @@ bool ConnectionManager::ExecutePreparedDeployment(uint32_t clientId,
 
     const OwningPawnGraphGateResult graphGate =
         GateOwningPawnGraphForDeployment(
-            clientId, deploymentTeam, spawnId);
+            clientId, deploymentTeam, spawnId,
+            roundStartAuthorization);
     if (graphGate == OwningPawnGraphGateResult::Deferred) {
         Logger::Info(
             "[Deployment] client %u deferred spawn %u until the prior "
@@ -4286,6 +4749,7 @@ bool ConnectionManager::ExecutePreparedDeployment(uint32_t clientId,
     }
     BindPossessionRecovery(cs, pawnGeneration);
     cs.spawned = true;
+    ClearAndPublishActiveDeploymentDeadline(clientId);
     return true;
 }
 
@@ -4293,6 +4757,9 @@ void ConnectionManager::BeginDeploymentGeneration() {
     ++m_deploymentGeneration;
     m_deploymentCoordinator.ResetForGeneration(m_deploymentGeneration);
     m_deploymentCountdown.ResetForGeneration(m_deploymentGeneration);
+    m_lastActiveDeploymentPhase = ActiveDeploymentPhase::None;
+    m_lastActiveDeploymentRemainingSeconds.reset();
+    m_lastActiveDeploymentScanSecond.reset();
 
     for (const auto& connection : GetAllConnections()) {
         if (!connection || !connection->IsUE3Client() ||
@@ -4308,6 +4775,7 @@ void ConnectionManager::BeginDeploymentGeneration() {
         }
         ControlState& cs = stateIt->second;
         cs.spawned = false;
+        ClearAndPublishActiveDeploymentDeadline(clientId);
         cs.deferredOwningPawnGraphDeployment.reset();
         cs.owningPawnAlive = false;
         cs.possessionAckedGeneration = 0u;
@@ -4358,6 +4826,10 @@ void ConnectionManager::UpdateRetailDeploymentCountdown() {
         phase.phase == DeploymentCountdown::Phase::Active &&
         (!m_lastDeploymentPhase.has_value() ||
          *m_lastDeploymentPhase != DeploymentCountdown::Phase::Active);
+    const bool crossedPreparationToActive =
+        phase.phase == DeploymentCountdown::Phase::Active &&
+        m_lastDeploymentPhase ==
+            DeploymentCountdown::Phase::Preparation;
 
     // A fresh Preparation following any other phase is a new authorization
     // generation. Existing one-shot approvals must never carry into a round.
@@ -4373,9 +4845,14 @@ void ConnectionManager::UpdateRetailDeploymentCountdown() {
     if (global.deployPreparedClients) {
         for (const auto& [clientId, spawnId] :
              m_deploymentCoordinator.GetPreparedDeployments()) {
-            ExecutePreparedDeployment(clientId, spawnId);
+            ExecutePreparedDeployment(
+                clientId, spawnId,
+                /*roundStartAuthorization=*/
+                    crossedPreparationToActive);
         }
     }
+
+    UpdateRetailActiveDeployments();
 
     for (const auto& connection : GetAllConnections()) {
         if (!connection || !connection->IsUE3Client() ||
@@ -5264,6 +5741,7 @@ void ConnectionManager::ReplicateRetailParticipantCombatState(
     int score, bool isDead, bool sendHealth, bool sendDeathRpc) {
     DeploymentRepl::RetailParticipantCombatState combat{
         participant, health, kills, deaths, score, isDead};
+    bool revokeOwningDeploymentAfterPublication = false;
 
     // A death/respawn RPC marks an authoritative pawn-lifecycle boundary in
     // both directions. Re-anchor even when the current SpawnSystem still uses
@@ -5293,6 +5771,12 @@ void ConnectionManager::ReplicateRetailParticipantCombatState(
                     owner.possessionAckedGeneration = 0u;
                     owner.possessionRecoveryGeneration = 0u;
                     ResetPossessionRecovery(owner);
+
+                    // Preserve the graph-generation binding until the owning
+                    // ClientOnDead reliable is queued below. Revoking the old
+                    // deployment invalidates that binding, so the coordinator
+                    // and h316 transition commit only after wire publication.
+                    revokeOwningDeploymentAfterPublication = true;
                 } else {
                     Logger::Trace(
                         "[PawnLifecycle] client %u ignored duplicate dead "
@@ -5337,12 +5821,13 @@ void ConnectionManager::ReplicateRetailParticipantCombatState(
     // optional scoreboard fields are currently wire-encodable. A negative
     // script-adjusted score, for example, suppresses this delta but cannot
     // prevent the Dead -> Alive pawn generation from advancing after spawn.
-    if (!DeploymentRepl::IsValidRetailParticipantCombatState(combat)) {
+    const bool validCombatState =
+        DeploymentRepl::IsValidRetailParticipantCombatState(combat);
+    if (!validCombatState) {
         Logger::Warn(
             "[PawnLifecycle] suppressed invalid retail combat delta for %s "
             "%u after applying its authoritative life boundary",
             participant.IsHuman() ? "client" : "bot", participant.value);
-        return;
     }
 
     for (const auto& entry : m_clients) {
@@ -5553,6 +6038,19 @@ void ConnectionManager::ReplicateRetailParticipantCombatState(
                 binding->priDeadWireValid = true;
                 binding->priDeadWireValue = combat.dead;
             }
+        }
+    }
+
+    if (revokeOwningDeploymentAfterPublication) {
+        // A completed deployment is not a reusable respawn token. Preserve the
+        // finalized role, but clear selection/Ready in the same callback so
+        // PlayerManager's legacy timer cannot bypass the retail transaction.
+        RevokePreparedDeploymentAuthorization(participant.value);
+        const auto ownerState = m_controlState.find(participant.value);
+        if (ownerState != m_controlState.end()) {
+            ClearActiveDeploymentDeadline(ownerState->second);
+            (void)ArmActiveDeploymentDeadline(
+                participant.value, /*replaceExisting=*/true);
         }
     }
 }
@@ -6622,8 +7120,8 @@ bool ConnectionManager::ProcessPawnSpawn(
             ActorRepl::WritePropObject(
                 pawnProperty, 24, kRoPcMaxHandle,
                 ActorRepl::NetGUIDRef{/*isDynamic=*/true, kPawnCh});
-            ActorRepl::WritePropInt(
-                pawnProperty, 316, kRoPcMaxHandle, 9999999);
+            DeploymentRepl::WriteOwnerNextRespawnTime(
+                pawnProperty, DeploymentRepl::kNoPendingRespawnTime);
         } else {
             ActorRepl::WritePropObject(
                 pawnProperty, 24, kRoPcMaxHandle,
@@ -8167,6 +8665,13 @@ void ConnectionManager::DecodeInboundActorBunch(uint32_t clientId,
             SynchronizeRetailSquadAssignments();
         }
 
+        // SetNextRespawnTime is anchored only after the authoritative numeric
+        // team mutation commits.  During Preparation this simply clears any
+        // stale prior-life deadline; active Cu Chi publishes the owner h316
+        // value in the new team's 15/20-second coordinate.
+        (void)ArmActiveDeploymentDeadline(
+            clientId, /*replaceExisting=*/true);
+
         // Team is required to bind a remote PRI to an already-open TeamInfo.
         // Queue remote actors only after the load-bearing ChangedTeams advance;
         // team selection is also proof that the fixed bootstrap actors resolved.
@@ -8692,8 +9197,34 @@ void ConnectionManager::DecodeInboundActorBunch(uint32_t clientId,
                 return;
             }
             const DeploymentPhaseState phase = GetDeploymentPhaseState();
-            if (IsDeploymentWindowOpen(phase)) {
+            const bool finalPreparationWindow =
+                phase.phase == DeploymentCountdown::Phase::Preparation &&
+                std::isfinite(phase.remainingSeconds) &&
+                phase.remainingSeconds >= 0.0f &&
+                phase.remainingSeconds <= static_cast<float>(
+                    DeploymentCountdown::kRoundStartScreenSeconds);
+            if (finalPreparationWindow) {
                 ExecutePreparedDeployment(clientId, *newlyAuthorizedSpawn);
+                return;
+            }
+            if (phase.phase != DeploymentCountdown::Phase::Active) return;
+
+            const ActiveDeploymentPolicy policy =
+                GetActiveDeploymentPolicy(clientId);
+            if (policy == ActiveDeploymentPolicy::Timed) {
+                // h434 changes SpawnReadyStatus only. The ordinary active
+                // Territory release remains owned by the once-per-second
+                // reinforcement scan, even when the saved deadline is already
+                // due when a late Ready arrives.
+                (void)ArmActiveDeploymentDeadline(clientId);
+            } else if (policy == ActiveDeploymentPolicy::Immediate) {
+                ExecutePreparedDeployment(clientId, *newlyAuthorizedSpawn);
+            } else {
+                Logger::Info(
+                    "[Deployment] client %u Ready has no spawn authority "
+                    "in a closed/unsupported Territory phase",
+                    clientId);
+                RevokePreparedDeploymentAuthorization(clientId);
             }
         };
 

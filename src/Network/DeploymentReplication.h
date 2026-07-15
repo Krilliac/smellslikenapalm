@@ -23,6 +23,7 @@ namespace DeploymentRepl {
 
 constexpr uint32_t kRoPlayerControllerMaxHandle = 531;
 constexpr uint32_t kNextRespawnTimeHandle = 316;
+constexpr int32_t kNoPendingRespawnTime = 9999999;
 // SerializeInt(316, 531) consumes nine bits; the IntProperty payload is the
 // following raw signed 32-bit value.
 constexpr size_t kNextRespawnTimePropertyBits = 41;

@@ -13,11 +13,14 @@
 #include "Network/UDPSocket.h"
 #include "Game/GameServer.h"
 #include "Game/BotManager.h"
+#include "Game/ObjectiveSystem.h"
 #include "Game/PlayerManager.h"
 #include "Game/RoleSystem.h"
 #include "Game/SpawnSystem.h"
 #include "Game/SupremacyMode.h"
 #include "Game/TeamManager.h"
+#include "Game/TeamMapping.h"
+#include "Game/TerritoryMode.h"
 #include "Game/TicketSystem.h"
 #include "TelemetryManager.h"
 #include "Utils/Logger.h"
@@ -93,8 +96,10 @@ public:
     }
 
     static void ResetRoleSelectionRuntime(GameServer& server) {
+        server.m_territoryMode.reset();
         server.m_supremacyMode.reset();
         server.m_ticketSystem.reset();
+        server.m_objectiveSystem.reset();
         server.m_botManager.reset();
         server.m_spawnSystem.reset();
         server.m_roleSystem.reset();
@@ -114,6 +119,41 @@ public:
         server.m_supremacyMode->Update(
             server.m_supremacyMode->GetPhaseTimeRemaining());
         return server.m_supremacyMode.get();
+    }
+
+    static void InstallTerritoryObjective(GameServer& server) {
+        server.m_objectiveSystem =
+            std::make_unique<ObjectiveSystem>(&server);
+        server.m_objectiveSystem->Initialize();
+        CaptureZone objective;
+        objective.name = "Cu Chi deployment phase";
+        objective.type = ObjectiveType::Territory;
+        objective.territoryOrder = 0;
+        const uint32_t objectiveId =
+            server.m_objectiveSystem->AddObjective(objective);
+        server.m_objectiveSystem->SetTerritoryOrder({objectiveId});
+    }
+
+    static TerritoryMode* InstallActiveTerritoryMode(
+        GameServer& server, float roundSeconds = 120.0f) {
+        InstallTerritoryObjective(server);
+        server.m_territoryMode = std::make_unique<TerritoryMode>(&server);
+        server.m_territoryMode->Initialize();
+        server.m_territoryMode->SetRoundTime(roundSeconds);
+        server.m_territoryMode->SetPreparationTime(0.0f);
+        server.m_territoryMode->StartRound();
+        server.m_territoryMode->Update(0.0f);
+        return server.m_territoryMode.get();
+    }
+
+    static TerritoryMode* InstallPreparationTerritoryMode(
+        GameServer& server, float preparationSeconds) {
+        InstallTerritoryObjective(server);
+        server.m_territoryMode = std::make_unique<TerritoryMode>(&server);
+        server.m_territoryMode->Initialize();
+        server.m_territoryMode->SetPreparationTime(preparationSeconds);
+        server.m_territoryMode->StartRound();
+        return server.m_territoryMode.get();
     }
 
     static TicketSystem* InstallTicketSystem(
@@ -497,9 +537,56 @@ public:
     }
 
     static bool ExecutePreparedDeployment(ConnectionManager& manager,
-                                          uint32_t clientId,
-                                          uint32_t spawnId) {
+                                           uint32_t clientId,
+                                           uint32_t spawnId) {
         return manager.ExecutePreparedDeployment(clientId, spawnId);
+    }
+
+    static std::optional<int32_t> RetailRemainingSecond(
+        float remainingSeconds) {
+        return ConnectionManager::RetailRemainingSecond(remainingSeconds);
+    }
+
+    static std::optional<int32_t> CalculateActiveDeploymentDeadline(
+        int32_t remainingSeconds, uint32_t serverTeamId) {
+        return ConnectionManager::CalculateActiveDeploymentDeadline(
+            remainingSeconds, serverTeamId);
+    }
+
+    static std::optional<int32_t> RebaseActiveDeploymentDeadline(
+        int32_t previousRemainingSeconds,
+        int32_t previousDeadlineRemainingSeconds,
+        int32_t currentRemainingSeconds) {
+        return ConnectionManager::RebaseActiveDeploymentDeadline(
+            previousRemainingSeconds, previousDeadlineRemainingSeconds,
+            currentRemainingSeconds);
+    }
+
+    static bool HasReachedActiveDeploymentDeadline(
+        int32_t remainingSeconds, int32_t deadlineRemainingSeconds) {
+        return ConnectionManager::HasReachedActiveDeploymentDeadline(
+            remainingSeconds, deadlineRemainingSeconds);
+    }
+
+    static std::optional<int32_t> ActiveDeploymentDeadline(
+        const ConnectionManager& manager, uint32_t clientId) {
+        return manager.m_controlState.at(clientId)
+            .activeDeploymentDeadlineRemainingSeconds;
+    }
+
+    static std::optional<int32_t> PublishedNextRespawnTime(
+        const ConnectionManager& manager, uint32_t clientId) {
+        return manager.m_controlState.at(clientId).publishedNextRespawnTime;
+    }
+
+    static bool ActiveDeploymentPolicyIsClosed(
+        const ConnectionManager& manager, uint32_t clientId) {
+        return manager.GetActiveDeploymentPolicy(clientId) ==
+            ConnectionManager::ActiveDeploymentPolicy::Closed;
+    }
+
+    static void UpdateRetailDeploymentCountdown(ConnectionManager& manager) {
+        manager.UpdateRetailDeploymentCountdown();
     }
 
     static uint64_t OwningPawnGeneration(
@@ -516,6 +603,19 @@ public:
         const ConnectionManager& manager, uint32_t clientId) {
         return manager.m_controlState.at(clientId)
             .deferredOwningPawnGraphDeployment.has_value();
+    }
+
+    static bool DeferredOwningPawnHasRoundStartAuthorization(
+        const ConnectionManager& manager, uint32_t clientId) {
+        const auto& deferred = manager.m_controlState.at(clientId)
+            .deferredOwningPawnGraphDeployment;
+        return deferred.has_value() && deferred->roundStartAuthorization;
+    }
+
+    static void UseCanonicalResortProfile(
+        ConnectionManager& manager, uint32_t clientId) {
+        manager.m_controlState.at(clientId).retailBootstrapProfile =
+            RetailBootstrap::CanonicalProfile();
     }
 
     static uint32_t NextCh2Reliable(
@@ -1363,6 +1463,53 @@ protected:
         return bunch;
     }
 
+    static PacketCodec::Bunch ExpectedClientOnDead(bool isDead) {
+        BitWriter writer;
+        writer.SerializeInt(151u,
+                            DeploymentRepl::kRoPlayerControllerMaxHandle);
+        writer.WriteBit(isDead);
+        PacketCodec::Bunch bunch;
+        bunch.bReliable = true;
+        bunch.chIndex = 2u;
+        bunch.payload = writer.GetBytes();
+        bunch.payloadBits = static_cast<uint32_t>(writer.NumBits());
+        return bunch;
+    }
+
+    static PacketCodec::Bunch ExpectedOwnerNextRespawnTime(
+        int32_t nextRespawnTime) {
+        BitWriter writer;
+        DeploymentRepl::WriteOwnerNextRespawnTime(
+            writer, nextRespawnTime);
+
+        PacketCodec::Bunch bunch;
+        bunch.bReliable = false;
+        bunch.chIndex = 2u;
+        bunch.payload = writer.GetBytes();
+        bunch.payloadBits = static_cast<uint32_t>(writer.NumBits());
+        return bunch;
+    }
+
+    bool PublishCuChiSpawnSelection(size_t receiverIndex,
+                                    uint32_t clientId,
+                                    bool south) {
+        ConnectionTravelLifecycleTestHarness::DeliverActorBunch(
+            manager_, clientId, CuChiFinalRoleBunch(south));
+        (void)DrainDecodedPackets(receiverIndex);
+        ConnectionTravelLifecycleTestHarness::AcknowledgeAllPendingReliables(
+            manager_, clientId);
+
+        ConnectionTravelLifecycleTestHarness::DeliverActorBunch(
+            manager_, clientId, SpawnSelectBunch());
+        (void)DrainDecodedPackets(receiverIndex);
+        const auto deployment =
+            ConnectionTravelLifecycleTestHarness::DeploymentState(
+                manager_, clientId);
+        return deployment.has_value() &&
+            deployment->selectedSpawnId.has_value() &&
+            !deployment->deploymentAuthorized;
+    }
+
     static PacketCodec::Bunch ExpectedOwnerPriAssignment(
         uint8_t squadIndex, uint8_t roleIndex) {
         BitWriter writer;
@@ -1426,6 +1573,626 @@ private:
 };
 
 } // namespace
+
+TEST(ConnectionTravelLifecycle,
+     ActiveTerritoryDeadlineUsesRetailIntegerCoordinateAndCarriesResidual) {
+    using Harness = ConnectionTravelLifecycleTestHarness;
+
+    EXPECT_EQ(Harness::RetailRemainingSecond(100.0f),
+              std::optional<int32_t>{100});
+    EXPECT_EQ(Harness::RetailRemainingSecond(100.01f),
+              std::optional<int32_t>{101});
+    EXPECT_FALSE(Harness::RetailRemainingSecond(-0.01f).has_value());
+    EXPECT_FALSE(Harness::RetailRemainingSecond(
+        std::numeric_limits<float>::infinity()).has_value());
+
+    EXPECT_EQ(Harness::CalculateActiveDeploymentDeadline(
+                  100, TeamMapping::kServerUs),
+              std::optional<int32_t>{85});
+    EXPECT_EQ(Harness::CalculateActiveDeploymentDeadline(
+                  100, TeamMapping::kServerNva),
+              std::optional<int32_t>{80});
+    EXPECT_FALSE(Harness::CalculateActiveDeploymentDeadline(
+        100, 0u).has_value());
+
+    // Seven seconds remained when the old coordinate ended. A phase clock
+    // reset to 180 therefore carries the deadline to 173 rather than granting
+    // a fresh 15/20-second interval.
+    EXPECT_EQ(Harness::RebaseActiveDeploymentDeadline(
+                  /*previousRemainingSeconds=*/2,
+                  /*previousDeadlineRemainingSeconds=*/-5,
+                  /*currentRemainingSeconds=*/180),
+              std::optional<int32_t>{173});
+    EXPECT_FALSE(Harness::HasReachedActiveDeploymentDeadline(174, 173));
+    EXPECT_TRUE(Harness::HasReachedActiveDeploymentDeadline(173, 173));
+    EXPECT_TRUE(Harness::HasReachedActiveDeploymentDeadline(172, 173));
+}
+
+TEST_F(ConnectionTravelCuChiRoleIntegrationTest,
+       ActiveTerritoryReadyDefersSouthAndNorthWithOwnerOnlyH316) {
+    using Harness = ConnectionTravelLifecycleTestHarness;
+    constexpr uint32_t kSouthClient = 70u;
+    constexpr uint32_t kNorthClient = 71u;
+    constexpr uint32_t kSouthTeam = TeamMapping::kServerUs;
+    constexpr uint32_t kNorthTeam = TeamMapping::kServerNva;
+
+    TerritoryMode* territory =
+        Harness::InstallActiveTerritoryMode(server_, 120.0f);
+    ASSERT_TRUE(territory != nullptr);
+    ASSERT_EQ(territory->GetPhase(), TerritoryMode::Phase::Active);
+    // Prime the manager's phase edge before either client can hold a prepared
+    // deployment. The initial-round batch is a distinct protocol path.
+    Harness::UpdateRetailDeploymentCountdown(manager_);
+
+    ASSERT_TRUE(Connect(0u, kSouthClient, kSouthTeam) != nullptr);
+    ASSERT_TRUE(Connect(1u, kNorthClient, kNorthTeam) != nullptr);
+    ASSERT_TRUE(PublishCuChiSpawnSelection(
+        0u, kSouthClient, /*south=*/true));
+    ASSERT_TRUE(PublishCuChiSpawnSelection(
+        1u, kNorthClient, /*south=*/false));
+    (void)DrainDecodedPackets(0u);
+    (void)DrainDecodedPackets(1u);
+
+    Harness::DeliverActorBunch(manager_, kSouthClient, ReadyBunch());
+    const std::vector<PacketCodec::Bunch> southWire =
+        FlattenBunches(DrainDecodedPackets(0u));
+    const PacketCodec::Bunch expectedSouth =
+        ExpectedOwnerNextRespawnTime(105);
+    EXPECT_TRUE(FindWireBunch(southWire, expectedSouth) < southWire.size());
+    EXPECT_EQ(expectedSouth.payloadBits,
+              DeploymentRepl::kNextRespawnTimePropertyBits);
+    EXPECT_TRUE(DrainDecodedPackets(1u).empty());
+    EXPECT_EQ(Harness::ActiveDeploymentDeadline(manager_, kSouthClient),
+              std::optional<int32_t>{105});
+    EXPECT_EQ(Harness::PublishedNextRespawnTime(manager_, kSouthClient),
+              std::optional<int32_t>{105});
+    EXPECT_TRUE(Harness::DeploymentPrepared(manager_, kSouthClient));
+    EXPECT_FALSE(Harness::Spawned(manager_, kSouthClient));
+
+    Harness::DeliverActorBunch(manager_, kNorthClient, ReadyBunch());
+    const std::vector<PacketCodec::Bunch> northWire =
+        FlattenBunches(DrainDecodedPackets(1u));
+    const PacketCodec::Bunch expectedNorth =
+        ExpectedOwnerNextRespawnTime(100);
+    EXPECT_TRUE(FindWireBunch(northWire, expectedNorth) < northWire.size());
+    EXPECT_TRUE(DrainDecodedPackets(0u).empty());
+    EXPECT_EQ(Harness::ActiveDeploymentDeadline(manager_, kNorthClient),
+              std::optional<int32_t>{100});
+    EXPECT_EQ(Harness::PublishedNextRespawnTime(manager_, kNorthClient),
+              std::optional<int32_t>{100});
+    EXPECT_TRUE(Harness::DeploymentPrepared(manager_, kNorthClient));
+    EXPECT_FALSE(Harness::Spawned(manager_, kNorthClient));
+}
+
+TEST_F(ConnectionTravelCuChiRoleIntegrationTest,
+       ActiveTerritoryTeamSwitchReplacesOwnerDeadlineAfterTeamCommit) {
+    using Harness = ConnectionTravelLifecycleTestHarness;
+    constexpr uint32_t kOwnerClient = 81u;
+    constexpr uint32_t kObserverClient = 82u;
+    constexpr uint32_t kSouthTeam = TeamMapping::kServerUs;
+    constexpr uint32_t kNorthTeam = TeamMapping::kServerNva;
+
+    TerritoryMode* territory =
+        Harness::InstallActiveTerritoryMode(server_, 120.0f);
+    ASSERT_TRUE(territory != nullptr);
+    Harness::UpdateRetailDeploymentCountdown(manager_);
+    ASSERT_TRUE(Connect(0u, kOwnerClient, kSouthTeam) != nullptr);
+    ASSERT_TRUE(Connect(1u, kObserverClient, kSouthTeam) != nullptr);
+    ASSERT_TRUE(PublishCuChiSpawnSelection(
+        0u, kOwnerClient, /*south=*/true));
+
+    Harness::DeliverActorBunch(manager_, kOwnerClient, ReadyBunch());
+    (void)DrainDecodedPackets(0u);
+    (void)DrainDecodedPackets(1u);
+    TeamManager* teams = server_.GetTeamManager();
+    ASSERT_TRUE(teams != nullptr);
+    ASSERT_EQ(teams->GetPlayerTeam(kOwnerClient), kSouthTeam);
+    ASSERT_EQ(Harness::ActiveDeploymentDeadline(manager_, kOwnerClient),
+              std::optional<int32_t>{105});
+    ASSERT_TRUE(Harness::DeploymentPrepared(manager_, kOwnerClient));
+    ASSERT_FALSE(Harness::Spawned(manager_, kOwnerClient));
+
+    // Retail team zero is NLF/NVA. h170 must first commit that authoritative
+    // numeric team mutation, then replace the old South interval with the
+    // North 20-second owner deadline in the same RemainingTime coordinate.
+    Harness::DeliverActorBunch(
+        manager_, kOwnerClient, MakeSelectTeamBunch(/*retail NLF=*/0u));
+
+    EXPECT_EQ(teams->GetPlayerTeam(kOwnerClient), kNorthTeam);
+    EXPECT_EQ(Harness::ActiveDeploymentDeadline(manager_, kOwnerClient),
+              std::optional<int32_t>{100});
+    EXPECT_EQ(Harness::PublishedNextRespawnTime(manager_, kOwnerClient),
+              std::optional<int32_t>{100});
+    EXPECT_FALSE(Harness::DeploymentPrepared(manager_, kOwnerClient));
+    EXPECT_FALSE(Harness::Spawned(manager_, kOwnerClient));
+    const auto deployment =
+        Harness::DeploymentState(manager_, kOwnerClient);
+    ASSERT_TRUE(deployment.has_value());
+    EXPECT_FALSE(deployment->deploymentAuthorized);
+
+    const std::vector<PacketCodec::Bunch> ownerWire =
+        FlattenBunches(DrainDecodedPackets(0u));
+    const PacketCodec::Bunch expectedNorthDeadline =
+        ExpectedOwnerNextRespawnTime(100);
+    EXPECT_TRUE(FindWireBunch(ownerWire, expectedNorthDeadline) <
+                ownerWire.size());
+    const std::vector<PacketCodec::Bunch> observerWire =
+        FlattenBunches(DrainDecodedPackets(1u));
+    EXPECT_EQ(FindWireBunch(observerWire, expectedNorthDeadline),
+              observerWire.size());
+}
+
+TEST_F(ConnectionTravelCuChiRoleIntegrationTest,
+       ActiveTerritoryScanReleasesExactlyOnceAtOwnerDeadline) {
+    using Harness = ConnectionTravelLifecycleTestHarness;
+    constexpr uint32_t kClientId = 72u;
+    constexpr uint32_t kSouthTeam = TeamMapping::kServerUs;
+
+    TerritoryMode* territory =
+        Harness::InstallActiveTerritoryMode(server_, 120.0f);
+    ASSERT_TRUE(territory != nullptr);
+    Harness::UpdateRetailDeploymentCountdown(manager_);
+    ASSERT_TRUE(Connect(0u, kClientId, kSouthTeam) != nullptr);
+    ASSERT_TRUE(PublishCuChiSpawnSelection(
+        0u, kClientId, /*south=*/true));
+
+    Harness::DeliverActorBunch(manager_, kClientId, ReadyBunch());
+    (void)DrainDecodedPackets(0u);
+    ASSERT_EQ(Harness::ActiveDeploymentDeadline(manager_, kClientId),
+              std::optional<int32_t>{105});
+    ASSERT_TRUE(Harness::DeploymentPrepared(manager_, kClientId));
+    ASSERT_FALSE(Harness::Spawned(manager_, kClientId));
+    Harness::ModelOwningPawnSpawnCallback(manager_, kClientId);
+
+    territory->Update(14.0f);
+    ASSERT_EQ(territory->GetRoundTimeRemaining(), 106.0f);
+    Harness::UpdateRetailDeploymentCountdown(manager_);
+    EXPECT_FALSE(Harness::Spawned(manager_, kClientId));
+    const std::vector<PacketCodec::Bunch> republishedAt106 =
+        FlattenBunches(DrainDecodedPackets(0u));
+    EXPECT_TRUE(FindWireBunch(
+        republishedAt106, ExpectedOwnerNextRespawnTime(105)) <
+        republishedAt106.size());
+    const uint32_t packetAt106 =
+        Harness::NextOutboundPacketId(manager_, kClientId);
+    Harness::UpdateRetailDeploymentCountdown(manager_);
+    EXPECT_FALSE(Harness::Spawned(manager_, kClientId));
+    EXPECT_EQ(Harness::NextOutboundPacketId(manager_, kClientId),
+              packetAt106);
+
+    territory->Update(1.0f);
+    Harness::UpdateRetailDeploymentCountdown(manager_);
+    ASSERT_TRUE(Harness::Spawned(manager_, kClientId));
+    ASSERT_FALSE(Harness::ActiveDeploymentDeadline(
+        manager_, kClientId).has_value());
+    EXPECT_EQ(Harness::PublishedNextRespawnTime(manager_, kClientId),
+              std::optional<int32_t>{
+                  DeploymentRepl::kNoPendingRespawnTime});
+    const std::vector<PacketCodec::Bunch> releaseWire =
+        FlattenBunches(DrainDecodedPackets(0u));
+    EXPECT_TRUE(FindWireBunch(
+        releaseWire,
+        ExpectedOwnerNextRespawnTime(
+            DeploymentRepl::kNoPendingRespawnTime)) < releaseWire.size());
+    const uint32_t packetAfterRelease =
+        Harness::NextOutboundPacketId(manager_, kClientId);
+    const size_t pendingAfterRelease =
+        Harness::PendingReliableCount(manager_, kClientId);
+
+    // Re-running both the same integer second and a fractional tick that still
+    // ceil-replicates as 105 cannot publish a second owning graph.
+    Harness::UpdateRetailDeploymentCountdown(manager_);
+    territory->Update(0.25f);
+    Harness::UpdateRetailDeploymentCountdown(manager_);
+    EXPECT_EQ(Harness::NextOutboundPacketId(manager_, kClientId),
+              packetAfterRelease);
+    EXPECT_EQ(Harness::PendingReliableCount(manager_, kClientId),
+              pendingAfterRelease);
+}
+
+TEST_F(ConnectionTravelCuChiRoleIntegrationTest,
+       ActiveTerritoryDeadlineCarriesIntoOvertimeAndReleasesOnResidual) {
+    using Harness = ConnectionTravelLifecycleTestHarness;
+    constexpr uint32_t kClientId = 80u;
+    constexpr uint32_t kSouthTeam = TeamMapping::kServerUs;
+
+    TerritoryMode* territory =
+        Harness::InstallActiveTerritoryMode(server_, 10.0f);
+    ASSERT_TRUE(territory != nullptr);
+    Harness::UpdateRetailDeploymentCountdown(manager_);
+    ASSERT_TRUE(Connect(0u, kClientId, kSouthTeam) != nullptr);
+    ASSERT_TRUE(PublishCuChiSpawnSelection(
+        0u, kClientId, /*south=*/true));
+
+    Harness::DeliverActorBunch(manager_, kClientId, ReadyBunch());
+    (void)DrainDecodedPackets(0u);
+    ASSERT_EQ(Harness::ActiveDeploymentDeadline(manager_, kClientId),
+              std::optional<int32_t>{-5});
+    ASSERT_TRUE(Harness::DeploymentPrepared(manager_, kClientId));
+    Harness::ModelOwningPawnSpawnCallback(manager_, kClientId);
+
+    ObjectiveSystem* objectives = server_.GetObjectiveSystem();
+    ASSERT_TRUE(objectives != nullptr);
+    const uint32_t attackingTeam = territory->GetAttackingTeam();
+    objectives->SetBotCaptureWeightProvider(
+        [attackingTeam](uint32_t, uint32_t teamId) {
+            return teamId == attackingTeam ? 1.0f : 0.0f;
+        });
+    objectives->RefreshPlayerZones();
+
+    territory->Update(10.0f);
+    ASSERT_EQ(territory->GetPhase(), TerritoryMode::Phase::Overtime);
+    ASSERT_FLOAT_EQ(
+        territory->GetPreviousPhaseRemainingAtTransition(), 0.0f);
+    ASSERT_FLOAT_EQ(territory->GetRoundTimeRemaining(), 180.0f);
+    Harness::UpdateRetailDeploymentCountdown(manager_);
+
+    EXPECT_FALSE(Harness::Spawned(manager_, kClientId));
+    EXPECT_EQ(Harness::ActiveDeploymentDeadline(manager_, kClientId),
+              std::optional<int32_t>{175});
+    EXPECT_EQ(Harness::PublishedNextRespawnTime(manager_, kClientId),
+              std::optional<int32_t>{175});
+    const std::vector<PacketCodec::Bunch> transitionWire =
+        FlattenBunches(DrainDecodedPackets(0u));
+    EXPECT_TRUE(FindWireBunch(
+        transitionWire, ExpectedOwnerNextRespawnTime(175)) <
+        transitionWire.size());
+
+    territory->Update(4.0f);
+    ASSERT_FLOAT_EQ(territory->GetRoundTimeRemaining(), 176.0f);
+    Harness::UpdateRetailDeploymentCountdown(manager_);
+    EXPECT_FALSE(Harness::Spawned(manager_, kClientId));
+    (void)DrainDecodedPackets(0u);
+
+    territory->Update(1.0f);
+    ASSERT_FLOAT_EQ(territory->GetRoundTimeRemaining(), 175.0f);
+    Harness::UpdateRetailDeploymentCountdown(manager_);
+    EXPECT_TRUE(Harness::Spawned(manager_, kClientId));
+    EXPECT_FALSE(Harness::ActiveDeploymentDeadline(
+        manager_, kClientId).has_value());
+}
+
+TEST_F(ConnectionTravelCuChiRoleIntegrationTest,
+       NonCuChiTerritoryPreservesEstablishedImmediateActiveDeployment) {
+    using Harness = ConnectionTravelLifecycleTestHarness;
+    constexpr uint32_t kClientId = 78u;
+
+    TerritoryMode* territory =
+        Harness::InstallActiveTerritoryMode(server_, 120.0f);
+    ASSERT_TRUE(territory != nullptr);
+    Harness::UpdateRetailDeploymentCountdown(manager_);
+    ASSERT_TRUE(Connect(
+        0u, kClientId, TeamMapping::kServerUs) != nullptr);
+    ASSERT_TRUE(PublishCuChiSpawnSelection(
+        0u, kClientId, /*south=*/true));
+    Harness::UseCanonicalResortProfile(manager_, kClientId);
+    Harness::ModelOwningPawnSpawnCallback(manager_, kClientId);
+
+    Harness::DeliverActorBunch(manager_, kClientId, ReadyBunch());
+
+    EXPECT_TRUE(Harness::Spawned(manager_, kClientId));
+    EXPECT_FALSE(Harness::ActiveDeploymentDeadline(
+        manager_, kClientId).has_value());
+    const std::vector<PacketCodec::Bunch> wire =
+        FlattenBunches(DrainDecodedPackets(0u));
+    EXPECT_TRUE(FindWireBunch(
+        wire, ExpectedOwnerNextRespawnTime(105)) == wire.size());
+}
+
+TEST_F(ConnectionTravelCuChiRoleIntegrationTest,
+       FinalPreparationFactionCloseRetainsRoundStartAuthorization) {
+    using Harness = ConnectionTravelLifecycleTestHarness;
+    constexpr uint32_t kClientId = 79u;
+    constexpr uint32_t kSouthTeam = TeamMapping::kServerUs;
+    constexpr uint32_t kNorthTeam = TeamMapping::kServerNva;
+
+    TerritoryMode* territory =
+        Harness::InstallPreparationTerritoryMode(server_, 8.0f);
+    ASSERT_TRUE(territory != nullptr);
+    ASSERT_TRUE(Connect(0u, kClientId, kSouthTeam) != nullptr);
+    Harness::UpdateRetailDeploymentCountdown(manager_);
+
+    PlayerManager* players = server_.GetPlayerManager();
+    TeamManager* teams = server_.GetTeamManager();
+    ASSERT_TRUE(players != nullptr);
+    ASSERT_TRUE(teams != nullptr);
+    const std::shared_ptr<Player> player = players->GetPlayer(kClientId);
+    ASSERT_TRUE(player != nullptr);
+
+    Harness::PrepareOwningPawnLifeForFactionSwitch(manager_, kClientId);
+    const std::optional<uint32_t> southSpawn =
+        Harness::PrepareDeploymentForCurrentTeam(manager_, kClientId);
+    ASSERT_TRUE(southSpawn.has_value());
+    ASSERT_TRUE(Harness::ExecutePreparedDeployment(
+        manager_, kClientId, *southSpawn));
+    Harness::AcknowledgeAllPendingReliables(manager_, kClientId);
+    ASSERT_EQ(Harness::PawnGraphTeam(manager_, kClientId), kSouthTeam);
+
+    players->OnPlayerDeath(kClientId);
+    teams->AddPlayerToTeam(kClientId, kNorthTeam);
+    Harness::PrepareOwningPawnLifeForFactionSwitch(manager_, kClientId);
+    const std::optional<uint32_t> northSpawn =
+        Harness::PrepareDeploymentForCurrentTeam(manager_, kClientId);
+    ASSERT_TRUE(northSpawn.has_value());
+    EXPECT_FALSE(Harness::ExecutePreparedDeployment(
+        manager_, kClientId, *northSpawn));
+    ASSERT_EQ(Harness::PawnGraphPhase(manager_, kClientId),
+              Harness::OwningGraphPhase::Closing);
+    ASSERT_TRUE(Harness::DeferredOwningPawnHasRoundStartAuthorization(
+        manager_, kClientId));
+
+    territory->Update(8.0f);
+    ASSERT_EQ(territory->GetPhase(), TerritoryMode::Phase::Active);
+    Harness::UpdateRetailDeploymentCountdown(manager_);
+    ASSERT_FALSE(Harness::Spawned(manager_, kClientId));
+    ASSERT_TRUE(Harness::ActiveDeploymentDeadline(
+        manager_, kClientId).has_value());
+
+    Harness::AcknowledgeAllPendingReliables(manager_, kClientId);
+
+    EXPECT_TRUE(Harness::Spawned(manager_, kClientId));
+    EXPECT_TRUE(player->IsAlive());
+    EXPECT_EQ(Harness::PawnGraphPhase(manager_, kClientId),
+              Harness::OwningGraphPhase::Open);
+    EXPECT_EQ(Harness::PawnGraphTeam(manager_, kClientId), kNorthTeam);
+    EXPECT_FALSE(Harness::ActiveDeploymentDeadline(
+        manager_, kClientId).has_value());
+}
+
+TEST_F(ConnectionTravelCuChiRoleIntegrationTest,
+       ActiveTerritoryTicketDepletionRequiresFreshSelectAndReady) {
+    using Harness = ConnectionTravelLifecycleTestHarness;
+    constexpr uint32_t kClientId = 73u;
+    constexpr uint32_t kSouthTeam = TeamMapping::kServerUs;
+
+    TerritoryMode* territory =
+        Harness::InstallActiveTerritoryMode(server_, 120.0f);
+    ASSERT_TRUE(territory != nullptr);
+    Harness::UpdateRetailDeploymentCountdown(manager_);
+    ASSERT_TRUE(Connect(0u, kClientId, kSouthTeam) != nullptr);
+    TicketSystem* tickets = Harness::InstallTicketSystem(
+        server_, /*southTickets=*/1u, /*northTickets=*/1u);
+    ASSERT_TRUE(tickets != nullptr);
+    ASSERT_TRUE(PublishCuChiSpawnSelection(
+        0u, kClientId, /*south=*/true));
+    const Harness::RoleLedgerSnapshot role =
+        Harness::RoleLedger(manager_, kClientId);
+    ASSERT_TRUE(role.changedRole.has_value());
+
+    Harness::DeliverActorBunch(manager_, kClientId, ReadyBunch());
+    (void)DrainDecodedPackets(0u);
+    Harness::ModelOwningPawnSpawnCallback(manager_, kClientId);
+    tickets->SetTickets(kSouthTeam, 0u);
+    territory->Update(15.0f);
+    Harness::UpdateRetailDeploymentCountdown(manager_);
+
+    EXPECT_FALSE(Harness::Spawned(manager_, kClientId));
+    const auto depleted = Harness::DeploymentState(manager_, kClientId);
+    ASSERT_TRUE(depleted.has_value());
+    EXPECT_TRUE(depleted->roleFinalized);
+    EXPECT_FALSE(depleted->selectedSpawnId.has_value());
+    EXPECT_EQ(depleted->readyStatus,
+              DeploymentCoordinator::ReadyStatus::ForceOnly);
+    EXPECT_FALSE(depleted->deploymentAuthorized);
+    const std::vector<PacketCodec::Bunch> recovery =
+        FlattenBunches(DrainDecodedPackets(0u));
+    const PacketCodec::Bunch expectedStop = ExpectedTempStopAutoSpawn();
+    const PacketCodec::Bunch expectedRole =
+        ExpectedChangedRole(*role.changedRole);
+    const size_t stopIndex = FindWireBunch(recovery, expectedStop);
+    const size_t roleIndex = FindWireBunch(recovery, expectedRole);
+    ASSERT_TRUE(stopIndex < roleIndex);
+    ASSERT_TRUE(roleIndex < recovery.size());
+    EXPECT_EQ(recovery[roleIndex].chSequence,
+              recovery[stopIndex].chSequence + 1u);
+    Harness::AcknowledgeAllPendingReliables(manager_, kClientId);
+
+    tickets->AddTickets(kSouthTeam, 1u);
+    territory->Update(1.0f);
+    Harness::UpdateRetailDeploymentCountdown(manager_);
+    EXPECT_FALSE(Harness::Spawned(manager_, kClientId));
+    EXPECT_FALSE(Harness::DeploymentPrepared(manager_, kClientId));
+    const std::vector<PacketCodec::Bunch> unpreparedRetry =
+        FlattenBunches(DrainDecodedPackets(0u));
+    EXPECT_TRUE(FindWireBunch(
+        unpreparedRetry, ExpectedOwnerNextRespawnTime(105)) <
+        unpreparedRetry.size());
+
+    Harness::DeliverActorBunch(manager_, kClientId, SpawnSelectBunch());
+    (void)DrainDecodedPackets(0u);
+    Harness::ModelOwningPawnSpawnCallback(manager_, kClientId);
+    EXPECT_FALSE(Harness::DeploymentPrepared(manager_, kClientId));
+    territory->Update(1.0f);
+    Harness::UpdateRetailDeploymentCountdown(manager_);
+    EXPECT_FALSE(Harness::Spawned(manager_, kClientId));
+    EXPECT_FALSE(Harness::DeploymentPrepared(manager_, kClientId));
+    (void)DrainDecodedPackets(0u);
+
+    Harness::DeliverActorBunch(manager_, kClientId, ReadyBunch());
+    EXPECT_FALSE(Harness::Spawned(manager_, kClientId));
+    ASSERT_TRUE(Harness::DeploymentPrepared(manager_, kClientId));
+    territory->Update(1.0f);
+    Harness::UpdateRetailDeploymentCountdown(manager_);
+    EXPECT_TRUE(Harness::Spawned(manager_, kClientId));
+}
+
+TEST_F(ConnectionTravelCuChiRoleIntegrationTest,
+       ActiveTerritoryForceOnlyRemainsRevokedAtDeadline) {
+    using Harness = ConnectionTravelLifecycleTestHarness;
+    constexpr uint32_t kClientId = 74u;
+
+    TerritoryMode* territory =
+        Harness::InstallActiveTerritoryMode(server_, 60.0f);
+    ASSERT_TRUE(territory != nullptr);
+    Harness::UpdateRetailDeploymentCountdown(manager_);
+    ASSERT_TRUE(Connect(
+        0u, kClientId, TeamMapping::kServerUs) != nullptr);
+    ASSERT_TRUE(PublishCuChiSpawnSelection(
+        0u, kClientId, /*south=*/true));
+
+    Harness::DeliverActorBunch(manager_, kClientId, ReadyBunch());
+    (void)DrainDecodedPackets(0u);
+    ASSERT_TRUE(Harness::DeploymentPrepared(manager_, kClientId));
+    ASSERT_EQ(Harness::ActiveDeploymentDeadline(manager_, kClientId),
+              std::optional<int32_t>{45});
+    Harness::DeliverActorBunch(manager_, kClientId, ForceOnlyBunch());
+    const auto revoked = Harness::DeploymentState(manager_, kClientId);
+    ASSERT_TRUE(revoked.has_value());
+    EXPECT_EQ(revoked->readyStatus,
+              DeploymentCoordinator::ReadyStatus::ForceOnly);
+    EXPECT_FALSE(revoked->deploymentAuthorized);
+    EXPECT_FALSE(Harness::DeploymentPrepared(manager_, kClientId));
+
+    Harness::ModelOwningPawnSpawnCallback(manager_, kClientId);
+    territory->Update(15.0f);
+    Harness::UpdateRetailDeploymentCountdown(manager_);
+    EXPECT_FALSE(Harness::Spawned(manager_, kClientId));
+    const auto stillRevoked = Harness::DeploymentState(manager_, kClientId);
+    ASSERT_TRUE(stillRevoked.has_value());
+    EXPECT_EQ(stillRevoked->readyStatus,
+              DeploymentCoordinator::ReadyStatus::ForceOnly);
+    EXPECT_FALSE(stillRevoked->deploymentAuthorized);
+}
+
+TEST_F(ConnectionTravelCuChiRoleIntegrationTest,
+       TerritorySuddenDeathClearsArmedDeadlineAndClosesExecution) {
+    using Harness = ConnectionTravelLifecycleTestHarness;
+    constexpr uint32_t kClientId = 75u;
+
+    TerritoryMode* territory =
+        Harness::InstallActiveTerritoryMode(server_, 60.0f);
+    ASSERT_TRUE(territory != nullptr);
+    Harness::UpdateRetailDeploymentCountdown(manager_);
+    ASSERT_TRUE(Connect(
+        0u, kClientId, TeamMapping::kServerUs) != nullptr);
+    ASSERT_TRUE(PublishCuChiSpawnSelection(
+        0u, kClientId, /*south=*/true));
+    const auto prepared = Harness::DeploymentState(manager_, kClientId);
+    ASSERT_TRUE(prepared.has_value());
+    ASSERT_TRUE(prepared->selectedSpawnId.has_value());
+    const uint32_t spawnId = *prepared->selectedSpawnId;
+
+    Harness::DeliverActorBunch(manager_, kClientId, ReadyBunch());
+    ASSERT_TRUE(Harness::DeploymentPrepared(manager_, kClientId));
+    ASSERT_EQ(Harness::ActiveDeploymentDeadline(manager_, kClientId),
+              std::optional<int32_t>{45});
+    (void)DrainDecodedPackets(0u);
+
+    territory->OnTicketsDepleted(TeamMapping::kServerUs);
+    ASSERT_EQ(territory->GetPhase(), TerritoryMode::Phase::SuddenDeath);
+    ASSERT_TRUE(Harness::ActiveDeploymentPolicyIsClosed(
+        manager_, kClientId));
+    Harness::UpdateRetailDeploymentCountdown(manager_);
+    const std::vector<PacketCodec::Bunch> wire =
+        FlattenBunches(DrainDecodedPackets(0u));
+    EXPECT_TRUE(FindWireBunch(
+        wire, ExpectedOwnerNextRespawnTime(
+                  DeploymentRepl::kNoPendingRespawnTime)) < wire.size());
+    EXPECT_FALSE(Harness::Spawned(manager_, kClientId));
+    EXPECT_FALSE(Harness::ActiveDeploymentDeadline(
+        manager_, kClientId).has_value());
+    EXPECT_EQ(Harness::PublishedNextRespawnTime(manager_, kClientId),
+              std::optional<int32_t>{
+                  DeploymentRepl::kNoPendingRespawnTime});
+
+    EXPECT_FALSE(Harness::ExecutePreparedDeployment(
+        manager_, kClientId, spawnId));
+    EXPECT_FALSE(Harness::Spawned(manager_, kClientId));
+    EXPECT_FALSE(Harness::DeploymentPrepared(manager_, kClientId));
+}
+
+TEST_F(ConnectionTravelCuChiRoleIntegrationTest,
+       FinalEightPreparationSecondsStillDeployImmediately) {
+    using Harness = ConnectionTravelLifecycleTestHarness;
+    constexpr uint32_t kClientId = 76u;
+
+    TerritoryMode* territory =
+        Harness::InstallPreparationTerritoryMode(server_, 8.0f);
+    ASSERT_TRUE(territory != nullptr);
+    ASSERT_EQ(territory->GetPhase(), TerritoryMode::Phase::Preparation);
+    ASSERT_EQ(territory->GetRoundTimeRemaining(), 8.0f);
+    ASSERT_TRUE(Connect(
+        0u, kClientId, TeamMapping::kServerUs) != nullptr);
+    ASSERT_TRUE(PublishCuChiSpawnSelection(
+        0u, kClientId, /*south=*/true));
+    Harness::ModelOwningPawnSpawnCallback(manager_, kClientId);
+
+    Harness::DeliverActorBunch(manager_, kClientId, ReadyBunch());
+    const std::vector<PacketCodec::Bunch> wire =
+        FlattenBunches(DrainDecodedPackets(0u));
+    EXPECT_TRUE(Harness::Spawned(manager_, kClientId));
+    EXPECT_FALSE(Harness::ActiveDeploymentDeadline(
+        manager_, kClientId).has_value());
+    EXPECT_TRUE(FindWireBunch(
+        wire, ExpectedOwnerNextRespawnTime(-7)) == wire.size());
+}
+
+TEST_F(ConnectionTravelCuChiRoleIntegrationTest,
+       ActiveTerritoryDeathRevokesReadyAndArmsFreshOwnerDeadline) {
+    using Harness = ConnectionTravelLifecycleTestHarness;
+    constexpr uint32_t kClientId = 77u;
+
+    TerritoryMode* territory =
+        Harness::InstallActiveTerritoryMode(server_, 120.0f);
+    ASSERT_TRUE(territory != nullptr);
+    Harness::UpdateRetailDeploymentCountdown(manager_);
+    ASSERT_TRUE(Connect(
+        0u, kClientId, TeamMapping::kServerUs) != nullptr);
+    const std::optional<uint32_t> selectedSpawn =
+        Harness::PrepareDeploymentForCurrentTeam(manager_, kClientId);
+    ASSERT_TRUE(selectedSpawn.has_value());
+    ASSERT_TRUE(Harness::DeploymentPrepared(manager_, kClientId));
+
+    PlayerManager* players = server_.GetPlayerManager();
+    ASSERT_TRUE(players != nullptr);
+    const std::shared_ptr<Player> player = players->GetPlayer(kClientId);
+    ASSERT_TRUE(player != nullptr);
+    players->OnPlayerSpawn(kClientId);
+    player->SetReadyToSpawn(true);
+    Harness::SetPossessionRecoveryEligibility(
+        manager_, kClientId, true, true, false, 1u);
+    ASSERT_TRUE(player->IsAlive());
+    ASSERT_TRUE(player->IsReadyToSpawn());
+    (void)DrainDecodedPackets(0u);
+
+    players->OnPlayerDeath(kClientId);
+    // A script-adjusted negative score is not wire-encodable, but the
+    // authoritative death boundary must still publish ClientOnDead, revoke
+    // Ready, and arm the next owner deadline.
+    manager_.ReplicateRetailParticipantCombatState(
+        ParticipantId::Human(kClientId), 0, 0, 1, -1,
+        /*isDead=*/true, /*sendHealth=*/false, /*sendDeathRpc=*/true);
+
+    EXPECT_FALSE(Harness::Spawned(manager_, kClientId));
+    EXPECT_FALSE(player->IsAlive());
+    EXPECT_FALSE(player->IsReadyToSpawn());
+    const auto revoked = Harness::DeploymentState(manager_, kClientId);
+    ASSERT_TRUE(revoked.has_value());
+    EXPECT_TRUE(revoked->roleFinalized);
+    EXPECT_FALSE(revoked->selectedSpawnId.has_value());
+    EXPECT_EQ(revoked->readyStatus,
+              DeploymentCoordinator::ReadyStatus::ForceOnly);
+    EXPECT_FALSE(revoked->deploymentAuthorized);
+    EXPECT_EQ(Harness::ActiveDeploymentDeadline(manager_, kClientId),
+              std::optional<int32_t>{105});
+    EXPECT_EQ(Harness::PublishedNextRespawnTime(manager_, kClientId),
+              std::optional<int32_t>{105});
+    const std::vector<PacketCodec::Bunch> deathWire =
+        FlattenBunches(DrainDecodedPackets(0u));
+    EXPECT_TRUE(FindWireBunch(
+        deathWire, ExpectedClientOnDead(true)) < deathWire.size());
+    EXPECT_TRUE(FindWireBunch(
+        deathWire, ExpectedOwnerNextRespawnTime(105)) < deathWire.size());
+
+    territory->Update(1.0f);
+    Harness::UpdateRetailDeploymentCountdown(manager_);
+    EXPECT_FALSE(Harness::DeploymentPrepared(manager_, kClientId));
+    const std::vector<PacketCodec::Bunch> unpreparedRetry =
+        FlattenBunches(DrainDecodedPackets(0u));
+    EXPECT_TRUE(FindWireBunch(
+        unpreparedRetry, ExpectedOwnerNextRespawnTime(105)) <
+        unpreparedRetry.size());
+}
 
 TEST(ConnectionTravelLifecycle, RetailRoundClockPolicyNeverParksOutsidePreparation) {
     using Phase = DeploymentCountdown::Phase;
@@ -3794,12 +4561,18 @@ TEST_F(ConnectionTravelCuChiRoleIntegrationTest,
     (void)DrainDecodedPackets(0u);
     EXPECT_FALSE(player->IsAlive());
     EXPECT_FALSE(Harness::Spawned(manager_, kClientId));
-    // Death ends the pawn lifecycle, not the already-completed deployment
-    // transaction. This is the stale authorization the next final must clear.
+    // The authoritative death boundary invalidates the completed deployment
+    // transaction immediately. The following same-role final is idempotent
+    // over this already-clean state and must not be required for correctness.
     deployment = Harness::DeploymentState(manager_, kClientId);
     ASSERT_TRUE(deployment.has_value());
-    ASSERT_TRUE(deployment->deploymentAuthorized);
-    ASSERT_TRUE(player->IsReadyToSpawn());
+    EXPECT_TRUE(deployment->roleFinalized);
+    EXPECT_FALSE(deployment->selectedSlot.has_value());
+    EXPECT_FALSE(deployment->selectedSpawnId.has_value());
+    EXPECT_EQ(deployment->readyStatus,
+              DeploymentCoordinator::ReadyStatus::ForceOnly);
+    EXPECT_FALSE(deployment->deploymentAuthorized);
+    EXPECT_FALSE(player->IsReadyToSpawn());
 
     Harness::DeliverActorBunch(manager_, kClientId, CuChiFinalRoleBunch(true));
     (void)DrainDecodedPackets(0u);

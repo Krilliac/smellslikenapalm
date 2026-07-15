@@ -95,9 +95,10 @@ public:
         const std::string& mapUrl,
         size_t* eligibleClients = nullptr) const;
 
-    // Drive the retail 30-second preparation / final eight-second deployment
-    // transition. GameServer calls this after the authoritative mode clock has
-    // advanced so the screen RPCs and pawn deployment share one phase source.
+    // Drive the retail preparation/final-eight transition plus the supported
+    // once-per-RemainingTime-second active reinforcement scan. GameServer calls
+    // this after the authoritative mode clock advances so UI and deployment
+    // authority share one countdown coordinate.
     void UpdateRetailDeploymentCountdown();
 
     // WarmUp/PostRound transitions must continue without a selected role, but
@@ -178,10 +179,22 @@ private:
         Deferred,
         Failed,
     };
+    enum class ActiveDeploymentPhase : uint8_t {
+        None,
+        TerritoryActive,
+        TerritoryOvertime,
+        TerritoryLockdown,
+    };
+    enum class ActiveDeploymentPolicy : uint8_t {
+        Immediate,
+        Timed,
+        Closed,
+    };
     struct DeferredOwningPawnGraphDeployment {
         uint64_t deploymentGeneration = 0;
         uint32_t spawnId = 0;
         uint32_t teamId = 0;
+        bool roundStartAuthorization = false;
     };
     static constexpr std::array<uint32_t, 7> kOwningPawnGraphChannels{
         209u, 210u, 211u, 212u, 213u, 214u, 219u};
@@ -208,6 +221,10 @@ private:
     DeploymentCoordinator m_deploymentCoordinator{m_deploymentGeneration};
     DeploymentCountdown m_deploymentCountdown{m_deploymentGeneration};
     std::optional<DeploymentCountdown::Phase> m_lastDeploymentPhase;
+    ActiveDeploymentPhase m_lastActiveDeploymentPhase =
+        ActiveDeploymentPhase::None;
+    std::optional<int32_t> m_lastActiveDeploymentRemainingSeconds;
+    std::optional<int32_t> m_lastActiveDeploymentScanSecond;
     bool m_waitForReadyPlayer = true;
 
     // Client lookup by address
@@ -253,6 +270,15 @@ private:
         uint8_t  selectedRoleIndex = 255;
         bool     menuResent = false;   // re-sent ClientShowTeamSelect on client proof-of-life
         bool     spawned = false;      // sent the pawn-spawn + possession once (SelectRoleByClass)
+        // ROPlayerController.NextRespawnTime is expressed in the same integer
+        // RemainingTime coordinate as the owning client's GRI.  It is armed at
+        // a source-grounded active Territory death/team boundary and survives
+        // spawn-scene Ready/ForceOnly churn until the next life begins.
+        std::optional<int32_t> activeDeploymentDeadlineRemainingSeconds;
+        ActiveDeploymentPhase activeDeploymentDeadlinePhase =
+            ActiveDeploymentPhase::None;
+        std::optional<int32_t> publishedNextRespawnTime;
+        std::optional<int32_t> nextRespawnLastPublishScanSecond;
         bool     pawnGraphOpen = false; // true only while the owning graph is reusable/open
         uint32_t pawnGraphTeamId = 0;  // immutable faction of the open ch209..219 graph
         OwningPawnGraphPhase pawnGraphPhase = OwningPawnGraphPhase::Unopened;
@@ -498,7 +524,8 @@ private:
                                          ControlState& state);
     bool QueueOwningPawnGraphClose(uint32_t clientId);
     OwningPawnGraphGateResult GateOwningPawnGraphForDeployment(
-        uint32_t clientId, uint32_t teamId, uint32_t spawnId);
+        uint32_t clientId, uint32_t teamId, uint32_t spawnId,
+        bool roundStartAuthorization);
     void CompleteOwningPawnGraphClose(
         uint32_t clientId,
         std::optional<uint32_t> inboundBarrierPacketId = std::nullopt);
@@ -600,7 +627,36 @@ private:
         float remainingSeconds = 0.0f;
     };
 
+    struct ActiveDeploymentPhaseState {
+        ActiveDeploymentPhase phase = ActiveDeploymentPhase::None;
+        int32_t remainingSeconds = 0;
+        ActiveDeploymentPhase previousPhase = ActiveDeploymentPhase::None;
+        std::optional<int32_t> previousPhaseRemainingAtTransition;
+    };
+
     DeploymentPhaseState GetDeploymentPhaseState() const;
+    std::optional<ActiveDeploymentPhaseState>
+    GetActiveDeploymentPhaseState() const;
+    ActiveDeploymentPolicy GetActiveDeploymentPolicy(
+        uint32_t clientId) const;
+    static std::optional<int32_t> RetailRemainingSecond(
+        float remainingSeconds) noexcept;
+    static std::optional<int32_t> CalculateActiveDeploymentDeadline(
+        int32_t remainingSeconds, uint32_t serverTeamId) noexcept;
+    static bool HasReachedActiveDeploymentDeadline(
+        int32_t remainingSeconds,
+        int32_t deadlineRemainingSeconds) noexcept;
+    static std::optional<int32_t> RebaseActiveDeploymentDeadline(
+        int32_t previousRemainingSeconds,
+        int32_t previousDeadlineRemainingSeconds,
+        int32_t currentRemainingSeconds) noexcept;
+    bool SendOwnerNextRespawnTime(uint32_t clientId,
+                                  int32_t nextRespawnTime);
+    bool ArmActiveDeploymentDeadline(uint32_t clientId,
+                                     bool replaceExisting = false);
+    void ClearActiveDeploymentDeadline(ControlState& state) noexcept;
+    void ClearAndPublishActiveDeploymentDeadline(uint32_t clientId);
+    void UpdateRetailActiveDeployments();
     static bool IsDeploymentWindowOpen(
         const DeploymentPhaseState& state) noexcept;
     void RevokePreparedDeploymentAuthorization(uint32_t clientId);
@@ -622,7 +678,9 @@ private:
     void SendPriSpawnSelection(uint32_t clientId, uint8_t encodedSelection);
     bool SendShowRoundStartScreen(uint32_t clientId, uint32_t displaySeconds);
     bool SendHideRoundStartScreen(uint32_t clientId);
-    bool ExecutePreparedDeployment(uint32_t clientId, uint32_t spawnId);
+    bool ExecutePreparedDeployment(
+        uint32_t clientId, uint32_t spawnId,
+        bool roundStartAuthorization = false);
     void BeginDeploymentGeneration();
     bool IsRetailGameplayActive(uint32_t clientId) const;
 

@@ -245,6 +245,57 @@ TEST(TerritoryMode, RejectsMalformedTimeAndWrongPhaseEvents) {
     EXPECT_EQ(mode.GetAttackerObjectivesCaptured(0), 0);
 }
 
+TEST(TerritoryMode, CoarsePreparationTransitionRecordsExpiredCountdown) {
+    TerritoryMode mode(nullptr);
+    mode.Initialize();
+    mode.SetPreparationTime(1.25f);
+    mode.SetRoundTime(37.5f);
+
+    mode.StartRound();
+    ASSERT_EQ(mode.GetPhase(), TerritoryMode::Phase::Preparation);
+    ASSERT_FLOAT_EQ(mode.GetRoundTimeRemaining(), 1.25f);
+
+    // A coarse frame clamps the old countdown to zero before Active installs
+    // its own duration. Transition metadata must retain that old coordinate,
+    // not the freshly reset Active clock.
+    mode.Update(20.0f);
+
+    ASSERT_EQ(mode.GetPhase(), TerritoryMode::Phase::Active);
+    EXPECT_EQ(mode.GetPreviousPhase(), TerritoryMode::Phase::Preparation);
+    EXPECT_FLOAT_EQ(mode.GetPreviousPhaseRemainingAtTransition(), 0.0f);
+    EXPECT_FLOAT_EQ(mode.GetRoundTimeRemaining(), 37.5f);
+}
+
+TEST(TerritoryMode, OvertimeTransitionRecordsActiveCountdownBeforeReset) {
+    TerritoryMode mode(nullptr);
+    mode.Initialize();
+    mode.SetRoundTime(9.75f);
+    TerritoryModeTestAccess::ForcePhase(mode, TerritoryMode::Phase::Active);
+
+    TerritoryModeTestAccess::AdvanceActive(mode, 12.0f, true, false);
+
+    ASSERT_EQ(mode.GetPhase(), TerritoryMode::Phase::Overtime);
+    EXPECT_EQ(mode.GetPreviousPhase(), TerritoryMode::Phase::Active);
+    EXPECT_FLOAT_EQ(mode.GetPreviousPhaseRemainingAtTransition(), 0.0f);
+    EXPECT_FLOAT_EQ(mode.GetRoundTimeRemaining(), 180.0f);
+}
+
+TEST(TerritoryMode, SuddenDeathTransitionRecordsLiveActiveCountdownExactly) {
+    TerritoryMode mode(nullptr);
+    mode.Initialize();
+    mode.SetRoundTime(42.5f);
+    TerritoryModeTestAccess::ForcePhase(mode, TerritoryMode::Phase::Active);
+    TerritoryModeTestAccess::AdvanceActive(mode, 2.25f, false, false);
+    ASSERT_FLOAT_EQ(mode.GetRoundTimeRemaining(), 40.25f);
+
+    mode.OnTicketsDepleted(mode.GetAttackingTeam());
+
+    ASSERT_EQ(mode.GetPhase(), TerritoryMode::Phase::SuddenDeath);
+    EXPECT_EQ(mode.GetPreviousPhase(), TerritoryMode::Phase::Active);
+    EXPECT_FLOAT_EQ(mode.GetPreviousPhaseRemainingAtTransition(), 40.25f);
+    EXPECT_FLOAT_EQ(mode.GetRoundTimeRemaining(), 0.0f);
+}
+
 TEST(TerritoryMode, MissingObjectivesFailClosedAtDeadlineWithoutCrashing) {
     GameServer server;
     TerritoryMode mode(&server);
