@@ -8,6 +8,7 @@
 #include "Game/ObjectiveSystem.h"
 #include "Game/PlayerManager.h"
 #include "Game/TeamManager.h"
+#include "Game/TicketSystem.h"
 #include "Utils/Logger.h"
 
 #include <algorithm>
@@ -28,6 +29,7 @@ void SupremacyMode::Initialize() {
     m_score = 0;
     m_winningTeam = 0;
     m_scoreTickTimer = 0.0;
+    m_ticketsDepleted.fill(false);
     ResetObjectivesToInitialOwners();
     Logger::Info("SupremacyMode initialized (signed target +/-%d)", m_scoreTarget);
 }
@@ -40,8 +42,16 @@ void SupremacyMode::StartRound() {
     m_score = 0;
     m_winningTeam = 0;
     m_scoreTickTimer = 0.0;
+    m_ticketsDepleted.fill(false);
     ResetObjectivesToInitialOwners();
     if (m_server) {
+        if (auto* tickets = m_server->GetTicketSystem()) {
+            // TicketSystem owns the configured starting pools. Restore both
+            // teams as one reset transaction before Preparation can advance to
+            // respawn or elimination checks; do not hard-code map values here.
+            // An initial pool of zero remains the unlimited-ticket sentinel.
+            tickets->Reset();
+        }
         if (auto* objectives = m_server->GetObjectiveSystem()) {
             objectives->ResetObjectivesToInitialOwners();
         }
@@ -75,6 +85,13 @@ void SupremacyMode::Update(float deltaSeconds) {
             break;
 
         case Phase::Active:
+            // Retail keeps Supremacy active after reinforcement depletion and
+            // ends a side only once its last living participant is gone. Poll
+            // before score flow so an elimination and score tick in the same
+            // frame resolve in retail's OneSecondLoopingTimer order.
+            CheckReinforcementElimination();
+            if (m_phase != Phase::Active) break;
+
             // A delayed frame may extend beyond the round deadline. Only the
             // portion that actually occurred while Active contributes score;
             // this makes one large update equivalent to updates split exactly
@@ -88,10 +105,8 @@ void SupremacyMode::Update(float deltaSeconds) {
             break;
 
         case Phase::SuddenDeath:
-            // Bot deaths do not have client ids and therefore do not travel
-            // through OnPlayerKilled. Poll the unified liveness view while
-            // respawns are disabled so a headless final kill resolves.
-            CheckSuddenDeathElimination();
+            // Reserved for stable phase ordinals. Ticket depletion never
+            // enters this phase in retail Supremacy.
             break;
 
         case Phase::PostRound:
@@ -268,20 +283,33 @@ void SupremacyMode::OnTicketsDepleted(uint32_t teamId) {
         (teamId != kSouthTeamId && teamId != kNorthTeamId)) {
         return;
     }
-    Logger::Info("Team %u tickets depleted in Supremacy - sudden death",
-                 teamId);
-    SetPhase(Phase::SuddenDeath);
+
+    m_ticketsDepleted[teamId == kSouthTeamId ? 0u : 1u] = true;
+    Logger::Info(
+        "Team %u tickets depleted in Supremacy - respawns disabled; "
+        "round remains active until elimination",
+        teamId);
+
+    // Do not check liveness here. TicketSystem commits a simultaneous death
+    // batch before publishing its per-team depletion callbacks, but those
+    // callbacks still arrive one at a time. Deferring until Update lets the
+    // complete human/bot combat transaction become visible before resolving a
+    // mutual last-ticket wipe.
 }
 
 void SupremacyMode::OnPlayerKilled(uint32_t /*killerId*/,
                                    uint32_t /*victimId*/) {
-    CheckSuddenDeathElimination();
+    // GameServer publishes the deaths in one CombatAuthority result
+    // sequentially. Resolving here would let the first victim in a mutual
+    // last-ticket volley choose a winner before the second victim is marked
+    // dead. Update is the stable post-combat boundary for both humans and bots.
 }
 
 void SupremacyMode::OnTeamEliminated(uint32_t eliminatedTeamId) {
-    if (m_phase != Phase::SuddenDeath ||
+    if (m_phase != Phase::Active ||
         (eliminatedTeamId != kSouthTeamId &&
-         eliminatedTeamId != kNorthTeamId)) {
+         eliminatedTeamId != kNorthTeamId) ||
+        !IsTeamTicketsDepleted(eliminatedTeamId)) {
         return;
     }
 
@@ -296,7 +324,8 @@ void SupremacyMode::OnTeamEliminated(uint32_t eliminatedTeamId) {
     const uint32_t winningTeam = eliminatedTeamId == kSouthTeamId
         ? kNorthTeamId
         : kSouthTeamId;
-    Logger::Info("Team %u eliminated in Supremacy sudden death; team %u wins",
+    Logger::Info("Team %u eliminated after exhausting Supremacy reinforcements; "
+                 "team %u wins",
                  eliminatedTeamId, winningTeam);
     FinishRoundWithWinner(winningTeam);
 }
@@ -471,6 +500,23 @@ void SupremacyMode::ResetObjectivesToInitialOwners() {
     }
 }
 
+bool SupremacyMode::IsTeamTicketsDepleted(uint32_t teamId) const {
+    if (teamId != kSouthTeamId && teamId != kNorthTeamId) return false;
+
+    // The callback flag preserves the event for detached unit tests, while a
+    // live server can answer the retail question directly from the current
+    // pool. This also makes an administrative reinforcement grant cancel the
+    // pending elimination instead of treating depletion as irreversible.
+    if (m_server) {
+        if (const auto* tickets = m_server->GetTicketSystem()) {
+            if (tickets->GetInitialTickets(teamId) > 0) {
+                return !tickets->HasTickets(teamId);
+            }
+        }
+    }
+    return m_ticketsDepleted[teamId == kSouthTeamId ? 0u : 1u];
+}
+
 bool SupremacyMode::TeamHasLivingParticipant(uint32_t teamId) const {
     if (!m_server ||
         (teamId != kSouthTeamId && teamId != kNorthTeamId)) {
@@ -492,17 +538,22 @@ bool SupremacyMode::TeamHasLivingParticipant(uint32_t teamId) const {
     return false;
 }
 
-void SupremacyMode::CheckSuddenDeathElimination() {
-    if (m_phase != Phase::SuddenDeath || !m_server) return;
+void SupremacyMode::CheckReinforcementElimination() {
+    if (m_phase != Phase::Active || !m_server) return;
 
-    const bool southAlive = TeamHasLivingParticipant(kSouthTeamId);
-    const bool northAlive = TeamHasLivingParticipant(kNorthTeamId);
-    if (!southAlive && !northAlive) {
-        Logger::Info("Both teams eliminated in Supremacy sudden death");
+    const bool southEliminated =
+        IsTeamTicketsDepleted(kSouthTeamId) &&
+        !TeamHasLivingParticipant(kSouthTeamId);
+    const bool northEliminated =
+        IsTeamTicketsDepleted(kNorthTeamId) &&
+        !TeamHasLivingParticipant(kNorthTeamId);
+    if (southEliminated && northEliminated) {
+        Logger::Info(
+            "Both teams eliminated after exhausting Supremacy reinforcements");
         FinishRoundWithWinner(0);
-    } else if (!southAlive) {
+    } else if (southEliminated) {
         OnTeamEliminated(kSouthTeamId);
-    } else if (!northAlive) {
+    } else if (northEliminated) {
         OnTeamEliminated(kNorthTeamId);
     }
 }

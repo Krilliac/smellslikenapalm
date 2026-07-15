@@ -523,6 +523,11 @@ Supremacy uses retail's single signed score and counts only objectives connected
 to their team's home base when both valid HQ markers exist. If either marker is
 missing or malformed, supply lines are disabled globally and every controlled
 objective scores, matching `ROGameInfoSupremacy.Reset` and `UpdatePointsHeld`.
+Exhausting reinforcements does not enter a separate sudden-death phase: the
+round clock, captures, and signed score remain active for surviving players,
+while respawn closes only for the depleted team. The round resolves when that
+team has no living human or bot participant; simultaneous last-ticket
+elimination is a draw regardless of death-publication order.
 
 ### Key Source Files
 

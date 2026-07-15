@@ -3,9 +3,13 @@
 #include "Game/BotManager.h"
 #include "Game/CombatAuthority.h"
 #include "Game/GameServer.h"
+#include "Game/ObjectiveSystem.h"
 #include "Game/Player.h"
 #include "Game/PlayerManager.h"
 #include "Game/SkirmishMode.h"
+#include "Game/SpawnSystem.h"
+#include "Game/SupremacyMode.h"
+#include "Game/TeamManager.h"
 #include "Game/TicketSystem.h"
 #include "Network/ClientConnection.h"
 #include "Network/GameplayRpcReplication.h"
@@ -85,13 +89,131 @@ public:
             });
     }
 
+    static void InstallSupremacyMutualTicketVolley(
+        GameServer& server, const BotManagerConfig& config,
+        std::size_t& batchCallbacks,
+        std::vector<std::size_t>& batchSizes,
+        std::vector<std::uint8_t>& firstVictimTeams) {
+        server.m_ticketSystem = std::make_unique<TicketSystem>(&server);
+        server.m_ticketSystem->Initialize(1, 1);
+        server.m_botManager = std::make_unique<BotManager>(config);
+        server.m_botCombatGeneration = config.humanCombatGeneration;
+        server.m_supremacyMode = std::make_unique<SupremacyMode>(&server);
+        server.m_activeModeDriver = GameServer::ActiveModeDriver::Supremacy;
+
+        server.m_ticketSystem->SetOnTicketsDepleted(
+            [&server](uint32_t teamId) {
+                if (server.m_supremacyMode) {
+                    server.m_supremacyMode->OnTicketsDepleted(teamId);
+                }
+            });
+        server.m_botManager->SetDeathBatchCallback(
+            [&server, &batchCallbacks, &batchSizes, &firstVictimTeams](
+                const std::vector<BotDeathEvent>& deaths) {
+                ++batchCallbacks;
+                batchSizes.push_back(deaths.size());
+                if (!deaths.empty()) {
+                    firstVictimTeams.push_back(deaths.front().teamId);
+                }
+                server.ProcessBotDeathBatch(deaths);
+            });
+    }
+
+    static void InstallSupremacyRespawnGate(
+        GameServer& server, const BotManagerConfig& config) {
+        server.m_ticketSystem = std::make_unique<TicketSystem>(&server);
+        server.m_ticketSystem->Initialize(1, 1);
+
+        server.m_botManager = std::make_unique<BotManager>(config);
+        server.m_botCombatGeneration = config.humanCombatGeneration;
+        server.m_botManager->SetTeamRespawnAllowed(
+            BotManager::kTeamOne, false);
+        server.m_botManager->SetTeamRespawnAllowed(
+            BotManager::kTeamTwo, false);
+
+        server.m_spawnSystem = std::make_unique<SpawnSystem>(&server);
+        server.m_spawnSystem->Initialize();
+        SpawnLocation southSpawn;
+        southSpawn.type = SpawnType::BaseSpawn;
+        southSpawn.name = "South Base";
+        southSpawn.teamId = BotManager::kTeamOne;
+        southSpawn.position = Vector3(-100.0f, 0.0f, 0.0f);
+        server.m_spawnSystem->AddSpawnLocation(southSpawn);
+        SpawnLocation northSpawn;
+        northSpawn.type = SpawnType::BaseSpawn;
+        northSpawn.name = "North Base";
+        northSpawn.teamId = BotManager::kTeamTwo;
+        northSpawn.position = Vector3(100.0f, 0.0f, 0.0f);
+        server.m_spawnSystem->AddSpawnLocation(northSpawn);
+
+        server.m_objectiveSystem = std::make_unique<ObjectiveSystem>(&server);
+        server.m_objectiveSystem->Initialize();
+        server.m_supremacyMode = std::make_unique<SupremacyMode>(&server);
+        server.m_supremacyMode->Initialize();
+        server.m_supremacyMode->StartRound();
+        server.m_supremacyMode->Update(30.0f);
+        server.m_ticketSystem->SetTickets(BotManager::kTeamOne, 0);
+        server.m_activeModeDriver = GameServer::ActiveModeDriver::Supremacy;
+    }
+
+    static void InstallSupremacyTicketLifecycle(
+        GameServer& server, uint32_t teamOneTickets,
+        uint32_t teamTwoTickets) {
+        server.m_ticketSystem = std::make_unique<TicketSystem>(&server);
+        server.m_ticketSystem->Initialize(teamOneTickets, teamTwoTickets);
+        server.m_supremacyMode = std::make_unique<SupremacyMode>(&server);
+        server.m_activeModeDriver = GameServer::ActiveModeDriver::Supremacy;
+        server.m_ticketSystem->SetOnTicketsDepleted(
+            [&server](uint32_t teamId) {
+                if (server.m_supremacyMode) {
+                    server.m_supremacyMode->OnTicketsDepleted(teamId);
+                }
+            });
+        server.m_supremacyMode->Initialize();
+    }
+
+    static void InstallSupremacyHumanTicketVolley(GameServer& server) {
+        InstallSupremacyTicketLifecycle(server, 1, 1);
+        server.m_playerManager = std::make_unique<PlayerManager>(&server);
+        server.m_playerManager->Initialize();
+        server.m_teamManager = std::make_unique<TeamManager>(&server);
+        server.m_teamManager->Initialize();
+
+        const auto connect = [&server](uint32_t clientId, uint32_t teamId) {
+            auto connection = std::make_shared<ClientConnection>(
+                clientId, "127.0.0.1", uint16_t{7777}, nullptr, nullptr);
+            connection->SetUE3Client(true);
+            connection->SetPlayerName("SupremacyVolley");
+            connection->SetTeamId(teamId);
+            server.m_playerManager->OnPlayerConnect(connection);
+            server.m_teamManager->AddPlayerToTeam(clientId, teamId);
+            server.m_playerManager->OnPlayerSpawn(clientId);
+        };
+        connect(101u, BotManager::kTeamOne);
+        connect(202u, BotManager::kTeamTwo);
+    }
+
+    static void ProcessCombatEvents(
+        GameServer& server,
+        const std::vector<CombatAuthority::CombatEvent>& events) {
+        server.ProcessCombatEvents(events);
+    }
+
+    static void RefreshBotWorldState(GameServer& server) {
+        server.RefreshBotWorldState();
+    }
+
     static void Reset(GameServer& server) {
         // PlayerManager teardown calls back into GameServer, so destroy it
         // while the authority member is still a live (possibly populated)
         // unique_ptr. The remaining members then have no callbacks into each
         // other.
         server.m_skirmishMode.reset();
+        server.m_supremacyMode.reset();
         server.m_playerManager.reset();
+        server.m_teamManager.reset();
+        server.m_objectiveSystem.reset();
+        server.m_spawnSystem.reset();
         server.m_botManager.reset();
         server.m_ticketSystem.reset();
         server.m_combatAuthority.reset();
@@ -146,6 +268,17 @@ struct MutualVolleyResult {
     int northWins = 0;
 };
 
+struct SupremacyVolleyResult {
+    bool updated = false;
+    std::size_t batchCallbacks = 0;
+    std::vector<std::size_t> batchSizes;
+    std::vector<std::uint8_t> firstVictimTeams;
+    uint32_t southTickets = 0;
+    uint32_t northTickets = 0;
+    SupremacyMode::Phase phase = SupremacyMode::Phase::WarmUp;
+    uint32_t winningTeam = 0;
+};
+
 MutualVolleyResult RunMutualLastTicketVolley(bool northVictimPublishesFirst) {
     BotManagerConfig config = CombatConfig(kInitialGeneration + 100);
     config.combatDamage = 100.0f;
@@ -184,6 +317,50 @@ MutualVolleyResult RunMutualLastTicketVolley(bool northVictimPublishesFirst) {
     result.phase = mode->GetPhase();
     result.southWins = mode->GetTeamRoundWins(BotManager::kTeamOne);
     result.northWins = mode->GetTeamRoundWins(BotManager::kTeamTwo);
+
+    GameServerBotCombatTestHarness::Reset(server);
+    return result;
+}
+
+SupremacyVolleyResult RunSupremacyMutualLastTicketVolley(
+    bool northVictimPublishesFirst) {
+    BotManagerConfig config = CombatConfig(kInitialGeneration + 200);
+    config.combatDamage = 100.0f;
+
+    GameServer server;
+    SupremacyVolleyResult result;
+    GameServerBotCombatTestHarness::InstallSupremacyMutualTicketVolley(
+        server, config, result.batchCallbacks, result.batchSizes,
+        result.firstVictimTeams);
+
+    BotManager* bots = server.GetBotManager();
+    bots->SetEligibleSpawns({
+        BotSpawnSnapshot{1, BotManager::kTeamOne,
+                         Vector3(0.0f, 0.0f, 0.0f)},
+        BotSpawnSnapshot{2, BotManager::kTeamTwo,
+                         Vector3(0.0f, 0.0f, 0.0f)},
+    });
+    if (northVictimPublishesFirst) {
+        bots->SetHumanTeamCount(BotManager::kTeamOne, 1);
+        bots->SetHumanTeamCount(BotManager::kTeamOne, 0);
+    }
+    bots->ConsumeRespawnEvents();
+
+    SupremacyMode* mode = server.GetSupremacyMode();
+    mode->Initialize();
+    mode->StartRound();
+    mode->Update(30.0f);
+    result.updated = bots->Update(0.1f);
+    // Production drains the complete bot death transaction before the native
+    // mode Update. Winner selection must observe that same stable boundary.
+    mode->Update(0.0f);
+
+    result.southTickets =
+        server.GetTicketSystem()->GetTickets(BotManager::kTeamOne);
+    result.northTickets =
+        server.GetTicketSystem()->GetTickets(BotManager::kTeamTwo);
+    result.phase = mode->GetPhase();
+    result.winningTeam = mode->GetWinningTeam();
 
     GameServerBotCombatTestHarness::Reset(server);
     return result;
@@ -505,6 +682,142 @@ TEST(GameServerBotCombat,
     ASSERT_EQ(northFirst.firstVictimTeams.size(), static_cast<std::size_t>(1));
     EXPECT_EQ(southFirst.firstVictimTeams.front(), BotManager::kTeamOne);
     EXPECT_EQ(northFirst.firstVictimTeams.front(), BotManager::kTeamTwo);
+}
+
+TEST(GameServerBotCombat,
+     SupremacyMutualLastTicketVolleyIsADrawInEitherPublicationOrder) {
+    const SupremacyVolleyResult southFirst =
+        RunSupremacyMutualLastTicketVolley(false);
+    const SupremacyVolleyResult northFirst =
+        RunSupremacyMutualLastTicketVolley(true);
+
+    for (const SupremacyVolleyResult* result : {&southFirst, &northFirst}) {
+        EXPECT_TRUE(result->updated);
+        EXPECT_EQ(result->batchCallbacks, static_cast<std::size_t>(1));
+        ASSERT_EQ(result->batchSizes.size(), static_cast<std::size_t>(1));
+        EXPECT_EQ(result->batchSizes.front(), static_cast<std::size_t>(2));
+        EXPECT_EQ(result->southTickets, 0u);
+        EXPECT_EQ(result->northTickets, 0u);
+        EXPECT_EQ(result->phase, SupremacyMode::Phase::PostRound);
+        EXPECT_EQ(result->winningTeam, 0u);
+    }
+
+    ASSERT_EQ(southFirst.firstVictimTeams.size(), static_cast<std::size_t>(1));
+    ASSERT_EQ(northFirst.firstVictimTeams.size(), static_cast<std::size_t>(1));
+    EXPECT_EQ(southFirst.firstVictimTeams.front(), BotManager::kTeamOne);
+    EXPECT_EQ(northFirst.firstVictimTeams.front(), BotManager::kTeamTwo);
+}
+
+TEST(GameServerBotCombat,
+     SupremacyMutualHumanLastTicketDeathsWaitForThePostBatchUpdate) {
+    for (const bool southVictimFirst : {true, false}) {
+        GameServer server;
+        GameServerBotCombatTestHarness::InstallSupremacyHumanTicketVolley(
+            server);
+        SupremacyMode* mode = server.GetSupremacyMode();
+        mode->StartRound();
+        mode->Update(30.0f);
+        ASSERT_EQ(mode->GetPhase(), SupremacyMode::Phase::Active);
+
+        CombatAuthority::CombatEvent southDeath;
+        southDeath.kind = CombatAuthority::EventKind::ParticipantDied;
+        southDeath.sourceId = 202u;
+        southDeath.targetId = 101u;
+        CombatAuthority::CombatEvent northDeath;
+        northDeath.kind = CombatAuthority::EventKind::ParticipantDied;
+        northDeath.sourceId = 101u;
+        northDeath.targetId = 202u;
+
+        const std::vector<CombatAuthority::CombatEvent> deaths =
+            southVictimFirst
+                ? std::vector<CombatAuthority::CombatEvent>{southDeath,
+                                                            northDeath}
+                : std::vector<CombatAuthority::CombatEvent>{northDeath,
+                                                            southDeath};
+        GameServerBotCombatTestHarness::ProcessCombatEvents(server, deaths);
+
+        EXPECT_EQ(server.GetTicketSystem()->GetTickets(
+                      BotManager::kTeamOne),
+                  0u);
+        EXPECT_EQ(server.GetTicketSystem()->GetTickets(
+                      BotManager::kTeamTwo),
+                  0u);
+        EXPECT_FALSE(server.GetPlayerManager()->GetPlayer(101u)->IsAlive());
+        EXPECT_FALSE(server.GetPlayerManager()->GetPlayer(202u)->IsAlive());
+        // The old per-death resolution awarded the still-alive opponent here,
+        // making this assertion fail in one direction or the other.
+        EXPECT_EQ(mode->GetPhase(), SupremacyMode::Phase::Active);
+        EXPECT_EQ(mode->GetWinningTeam(), 0u);
+
+        mode->Update(0.0f);
+        EXPECT_EQ(mode->GetPhase(), SupremacyMode::Phase::PostRound);
+        EXPECT_EQ(mode->GetWinningTeam(), 0u);
+
+        GameServerBotCombatTestHarness::Reset(server);
+    }
+}
+
+TEST(GameServerBotCombat,
+     SupremacySecondRoundRestoresConfiguredPoolsAndUnlimitedSentinel) {
+    GameServer server;
+    GameServerBotCombatTestHarness::InstallSupremacyTicketLifecycle(
+        server, 3u, 0u);
+    SupremacyMode* mode = server.GetSupremacyMode();
+    TicketSystem* tickets = server.GetTicketSystem();
+    mode->StartRound();
+    mode->Update(30.0f);
+    ASSERT_EQ(mode->GetPhase(), SupremacyMode::Phase::Active);
+
+    tickets->ConsumeTicket(BotManager::kTeamOne, 3u);
+    tickets->AddTickets(BotManager::kTeamOne, 1u);
+    mode->Update(0.0f);
+    EXPECT_EQ(mode->GetPhase(), SupremacyMode::Phase::Active);
+    EXPECT_EQ(tickets->GetTickets(BotManager::kTeamOne), 1u);
+
+    tickets->ConsumeTicket(BotManager::kTeamOne);
+    mode->Update(0.0f);
+    ASSERT_EQ(mode->GetPhase(), SupremacyMode::Phase::PostRound);
+    EXPECT_EQ(mode->GetWinningTeam(), SupremacyMode::kNorthTeamId);
+
+    mode->StartRound();
+    EXPECT_EQ(mode->GetPhase(), SupremacyMode::Phase::Preparation);
+    EXPECT_EQ(tickets->GetTickets(BotManager::kTeamOne), 3u);
+    EXPECT_EQ(tickets->GetTickets(BotManager::kTeamTwo), 0u);
+    EXPECT_EQ(tickets->GetInitialTickets(BotManager::kTeamOne), 3u);
+    EXPECT_EQ(tickets->GetInitialTickets(BotManager::kTeamTwo), 0u);
+    EXPECT_TRUE(tickets->HasTickets(BotManager::kTeamTwo));
+
+    mode->Update(30.0f);
+    ASSERT_EQ(mode->GetPhase(), SupremacyMode::Phase::Active);
+    tickets->SetTickets(BotManager::kTeamOne, 0u);
+    tickets->AddTickets(BotManager::kTeamOne, 1u);
+    mode->Update(0.0f);
+    EXPECT_EQ(mode->GetPhase(), SupremacyMode::Phase::Active);
+    EXPECT_EQ(tickets->GetTickets(BotManager::kTeamOne), 1u);
+
+    GameServerBotCombatTestHarness::Reset(server);
+}
+
+TEST(GameServerBotCombat,
+     SupremacyBotRespawnGateClosesOnlyTheDepletedTeam) {
+    BotManagerConfig config = CombatConfig(kInitialGeneration + 300);
+    GameServer server;
+    GameServerBotCombatTestHarness::InstallSupremacyRespawnGate(server, config);
+
+    GameServerBotCombatTestHarness::RefreshBotWorldState(server);
+    EXPECT_EQ(server.GetBotManager()->CountAliveBots(BotManager::kTeamOne),
+              static_cast<std::size_t>(0));
+    EXPECT_EQ(server.GetBotManager()->CountAliveBots(BotManager::kTeamTwo),
+              static_cast<std::size_t>(1));
+
+    server.GetTicketSystem()->SetTickets(BotManager::kTeamOne, 1);
+    GameServerBotCombatTestHarness::RefreshBotWorldState(server);
+    EXPECT_EQ(server.GetBotManager()->CountAliveBots(BotManager::kTeamOne),
+              static_cast<std::size_t>(1));
+    EXPECT_EQ(server.GetBotManager()->CountAliveBots(BotManager::kTeamTwo),
+              static_cast<std::size_t>(1));
+
+    GameServerBotCombatTestHarness::Reset(server);
 }
 
 } // namespace

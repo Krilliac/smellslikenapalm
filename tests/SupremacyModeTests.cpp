@@ -105,10 +105,10 @@ TEST(SupremacyMode, PhaseClockUsesTheDurationAssignedToEachPhase) {
     EXPECT_FLOAT_EQ(mode.GetPhaseTimeRemaining(), 1200.0f);
 
     mode.OnTicketsDepleted(SupremacyMode::kSouthTeamId);
-    EXPECT_EQ(mode.GetPhase(), SupremacyMode::Phase::SuddenDeath);
-    EXPECT_FALSE(mode.CanCaptureObjectives());
-    EXPECT_FLOAT_EQ(mode.GetPhaseDuration(), 0.0f);
-    EXPECT_FLOAT_EQ(mode.GetPhaseTimeRemaining(), 0.0f);
+    EXPECT_EQ(mode.GetPhase(), SupremacyMode::Phase::Active);
+    EXPECT_TRUE(mode.CanCaptureObjectives());
+    EXPECT_FLOAT_EQ(mode.GetPhaseDuration(), 1200.0f);
+    EXPECT_FLOAT_EQ(mode.GetPhaseTimeRemaining(), 1200.0f);
 
     mode.OnTeamEliminated(SupremacyMode::kSouthTeamId);
     EXPECT_EQ(mode.GetPhase(), SupremacyMode::Phase::PostRound);
@@ -397,9 +397,22 @@ TEST(SupremacyMode, SouthEliminationAwardsNorthDespiteSouthScoreLead) {
     mode.OnObjectiveCaptured(1, SupremacyMode::kSouthTeamId);
     mode.Update(5.0f);
     ASSERT_GT(mode.GetScore(), 0);
+    const int32_t scoreBeforeDepletion = mode.GetScore();
+    const float timeBeforeDepletion = mode.GetPhaseTimeRemaining();
 
     mode.OnTicketsDepleted(SupremacyMode::kSouthTeamId);
-    ASSERT_EQ(mode.GetPhase(), SupremacyMode::Phase::SuddenDeath);
+    ASSERT_EQ(mode.GetPhase(), SupremacyMode::Phase::Active);
+    EXPECT_TRUE(mode.CanCaptureObjectives());
+
+    // Retail leaves the depleted team's survivors in the active tug of war:
+    // they can still capture and the signed score/round clock continue.
+    mode.OnObjectiveCaptured(2, SupremacyMode::kSouthTeamId);
+    mode.Update(5.0f);
+    EXPECT_EQ(mode.GetObjectiveControllingTeam(2),
+              SupremacyMode::kSouthTeamId);
+    EXPECT_GT(mode.GetScore(), scoreBeforeDepletion);
+    EXPECT_FLOAT_EQ(mode.GetPhaseTimeRemaining(), timeBeforeDepletion - 5.0f);
+
     mode.OnTeamEliminated(SupremacyMode::kSouthTeamId);
 
     EXPECT_EQ(mode.GetPhase(), SupremacyMode::Phase::PostRound);
@@ -454,11 +467,12 @@ TEST(SupremacyMode, RejectsMalformedTimeAndWrongPhaseAuthorityEvents) {
     EXPECT_EQ(mode.GetPhase(), SupremacyMode::Phase::Active);
 
     mode.OnTicketsDepleted(SupremacyMode::kSouthTeamId);
-    ASSERT_EQ(mode.GetPhase(), SupremacyMode::Phase::SuddenDeath);
+    ASSERT_EQ(mode.GetPhase(), SupremacyMode::Phase::Active);
     mode.OnTicketsDepleted(SupremacyMode::kNorthTeamId);
     mode.OnObjectiveCaptured(1, SupremacyMode::kSouthTeamId);
-    EXPECT_EQ(mode.GetPhase(), SupremacyMode::Phase::SuddenDeath);
-    EXPECT_EQ(mode.GetObjectiveControllingTeam(1), 0u);
+    EXPECT_EQ(mode.GetPhase(), SupremacyMode::Phase::Active);
+    EXPECT_EQ(mode.GetObjectiveControllingTeam(1),
+              SupremacyMode::kSouthTeamId);
 }
 
 TEST(SupremacyMode, ReinitializeRestoresFirstRoundStateAndNullWarmupIsSafe) {
@@ -469,6 +483,7 @@ TEST(SupremacyMode, ReinitializeRestoresFirstRoundStateAndNullWarmupIsSafe) {
     mode.OnObjectiveCaptured(1, SupremacyMode::kSouthTeamId);
     mode.Update(5.0f);
     ASSERT_NE(mode.GetScore(), 0);
+    mode.OnTicketsDepleted(SupremacyMode::kSouthTeamId);
 
     mode.Initialize();
     EXPECT_EQ(mode.GetPhase(), SupremacyMode::Phase::WarmUp);
@@ -477,6 +492,10 @@ TEST(SupremacyMode, ReinitializeRestoresFirstRoundStateAndNullWarmupIsSafe) {
     EXPECT_EQ(mode.GetObjectiveControllingTeam(1), 0u);
     EXPECT_NO_THROW(mode.Update(0.0f));
     EXPECT_EQ(mode.GetPhase(), SupremacyMode::Phase::WarmUp);
+
+    BeginActiveRound(mode);
+    mode.OnTeamEliminated(SupremacyMode::kSouthTeamId);
+    EXPECT_EQ(mode.GetPhase(), SupremacyMode::Phase::Active);
 }
 
 RS2V_TEST_MAIN()

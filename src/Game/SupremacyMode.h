@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <map>
 #include <optional>
@@ -21,6 +22,8 @@ public:
         WarmUp,
         Preparation,
         Active,
+        // Reserved ordinal. Retail Supremacy remains Active when a team runs
+        // out of reinforcements; elimination is tracked independently.
         SuddenDeath,
         PostRound,
         Finished
@@ -123,14 +126,16 @@ private:
     std::map<uint32_t, ObjectiveNode> m_objectiveGraph;
     std::optional<uint32_t> m_southHQ;
     std::optional<uint32_t> m_northHQ;
+    std::array<bool, 2> m_ticketsDepleted{};
 
     void SetPhase(Phase newPhase);
     void ProcessScoreFlow(float deltaSeconds);
     int64_t CalculateLinkedObjectiveValue(uint32_t teamId) const;
     bool HasPathFromHQ(uint32_t objectiveId, uint32_t teamId) const;
     void ResetObjectivesToInitialOwners();
+    bool IsTeamTicketsDepleted(uint32_t teamId) const;
     bool TeamHasLivingParticipant(uint32_t teamId) const;
-    void CheckSuddenDeathElimination();
+    void CheckReinforcementElimination();
     void CheckWinConditions();
     uint32_t DetermineWinner() const;
     void FinishRoundWithWinner(uint32_t winningTeam);

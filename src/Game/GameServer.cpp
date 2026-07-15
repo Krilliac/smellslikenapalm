@@ -2900,8 +2900,15 @@ void GameServer::RefreshBotWorldState() {
             phase == TerritoryMode::Phase::Overtime ||
             phase == TerritoryMode::Phase::Lockdown;
     } else if (m_supremacyMode) {
-        respawnTeam1 = respawnTeam2 =
+        const bool active =
             m_supremacyMode->GetPhase() == SupremacyMode::Phase::Active;
+        const auto teamCanRespawn = [this](uint32_t teamId) {
+            return !m_ticketSystem ||
+                   m_ticketSystem->GetInitialTickets(teamId) == 0 ||
+                   m_ticketSystem->HasTickets(teamId);
+        };
+        respawnTeam1 = active && teamCanRespawn(1);
+        respawnTeam2 = active && teamCanRespawn(2);
     } else if (m_skirmishMode) {
         respawnTeam1 = m_skirmishMode->IsSpawnWindowOpen(1);
         respawnTeam2 = m_skirmishMode->IsSpawnWindowOpen(2);
