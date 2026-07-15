@@ -363,12 +363,14 @@ map_list         = hill_400, hacienda
 
 Defines all available maps, their properties, and the rotation order. The rotation order follows the section order in the file. For a detailed guide on each map, see [MAPS.md](MAPS.md).
 
+At load time the server also performs read-only Steam discovery for app 418460. It adds runtime-only fallback definitions for the four maps with exact replication profiles (`VNTE-Resort`, `VNTE-CuChi`, `VNSU-HueCity`, and `VNSK-Compound`) when their installed `.roe` package and repository sidecar directory are both present. An explicit `maps.ini` section always wins. Discovered absolute paths are never written to `maps.ini`, including when `MapConfig::Save()` is called, and malformed, ambiguous, or out-of-install paths fail closed.
+
 ### Schema
 
 | Key | Type | Required | Default | Description |
 |---|---|---|---|---|
 | `display_name` | string | Yes | — | Human-readable name shown in the server browser, map vote screen, and MOTD. |
-| `file` | path | Yes | — | Map asset filename, relative to the `maps_path` directory (configured in `[DataPaths]`). Typically a `.umap` file. |
+| `file` | path | Yes | — | Map asset filename relative to `maps_path`, or an absolute retail package path. Retail maps use `.roe`; legacy/custom definitions may use `.umap`. |
 | `supported_modes` | string | Yes | — | Comma-separated list of `ModeID` values from `game_modes.ini` that this map supports. |
 | `min_players` | integer | No | `2` | Minimum number of connected players required to start a round on this map. |
 | `max_players` | integer | No | `64` | Maximum player capacity for this map. Overrides `[General].max_players` if lower. |

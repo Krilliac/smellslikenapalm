@@ -4,6 +4,8 @@
 
 #include <string>
 #include <map>
+#include <filesystem>
+#include <set>
 #include <vector>
 #include <optional>
 #include "Math/Vector3.h"
@@ -58,7 +60,13 @@ class ServerConfig;
 
 class MapConfig {
 public:
+    // Production path: probe Steam's registered libraries automatically.
     explicit MapConfig(const ServerConfig& cfg);
+
+    // Injected-only path: inspect exactly these roots. Passing an empty vector
+    // disables discovery, keeping isolated tests independent of the host.
+    MapConfig(const ServerConfig& cfg,
+              std::vector<std::filesystem::path> retailDiscoveryRoots);
     ~MapConfig();
 
     // Initialize (load from disk)
@@ -92,5 +100,8 @@ private:
     std::string                                    m_mapsDir;
     std::string                                    m_rotationFile;
     std::string                                    m_configPath;
+    bool                                           m_autoDiscoverRetailMaps = false;
+    std::vector<std::filesystem::path>             m_retailDiscoveryRoots;
+    std::set<std::string>                          m_discoveredDefinitionNames;
     std::map<std::string, MapDefinition>           m_mapDefinitions;
 };

@@ -289,7 +289,8 @@ TEST(GameServerNativeRotation, AdminCommandQueuesValidatedDeferredTarget) {
     configManager->SetString(
         "General.map_rotation_file", rotationFile.generic_string());
     ServerConfig serverConfig(configManager);
-    auto mapConfig = std::make_shared<MapConfig>(serverConfig);
+    auto mapConfig = std::make_shared<MapConfig>(
+        serverConfig, std::vector<std::filesystem::path>{});
     ASSERT_TRUE(mapConfig->Initialize());
 
     const auto makeContext = [](GameServer& server,

@@ -8,6 +8,7 @@
 
 #include "Config/ConfigManager.h"
 #include "Config/MapConfig.h"
+#include "Config/RetailMapDiscovery.h"
 #include "Config/ServerConfig.h"
 #include "Game/MapManager.h"
 #include "Game/MapVoteManager.h"
@@ -22,6 +23,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <memory>
 #include <limits>
 #include <set>
@@ -51,6 +53,48 @@ protected:
         std::filesystem::create_directories(path.parent_path());
         std::ofstream out(path);
         out << text;
+    }
+
+    static std::string ReadText(const std::filesystem::path& path) {
+        std::ifstream input(path, std::ios::binary);
+        return std::string(std::istreambuf_iterator<char>(input),
+                           std::istreambuf_iterator<char>());
+    }
+
+    static std::string EscapeKeyValuesPath(const std::filesystem::path& path) {
+        std::string escaped;
+        for (const char ch : path.string()) {
+            if (ch == '\\' || ch == '"') escaped.push_back('\\');
+            escaped.push_back(ch);
+        }
+        return escaped;
+    }
+
+    static void WriteSteamMetadata(const std::filesystem::path& steamRoot,
+                                   const std::filesystem::path& libraryRoot,
+                                   std::string_view installDirectory =
+                                       "Rising Storm 2") {
+        WriteText(
+            steamRoot / "steamapps" / "libraryfolders.vdf",
+            "\"libraryfolders\"\n"
+            "{\n"
+            "  \"0\"\n"
+            "  {\n"
+            "    \"path\" \"" + EscapeKeyValuesPath(steamRoot) + "\"\n"
+            "  }\n"
+            "  \"1\"\n"
+            "  {\n"
+            "    \"path\" \"" + EscapeKeyValuesPath(libraryRoot) + "\"\n"
+            "    \"apps\" { \"418460\" \"1\" }\n"
+            "  }\n"
+            "}\n");
+        WriteText(
+            libraryRoot / "steamapps" / "appmanifest_418460.acf",
+            "\"AppState\"\n"
+            "{\n"
+            "  \"appid\" \"418460\"\n"
+            "  \"installdir\" \"" + std::string(installDirectory) + "\"\n"
+            "}\n");
     }
 
     static void WriteRetailPackage(
@@ -118,7 +162,8 @@ protected:
         configManager->SetString("General.map_rotation_file", rotationFile.generic_string());
 
         ServerConfig serverConfig(configManager);
-        auto mapConfig = std::make_shared<MapConfig>(serverConfig);
+        auto mapConfig = std::make_shared<MapConfig>(
+            serverConfig, std::vector<std::filesystem::path>{});
         if (!mapConfig->Initialize()) return nullptr;
         return mapConfig;
     }
@@ -153,7 +198,8 @@ TEST_F(MapRuntimeTest, AbsoluteAssetUsesConfiguredGlobalSpawnFallback) {
     configManager->SetString("General.map_rotation_file", rotationFile.generic_string());
 
     ServerConfig serverConfig(configManager);
-    auto mapConfig = std::make_shared<MapConfig>(serverConfig);
+    auto mapConfig = std::make_shared<MapConfig>(
+        serverConfig, std::vector<std::filesystem::path>{});
     ASSERT_TRUE(mapConfig->Initialize());
     EXPECT_TRUE(std::filesystem::equivalent(
         std::filesystem::path(mapConfig->GetMapsDirectory()), m_mapsDir));
@@ -182,6 +228,199 @@ TEST_F(MapRuntimeTest, AbsoluteAssetUsesConfiguredGlobalSpawnFallback) {
     EXPECT_FLOAT_EQ(spawns[1].position.x, -625.0f);
     EXPECT_FLOAT_EQ(spawns[1].position.y, -750.0f);
     EXPECT_FLOAT_EQ(spawns[1].position.z, 875.0f);
+}
+
+TEST_F(MapRuntimeTest,
+       SteamDiscoveryAddsExactRetailFallbackWithoutWritingConfig) {
+    const std::filesystem::path steamRoot = m_root / "steam";
+    const std::filesystem::path libraryRoot = m_root / "steam-library";
+    WriteSteamMetadata(steamRoot, libraryRoot);
+
+    const std::filesystem::path retailMaps =
+        libraryRoot / "steamapps" / "common" / "Rising Storm 2" /
+        "ROGame" / "BrewedPC" / "Maps";
+    const std::filesystem::path retailPackage =
+        retailMaps / "CuChi" / "VNTE-CuChi.roe";
+    WriteRetailPackage(retailPackage);
+    WriteRetailPackage(retailMaps / "Resort" / "VNTE-Resort.roe");
+    WriteRetailPackage(retailMaps / "HueCity" / "VNSU-HueCity.roe");
+    WriteRetailPackage(retailMaps / "Compound" / "VNSK-Compound.roe");
+    WriteText(m_mapsDir / "VNTE-CuChi" / "spawns.txt", "1 2 3 1\n");
+    WriteText(m_mapsDir / "VNTE-CuChi" / "objectives.txt",
+              "Alpha 10 20 30 35 0 0\n");
+    std::filesystem::create_directories(m_mapsDir / "VNTE-Resort");
+    std::filesystem::create_directories(m_mapsDir / "VNSU-HueCity");
+    std::filesystem::create_directories(m_mapsDir / "VNSK-Compound");
+
+    const std::filesystem::path rotationFile = m_root / "config" / "maps.ini";
+    WriteText(rotationFile,
+              "[LocalOnly]\n"
+              "display_name=Explicit local entry\n"
+              "file=missing.umap\n"
+              "default_mode=Conquest\n"
+              "supported_modes=Conquest\n");
+    const std::string originalConfig = ReadText(rotationFile);
+
+    auto configManager = std::make_shared<ConfigManager>();
+    configManager->SetString("General.data_directory",
+                             (m_root / "server_data").generic_string());
+    configManager->SetString("DataPaths.maps_path", m_mapsDir.generic_string());
+    configManager->SetString("General.map_rotation_file",
+                             rotationFile.generic_string());
+    ServerConfig serverConfig(configManager);
+    auto mapConfig = std::make_shared<MapConfig>(
+        serverConfig, std::vector<std::filesystem::path>{steamRoot});
+
+    ASSERT_TRUE(mapConfig->Initialize());
+    EXPECT_EQ(ReadText(rotationFile), originalConfig);
+    const MapDefinition* discovered = mapConfig->GetDefinition("VNTE-CuChi");
+    ASSERT_TRUE(discovered != nullptr);
+    EXPECT_EQ(discovered->defaultMode, std::string("Territories"));
+    ASSERT_EQ(discovered->supportedModes.size(), 1u);
+    EXPECT_EQ(discovered->supportedModes[0], std::string("Territories"));
+    EXPECT_TRUE(std::filesystem::equivalent(discovered->filePath,
+                                            retailPackage));
+    ASSERT_TRUE(mapConfig->GetDefinition("VNTE-Resort") != nullptr);
+    EXPECT_EQ(mapConfig->GetDefinition("VNTE-Resort")->defaultMode,
+              std::string("Territories"));
+    ASSERT_TRUE(mapConfig->GetDefinition("VNSU-HueCity") != nullptr);
+    EXPECT_EQ(mapConfig->GetDefinition("VNSU-HueCity")->defaultMode,
+              std::string("Supremacy"));
+    ASSERT_TRUE(mapConfig->GetDefinition("VNSK-Compound") != nullptr);
+    EXPECT_EQ(mapConfig->GetDefinition("VNSK-Compound")->defaultMode,
+              std::string("Skirmish"));
+    EXPECT_EQ(mapConfig->GetAvailableMaps().size(), 5u);
+
+    MapManager manager(nullptr, mapConfig);
+    ASSERT_TRUE(manager.LoadMap("VNTE-CuChi"));
+    EXPECT_EQ(manager.GetSpawnPoints().size(), 1u);
+    EXPECT_EQ(manager.GetMapObjectives().size(), 1u);
+
+    // Even an explicit Save request persists only operator-authored sections.
+    ASSERT_TRUE(mapConfig->Save());
+    const std::string savedConfig = ReadText(rotationFile);
+    EXPECT_TRUE(savedConfig.find("[LocalOnly]") != std::string::npos);
+    EXPECT_TRUE(savedConfig.find("[VNTE-CuChi]") == std::string::npos);
+    EXPECT_TRUE(savedConfig.find("[VNTE-Resort]") == std::string::npos);
+    EXPECT_TRUE(savedConfig.find("[VNSU-HueCity]") == std::string::npos);
+    EXPECT_TRUE(savedConfig.find("[VNSK-Compound]") == std::string::npos);
+    EXPECT_TRUE(savedConfig.find(retailPackage.string()) == std::string::npos);
+}
+
+TEST_F(MapRuntimeTest, ExplicitRetailDefinitionWinsOverSteamDiscovery) {
+    const std::filesystem::path steamRoot = m_root / "steam";
+    const std::filesystem::path libraryRoot = m_root / "steam-library";
+    WriteSteamMetadata(steamRoot, libraryRoot);
+    const std::filesystem::path discoveredPackage =
+        libraryRoot / "steamapps" / "common" / "Rising Storm 2" /
+        "ROGame" / "BrewedPC" / "Maps" / "CuChi" / "VNTE-CuChi.roe";
+    WriteRetailPackage(discoveredPackage);
+
+    const std::filesystem::path explicitPackage =
+        std::filesystem::absolute(m_externalDir / "VNTE-CuChi.roe");
+    WriteRetailPackage(explicitPackage);
+    WriteText(m_mapsDir / "VNTE-CuChi" / "spawns.txt", "1 2 3 1\n");
+
+    const std::filesystem::path rotationFile = m_root / "config" / "maps.ini";
+    WriteText(rotationFile,
+              "[VNTE-CuChi]\n"
+              "display_name=Operator Cu Chi\n"
+              "file=" + explicitPackage.generic_string() + "\n"
+              "default_mode=Territories\n"
+              "supported_modes=Territories\n");
+    const std::string originalConfig = ReadText(rotationFile);
+
+    auto configManager = std::make_shared<ConfigManager>();
+    configManager->SetString("General.data_directory",
+                             (m_root / "server_data").generic_string());
+    configManager->SetString("DataPaths.maps_path", m_mapsDir.generic_string());
+    configManager->SetString("General.map_rotation_file",
+                             rotationFile.generic_string());
+    ServerConfig serverConfig(configManager);
+    MapConfig mapConfig(
+        serverConfig, std::vector<std::filesystem::path>{steamRoot});
+
+    ASSERT_TRUE(mapConfig.Initialize());
+    const MapDefinition* definition = mapConfig.GetDefinition("VNTE-CuChi");
+    ASSERT_TRUE(definition != nullptr);
+    EXPECT_EQ(definition->displayName, std::string("Operator Cu Chi"));
+    EXPECT_TRUE(std::filesystem::equivalent(definition->filePath,
+                                            explicitPackage));
+    EXPECT_EQ(ReadText(rotationFile), originalConfig);
+}
+
+TEST_F(MapRuntimeTest,
+       DiscoveryExcludesUnsupportedMapsAndGeometryValidationStillFailsClosed) {
+    const std::filesystem::path steamRoot = m_root / "steam";
+    const std::filesystem::path libraryRoot = m_root / "steam-library";
+    WriteSteamMetadata(steamRoot, libraryRoot);
+    const std::filesystem::path retailMaps =
+        libraryRoot / "steamapps" / "common" / "Rising Storm 2" /
+        "ROGame" / "BrewedPC" / "Maps";
+    WriteRetailPackage(retailMaps / "Hill937" / "VNTE-Hill937.roe");
+    WriteRetailPackage(retailMaps / "RungSac" / "VNTE-RungSac.roe");
+    WriteTruncatedRetailPrefix(retailMaps / "CuChi" / "VNTE-CuChi.roe");
+    WriteText(m_mapsDir / "VNTE-CuChi" / "spawns.txt", "1 2 3 1\n");
+
+    const std::filesystem::path rotationFile = m_root / "config" / "maps.ini";
+    WriteText(rotationFile,
+              "[LocalOnly]\n"
+              "file=missing.umap\n"
+              "default_mode=Conquest\n");
+    const std::string originalConfig = ReadText(rotationFile);
+
+    auto configManager = std::make_shared<ConfigManager>();
+    configManager->SetString("General.data_directory",
+                             (m_root / "server_data").generic_string());
+    configManager->SetString("DataPaths.maps_path", m_mapsDir.generic_string());
+    configManager->SetString("General.map_rotation_file",
+                             rotationFile.generic_string());
+    ServerConfig serverConfig(configManager);
+    auto mapConfig = std::make_shared<MapConfig>(
+        serverConfig, std::vector<std::filesystem::path>{steamRoot});
+
+    ASSERT_TRUE(mapConfig->Initialize());
+    EXPECT_TRUE(mapConfig->GetDefinition("VNTE-CuChi") != nullptr);
+    EXPECT_TRUE(mapConfig->GetDefinition("VNTE-Hill937") == nullptr);
+    EXPECT_TRUE(mapConfig->GetDefinition("VNTE-RungSac") == nullptr);
+    EXPECT_EQ(ReadText(rotationFile), originalConfig);
+
+    MapManager manager(nullptr, mapConfig);
+    EXPECT_FALSE(manager.LoadMap("VNTE-CuChi"));
+    EXPECT_TRUE(manager.GetCurrentMapName().empty());
+}
+
+TEST_F(MapRuntimeTest, MalformedAndAmbiguousSteamManifestsFailClosed) {
+    const auto writeInstalledCuChi = [&](const std::filesystem::path& root,
+                                         std::string_view installDirectory) {
+        const std::filesystem::path package =
+            root / "steamapps" / "common" / installDirectory /
+            "ROGame" / "BrewedPC" / "Maps" / "CuChi" /
+            "VNTE-CuChi.roe";
+        WriteRetailPackage(package);
+    };
+
+    const std::filesystem::path malformedRoot = m_root / "malformed-steam";
+    writeInstalledCuChi(malformedRoot, "Rising Storm 2");
+    WriteText(malformedRoot / "steamapps" / "appmanifest_418460.acf",
+              "\"AppState\"\n"
+              "{\n"
+              "  \"appid\" \"418460\"\n"
+              "  \"installdir\" \"Rising Storm 2\"\n");
+    EXPECT_TRUE(RetailMapDiscovery::DiscoverFromSteamRoots({malformedRoot})
+                    .empty());
+
+    const std::filesystem::path ambiguousRoot = m_root / "ambiguous-steam";
+    writeInstalledCuChi(ambiguousRoot, "Rising Storm 2");
+    WriteText(ambiguousRoot / "steamapps" / "appmanifest_418460.acf",
+              "\"AppState\"\n"
+              "{\n"
+              "  \"appid\" \"418460\"\n"
+              "  \"installdir\" \"Rising Storm 2\"\n"
+              "  \"installdir\" \"Conflicting Install\"\n"
+              "}\n");
+    EXPECT_TRUE(RetailMapDiscovery::DiscoverFromSteamRoots({ambiguousRoot})
+                    .empty());
 }
 
 TEST_F(MapRuntimeTest, RotationSkipsMapsWithoutExactRetailProfiles) {
@@ -218,7 +457,8 @@ TEST_F(MapRuntimeTest, RotationSkipsMapsWithoutExactRetailProfiles) {
     configManager->SetString(
         "General.map_rotation_file", rotationFile.generic_string());
     ServerConfig serverConfig(configManager);
-    auto mapConfig = std::make_shared<MapConfig>(serverConfig);
+    auto mapConfig = std::make_shared<MapConfig>(
+        serverConfig, std::vector<std::filesystem::path>{});
     ASSERT_TRUE(mapConfig->Initialize());
 
     MapManager manager(nullptr, mapConfig);
@@ -427,7 +667,8 @@ TEST_F(MapRuntimeTest, FailedRetailPackageValidationKeepsCurrentMapState) {
     configManager->SetString("DataPaths.maps_path", m_mapsDir.generic_string());
     configManager->SetString("General.map_rotation_file", rotationFile.generic_string());
     ServerConfig serverConfig(configManager);
-    auto mapConfig = std::make_shared<MapConfig>(serverConfig);
+    auto mapConfig = std::make_shared<MapConfig>(
+        serverConfig, std::vector<std::filesystem::path>{});
     ASSERT_TRUE(mapConfig->Initialize());
 
     MapManager manager(nullptr, mapConfig);
@@ -469,7 +710,8 @@ TEST_F(MapRuntimeTest, SpawnTerritoryPhaseBoundsAreParsedCompatibly) {
     configManager->SetString("General.map_rotation_file", rotationFile.generic_string());
 
     ServerConfig serverConfig(configManager);
-    auto mapConfig = std::make_shared<MapConfig>(serverConfig);
+    auto mapConfig = std::make_shared<MapConfig>(
+        serverConfig, std::vector<std::filesystem::path>{});
     ASSERT_TRUE(mapConfig->Initialize());
 
     MapManager manager(nullptr, mapConfig);
@@ -807,7 +1049,8 @@ TEST_F(MapRuntimeTest, PerMapRetailObjectivesOverrideGlobalFallback) {
     configManager->SetString("General.map_rotation_file", rotationFile.generic_string());
 
     ServerConfig serverConfig(configManager);
-    auto mapConfig = std::make_shared<MapConfig>(serverConfig);
+    auto mapConfig = std::make_shared<MapConfig>(
+        serverConfig, std::vector<std::filesystem::path>{});
     ASSERT_TRUE(mapConfig->Initialize());
 
     MapManager manager(nullptr, mapConfig);
@@ -1021,7 +1264,8 @@ TEST_F(MapRuntimeTest, InvalidOrDuplicateRetailObjectiveMappingsRemainUnmapped) 
     configManager->SetString("General.map_rotation_file", rotationFile.generic_string());
 
     ServerConfig serverConfig(configManager);
-    auto mapConfig = std::make_shared<MapConfig>(serverConfig);
+    auto mapConfig = std::make_shared<MapConfig>(
+        serverConfig, std::vector<std::filesystem::path>{});
     ASSERT_TRUE(mapConfig->Initialize());
 
     MapManager manager(nullptr, mapConfig);
@@ -1131,7 +1375,8 @@ TEST_F(MapRuntimeTest, AuthoredResortSpawnRequiresMovementBeforeBeachCapture) {
     configManager->SetString("General.map_rotation_file", rotationFile.generic_string());
 
     ServerConfig serverConfig(configManager);
-    auto mapConfig = std::make_shared<MapConfig>(serverConfig);
+    auto mapConfig = std::make_shared<MapConfig>(
+        serverConfig, std::vector<std::filesystem::path>{});
     ASSERT_TRUE(mapConfig->Initialize());
 
     MapManager manager(nullptr, mapConfig);
@@ -1290,7 +1535,8 @@ TEST_F(MapRuntimeTest, AuthoredNonResortProfilesExposeCookedSpawnsAndObjectives)
     configManager->SetString("DataPaths.maps_path", authoredMaps.generic_string());
     configManager->SetString("General.map_rotation_file", rotationFile.generic_string());
     ServerConfig serverConfig(configManager);
-    auto mapConfig = std::make_shared<MapConfig>(serverConfig);
+    auto mapConfig = std::make_shared<MapConfig>(
+        serverConfig, std::vector<std::filesystem::path>{});
     ASSERT_TRUE(mapConfig->Initialize());
 
     MapManager manager(nullptr, mapConfig);
@@ -1367,7 +1613,8 @@ TEST_F(MapRuntimeTest, AuthoredHill937LoadsCookedTerritoryChainAndPhaseSpawns) {
     configManager->SetString("DataPaths.maps_path", authoredMaps.generic_string());
     configManager->SetString("General.map_rotation_file", rotationFile.generic_string());
     ServerConfig serverConfig(configManager);
-    auto mapConfig = std::make_shared<MapConfig>(serverConfig);
+    auto mapConfig = std::make_shared<MapConfig>(
+        serverConfig, std::vector<std::filesystem::path>{});
     ASSERT_TRUE(mapConfig->Initialize());
 
     MapManager manager(nullptr, mapConfig);

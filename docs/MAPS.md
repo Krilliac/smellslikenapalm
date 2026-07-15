@@ -29,11 +29,11 @@ For game mode details, see [GAME_MODES.md](GAME_MODES.md). For configuration fil
 
 ## 1 · Overview
 
-The RS2V Custom Server ships with **eight built-in maps**, each designed for specific game modes, player counts, and atmospheric conditions. Maps are defined in `config/maps.ini` and store their asset files in the `data/maps/` directory (configurable via `[DataPaths].maps_path` in `server.ini`).
+The tracked `config/maps.ini` contains the project's legacy example catalog. For retail emulation, the server can also discover the local Rising Storm 2 Steam installation read-only and add only the four maps that currently have exact replication profiles: Resort, Cu Chi, Hue City Supremacy, and Compound Skirmish. Explicit `maps.ini` definitions take precedence, while repository-owned files under `data/maps/<MapID>/` supply authoritative spawn/objective metadata.
 
 ### Map File Format
 
-Maps use the Unreal Engine `.umap` format. Each map consists of:
+Retail RS2 maps are cooked Unreal Engine 3 `.roe` packages; legacy/custom definitions may use `.umap`. Each map consists of:
 - **Geometry**: Terrain, structures, and static meshes
 - **Spawn Points**: Per-team spawn locations referenced by `teams.ini`
 - **Objectives**: Capture points, flag stands, and zone markers used by game modes
@@ -42,10 +42,10 @@ Maps use the Unreal Engine `.umap` format. Each map consists of:
 
 ### How Maps Are Loaded
 
-1. The server reads `config/maps.ini` at startup and registers all map sections.
-2. The `MapManager` validates that each map's `.umap` file exists in `maps_path`.
-3. The initial map is the first entry in the rotation (or specified by command line).
-4. Map transitions load the new `.umap` file, reset game state, and initialize the selected game mode's objectives.
+1. The server reads `config/maps.ini` at startup and registers all explicit sections.
+2. It discovers Steam app 418460 and merges missing definitions only for exact supported retail profiles. Discovery never rewrites configuration.
+3. `MapManager` validates the selected package and loads its repository sidecars before activation.
+4. The configured or command-line initial map activates; later transitions reset game state and initialize the selected native mode.
 
 ---
 

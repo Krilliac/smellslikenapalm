@@ -1,6 +1,7 @@
 // src/Config/MapConfig.cpp
 
 #include "Config/MapConfig.h"
+#include "Config/RetailMapDiscovery.h"
 #include "Config/ServerConfig.h"
 #include "Utils/Logger.h"
 #include "Utils/StringUtils.h"
@@ -9,6 +10,7 @@
 #include <filesystem>
 #include <limits>
 #include <sstream>
+#include <utility>
 
 namespace {
 // Normalize a directory path so it always ends in exactly one separator. The
@@ -39,8 +41,16 @@ std::string ResolveMapsDir(const std::string& dataDir, const std::string& mapsPa
 } // namespace
 
 MapConfig::MapConfig(const ServerConfig& cfg)
+  : MapConfig(cfg, {})
+{
+    m_autoDiscoverRetailMaps = true;
+}
+
+MapConfig::MapConfig(const ServerConfig& cfg,
+                     std::vector<std::filesystem::path> retailDiscoveryRoots)
   : m_mapsDir(ResolveMapsDir(cfg.GetDataDirectory(), cfg.GetMapsDataPath())),
-    m_rotationFile(cfg.GetMapRotationFile())
+    m_rotationFile(cfg.GetMapRotationFile()),
+    m_retailDiscoveryRoots(std::move(retailDiscoveryRoots))
 {
     Logger::Info("MapConfig initialized with assets directory: %s", m_mapsDir.c_str());
 }
@@ -88,6 +98,7 @@ bool MapConfig::Load()
     }
 
     m_mapDefinitions.clear();
+    m_discoveredDefinitionNames.clear();
     std::string line, section;
     MapDefinition def;
     size_t lineNo = 0;
@@ -121,6 +132,45 @@ bool MapConfig::Load()
     }
     file.close();
 
+    // Steam-discovered definitions are runtime-only fallbacks. An explicit
+    // maps.ini section always wins, and discovery never rewrites the operator's
+    // config with a machine-local absolute path. Restrict activation to maps for
+    // which this checkout also owns map-specific gameplay sidecars.
+    const std::vector<RetailMapPackage> retailPackages =
+        m_autoDiscoverRetailMaps
+            ? RetailMapDiscovery::Discover()
+            : RetailMapDiscovery::DiscoverFromSteamRoots(m_retailDiscoveryRoots);
+    for (const RetailMapPackage& package : retailPackages) {
+        if (m_mapDefinitions.find(package.mapName) != m_mapDefinitions.end()) {
+            continue;
+        }
+
+        std::error_code sidecarError;
+        const std::filesystem::path sidecarDirectory =
+            std::filesystem::path(m_mapsDir) / package.mapName;
+        if (!std::filesystem::is_directory(sidecarDirectory, sidecarError) ||
+            sidecarError) {
+            Logger::Warn(
+                "MapConfig: discovered retail package '%s' but no local gameplay "
+                "data directory exists at %s; leaving it unavailable",
+                package.mapName.c_str(), sidecarDirectory.string().c_str());
+            continue;
+        }
+
+        MapDefinition retailDefinition;
+        retailDefinition.name = package.mapName;
+        retailDefinition.displayName = package.displayName;
+        retailDefinition.filePath = package.packagePath.string();
+        retailDefinition.maxPlayers = 64;
+        retailDefinition.defaultMode = package.defaultMode;
+        retailDefinition.supportedModes = {package.defaultMode};
+        m_mapDefinitions.emplace(package.mapName, std::move(retailDefinition));
+        m_discoveredDefinitionNames.insert(package.mapName);
+        Logger::Info("MapConfig: discovered runtime retail map '%s' at %s",
+                     package.mapName.c_str(),
+                     package.packagePath.string().c_str());
+    }
+
     // Post-process: fill in derived defaults that the file may have omitted.
     for (auto& [name, d] : m_mapDefinitions) {
         if (d.filePath.empty()) {
@@ -148,6 +198,12 @@ bool MapConfig::Save() const
 
     file << "# RS2V Map Configuration\n";
     for (const auto& [name, def] : m_mapDefinitions) {
+        // Runtime discovery must never turn config/maps.ini into generated,
+        // machine-specific state, even if an explicit caller requests Save().
+        if (m_discoveredDefinitionNames.find(name) !=
+            m_discoveredDefinitionNames.end()) {
+            continue;
+        }
         file << "\n[" << name << "]\n";
         file << "display_name="    << def.displayName << "\n";
         file << "description="     << def.description << "\n";
@@ -185,6 +241,7 @@ bool MapConfig::Save() const
 void MapConfig::CreateDefaultConfig()
 {
     m_mapDefinitions.clear();
+    m_discoveredDefinitionNames.clear();
 
     MapDefinition d;
     d.name           = "VNTE-CuChi";

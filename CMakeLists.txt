@@ -184,7 +184,7 @@ target_link_libraries(rs2v_core PUBLIC Threads::Threads)
 
 # Platform-specific link libraries (PUBLIC so consumers inherit them)
 if(WIN32)
-    target_link_libraries(rs2v_core PUBLIC ws2_32 iphlpapi pdh psapi dbghelp)
+    target_link_libraries(rs2v_core PUBLIC ws2_32 iphlpapi pdh psapi dbghelp advapi32)
 else()
     target_link_libraries(rs2v_core PUBLIC dl)
 endif()
