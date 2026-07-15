@@ -401,11 +401,17 @@ The original roadmap is complete for the bounded bootstrap surface:
    `HandshakeComplete`, actor traffic, or the Game callback.
 3. The live actor builder opens owning PC ch2 first and places NMT `0x24` in the
    same retry-ledger packet.
-4. GRI ch3, TeamInfo ch4/ch5, and PRI ch26 are authored from the frozen profile,
-   artifact layout, LoginBridge PlayerID, player name, tickets, and objective state.
-5. The ch2 h23 link to PRI ch26 is retry-owned and precedes the reliable team-menu
+4. On normal live-authored bootstrap, GRI ch3, TeamInfo ch4/ch5, and PRI ch26 are
+   authored from the frozen profile, artifact layout, LoginBridge PlayerID, player
+   name, tickets, and live game state.
+   GRI h24 carries `[General].server_name`, with the defensive retail-facing fallback
+   `Rising Storm 2: Vietnam Server` when configuration is unavailable or invalid.
+5. That live path's GRI baseline publishes applicable active-match, timer, and mode
+   scalars even when the map has zero cooked objective mappings. Such maps omit
+   objective arrays and capper structs instead of omitting the entire scalar baseline.
+6. The ch2 h23 link to PRI ch26 is retry-owned and precedes the reliable team-menu
    RPCs in ch2 sequence order.
-6. Exact-profile/artifact/layout failures are connection-local and fail closed.
+7. Exact-profile/artifact/layout failures are connection-local and fail closed.
 
 Steady-state work remains broader than bootstrap: additional relevant actors,
 complete movement/combat state, and mode-specific role/deployment coverage continue

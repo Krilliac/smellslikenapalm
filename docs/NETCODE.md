@@ -439,7 +439,7 @@ frozen canonical or installed PackageMap layout:
 | Channel | Live actor | Required initial state |
 |---|---|---|
 | 2 | owning `ROPlayerController` | artifact-specific class ref, `NetPlayerIndex=0` |
-| 3 | `ROGameReplicationInfo` | profile-specific Territories/Supremacy/Skirmish `GameClass`, menu scalars |
+| 3 | `ROGameReplicationInfo` | h24 `ServerName` from `[General].server_name` (defensive retail fallback when unavailable/invalid), profile-specific Territories/Supremacy/Skirmish `GameClass`, and menu scalars |
 | 4 / 5 | playable `ROTeamInfo` pair | retail TeamIndex 0/1 and authoritative reinforcements |
 | 26 | owning `ROPlayerReplicationInfo` | LoginBridge `PlayerID` and connection-local player name |
 
@@ -458,6 +458,18 @@ The ordering is load-bearing:
    values, or a failed cohort publication disconnect before the Game callback can expose
    an actor-less joined session.
 
+The normal live-authored GRI open snapshots the current configured server name into
+initial property h24. Its retail-ANSI wire policy accepts 1 through 128 encoded bytes,
+each printable 7-bit ASCII (`0x20` through `0x7E`), with at least one non-space byte.
+Startup/reload rejects an invalid configuration candidate atomically, while this
+protocol boundary revalidates programmatic values and uses the defensive retail-facing
+fallback `Rising Storm 2: Vietnam Server` if configuration is unavailable or invalid.
+After that open, the reliable GRI baseline publishes all applicable active-match,
+timer, and mode scalar state even when the map has zero cooked objective mappings.
+In that case the live-authored path simply omits the objective mapping/state arrays
+(h174-h179) and h124 capper structs; the absence of mapped objectives does not
+suppress h31 match-start state, the phase clock, or mode scores/rules.
+
 `data/actor_bootstrap.bin` is no longer a gameplay default. It contains a populated
 retail Resort match with stale session actors and is reachable only when the process is
 started with the exact direct switch `RS2V_REPLAY_CAPTURE_WORLD=1`. That diagnostic is
@@ -465,7 +477,9 @@ accepted only for the canonical artifact and exact Resort/Territories profile; i
 or non-Resort combinations fail closed before queuing a bunch. The file format remains
 `[u16 ChIndex][u8 ChType][u8 flags][u16 ChSequence][u32 BunchDataBits][payload]`
 for reverse-engineering comparisons. This process switch is not an INI override and is
-not hot-reloaded.
+not hot-reloaded. Unlike normal live-authored bootstrap, the diagnostic retains its
+captured h24 and captured objective arrays. If no cooked objective mapping is available,
+omitting array corrections from the scalar baseline does not erase that captured state.
 
 The live actor cohort has grounded class/GameClass refs for all four exact profiles
 across both artifact layouts. Actor-bootstrap compatibility and h175 role/spawn support

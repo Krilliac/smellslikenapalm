@@ -121,7 +121,7 @@ Typed getters for every key in `config/server.ini`.
 
 | Method | Returns | Default | Description |
 |--------|---------|---------|-------------|
-| `std::string GetServerName()` | `string` | `"RS2V Server"` | Server display name |
+| `std::string GetServerName()` | `string` | `"RS2V Custom Server"` | `[General].server_name`; normal live bootstrap publishes it as GRI h24 |
 | `int GetMaxPlayers()` | `int` | `64` | Maximum concurrent players |
 | `std::string GetMapRotationFile()` | `string` | `"maps.ini"` | Map rotation config file |
 | `std::string GetGameModesFile()` | `string` | `"gamemodes.ini"` | Game modes config file |
@@ -164,11 +164,11 @@ Typed getters for every key in `config/server.ini`.
 
 | Section | Key | Type | Default | Description |
 |---------|-----|------|---------|-------------|
-| `[Server]` | `Name` | string | `"RS2V Server"` | Listed in browser |
-| 〃 | `Port` | uint16 | `7777` | UDP listen |
-| 〃 | `MaxPlayers` | uint | `64` | Hard cap |
-| `[Network]` | `MaxBandwidthMbps` | float | `100.0` | Throttle |
-| 〃 | `CompressionEnabled` | bool | `true` | zlib/Brotli |
+| `[General]` | `server_name` | string | `"RS2V Custom Server"` | Display name; printable ASCII, 1–128 encoded bytes, not all spaces |
+| `[General]` | `max_players` | uint | `64` | Hard cap |
+| `[General]` | `tick_rate` | uint | `60` | Server simulation rate |
+| `[Network]` | `port` | uint16 | `7777` | UDP listen port |
+| `[Network]` | `max_packet_size` | uint | `1200` | Configured packet-size limit |
 | `[Telemetry]` | `Enabled` | bool | `true` | Master switch |
 | 〃 | `PrometheusPort` | int | `9100` | `/metrics` HTTP |
 

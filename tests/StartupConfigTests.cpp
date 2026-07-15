@@ -4,8 +4,10 @@
 #include "TestFramework.h"
 
 #include "Config/ConfigManager.h"
+#include "Config/ConfigValidator.h"
 #include "Config/GameConfig.h"
 #include "Config/ServerConfig.h"
+#include "Config/ServerNamePolicy.h"
 
 #include <atomic>
 #include <chrono>
@@ -13,6 +15,7 @@
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <map>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -73,6 +76,22 @@ protected:
             << "live_reload=false\n";
     }
 
+    static void WritePolicyConfig(const std::filesystem::path& path,
+                                  const std::string& serverName,
+                                  int maxPlayers,
+                                  int port = 17778) {
+        std::ofstream out(path, std::ios::binary | std::ios::trunc);
+        out << "[General]\n"
+            << "server_name=";
+        out.write(serverName.data(),
+                  static_cast<std::streamsize>(serverName.size()));
+        out << "\nmax_players=" << maxPlayers << "\n"
+            << "[Network]\n"
+            << "port=" << port << "\n"
+            << "[Configuration]\n"
+            << "live_reload=false\n";
+    }
+
     static std::string ReadFile(const std::filesystem::path& path) {
         std::ifstream in(path, std::ios::binary);
         std::ostringstream contents;
@@ -108,6 +127,122 @@ TEST_F(StartupConfigTest, InitializeLoadsTheExplicitPrimaryFile) {
     ConfigManager config;
     ASSERT_TRUE(config.Initialize(selected.string()));
     EXPECT_EQ(config.GetInt("Network.port", 0), 17778);
+}
+
+TEST_F(StartupConfigTest, ServerNameAcceptsWirePolicyBoundaries) {
+    const std::vector<std::string> validNames{
+        "X",
+        std::string(ServerNamePolicy::kMaxEncodedBytes, 'X'),
+        "Visible Name With Internal Spaces",
+    };
+
+    std::size_t index = 0;
+    for (const std::string& validName : validNames) {
+        const std::filesystem::path selected =
+            m_root / ("valid-server-name-" + std::to_string(index++) + ".ini");
+        WritePolicyConfig(selected, validName, 64);
+
+        ConfigManager config;
+        ASSERT_TRUE(config.Initialize(selected.string()));
+        EXPECT_EQ(config.GetString("General.server_name", "missing"),
+                  validName);
+    }
+}
+
+TEST_F(StartupConfigTest, ConfigValidatorUsesSharedServerNameWirePolicy) {
+    ConfigValidator validator;
+    ASSERT_TRUE(validator.Initialize());
+
+    std::map<std::string, std::string> config{
+        {"General.server_name",
+         std::string(ServerNamePolicy::kMaxEncodedBytes, 'X')},
+    };
+    EXPECT_TRUE(validator.ValidateConfiguration(config).isValid);
+
+    config["General.server_name"] =
+        std::string(ServerNamePolicy::kMaxEncodedBytes + 1u, 'X');
+    EXPECT_FALSE(validator.ValidateConfiguration(config).isValid);
+
+    config["General.server_name"] =
+        std::string("Bad") + static_cast<char>(0x80u) + "Name";
+    EXPECT_FALSE(validator.ValidateConfiguration(config).isValid);
+}
+
+TEST_F(StartupConfigTest,
+       ConfigValidatorFileParserMatchesConfigManagerCommentSemantics) {
+    struct ParserCase {
+        const char* label;
+        std::string fileValue;
+        std::string expectedValue;
+    };
+    const std::vector<ParserCase> cases{
+        {"leading literal hash", "#5", "#5"},
+        {"embedded literal hash", "Clan#5", "Clan#5"},
+        {"leading literal semicolon", ";5", ";5"},
+        {"embedded literal semicolon", "Clan;5", "Clan;5"},
+        // The invalid byte proves the whitespace-preceded marker was removed
+        // as a comment before the shared server-name wire policy ran.
+        {"whitespace hash comment",
+         std::string("Clan # ignored") + static_cast<char>(0x80u), "Clan"},
+        {"whitespace semicolon comment",
+         std::string("Clan ; ignored") + static_cast<char>(0x80u), "Clan"},
+    };
+
+    ConfigValidator validator;
+    ASSERT_TRUE(validator.Initialize());
+    std::size_t index = 0;
+    for (const ParserCase& parserCase : cases) {
+        const std::filesystem::path selected =
+            m_root / ("server-name-comment-parity-" +
+                      std::to_string(index++) + ".ini");
+        WritePolicyConfig(selected, parserCase.fileValue, 64);
+
+        ConfigManager config;
+        ASSERT_TRUE(config.Initialize(selected.string())) << parserCase.label;
+        EXPECT_EQ(config.GetString("General.server_name", "missing"),
+                  parserCase.expectedValue) << parserCase.label;
+        EXPECT_TRUE(validator.ValidateConfigurationFile(selected.string()))
+            << parserCase.label;
+    }
+}
+
+TEST_F(StartupConfigTest, InvalidServerNameReloadIsRejectedAtomically) {
+    struct InvalidName {
+        const char* label;
+        std::string serverName;
+    };
+    const std::vector<InvalidName> invalidNames{
+        {"empty", ""},
+        {"oversized",
+         std::string(ServerNamePolicy::kMaxEncodedBytes + 1u, 'X')},
+        {"embedded-nul", std::string("Visible\0Hidden", 14u)},
+        {"c0-control",
+         std::string("Bad") + static_cast<char>(0x1Fu) + "Name"},
+        {"del", std::string("Bad") + static_cast<char>(0x7Fu) + "Name"},
+        {"non-ascii",
+         std::string("Bad") + static_cast<char>(0x80u) + "Name"},
+        {"spaces-only", std::string(8u, ' ')},
+    };
+
+    std::size_t index = 0;
+    for (const InvalidName& invalid : invalidNames) {
+        const std::filesystem::path selected =
+            m_root / ("invalid-general-policy-" +
+                      std::to_string(index++) + ".ini");
+        WritePolicyConfig(selected, "Stable Server", 64);
+
+        ConfigManager config;
+        ASSERT_TRUE(config.Initialize(selected.string())) << invalid.label;
+        WritePolicyConfig(selected, invalid.serverName, 65, 18889);
+
+        EXPECT_FALSE(config.ReloadConfiguration()) << invalid.label;
+        EXPECT_EQ(config.GetString("General.server_name", "missing"),
+                  "Stable Server") << invalid.label;
+        EXPECT_EQ(config.GetInt("General.max_players", 0), 64)
+            << invalid.label;
+        EXPECT_EQ(config.GetInt("Network.port", 0), 17778)
+            << invalid.label;
+    }
 }
 
 TEST_F(StartupConfigTest, MissingExplicitFileDoesNotFallBackToDefault) {

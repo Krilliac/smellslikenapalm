@@ -17,6 +17,7 @@
 #include "Protocol/PropertyReplication.h"
 #include "Network/ClientConnection.h"
 #include "Config/ServerConfig.h"
+#include "Config/ServerNamePolicy.h"
 #include "Utils/Logger.h"
 
 #include <chrono>
@@ -341,8 +342,9 @@ void ConnectionLoginBridge::EnsureGameReplicationInfo()
     if (m_deps.serverConfig) {
         m_gri->serverName = m_deps.serverConfig->GetServerName();
     }
-    if (m_gri->serverName.empty()) {
-        m_gri->serverName = "Rising Storm 2: Vietnam Server";   // Engine default
+    if (!ServerNamePolicy::IsValid(m_gri->serverName)) {
+        m_gri->serverName.assign(ServerNamePolicy::kRetailFallback.data(),
+                                 ServerNamePolicy::kRetailFallback.size());
     }
     m_gri->gameClass = "ROGame.ROGameInfo";
 

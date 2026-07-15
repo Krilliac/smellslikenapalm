@@ -124,7 +124,7 @@ General server identity and behavior settings.
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `server_name` | string | `RS2V Custom Server` | The display name of the server as shown in the server browser and connection messages. Supports spaces and special characters. Maximum 128 characters. |
+| `server_name` | string | `RS2V Custom Server` | Display name used by the server browser and connection messages. Normal live-authored actor bootstrap snapshots it into GRI h24 for each newly joining retail client. See the wire policy below. |
 | `version` | string | `1.0.0` | Server version string. Informational only; used in status responses and telemetry. Does not affect protocol compatibility. |
 | `max_players` | integer | `64` | Maximum number of concurrent player connections. Valid range: 1–128. Higher values require more CPU, memory, and bandwidth. See [System Requirements](DEPLOYMENT.md) for hardware guidelines. |
 | `map_rotation_file` | path | `config/maps.ini` | Path to the map rotation configuration file, relative to server root. This file defines all available maps, their properties, and the rotation order. See [Section 5](#5--mapsini--map-rotation--settings). |
@@ -136,6 +136,25 @@ General server identity and behavior settings.
 | `data_directory` | path | `data/` | Path to the runtime data directory, relative to server root. Contains map assets, scripts, and other runtime resources. |
 | `log_directory` | path | `logs/` | Path to the log output directory, relative to server root. All log files (server, security, performance, telemetry) are written here. Created automatically if it does not exist. |
 | `admin_rcon_only` | boolean | `false` | When `true`, admin commands can only be issued via RCON (remote console). In-game chat commands are disabled for all admin levels. When `false`, admins can use both RCON and in-game chat commands based on their permission level. |
+
+`server_name` has an emulator wire policy because retail GRI h24 is an ANSI
+`FString`: the encoded value must contain **1 through 128 bytes**, every byte must
+be printable 7-bit ASCII (`0x20` through `0x7E`), and at least one byte must not be
+a space. After normal INI parsing this permits ordinary spaces and printable ASCII
+punctuation, but rejects all-space names, control characters, DEL, embedded NULs,
+and bytes at or above `0x80` (including unconverted UTF-8). The parser trims outer
+whitespace. A `#` or `;` begins a comment only at the start of a line or when
+preceded by whitespace, so use `Clan#5` rather than `Clan #5` when the marker
+is part of the name. Startup and reload validate the complete candidate configuration
+before publication. An invalid name rejects that candidate atomically; a failed reload
+leaves the last valid live configuration unchanged.
+
+The normal live-authored bootstrap validates the value again at the protocol
+boundary. If configuration is unavailable or a programmatic caller supplies an
+invalid value, h24 uses the defensive retail-facing fallback
+`Rising Storm 2: Vietnam Server`. The explicit
+`RS2V_REPLAY_CAPTURE_WORLD=1` reverse-engineering diagnostic is different: it
+retains the captured GRI h24 instead of substituting `server_name`.
 
 ### 2.2 [DataPaths]
 

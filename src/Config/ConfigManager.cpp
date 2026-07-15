@@ -1,6 +1,7 @@
 // src/Config/ConfigManager.cpp
 
 #include "Config/ConfigManager.h"
+#include "Config/ServerNamePolicy.h"
 #include "Utils/Logger.h"
 #include "Utils/FileUtils.h"
 #include "Utils/StringUtils.h"
@@ -698,8 +699,16 @@ bool ConfigManager::ValidateConfiguration(const ConfigValues& values) const {
 
 bool ConfigManager::ValidateServerConfig(const ConfigValues& values) const {
     Logger::Trace("[ConfigManager::ValidateServerConfig] Entry");
-    if (GetValue(values, "General.server_name", "").empty()) {
-        Logger::Error("[ConfigManager::ValidateServerConfig] General.server_name is required but empty or missing");
+    const std::string serverName =
+        GetValue(values, "General.server_name", "");
+    const ServerNamePolicy::ValidationError serverNameError =
+        ServerNamePolicy::Validate(serverName);
+    if (serverNameError != ServerNamePolicy::ValidationError::None) {
+        Logger::Error(
+            "[ConfigManager::ValidateServerConfig] General.server_name is invalid: "
+            "%s (encodedBytes=%zu, maximum=%zu)",
+            ServerNamePolicy::Describe(serverNameError), serverName.size(),
+            ServerNamePolicy::kMaxEncodedBytes);
         Logger::Trace("[ConfigManager::ValidateServerConfig] Exit - returning false");
         return false;
     }

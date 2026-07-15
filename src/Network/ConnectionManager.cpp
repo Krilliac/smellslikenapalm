@@ -19,6 +19,7 @@
 #include "Config/ConfigManager.h"
 #include "Config/GameConfig.h"
 #include "Config/ServerConfig.h"
+#include "Config/ServerNamePolicy.h"
 #include "Utils/Logger.h"
 #include "Network/Packet.h"
 #include "Network/BandwidthManager.h"
@@ -2309,9 +2310,25 @@ void ConnectionManager::SendLiveActorBootstrap(uint32_t clientId) {
     cs.publishedTeamReinforcements.fill(std::nullopt);
     cs.pendingTeamReinforcements.fill(std::nullopt);
     const uint32_t kGameClassIx = *gameClassRef; // GRI.GameClass h33
+    std::string serverName(ServerNamePolicy::kRetailFallback.data(),
+                           ServerNamePolicy::kRetailFallback.size());
     uint8_t maxPlayers = 64;
     if (m_server) {
         if (const std::shared_ptr<ServerConfig> cfg = m_server->GetServerConfig()) {
+            const std::string configuredServerName = cfg->GetServerName();
+            const ServerNamePolicy::ValidationError serverNameError =
+                ServerNamePolicy::Validate(configuredServerName);
+            if (serverNameError == ServerNamePolicy::ValidationError::None) {
+                serverName = configuredServerName;
+            } else {
+                Logger::Warn(
+                    "[ConnectionManager::SendLiveActorBootstrap] client %u "
+                    "ignored invalid configured server name: %s "
+                    "(encodedBytes=%zu, maximum=%zu); using retail fallback",
+                    clientId, ServerNamePolicy::Describe(serverNameError),
+                    configuredServerName.size(),
+                    ServerNamePolicy::kMaxEncodedBytes);
+            }
             maxPlayers = static_cast<uint8_t>(std::clamp(cfg->GetMaxPlayers(), 1, 128));
         }
     }
@@ -2373,6 +2390,7 @@ void ConnectionManager::SendLiveActorBootstrap(uint32_t clientId) {
 
     std::vector<PacketCodec::Bunch> batch;
     batch.push_back(MakeOpeningActorBunch(kChGRI, 1, hdrFor(kClsGRI, false), [&](BitWriter& w) {
+        ActorRepl::WritePropString(w, ObjectiveRepl::kServerName, kMaxGRI, serverName);
         ActorRepl::WritePropObject(w, 33, kMaxGRI, NetGUIDRef{false, kGameClassIx});  // GameClass
         // ROPC.IsTeamFull uses bBalanceTeams and MaxTeamDifference, while
         // ClientShowTeamSelect initializes the population UI from MaxPlayers.
@@ -2605,12 +2623,61 @@ void ConnectionManager::SendRetailObjectiveState(uint32_t clientId, bool baselin
             /*satchel=*/false);
     }
 
-    if (mappedCount == 0) {
-        if (baseline) {
-            Logger::Info("[ObjectiveReplication] client %u: map has no cooked objective mappings; "
-                         "retail HUD baseline omitted", clientId);
+    // h179 establishes the cooked-objective mapping consumed by every later
+    // objective array. A scalar-only zero-objective baseline intentionally
+    // caches an all-0xFF topology; if mappings subsequently appear, promote
+    // this update to a complete baseline so h179 precedes all dependent state.
+    // There is no grounded wire representation for removing a previously
+    // published mapping, and changing an existing slot's rep index may leave
+    // client-side references to the old cooked actor. Retire such a session
+    // before emitting any ambiguous objective state rather than inventing a
+    // sentinel or partial remap protocol.
+    if (cs.objectiveCacheValid) {
+        bool mappingAdded = false;
+        uint8_t unsafeSlot = 0xFF;
+        uint8_t cachedRepIndex = 0xFF;
+        uint8_t currentRepIndex = 0xFF;
+        for (uint8_t slot = 0; slot < 16; ++slot) {
+            const bool wasMapped = cs.objectiveRepIndex[slot] != 0xFF;
+            const bool isMapped = mapped[slot];
+            if (wasMapped &&
+                (!isMapped || cs.objectiveRepIndex[slot] != repIndex[slot])) {
+                unsafeSlot = slot;
+                cachedRepIndex = cs.objectiveRepIndex[slot];
+                currentRepIndex = isMapped ? repIndex[slot] : 0xFF;
+                break;
+            }
+            mappingAdded = mappingAdded || (!wasMapped && isMapped);
         }
-        return;
+
+        if (unsafeSlot != 0xFF) {
+            Logger::Error(
+                "[ObjectiveReplication] client %u: objective mapping topology "
+                "removed or reindexed slot %u (cachedRepIndex=%u, "
+                "currentRepIndex=%u); no grounded h179 clear/remap semantics "
+                "exist, failing closed",
+                clientId, static_cast<unsigned>(unsafeSlot),
+                static_cast<unsigned>(cachedRepIndex),
+                static_cast<unsigned>(currentRepIndex));
+            if (const std::shared_ptr<ClientConnection> connection =
+                    GetConnection(clientId)) {
+                connection->MarkDisconnected();
+            }
+            return;
+        }
+
+        if (mappingAdded && !baseline) {
+            Logger::Info(
+                "[ObjectiveReplication] client %u: new cooked objective "
+                "mapping discovered; promoting dirty update to full baseline",
+                clientId);
+            baseline = true;
+        }
+    }
+
+    if (mappedCount == 0 && baseline) {
+        Logger::Info("[ObjectiveReplication] client %u: map has no cooked objective mappings; "
+                     "publishing scalar-only GRI baseline", clientId);
     }
 
     std::vector<ObjectiveRepl::ArrayElement> fields;

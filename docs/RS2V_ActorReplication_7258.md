@@ -609,10 +609,16 @@ milestone after the menu (needs the Pawn open + `ClientRestart`), and is separab
 1. After the Join drain barrier, open owning **PC ch2** with the selected
    PackageMap's class ref and `NetPlayerIndex=0`.
 2. Put NMT `0x24` immediately after that open in the same reliable packet.
-3. Open **GRI ch3**, **TeamInfo ch4/ch5**, and **PRI ch26** from live profile,
-   ticket, LoginBridge identity, and player-name state.
-4. Publish PC h23 -> dynamic ch26 as retry-owned ch2 sequence 2; queue menu RPCs
+3. On normal live-authored bootstrap, open **GRI ch3**, **TeamInfo ch4/ch5**, and
+   **PRI ch26** from live profile, ticket, LoginBridge identity, and player-name state.
+   GRI h24 carries
+   `[General].server_name`, or the defensive retail-facing fallback
+   `Rising Storm 2: Vietnam Server` when configuration is unavailable or invalid.
+4. Publish the applicable active-match, timer, and mode scalar baseline even when
+   there are zero cooked objective mappings; omit objective arrays/capper structs in
+   that case rather than suppressing the whole GRI baseline.
+5. Publish PC h23 -> dynamic ch26 as retry-owned ch2 sequence 2; queue menu RPCs
    only on later ch2 sequences.
-5. Fail the connection closed if any exact profile, artifact class ref, GameClass,
+6. Fail the connection closed if any exact profile, artifact class ref, GameClass,
    or load-bearing publication is unavailable.
-6. Spawn and possess the pawn later, then send `ClientRestart` on ch2 (§5 Phase 3).
+7. Spawn and possess the pawn later, then send `ClientRestart` on ch2 (§5 Phase 3).

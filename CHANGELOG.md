@@ -13,6 +13,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - CONTRIBUTING.md with development workflow and coding standards
 - Full CHANGELOG.md and CONTRIBUTORS.md
 
+### Changed
+- **Breaking configuration validation:** `[General].server_name` now follows the
+  live retail-client wire policy: 1–128 encoded bytes, printable ASCII only, and
+  at least one non-space character. Existing non-ASCII, control-containing,
+  all-space, or longer names must be replaced before upgrading. Invalid startup
+  or reload candidates are rejected atomically; a value injected outside the
+  validated file path uses `Rising Storm 2: Vietnam Server` at the protocol
+  boundary instead of disconnecting joining clients.
+
 ---
 
 ## [0.9.0-alpha] - 2025-06-01

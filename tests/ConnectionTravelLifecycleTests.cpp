@@ -12,6 +12,9 @@
 #include "Network/RoleSelectionReplication.h"
 #include "Network/SocketFactory.h"
 #include "Network/UDPSocket.h"
+#include "Config/ConfigManager.h"
+#include "Config/ServerConfig.h"
+#include "Config/ServerNamePolicy.h"
 #include "Game/GameServer.h"
 #include "Game/BotManager.h"
 #include "Game/ObjectiveSystem.h"
@@ -123,13 +126,32 @@ public:
         server.InitializeBotsForCurrentMap();
     }
 
-    static SupremacyMode* InstallActiveSupremacyMode(GameServer& server) {
+    static SupremacyMode* InstallActiveSupremacyMode(
+        GameServer& server, float roundSeconds = 1200.0f,
+        int32_t scoreTarget = SupremacyMode::kDefaultScoreTarget) {
         server.m_supremacyMode = std::make_unique<SupremacyMode>(&server);
         server.m_supremacyMode->Initialize();
+        server.m_supremacyMode->SetRoundTime(roundSeconds);
+        server.m_supremacyMode->SetScoreTarget(scoreTarget);
         server.m_supremacyMode->StartRound();
         server.m_supremacyMode->Update(
             server.m_supremacyMode->GetPhaseTimeRemaining());
         return server.m_supremacyMode.get();
+    }
+
+    static void InstallEmptyObjectiveSystem(GameServer& server) {
+        server.m_objectiveSystem = std::make_unique<ObjectiveSystem>(&server);
+        server.m_objectiveSystem->Initialize();
+    }
+
+    static std::shared_ptr<ConfigManager> InstallServerConfig(
+        GameServer& server, const std::string& serverName,
+        int maxPlayers = 64) {
+        auto config = std::make_shared<ConfigManager>();
+        config->SetString("General.server_name", serverName);
+        config->SetInt("General.max_players", maxPlayers);
+        server.m_serverConfig = std::make_shared<ServerConfig>(config);
+        return config;
     }
 
     static void InstallTerritoryObjective(GameServer& server) {
@@ -1284,9 +1306,22 @@ public:
         return manager.m_controlState.at(clientId).griChannel;
     }
 
+    static bool ScalarObjectiveBaselineCachesValid(
+        const ConnectionManager& manager, uint32_t clientId) {
+        const auto& state = manager.m_controlState.at(clientId);
+        return state.objectiveCacheValid && state.griTimerCacheValid &&
+               state.supremacyCacheValid && state.griActiveStatePublished;
+    }
+
     static void SendActorBootstrap(ConnectionManager& manager,
                                    uint32_t clientId) {
         manager.SendActorBootstrap(clientId);
+    }
+
+    static void SendRetailObjectiveState(ConnectionManager& manager,
+                                         uint32_t clientId,
+                                         bool baseline) {
+        manager.SendRetailObjectiveState(clientId, baseline);
     }
 
     static std::vector<PacketCodec::Bunch> QueuedReliableBunches(
@@ -1410,6 +1445,22 @@ ActorRepl::NetGUIDRef DecodeLiveOpenClass(const PacketCodec::Bunch& bunch,
     }
     overflowed = reader.IsOverflowed();
     return classRef;
+}
+
+std::optional<std::string> DecodeLiveGriServerName(
+    const PacketCodec::Bunch& bunch) {
+    BitReader reader(bunch.payload.data(), bunch.payload.size(),
+                     bunch.payloadBits);
+    (void)ActorRepl::ReadNetGUID(reader);
+    float x = 0.0f, y = 0.0f, z = 0.0f;
+    ActorRepl::ReadCompressedVector(reader, x, y, z);
+    if (reader.SerializeInt(ObjectiveRepl::kGriMaxHandle) !=
+        ObjectiveRepl::kServerName) {
+        return std::nullopt;
+    }
+    std::string serverName = reader.ReadString();
+    if (reader.IsOverflowed()) return std::nullopt;
+    return serverName;
 }
 
 ClientTravelRepl::EncodedRpc MakeTravelRpc() {
@@ -6529,13 +6580,18 @@ TEST(ConnectionTravelLifecycle,
                 EXPECT_EQ(teamReader.BitPos(), teamBunch->payloadBits);
             }
 
-            // The GRI's first bNetInitial property is h33 GameClass. Decode it from
-            // the actual queued opening bunch rather than re-testing the resolver.
+            // The live GRI open starts with the per-session server name, then the
+            // selected profile's GameClass and menu scalars. Decode the complete
+            // property tail so padding or an accidental extra handle fails here.
             BitReader griReader(gri->payload.data(), gri->payload.size(),
                                 gri->payloadBits);
             (void)ActorRepl::ReadNetGUID(griReader);
             float x = 0.0f, y = 0.0f, z = 0.0f;
             ActorRepl::ReadCompressedVector(griReader, x, y, z);
+            EXPECT_EQ(griReader.SerializeInt(184u),
+                      ObjectiveRepl::kServerName);
+            EXPECT_EQ(griReader.ReadString(),
+                      std::string(ServerNamePolicy::kRetailFallback));
             EXPECT_EQ(griReader.SerializeInt(184u), 33u);
             const ActorRepl::NetGUIDRef gameClass =
                 ActorRepl::ReadNetGUID(griReader);
@@ -6556,6 +6612,366 @@ TEST(ConnectionTravelLifecycle,
                           ? profile.canonicalGameClass
                           : profile.installedGameClass);
         }
+    }
+}
+
+TEST(ConnectionTravelLifecycle,
+     LiveBootstrapPublishesConfiguredServerNameInGriOpen) {
+    GameServer server;
+    ConnectionManager manager(&server);
+    ConnectionTravelLifecycleTestHarness::InstallServerConfig(
+        server, "RS2V Zero Objective Test Server");
+    const std::shared_ptr<ClientConnection> connection =
+        ConnectionTravelLifecycleTestHarness::AddClient(
+            manager, 1, "127.0.0.1", 30140, true, 0, false);
+    ASSERT_TRUE(ConnectionTravelLifecycleTestHarness::FreezeRetailBootstrap(
+        manager, 1, {}));
+
+    ScopedEnvironmentVariable replayWorld(
+        "RS2V_REPLAY_CAPTURE_WORLD", "0");
+    ConnectionTravelLifecycleTestHarness::SendActorBootstrap(manager, 1);
+
+    ASSERT_FALSE(connection->IsDisconnected());
+    const std::vector<PacketCodec::Bunch> queued =
+        ConnectionTravelLifecycleTestHarness::QueuedReliableBunches(manager, 1);
+    const PacketCodec::Bunch* gri = FindQueuedOpen(queued, 3u);
+    ASSERT_TRUE(gri != nullptr);
+
+    BitReader reader(gri->payload.data(), gri->payload.size(),
+                     gri->payloadBits);
+    const ActorRepl::NetGUIDRef griClass = ActorRepl::ReadNetGUID(reader);
+    EXPECT_FALSE(griClass.isDynamic);
+    EXPECT_EQ(griClass.index, 70887u);
+    float x = 0.0f, y = 0.0f, z = 0.0f;
+    ActorRepl::ReadCompressedVector(reader, x, y, z);
+    EXPECT_EQ(reader.SerializeInt(ObjectiveRepl::kGriMaxHandle),
+              ObjectiveRepl::kServerName);
+    EXPECT_EQ(reader.ReadString(), "RS2V Zero Objective Test Server");
+    EXPECT_EQ(reader.SerializeInt(ObjectiveRepl::kGriMaxHandle), 33u);
+    const ActorRepl::NetGUIDRef gameClass = ActorRepl::ReadNetGUID(reader);
+    EXPECT_FALSE(gameClass.isDynamic);
+    EXPECT_EQ(gameClass.index, 69601u);
+    EXPECT_EQ(reader.SerializeInt(ObjectiveRepl::kGriMaxHandle),
+              ObjectiveRepl::kBalanceTeams);
+    EXPECT_TRUE(reader.ReadBit());
+    EXPECT_EQ(reader.SerializeInt(ObjectiveRepl::kGriMaxHandle),
+              ObjectiveRepl::kMaxTeamDifference);
+    EXPECT_EQ(reader.ReadByte(), 2u);
+    EXPECT_EQ(reader.SerializeInt(ObjectiveRepl::kGriMaxHandle),
+              ObjectiveRepl::kMaxPlayers);
+    EXPECT_EQ(reader.ReadByte(), 64u);
+    EXPECT_FALSE(reader.IsOverflowed());
+    EXPECT_EQ(reader.BitPos(), gri->payloadBits);
+}
+
+TEST(ConnectionTravelLifecycle,
+     LiveBootstrapFallsBackForEmptyConfiguredServerName) {
+    GameServer server;
+    ConnectionManager manager(&server);
+    const std::shared_ptr<ConfigManager> config =
+        ConnectionTravelLifecycleTestHarness::InstallServerConfig(
+            server, "Initially Valid Server");
+    config->SetString("General.server_name", "");
+    const std::shared_ptr<ClientConnection> connection =
+        ConnectionTravelLifecycleTestHarness::AddClient(
+            manager, 1, "127.0.0.1", 30142, true, 0, false);
+    ASSERT_TRUE(ConnectionTravelLifecycleTestHarness::FreezeRetailBootstrap(
+        manager, 1, {}));
+
+    ScopedEnvironmentVariable replayWorld(
+        "RS2V_REPLAY_CAPTURE_WORLD", "0");
+    ConnectionTravelLifecycleTestHarness::SendActorBootstrap(manager, 1);
+
+    ASSERT_FALSE(connection->IsDisconnected());
+    const std::vector<PacketCodec::Bunch> queued =
+        ConnectionTravelLifecycleTestHarness::QueuedReliableBunches(manager, 1);
+    const PacketCodec::Bunch* gri = FindQueuedOpen(queued, 3u);
+    ASSERT_TRUE(gri != nullptr);
+    const std::optional<std::string> serverName =
+        DecodeLiveGriServerName(*gri);
+    ASSERT_TRUE(serverName.has_value());
+    EXPECT_EQ(*serverName, std::string(ServerNamePolicy::kRetailFallback));
+}
+
+TEST(ConnectionTravelLifecycle,
+     LiveBootstrapFallsBackForUnsafeDirectServerNameMutations) {
+    struct InvalidName {
+        const char* label;
+        std::string value;
+    };
+    const std::vector<InvalidName> invalidNames{
+        {"oversized",
+         std::string(ServerNamePolicy::kMaxEncodedBytes + 1u, 'X')},
+        {"embedded NUL", std::string("Visible\0Hidden", 14u)},
+        {"C0 control", std::string("Bad") + static_cast<char>(0x1Fu) + "Name"},
+        {"DEL", std::string("Bad") + static_cast<char>(0x7Fu) + "Name"},
+        {"non-ASCII", std::string("Bad") + static_cast<char>(0x80u) + "Name"},
+        {"spaces only", std::string(8u, ' ')},
+    };
+
+    uint16_t port = 30143u;
+    for (const InvalidName& invalid : invalidNames) {
+        GameServer server;
+        ConnectionManager manager(&server);
+        const std::shared_ptr<ConfigManager> config =
+            ConnectionTravelLifecycleTestHarness::InstallServerConfig(
+                server, "Initially Valid Server");
+        // Direct mutation deliberately bypasses file-load validation. The wire
+        // boundary must still substitute the retail-safe fallback.
+        config->SetString("General.server_name", invalid.value);
+        const std::shared_ptr<ClientConnection> connection =
+            ConnectionTravelLifecycleTestHarness::AddClient(
+                manager, 1, "127.0.0.1", port++, true, 0, false);
+        ASSERT_TRUE(ConnectionTravelLifecycleTestHarness::FreezeRetailBootstrap(
+            manager, 1, {})) << invalid.label;
+
+        ScopedEnvironmentVariable replayWorld(
+            "RS2V_REPLAY_CAPTURE_WORLD", "0");
+        ConnectionTravelLifecycleTestHarness::SendActorBootstrap(manager, 1);
+
+        ASSERT_FALSE(connection->IsDisconnected()) << invalid.label;
+        const std::vector<PacketCodec::Bunch> queued =
+            ConnectionTravelLifecycleTestHarness::QueuedReliableBunches(
+                manager, 1);
+        const PacketCodec::Bunch* gri = FindQueuedOpen(queued, 3u);
+        ASSERT_TRUE(gri != nullptr) << invalid.label;
+        const std::optional<std::string> serverName =
+            DecodeLiveGriServerName(*gri);
+        ASSERT_TRUE(serverName.has_value()) << invalid.label;
+        EXPECT_EQ(*serverName, std::string(ServerNamePolicy::kRetailFallback))
+            << invalid.label;
+    }
+}
+
+TEST(ConnectionTravelLifecycle,
+     ActiveSupremacyWithoutObjectivesPublishesScalarOnlyGriBaseline) {
+    GameServer server;
+    ConnectionTravelLifecycleTestHarness::InstallEmptyObjectiveSystem(server);
+    ASSERT_TRUE(ConnectionTravelLifecycleTestHarness::InstallActiveSupremacyMode(
+                    server, 321.0f, 777) != nullptr);
+    ASSERT_TRUE(server.GetObjectiveSystem() != nullptr);
+    ASSERT_EQ(server.GetObjectiveSystem()->GetObjectiveCount(), 0u);
+    ConnectionManager manager(&server);
+    const std::shared_ptr<ClientConnection> connection =
+        ConnectionTravelLifecycleTestHarness::AddClient(
+            manager, 1, "127.0.0.1", 30141, true, 0, false);
+    ASSERT_TRUE(ConnectionTravelLifecycleTestHarness::FreezeRetailBootstrap(
+        manager, 1, {}, "VNSU-HueCity", "Supremacy"));
+
+    ScopedEnvironmentVariable replayWorld(
+        "RS2V_REPLAY_CAPTURE_WORLD", "0");
+    ConnectionTravelLifecycleTestHarness::SendActorBootstrap(manager, 1);
+
+    ASSERT_FALSE(connection->IsDisconnected());
+    const std::vector<PacketCodec::Bunch> queued =
+        ConnectionTravelLifecycleTestHarness::QueuedReliableBunches(manager, 1);
+    const auto baseline = std::find_if(
+        queued.begin(), queued.end(), [](const PacketCodec::Bunch& bunch) {
+            return bunch.bReliable && !bunch.bOpen && !bunch.bClose &&
+                   bunch.chIndex == 3u && bunch.chSequence == 2u;
+        });
+    ASSERT_TRUE(baseline != queued.end());
+    EXPECT_EQ(baseline->chType, 2u);
+
+    BitReader reader(baseline->payload.data(), baseline->payload.size(),
+                     baseline->payloadBits);
+    EXPECT_EQ(reader.SerializeInt(ObjectiveRepl::kGriMaxHandle),
+              ObjectiveRepl::kStopCountDown);
+    EXPECT_FALSE(reader.ReadBit());
+    EXPECT_EQ(reader.SerializeInt(ObjectiveRepl::kGriMaxHandle),
+              ObjectiveRepl::kMatchHasBegun);
+    EXPECT_TRUE(reader.ReadBit());
+    EXPECT_EQ(reader.SerializeInt(ObjectiveRepl::kGriMaxHandle),
+              ObjectiveRepl::kTimeLimit);
+    EXPECT_EQ(reader.ReadInt32(), 321);
+    EXPECT_EQ(reader.SerializeInt(ObjectiveRepl::kGriMaxHandle),
+              ObjectiveRepl::kRemainingTime);
+    EXPECT_EQ(reader.ReadInt32(), 321);
+    EXPECT_EQ(reader.SerializeInt(ObjectiveRepl::kGriMaxHandle),
+              ObjectiveRepl::kElapsedTime);
+    EXPECT_EQ(reader.ReadInt32(), 0);
+    for (uint8_t retailTeam = 0; retailTeam < 2u; ++retailTeam) {
+        EXPECT_EQ(reader.SerializeInt(ObjectiveRepl::kGriMaxHandle),
+                  ObjectiveRepl::kSuPointsHeld);
+        EXPECT_EQ(reader.ReadByte(), retailTeam);
+        EXPECT_EQ(reader.ReadInt32(), 0);
+    }
+    EXPECT_EQ(reader.SerializeInt(ObjectiveRepl::kGriMaxHandle),
+              ObjectiveRepl::kSuCurrentScore);
+    EXPECT_EQ(reader.ReadInt32(), 0);
+    EXPECT_EQ(reader.SerializeInt(ObjectiveRepl::kGriMaxHandle),
+              ObjectiveRepl::kSuTargetScore);
+    EXPECT_EQ(reader.ReadInt32(), 777);
+    EXPECT_EQ(reader.SerializeInt(ObjectiveRepl::kGriMaxHandle),
+              ObjectiveRepl::kDisableObjectiveOverview);
+    EXPECT_FALSE(reader.ReadBit());
+    EXPECT_FALSE(reader.IsOverflowed());
+    EXPECT_EQ(reader.BitPos(), baseline->payloadBits);
+
+    EXPECT_TRUE(
+        ConnectionTravelLifecycleTestHarness::ScalarObjectiveBaselineCachesValid(
+            manager, 1));
+}
+
+TEST(ConnectionTravelLifecycle,
+     MappedObjectiveAppearingAfterEmptyBaselineRepublishesMappingFirst) {
+    GameServer server;
+    ConnectionTravelLifecycleTestHarness::InstallEmptyObjectiveSystem(server);
+    ASSERT_TRUE(ConnectionTravelLifecycleTestHarness::InstallActiveSupremacyMode(
+                    server, 321.0f, 777) != nullptr);
+    ConnectionManager manager(&server);
+    const std::shared_ptr<ClientConnection> connection =
+        ConnectionTravelLifecycleTestHarness::AddClient(
+            manager, 1, "127.0.0.1", 30161, true, 0, false);
+    ASSERT_TRUE(ConnectionTravelLifecycleTestHarness::FreezeRetailBootstrap(
+        manager, 1, {}, "VNSU-HueCity", "Supremacy"));
+
+    ScopedEnvironmentVariable replayWorld(
+        "RS2V_REPLAY_CAPTURE_WORLD", "0");
+    ConnectionTravelLifecycleTestHarness::SendActorBootstrap(manager, 1);
+    ASSERT_FALSE(connection->IsDisconnected());
+    ASSERT_TRUE(
+        ConnectionTravelLifecycleTestHarness::ScalarObjectiveBaselineCachesValid(
+            manager, 1));
+
+    ObjectiveSystem* objectives = server.GetObjectiveSystem();
+    ASSERT_TRUE(objectives != nullptr);
+    CaptureZone lateObjective;
+    lateObjective.name = "Late mapped objective";
+    lateObjective.clientSlot = 0u;
+    lateObjective.cookedRepIndex = 42u;
+    ASSERT_NE(objectives->AddObjective(lateObjective), 0u);
+
+    ConnectionTravelLifecycleTestHarness::SendRetailObjectiveState(
+        manager, 1, /*baseline=*/false);
+    ASSERT_FALSE(connection->IsDisconnected());
+    const std::vector<PacketCodec::Bunch> queued =
+        ConnectionTravelLifecycleTestHarness::QueuedReliableBunches(manager, 1);
+    const auto mappingBaseline = std::find_if(
+        queued.begin(), queued.end(), [](const PacketCodec::Bunch& bunch) {
+            return bunch.bReliable && !bunch.bOpen && !bunch.bClose &&
+                   bunch.chIndex == 3u && bunch.chSequence == 3u;
+        });
+    ASSERT_TRUE(mappingBaseline != queued.end());
+    EXPECT_EQ(mappingBaseline->chType, 2u);
+
+    BitReader reader(mappingBaseline->payload.data(),
+                     mappingBaseline->payload.size(),
+                     mappingBaseline->payloadBits);
+    EXPECT_EQ(reader.SerializeInt(ObjectiveRepl::kGriMaxHandle),
+              ObjectiveRepl::kStopCountDown);
+    EXPECT_FALSE(reader.ReadBit());
+    EXPECT_EQ(reader.SerializeInt(ObjectiveRepl::kGriMaxHandle),
+              ObjectiveRepl::kMatchHasBegun);
+    EXPECT_TRUE(reader.ReadBit());
+    EXPECT_EQ(reader.SerializeInt(ObjectiveRepl::kGriMaxHandle),
+              ObjectiveRepl::kTimeLimit);
+    EXPECT_EQ(reader.ReadInt32(), 321);
+    EXPECT_EQ(reader.SerializeInt(ObjectiveRepl::kGriMaxHandle),
+              ObjectiveRepl::kRemainingTime);
+    EXPECT_EQ(reader.ReadInt32(), 321);
+    EXPECT_EQ(reader.SerializeInt(ObjectiveRepl::kGriMaxHandle),
+              ObjectiveRepl::kElapsedTime);
+    EXPECT_EQ(reader.ReadInt32(), 0);
+    for (uint8_t retailTeam = 0; retailTeam < 2u; ++retailTeam) {
+        EXPECT_EQ(reader.SerializeInt(ObjectiveRepl::kGriMaxHandle),
+                  ObjectiveRepl::kSuPointsHeld);
+        EXPECT_EQ(reader.ReadByte(), retailTeam);
+        EXPECT_EQ(reader.ReadInt32(), 0);
+    }
+    EXPECT_EQ(reader.SerializeInt(ObjectiveRepl::kGriMaxHandle),
+              ObjectiveRepl::kSuCurrentScore);
+    EXPECT_EQ(reader.ReadInt32(), 0);
+    EXPECT_EQ(reader.SerializeInt(ObjectiveRepl::kGriMaxHandle),
+              ObjectiveRepl::kSuTargetScore);
+    EXPECT_EQ(reader.ReadInt32(), 777);
+    EXPECT_EQ(reader.SerializeInt(ObjectiveRepl::kGriMaxHandle),
+              ObjectiveRepl::kDisableObjectiveOverview);
+    EXPECT_FALSE(reader.ReadBit());
+
+    // A newly visible cooked slot must be introduced by h179 before any h124
+    // capper struct or h174-h178 state refers to it.
+    EXPECT_EQ(reader.SerializeInt(ObjectiveRepl::kGriMaxHandle),
+              ObjectiveRepl::kRepIndices);
+    EXPECT_EQ(reader.ReadByte(), 0u);
+    EXPECT_EQ(reader.ReadByte(), 42u);
+    EXPECT_EQ(reader.SerializeInt(ObjectiveRepl::kGriMaxHandle),
+              ObjectiveRepl::kObjCappers);
+    EXPECT_EQ(reader.ReadByte(), 0u);
+    EXPECT_EQ(reader.ReadByte(), 0u);
+    EXPECT_EQ(reader.ReadByte(), 0u);
+    EXPECT_EQ(reader.ReadByte(), 0u);
+    EXPECT_EQ(reader.ReadByte(), 0u);
+    for (const uint32_t handle : {
+             ObjectiveRepl::kConnectedToBase,
+             ObjectiveRepl::kSatchelProgress,
+             ObjectiveRepl::kCapProgress,
+             ObjectiveRepl::kForceRatio}) {
+        EXPECT_EQ(reader.SerializeInt(ObjectiveRepl::kGriMaxHandle), handle);
+        EXPECT_EQ(reader.ReadByte(), 0u);
+        EXPECT_EQ(reader.ReadByte(), 0u);
+    }
+    EXPECT_EQ(reader.SerializeInt(ObjectiveRepl::kGriMaxHandle),
+              ObjectiveRepl::kStatus);
+    EXPECT_EQ(reader.ReadByte(), 0u);
+    EXPECT_EQ(reader.ReadByte(), 0x52u);
+    EXPECT_FALSE(reader.IsOverflowed());
+    EXPECT_EQ(reader.BitPos(), mappingBaseline->payloadBits);
+}
+
+TEST(ConnectionTravelLifecycle,
+     MappedObjectiveRemovalOrReindexFailsClosedWithoutPublishingDelta) {
+    enum class Mutation { Remove, Reindex };
+    const std::array<std::pair<const char*, Mutation>, 2> cases{{
+        {"remove", Mutation::Remove},
+        {"reindex", Mutation::Reindex},
+    }};
+
+    uint16_t port = 30162u;
+    for (const auto& [label, mutation] : cases) {
+        GameServer server;
+        ConnectionTravelLifecycleTestHarness::InstallEmptyObjectiveSystem(
+            server);
+        ObjectiveSystem* objectives = server.GetObjectiveSystem();
+        ASSERT_TRUE(objectives != nullptr) << label;
+        CaptureZone mappedObjective;
+        mappedObjective.name = "Initially mapped objective";
+        mappedObjective.clientSlot = 0u;
+        mappedObjective.cookedRepIndex = 42u;
+        const uint32_t objectiveId = objectives->AddObjective(mappedObjective);
+        ASSERT_NE(objectiveId, 0u) << label;
+        ASSERT_TRUE(
+            ConnectionTravelLifecycleTestHarness::InstallActiveSupremacyMode(
+                server, 321.0f, 777) != nullptr) << label;
+
+        ConnectionManager manager(&server);
+        const std::shared_ptr<ClientConnection> connection =
+            ConnectionTravelLifecycleTestHarness::AddClient(
+                manager, 1, "127.0.0.1", port++, true, 0, false);
+        ASSERT_TRUE(ConnectionTravelLifecycleTestHarness::FreezeRetailBootstrap(
+            manager, 1, {}, "VNSU-HueCity", "Supremacy")) << label;
+        ScopedEnvironmentVariable replayWorld(
+            "RS2V_REPLAY_CAPTURE_WORLD", "0");
+        ConnectionTravelLifecycleTestHarness::SendActorBootstrap(manager, 1);
+        ASSERT_FALSE(connection->IsDisconnected()) << label;
+        const size_t queuedBefore =
+            ConnectionTravelLifecycleTestHarness::QueuedReliableBunches(
+                manager, 1).size();
+
+        if (mutation == Mutation::Remove) {
+            objectives->RemoveObjective(objectiveId);
+        } else {
+            CaptureZone* objective = objectives->GetObjective(objectiveId);
+            ASSERT_TRUE(objective != nullptr) << label;
+            objective->cookedRepIndex = 43u;
+        }
+        ConnectionTravelLifecycleTestHarness::SendRetailObjectiveState(
+            manager, 1, /*baseline=*/false);
+
+        EXPECT_TRUE(connection->IsDisconnected()) << label;
+        EXPECT_EQ(ConnectionTravelLifecycleTestHarness::QueuedReliableBunches(
+                      manager, 1).size(),
+                  queuedBefore) << label;
     }
 }
 

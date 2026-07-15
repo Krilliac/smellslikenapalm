@@ -19,6 +19,7 @@
 namespace ObjectiveRepl {
 
 constexpr uint32_t kGriMaxHandle = 184;
+constexpr uint32_t kServerName = 24;
 constexpr uint32_t kTimeLimit = 25;
 constexpr uint32_t kRemainingMinute = 27;
 constexpr uint32_t kElapsedTime = 28;

@@ -1,7 +1,9 @@
 // src/Config/ConfigValidator.cpp
 
 #include "Config/ConfigValidator.h"
+#include "Config/ServerNamePolicy.h"
 #include <algorithm>
+#include <cctype>
 #include "Utils/Logger.h"
 #include "Utils/StringUtils.h"
 #include "Utils/FileUtils.h"
@@ -106,9 +108,27 @@ bool ConfigValidator::ValidateConfigurationFile(const std::string& configFile) {
 void ConfigValidator::ValidateGeneralSection(const std::map<std::string, std::string>& cfg, ValidationResult& r) {
     Logger::Trace("[ConfigValidator::ValidateGeneralSection] Entry");
     Logger::Debug("[ConfigValidator::ValidateGeneralSection] Validating [General] section...");
-    // server_name
-    Logger::Debug("[ConfigValidator::ValidateGeneralSection] Checking required key General.server_name");
-    ValidateRequired(cfg, "General.server_name", r);
+    // server_name: this must match the live GRI h24 policy used by
+    // ConfigManager and ConnectionManager.
+    Logger::Debug("[ConfigValidator::ValidateGeneralSection] Checking General.server_name wire policy");
+    const auto serverName = GetConfig(cfg, "General.server_name");
+    if (!serverName) {
+        ValidateRequired(cfg, "General.server_name", r);
+    } else {
+        const ServerNamePolicy::ValidationError serverNameError =
+            ServerNamePolicy::Validate(*serverName);
+        if (serverNameError != ServerNamePolicy::ValidationError::None) {
+            Logger::Error(
+                "[ConfigValidator::ValidateGeneralSection] General.server_name "
+                "is invalid: %s (encodedBytes=%zu, maximum=%zu)",
+                ServerNamePolicy::Describe(serverNameError), serverName->size(),
+                ServerNamePolicy::kMaxEncodedBytes);
+            r.errors.push_back(
+                std::string("General.server_name is invalid: ") +
+                ServerNamePolicy::Describe(serverNameError));
+            r.isValid = false;
+        }
+    }
     // max_players
     if (auto v = GetConfig(cfg, "General.max_players")) {
         int x = StringToInt(*v);
@@ -421,7 +441,14 @@ bool ConfigValidator::LoadConfigurationFromFile(
     size_t lineNumber = 0;
     while (std::getline(in, line)) {
         ++lineNumber;
-        if (auto p = line.find('#'); p!=std::string::npos) line.erase(p);
+        for (size_t i = 0; i < line.size(); ++i) {
+            if ((line[i] == '#' || line[i] == ';') &&
+                (i == 0 || std::isspace(
+                               static_cast<unsigned char>(line[i - 1])))) {
+                line.erase(i);
+                break;
+            }
+        }
         line = StringUtils::Trim(line);
         if (line.empty()) continue;
         if (line.front()=='[' && line.back()==']') {
@@ -436,6 +463,10 @@ bool ConfigValidator::LoadConfigurationFromFile(
         }
         auto key = StringUtils::Trim(line.substr(0, eq));
         auto val = StringUtils::Trim(line.substr(eq+1));
+        if (key.empty()) {
+            Logger::Warn("[ConfigValidator::LoadConfigurationFromFile] Line %zu: empty key before '=', skipping: '%s'", lineNumber, line.c_str());
+            continue;
+        }
         std::string fullKey = section.empty() ? key : section+"."+key;
         cfg[fullKey] = val;
         Logger::Trace("[ConfigValidator::LoadConfigurationFromFile] Line %zu: loaded %s='%s'", lineNumber, fullKey.c_str(), val.c_str());
