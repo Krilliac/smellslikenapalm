@@ -12,6 +12,7 @@
 #include <cstddef>
 #include <memory>
 #include <optional>
+#include <string_view>
 
 // Factions in RS2V
 enum class Faction : uint8_t {
@@ -90,6 +91,7 @@ struct RetailSquad {
 
     std::array<uint32_t, SLOT_COUNT> slotOwnerIds{};
     uint32_t leaderId = 0;
+    bool locked = false;
 
     size_t Occupancy() const {
         size_t count = 0;
@@ -187,8 +189,27 @@ public:
                                   uint8_t squadIndex) const;
     bool IsRetailSquadLeader(uint32_t playerId) const;
 
+    // Retail ROMapInfo.GetNumSquads behavior. Invalid/non-positive capacities
+    // use the shipped 64-player default instead of accidentally constraining a
+    // match to the smallest roster.
+    static uint8_t ResolveRetailSquadCount(std::string_view modeName,
+                                           int maxPlayers);
+    // Applies map/mode capacity and starts a fresh squad generation. The fixed
+    // ten-element backing arrays remain addressable for replication, while
+    // assignment APIs reject indices outside the active prefix.
+    uint32_t ConfigureRetailSquads(std::string_view modeName, int maxPlayers);
+    uint8_t GetActiveRetailSquadCount() const {
+        return m_activeRetailSquadCount;
+    }
+    // Squad locking affects new automatic and explicit joins. Existing members
+    // remain valid and may repeat an idempotent join request.
+    bool SetRetailSquadLocked(uint32_t teamId, uint8_t squadIndex,
+                              bool locked);
+    bool IsRetailSquadLocked(uint32_t teamId, uint8_t squadIndex) const;
+
     // Starts a fresh map/match generation and invalidates every previous
-    // retail assignment. Generation zero is reserved for invalid results.
+    // retail assignment. The configured active count is retained; all locks
+    // are cleared. Generation zero is reserved for invalid results.
     uint32_t ResetRetailSquads();
     uint32_t GetRetailSquadGeneration() const {
         return m_retailSquadGeneration;
@@ -228,6 +249,7 @@ private:
     std::unordered_map<uint32_t, RetailSquadAssignment>
         m_retailSquadAssignments;
     uint32_t m_retailSquadGeneration = 1;
+    uint8_t m_activeRetailSquadCount = RETAIL_SQUAD_COUNT;
 
     // Commander assignments per team
     std::map<uint32_t, uint32_t> m_teamCommanders;  // teamId -> playerId

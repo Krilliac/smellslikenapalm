@@ -8,12 +8,22 @@
 #include "Network/ControlChannel.h"
 #include "Network/PacketCodec.h"
 #include "Network/SpawnReplication.h"
+#include "Network/RoleSelectionReplication.h"
+#include "Network/SocketFactory.h"
+#include "Network/UDPSocket.h"
+#include "Game/GameServer.h"
+#include "Game/PlayerManager.h"
+#include "Game/RoleSystem.h"
+#include "Game/SpawnSystem.h"
 #include "Game/SupremacyMode.h"
+#include "Game/TeamManager.h"
 #include "TelemetryManager.h"
 #include "Utils/Logger.h"
 
 #include <algorithm>
 #include <array>
+#include <chrono>
+#include <cstddef>
 #include <cstdlib>
 #include <cstdint>
 #include <iostream>
@@ -23,6 +33,7 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -32,9 +43,10 @@ public:
         ConnectionManager& manager, uint32_t clientId,
         const std::string& ip, uint16_t port, bool joined,
         uint32_t ch2Reliable, bool travelPending,
-        const std::string& presentedSteamId = {}) {
+        const std::string& presentedSteamId = {},
+        std::shared_ptr<UDPSocket> socket = nullptr) {
         auto connection = std::make_shared<ClientConnection>(
-            clientId, ip, port, nullptr, &manager);
+            clientId, ip, port, std::move(socket), &manager);
         connection->SetUE3Client(true);
         connection->SetHandshakeComplete(joined);
         if (!presentedSteamId.empty()) {
@@ -49,6 +61,98 @@ public:
         state.outboundActorChannels.set(2u, ch2Reliable != 0u);
         manager.m_nextClientId = std::max(manager.m_nextClientId, clientId + 1u);
         return connection;
+    }
+
+    static void InstallRoleSelectionRuntime(GameServer& server) {
+        server.m_playerManager = std::make_unique<PlayerManager>(&server);
+        server.m_playerManager->Initialize();
+        server.m_teamManager = std::make_unique<TeamManager>(&server);
+        server.m_teamManager->Initialize();
+        server.m_roleSystem = std::make_unique<RoleSystem>(&server);
+        server.m_roleSystem->Initialize();
+        server.m_roleSystem->ConfigureRetailSquads("Territories", 64);
+        server.m_roleSystem->SetTeamFaction(1u, Faction::USArmy);
+        server.m_roleSystem->SetTeamFaction(2u, Faction::NLFSV);
+        server.m_spawnSystem = std::make_unique<SpawnSystem>(&server);
+        server.m_spawnSystem->Initialize();
+
+        SpawnLocation south;
+        south.type = SpawnType::BaseSpawn;
+        south.name = "Cu Chi South base";
+        south.teamId = 1u;
+        south.retailSpawnVolumeRef = 299107u;
+        (void)server.m_spawnSystem->AddSpawnLocation(south);
+
+        SpawnLocation north = south;
+        north.name = "Cu Chi North base";
+        north.teamId = 2u;
+        north.retailSpawnVolumeRef = 299103u;
+        (void)server.m_spawnSystem->AddSpawnLocation(north);
+    }
+
+    static void ResetRoleSelectionRuntime(GameServer& server) {
+        server.m_spawnSystem.reset();
+        server.m_roleSystem.reset();
+        // PlayerManager shutdown consults TeamManager, so preserve that order.
+        server.m_playerManager.reset();
+        server.m_teamManager.reset();
+    }
+
+    static bool AttachRoleSelectionPlayer(
+        GameServer& server, const std::shared_ptr<ClientConnection>& connection,
+        uint32_t teamId) {
+        if (!connection || !server.m_playerManager || !server.m_teamManager) {
+            return false;
+        }
+        connection->SetPlayerName("CuChiRoleTest");
+        server.m_playerManager->OnPlayerConnect(connection);
+        server.m_teamManager->AddPlayerToTeam(connection->GetClientId(), teamId);
+        return server.m_teamManager->GetPlayerTeam(connection->GetClientId()) ==
+               teamId;
+    }
+
+    static bool FreezeCanonicalCuChiSession(ConnectionManager& manager,
+                                            uint32_t clientId) {
+        std::string error;
+        const auto artifact =
+            RetailBootstrap::ResolveArtifactSelection({}, error);
+        const auto profile = RetailBootstrap::ResolveExactProfile(
+            "VNTE-CuChi", "Territories");
+        if (!artifact || !profile) return false;
+
+        auto& state = manager.m_controlState.at(clientId);
+        state.retailArtifactSelectionResolved = true;
+        state.retailArtifactSelection = artifact;
+        state.retailBootstrapProfile = profile;
+        state.teamSelected = true;
+        state.teamInfoChannels = {4u, 5u};
+        return true;
+    }
+
+    struct RoleLedgerSnapshot {
+        bool accepted = false;
+        bool finalized = false;
+        bool priClassReplicated = false;
+        uint32_t roleInfoObjectRef = 0;
+        uint8_t classIndex = 255;
+        uint8_t squadIndex = 255;
+        uint8_t roleIndex = 255;
+        std::optional<RoleSelectionRepl::ChangedRoleEvidence> changedRole;
+    };
+
+    static RoleLedgerSnapshot RoleLedger(const ConnectionManager& manager,
+                                         uint32_t clientId) {
+        const auto& state = manager.m_controlState.at(clientId);
+        return RoleLedgerSnapshot{
+            state.roleSelectionAccepted,
+            state.roleFinalized,
+            state.roleClassReplicated,
+            state.selectedRoleInfoObjectRef,
+            state.selectedRoleClassIndex,
+            state.selectedRoleSquadIndex,
+            state.selectedRoleIndex,
+            state.selectedChangedRole,
+        };
     }
 
     static void AddNullClientEntry(ConnectionManager& manager,
@@ -276,6 +380,12 @@ public:
     DeploymentState(
         const ConnectionManager& manager, uint32_t clientId) {
         return manager.m_deploymentCoordinator.GetClientState(clientId);
+    }
+
+    static bool DeploymentPrepared(const ConnectionManager& manager,
+                                   uint32_t clientId) {
+        return manager.m_deploymentCoordinator.IsPreparedForDeployment(
+            clientId);
     }
 
     static bool AuthorizePublishedSpawn(ConnectionManager& manager,
@@ -818,6 +928,183 @@ std::vector<uint8_t> ControlCloseDatagram() {
     packet.bunches.push_back(close);
     return EncodeClientPacket(packet);
 }
+
+class ConnectionTravelCuChiRoleIntegrationTest : public ::rs2v::Test {
+protected:
+    void SetUp() override {
+        ASSERT_TRUE(SocketFactory::Initialize());
+        receiverPorts_[0] = BindReceiver(receiverOne_);
+        receiverPorts_[1] = BindReceiver(receiverTwo_);
+        ASSERT_NE(receiverPorts_[0], 0u);
+        ASSERT_NE(receiverPorts_[1], 0u);
+
+        sender_ = std::make_shared<UDPSocket>();
+        ASSERT_TRUE(sender_->Bind(0));
+        ConnectionTravelLifecycleTestHarness::InstallRoleSelectionRuntime(
+            server_);
+    }
+
+    void TearDown() override {
+        ConnectionTravelLifecycleTestHarness::ResetRoleSelectionRuntime(
+            server_);
+        if (sender_) sender_->Close();
+        sender_.reset();
+        receiverOne_.Close();
+        receiverTwo_.Close();
+        SocketFactory::Shutdown();
+    }
+
+    std::shared_ptr<ClientConnection> Connect(size_t receiverIndex,
+                                              uint32_t clientId,
+                                              uint32_t teamId) {
+        if (receiverIndex >= receiverPorts_.size()) return nullptr;
+        auto connection = ConnectionTravelLifecycleTestHarness::AddClient(
+            manager_, clientId, "127.0.0.1", receiverPorts_[receiverIndex],
+            true, 7u, false, {}, sender_);
+        if (!ConnectionTravelLifecycleTestHarness::AttachRoleSelectionPlayer(
+                server_, connection, teamId) ||
+            !ConnectionTravelLifecycleTestHarness::FreezeCanonicalCuChiSession(
+                manager_, clientId)) {
+            return nullptr;
+        }
+        return connection;
+    }
+
+    static PacketCodec::Bunch CuChiFinalRoleBunch(bool south) {
+        return MakeCapturedPcBunch(
+            south
+                ? std::vector<uint8_t>{
+                      0xaf, 0x26, 0x5c, 0x15, 0x00, 0x80, 0xc3, 0x01}
+                : std::vector<uint8_t>{
+                      0xaf, 0x64, 0x56, 0x15, 0x00, 0x80, 0xc3, 0x01},
+            57u);
+    }
+
+    std::vector<PacketCodec::Packet> DrainDecodedPackets(
+        size_t receiverIndex) {
+        UDPSocket* receiver = Receiver(receiverIndex);
+        if (!receiver) return {};
+
+        std::vector<PacketCodec::Packet> packets;
+        const auto deadline = std::chrono::steady_clock::now() +
+            std::chrono::milliseconds(50);
+        size_t idlePollsAfterTraffic = 0u;
+        while (packets.size() < 32u &&
+               std::chrono::steady_clock::now() < deadline) {
+            std::string sourceIp;
+            uint16_t sourcePort = 0u;
+            std::vector<uint8_t> bytes(
+                PacketCodec::kServerSendMaxPacketBytes + 64u);
+            const int received = receiver->ReceiveFrom(
+                sourceIp, sourcePort, bytes.data(),
+                static_cast<int>(bytes.size()));
+            if (received <= 0) {
+                if (!packets.empty() && ++idlePollsAfterTraffic >= 3u) break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                continue;
+            }
+            idlePollsAfterTraffic = 0u;
+            bytes.resize(static_cast<size_t>(received));
+            packets.push_back(PacketCodec::Decode(
+                bytes.data(), bytes.size(),
+                PacketCodec::kServerSendMaxPacketBytes));
+        }
+        return packets;
+    }
+
+    static std::vector<PacketCodec::Bunch> FlattenBunches(
+        const std::vector<PacketCodec::Packet>& packets) {
+        std::vector<PacketCodec::Bunch> bunches;
+        for (const PacketCodec::Packet& packet : packets) {
+            bunches.insert(bunches.end(), packet.bunches.begin(),
+                           packet.bunches.end());
+        }
+        return bunches;
+    }
+
+    static PacketCodec::Bunch ExpectedOwnerPriClass(uint8_t classIndex) {
+        BitWriter writer;
+        RoleSelectionRepl::WriteOwnerPriClassIndex(writer, classIndex);
+
+        PacketCodec::Bunch bunch;
+        bunch.bReliable = false;
+        bunch.chIndex = 26u;
+        bunch.payload = writer.GetBytes();
+        bunch.payloadBits = static_cast<uint32_t>(writer.NumBits());
+        return bunch;
+    }
+
+    static PacketCodec::Bunch ExpectedChangedRole(
+        const RoleSelectionRepl::ChangedRoleEvidence& evidence) {
+        PacketCodec::Bunch bunch;
+        bunch.bReliable = true;
+        bunch.chIndex = 2u;
+        bunch.payload = RoleSelectionRepl::EncodeChangedRoleTransition(
+            evidence, bunch.payloadBits);
+        return bunch;
+    }
+
+    static PacketCodec::Bunch ExpectedOwnerPriAssignment(
+        uint8_t squadIndex, uint8_t roleIndex) {
+        BitWriter writer;
+        RoleSelectionRepl::WriteOwnerPriRoleAssignment(
+            writer, squadIndex, roleIndex);
+
+        PacketCodec::Bunch bunch;
+        bunch.bReliable = false;
+        bunch.chIndex = 26u;
+        bunch.payload = writer.GetBytes();
+        bunch.payloadBits = static_cast<uint32_t>(writer.NumBits());
+        return bunch;
+    }
+
+    static size_t FindWireBunch(
+        const std::vector<PacketCodec::Bunch>& bunches,
+        const PacketCodec::Bunch& expected, size_t begin = 0u) {
+        const auto found = std::find_if(
+            bunches.begin() + static_cast<std::ptrdiff_t>(
+                                  std::min(begin, bunches.size())),
+            bunches.end(),
+            [&expected](const PacketCodec::Bunch& bunch) {
+                return bunch.bReliable == expected.bReliable &&
+                       bunch.chIndex == expected.chIndex &&
+                       bunch.payloadBits == expected.payloadBits &&
+                       bunch.payload == expected.payload;
+            });
+        return found == bunches.end()
+            ? bunches.size()
+            : static_cast<size_t>(std::distance(bunches.begin(), found));
+    }
+
+    GameServer server_;
+    ConnectionManager manager_{&server_};
+
+private:
+    UDPSocket* Receiver(size_t receiverIndex) {
+        if (receiverIndex == 0u) return &receiverOne_;
+        if (receiverIndex == 1u) return &receiverTwo_;
+        return nullptr;
+    }
+
+    static uint16_t BindReceiver(UDPSocket& receiver) {
+        constexpr uint32_t kFirstPort = 32000u;
+        constexpr uint32_t kPortCount = 16000u;
+        const auto seed = static_cast<uint64_t>(
+            std::chrono::steady_clock::now().time_since_epoch().count());
+        const uint32_t start = static_cast<uint32_t>(seed % kPortCount);
+        for (uint32_t offset = 0; offset < 2048u; ++offset) {
+            const auto port = static_cast<uint16_t>(
+                kFirstPort + ((start + offset) % kPortCount));
+            if (receiver.Bind(port)) return port;
+        }
+        return 0u;
+    }
+
+    UDPSocket receiverOne_;
+    UDPSocket receiverTwo_;
+    std::array<uint16_t, 2> receiverPorts_{};
+    std::shared_ptr<UDPSocket> sender_;
+};
 
 } // namespace
 
@@ -1718,6 +2005,202 @@ TEST(ConnectionTravelLifecycle,
 
     EXPECT_TRUE(connection->IsDisconnected());
     EXPECT_FALSE(Harness::TeamSelected(manager, 1));
+}
+
+TEST_F(ConnectionTravelCuChiRoleIntegrationTest,
+       CanonicalSouthAndNorthFinalRequestsCommitRuntimeSquadAndRoleLedger) {
+    using Harness = ConnectionTravelLifecycleTestHarness;
+    struct RoleCase {
+        uint32_t clientId;
+        uint32_t teamId;
+        bool south;
+        uint32_t roleInfoRef;
+    };
+    const std::array<RoleCase, 2> cases{{
+        {1u, RoleSelectionRepl::kCuChiUsServerTeam, true,
+         RoleSelectionRepl::kCuChiSouthGruntRoleInfoObjectRef},
+        {2u, RoleSelectionRepl::kCuChiNlfServerTeam, false,
+         RoleSelectionRepl::kCuChiNorthGuerillaRoleInfoObjectRef},
+    }};
+
+    RoleSystem* roles = server_.GetRoleSystem();
+    ASSERT_TRUE(roles != nullptr);
+    for (size_t index = 0; index < cases.size(); ++index) {
+        const RoleCase& entry = cases[index];
+        ASSERT_TRUE(Connect(index, entry.clientId, entry.teamId) != nullptr);
+        const uint32_t nextReliableBefore =
+            Harness::NextCh2Reliable(manager_, entry.clientId);
+
+        Harness::DeliverActorBunch(
+            manager_, entry.clientId, CuChiFinalRoleBunch(entry.south));
+
+        const std::vector<PacketCodec::Packet> packets =
+            DrainDecodedPackets(index);
+        ASSERT_FALSE(packets.empty());
+        for (const PacketCodec::Packet& packet : packets) {
+            ASSERT_TRUE(packet.ok);
+        }
+        const std::vector<PacketCodec::Bunch> wireBunches =
+            FlattenBunches(packets);
+        const PacketCodec::Bunch expectedClass = ExpectedOwnerPriClass(
+            RoleSelectionRepl::kCuChiInfantryClassIndex);
+        const PacketCodec::Bunch expectedTransition = ExpectedChangedRole(
+            RoleSelectionRepl::ChangedRoleEvidence{
+                255u, RoleSelectionRepl::kCuChiInfantryClassIndex,
+                false, true,
+                RoleSelectionRepl::ChangedSquadEvidence{0u, 0u}});
+        ASSERT_EQ(expectedTransition.payloadBits, 32u);
+        EXPECT_EQ(expectedTransition.payload,
+                  (std::vector<uint8_t>{0xd2, 0xfe, 0x73, 0x1a}));
+        const PacketCodec::Bunch expectedAssignment =
+            ExpectedOwnerPriAssignment(0u, 0u);
+        const size_t classPosition =
+            FindWireBunch(wireBunches, expectedClass);
+        const size_t transitionPosition =
+            FindWireBunch(wireBunches, expectedTransition);
+        const size_t assignmentPosition =
+            FindWireBunch(wireBunches, expectedAssignment);
+        ASSERT_LT(classPosition, wireBunches.size());
+        ASSERT_LT(transitionPosition, wireBunches.size());
+        ASSERT_LT(assignmentPosition, wireBunches.size());
+        EXPECT_LT(classPosition, transitionPosition);
+        EXPECT_LT(transitionPosition, assignmentPosition);
+        EXPECT_EQ(wireBunches[transitionPosition].chSequence,
+                  nextReliableBefore);
+
+        BitReader classReader(
+            wireBunches[classPosition].payload.data(),
+            wireBunches[classPosition].payload.size(),
+            wireBunches[classPosition].payloadBits);
+        EXPECT_EQ(classReader.SerializeInt(
+                      RoleSelectionRepl::kRoPlayerReplicationInfoMaxHandle),
+                  RoleSelectionRepl::kPriClassIndexHandle);
+        EXPECT_EQ(classReader.ReadBits(8),
+                  RoleSelectionRepl::kCuChiInfantryClassIndex);
+        EXPECT_FALSE(classReader.IsOverflowed());
+        EXPECT_EQ(classReader.BitPos(),
+                  wireBunches[classPosition].payloadBits);
+
+        BitReader assignmentReader(
+            wireBunches[assignmentPosition].payload.data(),
+            wireBunches[assignmentPosition].payload.size(),
+            wireBunches[assignmentPosition].payloadBits);
+        EXPECT_EQ(assignmentReader.SerializeInt(
+                      RoleSelectionRepl::kRoPlayerReplicationInfoMaxHandle),
+                  RoleSelectionRepl::kPriSquadIndexHandle);
+        EXPECT_EQ(assignmentReader.ReadBits(8), 0u);
+        EXPECT_EQ(assignmentReader.SerializeInt(
+                      RoleSelectionRepl::kRoPlayerReplicationInfoMaxHandle),
+                  RoleSelectionRepl::kPriRoleIndexHandle);
+        EXPECT_EQ(assignmentReader.ReadBits(8), 0u);
+        EXPECT_FALSE(assignmentReader.IsOverflowed());
+        EXPECT_EQ(assignmentReader.BitPos(),
+                  wireBunches[assignmentPosition].payloadBits);
+
+        const auto assignment =
+            roles->GetRetailSquadAssignment(entry.clientId);
+        ASSERT_TRUE(assignment.has_value());
+        EXPECT_EQ(assignment->teamId, entry.teamId);
+        EXPECT_EQ(assignment->squadIndex, 0u);
+        EXPECT_EQ(assignment->roleIndex, 0u);
+        EXPECT_EQ(roles->GetRoleCount(entry.teamId, CombatRole::Rifleman), 1);
+
+        const Harness::RoleLedgerSnapshot ledger =
+            Harness::RoleLedger(manager_, entry.clientId);
+        EXPECT_TRUE(ledger.accepted);
+        EXPECT_TRUE(ledger.finalized);
+        EXPECT_TRUE(ledger.priClassReplicated);
+        EXPECT_EQ(ledger.roleInfoObjectRef, entry.roleInfoRef);
+        EXPECT_EQ(ledger.classIndex,
+                  RoleSelectionRepl::kCuChiInfantryClassIndex);
+        EXPECT_EQ(ledger.squadIndex, 0u);
+        EXPECT_EQ(ledger.roleIndex, 0u);
+        ASSERT_TRUE(ledger.changedRole.has_value());
+        EXPECT_EQ(ledger.changedRole->squadIndex, 255u);
+        EXPECT_EQ(ledger.changedRole->classIndex,
+                  RoleSelectionRepl::kCuChiInfantryClassIndex);
+        EXPECT_FALSE(ledger.changedRole->showLobby);
+        EXPECT_TRUE(ledger.changedRole->showSpawnSelect);
+        ASSERT_TRUE(ledger.changedRole->followingChangedSquad.has_value());
+        EXPECT_EQ(ledger.changedRole->followingChangedSquad->squadIndex, 0u);
+        EXPECT_EQ(ledger.changedRole->followingChangedSquad->roleIndex, 0u);
+
+        const auto deployment =
+            Harness::DeploymentState(manager_, entry.clientId);
+        ASSERT_TRUE(deployment.has_value());
+        EXPECT_TRUE(deployment->roleFinalized);
+        EXPECT_FALSE(deployment->selectedSlot.has_value());
+        EXPECT_FALSE(deployment->selectedSpawnId.has_value());
+        EXPECT_FALSE(deployment->deploymentAuthorized);
+        EXPECT_FALSE(Harness::DeploymentPrepared(manager_, entry.clientId));
+        EXPECT_EQ(Harness::NextCh2Reliable(manager_, entry.clientId),
+                  nextReliableBefore + 1u);
+        EXPECT_EQ(Harness::PendingReliableCount(manager_, entry.clientId),
+                  static_cast<size_t>(1));
+    }
+}
+
+TEST_F(ConnectionTravelCuChiRoleIntegrationTest,
+       LockedAndFullSquadRejectionsLeaveRoleTransactionUnchanged) {
+    using Harness = ConnectionTravelLifecycleTestHarness;
+    RoleSystem* roles = server_.GetRoleSystem();
+    ASSERT_TRUE(roles != nullptr);
+
+    ASSERT_TRUE(Connect(0u, 11u, RoleSelectionRepl::kCuChiUsServerTeam) !=
+                nullptr);
+    for (uint8_t squad = 0; squad < roles->GetActiveRetailSquadCount();
+         ++squad) {
+        ASSERT_TRUE(roles->SetRetailSquadLocked(
+            RoleSelectionRepl::kCuChiUsServerTeam, squad, true));
+    }
+    const uint32_t lockedNextReliable = Harness::NextCh2Reliable(manager_, 11u);
+    Harness::DeliverActorBunch(manager_, 11u, CuChiFinalRoleBunch(true));
+    EXPECT_TRUE(DrainDecodedPackets(0u).empty());
+    EXPECT_FALSE(roles->GetRetailSquadAssignment(11u).has_value());
+    EXPECT_EQ(roles->GetRoleCount(
+                  RoleSelectionRepl::kCuChiUsServerTeam,
+                  CombatRole::Rifleman),
+              0);
+    const Harness::RoleLedgerSnapshot locked = Harness::RoleLedger(manager_, 11u);
+    EXPECT_FALSE(locked.accepted);
+    EXPECT_FALSE(locked.finalized);
+    EXPECT_FALSE(locked.priClassReplicated);
+    EXPECT_FALSE(locked.changedRole.has_value());
+    EXPECT_EQ(locked.squadIndex, 255u);
+    EXPECT_EQ(locked.roleIndex, 255u);
+    EXPECT_EQ(Harness::NextCh2Reliable(manager_, 11u), lockedNextReliable);
+    EXPECT_EQ(Harness::PendingReliableCount(manager_, 11u),
+              static_cast<size_t>(0));
+
+    ASSERT_TRUE(Connect(1u, 12u, RoleSelectionRepl::kCuChiNlfServerTeam) !=
+                nullptr);
+    const size_t northCapacity =
+        static_cast<size_t>(roles->GetActiveRetailSquadCount()) *
+        RetailSquad::SLOT_COUNT;
+    for (size_t slot = 0; slot < northCapacity; ++slot) {
+        const RetailSquadAssignment occupied = roles->AutoAssignRetailSquad(
+            1000u + static_cast<uint32_t>(slot),
+            RoleSelectionRepl::kCuChiNlfServerTeam);
+        ASSERT_TRUE(occupied.IsValid());
+    }
+    const uint32_t fullNextReliable = Harness::NextCh2Reliable(manager_, 12u);
+    Harness::DeliverActorBunch(manager_, 12u, CuChiFinalRoleBunch(false));
+    EXPECT_TRUE(DrainDecodedPackets(1u).empty());
+    EXPECT_FALSE(roles->GetRetailSquadAssignment(12u).has_value());
+    EXPECT_EQ(roles->GetRoleCount(
+                  RoleSelectionRepl::kCuChiNlfServerTeam,
+                  CombatRole::Rifleman),
+              0);
+    const Harness::RoleLedgerSnapshot full = Harness::RoleLedger(manager_, 12u);
+    EXPECT_FALSE(full.accepted);
+    EXPECT_FALSE(full.finalized);
+    EXPECT_FALSE(full.priClassReplicated);
+    EXPECT_FALSE(full.changedRole.has_value());
+    EXPECT_EQ(full.squadIndex, 255u);
+    EXPECT_EQ(full.roleIndex, 255u);
+    EXPECT_EQ(Harness::NextCh2Reliable(manager_, 12u), fullNextReliable);
+    EXPECT_EQ(Harness::PendingReliableCount(manager_, 12u),
+              static_cast<size_t>(0));
 }
 
 TEST(ConnectionTravelLifecycle,

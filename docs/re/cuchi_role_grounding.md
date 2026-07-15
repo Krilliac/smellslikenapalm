@@ -93,21 +93,21 @@ known pairs reconcile exactly:
 39479 + 48013 = 87492  (captured Southern Grunt SK)
 ```
 
-Therefore, **when the connection exports the same `ROGame` package base** used
-by the emulator's captured PackageMap bootstrap, Cu Chi class-0 role objects
-are exactly:
+Therefore, **when role grounding uses the same historical +1 registry token**
+recovered from the captured bootstrap, Cu Chi class-0 role objects are exactly:
 
 ```text
 North / NLF / Guerilla: 39479 + 47919 = 87398
 South / US / Grunt:     39479 + 48011 = 87490
 ```
 
-The PackageMap-base condition matters. A map import `FPackageIndex` such as
+The registry-token condition matters. A map import `FPackageIndex` such as
 `-92` is not the wire object reference, and a linker export index alone is not
-the wire object reference. Before wiring these numbers, assert that the
-Cu Chi connection still uses `ROGame.ObjectBase == 39479`. The current server
-replays one captured bootstrap and carries that exact base in the frozen retail
-profile; semantic role grounding rejects every other or unknown base.
+the wire object reference. The canonical package's actual `ROGame.ObjectBase`
+is 39478; 39479 is the separately pinned historical +1 token against which the
+role decoder was grounded. The frozen retail profile must retain that token,
+and semantic role grounding rejects every other or unknown value. Do not
+replace it with an artifact layout base without migrating the registry.
 
 ## Squads are runtime state, not cooked definitions
 
@@ -143,28 +143,55 @@ prevented Cu Chi and other maps from working correctly:
    it must not be generalized to a Territories profile without proving the
    actual game-type context that produced the capture.
 
-The first bounded C++ slice is now wired as an authorization-only path:
+The bounded canonical C++ path now carries the request through live squad and
+spawn-selection authority:
 
 1. the decoder admits only the four exact Resort/Cu Chi role object references;
 2. `ResolveGroundedCuChiInfantry` requires exact Cu Chi, Territories, server
-   team/intent, class-0 CDO, and `ROGame.ObjectBase == 39479` inputs; and
-3. valid South/US and North/NLF results deliberately leave `ChangedRole`,
-   `SquadIndex`, and `RoleIndex` unset (`255`). `ConnectionManager` rejects the
-   request before any `RoleSystem` or deployment mutation.
+   team/intent, class-0 CDO, and historical role-registry token 39479 inputs;
+3. map activation derives the active 2/4/8/10 squad prefix from the configured
+   maximum players while retaining ten stable replication entries per team;
+4. `AutoAssignRetailSquad` transactionally chooses the most populated active,
+   unlocked, non-full squad and its first free slot among the six retail slots;
+5. `ConnectionManager` maps Cu Chi class 0 to Rifleman, publishes owner-PRI h79,
+   derives h210+h211 from the live assignment, publishes the owner-PRI squad and
+   role properties, and advances spawn selection only after every mutation and
+   publication precondition succeeds; and
+6. map/match reset advances the squad generation, clears locks and membership,
+   and prevents reconnects from inheriting stale occupancy.
 
-That last gate is necessary because the emulator's current `RoleSystem` is not
-yet an exact substrate for `ServerAutoSelectSquad`: it constructs a fixed eight
-squads per team, has no retail squad-lock state or max-player-derived 2/4/8/10
-count, and joining the first member of an empty squad changes their combat role
-to `SquadLeader`. Reusing the Resort capture's 8/5 or 2/3 occupancy tuple would
-be less correct than failing closed.
+The exact clean-server Cu Chi final requests are 57-bit
+`af265c150080c301` (South/US Grunt, object 87490) and
+`af6456150080c301` (North/NLF Guerilla, object 87398). The first live assignment
+is squad 0, slot 0, so its combined ChangedRole/ChangedSquad payload is the
+32-bit `d2fe731a`; Resort's captured 8/5 and 2/3 occupancy values are never
+reused.
 
-The next safe implementation slice is therefore to model the source-exact live
-squad count, lock, membership, and six role-slot states; allocate the most
-populated eligible squad and first empty slot transactionally; then derive the
-`ChangedRole` arguments from that authoritative result. A Cu Chi retail or
-capture-driven regression must select both sides, close the menu, spawn, and
-reconnect without preserving stale squad occupancy before the gate is removed.
+This path is deliberately **canonical-only**. Leave
+`RS2V_REPLICATION_BOOTSTRAP_VARIANT` unset when exercising Cu Chi. The installed
+artifact currently advertises `roleRegistryGrounded=false`, so an installed
+Cu Chi h175 request fails closed before role, squad, PRI, or deployment state
+changes. Installed support requires an independently grounded PackageMap role
+registry; export-index arithmetic alone is not sufficient evidence.
+
+## Canonical live verification
+
+On 2026-07-15, a Debug server loaded the installed `VNTE-CuChi.roe` read-only
+under the canonical artifact, activated Territories with US Army/NLFSV, loaded
+all seven cooked objective identities and ten deployment starts, and configured
+ten active squads for a 64-player server. The retail-protocol mock then passed:
+
+- South class-0 h175 -> live squad/slot 0/0 -> exact owning pawn/loadout graph;
+- North class-0 h175 -> live squad/slot 0/0 -> exact 32-bit h210+h211 transition
+  plus owning pawn/loadout graph;
+- a two-session same-UDP-endpoint reconnect with packet/channel cursors reset;
+  and
+- a repeated South role/spawn after disconnect, again assigned squad/slot 0/0.
+
+Server logs froze the canonical artifact with actual ROGame ObjectBase 39478,
+accepted clients 1, 2, and 5 at squad/slot 0/0, and removed each disconnected
+session before the next selection. This is direct evidence that captured Resort
+occupancy is not reused and stale Cu Chi membership does not survive reconnect.
 
 Remaining evidence work for full role coverage is mechanical but must stay
 exact: extract all `ROGame.u` role CDO exports, apply the source force/game-mode

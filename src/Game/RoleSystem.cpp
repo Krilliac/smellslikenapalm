@@ -7,6 +7,7 @@
 #include "Game/TeamManager.h"
 #include "Utils/Logger.h"
 #include <algorithm>
+#include <cctype>
 
 RoleSystem::RoleSystem(GameServer* server)
     : m_server(server)
@@ -348,6 +349,57 @@ void RoleSystem::DisbandSquad(uint32_t squadId) {
     m_squads.erase(it);
 }
 
+uint8_t RoleSystem::ResolveRetailSquadCount(std::string_view modeName,
+                                            int maxPlayers) {
+    // Retail defaults an absent/invalid MaxPlayers value to the normal
+    // 64-player server capacity.
+    if (maxPlayers <= 0) maxPlayers = 64;
+
+    std::string normalizedMode(modeName);
+    std::transform(
+        normalizedMode.begin(), normalizedMode.end(), normalizedMode.begin(),
+        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    const bool isSkirmish =
+        normalizedMode.find("skirm") != std::string::npos;
+
+    // Source-exact ROMapInfo.GetNumSquads thresholds. Skirmish has its own
+    // small-server branch through 24 players, then falls through to the normal
+    // 25+ behavior.
+    if (isSkirmish && maxPlayers <= 24) {
+        return maxPlayers <= 12 ? 1 : 2;
+    }
+    if (maxPlayers <= 12) return 2;
+    if (maxPlayers <= 24) return 4;
+    if (maxPlayers <= 32) return 8;
+    return RETAIL_SQUAD_COUNT;
+}
+
+uint32_t RoleSystem::ConfigureRetailSquads(std::string_view modeName,
+                                           int maxPlayers) {
+    m_activeRetailSquadCount =
+        ResolveRetailSquadCount(modeName, maxPlayers);
+    return ResetRetailSquads();
+}
+
+bool RoleSystem::SetRetailSquadLocked(uint32_t teamId, uint8_t squadIndex,
+                                      bool locked) {
+    if (teamId == 0 || teamId > RETAIL_TEAM_COUNT ||
+        squadIndex >= m_activeRetailSquadCount) {
+        return false;
+    }
+    m_retailSquads[teamId - 1][squadIndex].locked = locked;
+    return true;
+}
+
+bool RoleSystem::IsRetailSquadLocked(uint32_t teamId,
+                                     uint8_t squadIndex) const {
+    if (teamId == 0 || teamId > RETAIL_TEAM_COUNT ||
+        squadIndex >= m_activeRetailSquadCount) {
+        return false;
+    }
+    return m_retailSquads[teamId - 1][squadIndex].locked;
+}
+
 RetailSquadAssignment RoleSystem::AutoAssignRetailSquad(uint32_t playerId,
                                                         uint32_t teamId) {
     RetailSquadAssignment invalid;
@@ -411,6 +463,10 @@ RetailSquadAssignment RoleSystem::JoinRetailSquad(
         current->squadIndex == requestedSquadIndex) {
         return *current;
     }
+    if (requestedSquadIndex >= m_activeRetailSquadCount ||
+        m_retailSquads[authoritativeTeamId - 1][requestedSquadIndex].locked) {
+        return invalid;
+    }
 
     RetailSquadAssignment selected;
     selected.teamId = authoritativeTeamId;
@@ -464,9 +520,10 @@ RetailSquadAssignment RoleSystem::FindRetailSquadSlot(uint32_t teamId) const {
 
     const RetailSquadTeam& squads = m_retailSquads[teamId - 1];
     size_t selectedOccupancy = 0;
-    for (uint8_t squadIndex = 0; squadIndex < RETAIL_SQUAD_COUNT;
+    for (uint8_t squadIndex = 0; squadIndex < m_activeRetailSquadCount;
          ++squadIndex) {
         const RetailSquad& squad = squads[squadIndex];
+        if (squad.locked) continue;
         const size_t occupancy = squad.Occupancy();
         if (occupancy >= RetailSquad::SLOT_COUNT) continue;
         if (selected.squadIndex !=
@@ -502,7 +559,7 @@ RoleSystem::GetRetailSquadAssignment(uint32_t playerId) const {
     if (!assignment.IsValid() ||
         assignment.generation != m_retailSquadGeneration ||
         assignment.teamId > RETAIL_TEAM_COUNT ||
-        assignment.squadIndex >= RETAIL_SQUAD_COUNT ||
+        assignment.squadIndex >= m_activeRetailSquadCount ||
         assignment.roleIndex >= RetailSquad::SLOT_COUNT) {
         return std::nullopt;
     }
@@ -569,6 +626,16 @@ void RoleSystem::ReconcileRetailSquads(uint32_t removingPlayerId) {
         m_retailSquadAssignments.erase(removingPlayerId);
     }
 
+    // Inactive stable indices must never retain owners or locks. This also
+    // makes reconciliation a recovery boundary for raw/stale state injected
+    // before a capacity reduction.
+    for (RetailSquadTeam& team : m_retailSquads) {
+        for (uint8_t squadIndex = m_activeRetailSquadCount;
+             squadIndex < RETAIL_SQUAD_COUNT; ++squadIndex) {
+            team[squadIndex] = {};
+        }
+    }
+
     // Reject invalid reverse records first. Their owner slots become orphans
     // and are removed by the following grid sweep.
     for (auto it = m_retailSquadAssignments.begin();
@@ -577,7 +644,7 @@ void RoleSystem::ReconcileRetailSquads(uint32_t removingPlayerId) {
         if (it->first == 0 || !assignment.IsValid() ||
             assignment.generation != m_retailSquadGeneration ||
             assignment.teamId > RETAIL_TEAM_COUNT ||
-            assignment.squadIndex >= RETAIL_SQUAD_COUNT ||
+            assignment.squadIndex >= m_activeRetailSquadCount ||
             assignment.roleIndex >= RetailSquad::SLOT_COUNT) {
             it = m_retailSquadAssignments.erase(it);
         } else {
@@ -588,7 +655,9 @@ void RoleSystem::ReconcileRetailSquads(uint32_t removingPlayerId) {
     // Every retained owner slot must have a live reverse record. Also remove
     // every occurrence of the departing player, including stale duplicates.
     for (RetailSquadTeam& team : m_retailSquads) {
-        for (RetailSquad& squad : team) {
+        for (uint8_t squadIndex = 0; squadIndex < m_activeRetailSquadCount;
+             ++squadIndex) {
+            RetailSquad& squad = team[squadIndex];
             for (uint32_t& ownerId : squad.slotOwnerIds) {
                 if (ownerId == 0) continue;
                 if (ownerId == removingPlayerId ||
@@ -615,7 +684,8 @@ void RoleSystem::ReconcileRetailSquads(uint32_t removingPlayerId) {
 
         for (uint32_t teamId = 1; teamId <= RETAIL_TEAM_COUNT; ++teamId) {
             RetailSquadTeam& team = m_retailSquads[teamId - 1];
-            for (uint8_t squadIndex = 0; squadIndex < RETAIL_SQUAD_COUNT;
+            for (uint8_t squadIndex = 0;
+                 squadIndex < m_activeRetailSquadCount;
                  ++squadIndex) {
                 RetailSquad& squad = team[squadIndex];
                 for (uint8_t roleIndex = 0;
@@ -643,7 +713,8 @@ void RoleSystem::ReconcileRetailSquads(uint32_t removingPlayerId) {
 
         for (uint32_t teamId = 1; teamId <= RETAIL_TEAM_COUNT; ++teamId) {
             RetailSquadTeam& team = m_retailSquads[teamId - 1];
-            for (uint8_t squadIndex = 0; squadIndex < RETAIL_SQUAD_COUNT;
+            for (uint8_t squadIndex = 0;
+                 squadIndex < m_activeRetailSquadCount;
                  ++squadIndex) {
                 RetailSquad& squad = team[squadIndex];
                 for (uint8_t roleIndex = 0;
@@ -665,7 +736,8 @@ void RoleSystem::ReconcileRetailSquads(uint32_t removingPlayerId) {
     }
 
     for (uint32_t teamId = 1; teamId <= RETAIL_TEAM_COUNT; ++teamId) {
-        for (uint8_t squadIndex = 0; squadIndex < RETAIL_SQUAD_COUNT;
+        for (uint8_t squadIndex = 0;
+             squadIndex < m_activeRetailSquadCount;
              ++squadIndex) {
             RepairRetailSquad(teamId, squadIndex);
         }

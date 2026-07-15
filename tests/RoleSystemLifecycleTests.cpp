@@ -58,6 +58,11 @@ public:
         return roles.m_retailSquadAssignments.find(playerId) !=
                roles.m_retailSquadAssignments.end();
     }
+
+    static void SeedRetailLock(RoleSystem& roles, uint32_t teamId,
+                               uint8_t squadIndex) {
+        roles.m_retailSquads[teamId - 1][squadIndex].locked = true;
+    }
 };
 
 TEST(RoleSystemLifecycle, CommanderOwnershipIsFullyReleasedAndIdempotent) {
@@ -153,6 +158,116 @@ TEST(RoleSystemLifecycle, CleanupSweepsStaleDuplicateSquadReferences) {
     EXPECT_EQ(roles.GetPlayerRole(12), CombatRole::SquadLeader);
     EXPECT_EQ(roles.GetPlayerSquad(10), 0u);
     EXPECT_FALSE(RoleSystemLifecycleTestHarness::HasRoleEntry(roles, 10));
+}
+
+TEST(RoleSystemLifecycle, RetailSquadCountMatchesSourceThresholds) {
+    EXPECT_EQ(RoleSystem::ResolveRetailSquadCount("Territories", 1), 2u);
+    EXPECT_EQ(RoleSystem::ResolveRetailSquadCount("Territories", 12), 2u);
+    EXPECT_EQ(RoleSystem::ResolveRetailSquadCount("Territories", 13), 4u);
+    EXPECT_EQ(RoleSystem::ResolveRetailSquadCount("Supremacy", 24), 4u);
+    EXPECT_EQ(RoleSystem::ResolveRetailSquadCount("Territories", 25), 8u);
+    EXPECT_EQ(RoleSystem::ResolveRetailSquadCount("Territories", 32), 8u);
+    EXPECT_EQ(RoleSystem::ResolveRetailSquadCount("Territories", 33), 10u);
+
+    EXPECT_EQ(RoleSystem::ResolveRetailSquadCount("Skirmish", 1), 1u);
+    EXPECT_EQ(RoleSystem::ResolveRetailSquadCount("SKIRMISH", 12), 1u);
+    EXPECT_EQ(RoleSystem::ResolveRetailSquadCount("ROGameInfoSkirmish", 13),
+              2u);
+    EXPECT_EQ(RoleSystem::ResolveRetailSquadCount("skirmish", 24), 2u);
+    EXPECT_EQ(RoleSystem::ResolveRetailSquadCount("Skirmish", 25), 8u);
+    EXPECT_EQ(RoleSystem::ResolveRetailSquadCount("Skirmish", 32), 8u);
+    EXPECT_EQ(RoleSystem::ResolveRetailSquadCount("Skirmish", 33), 10u);
+
+    // Missing or invalid capacity safely uses the ordinary 64-player branch.
+    EXPECT_EQ(RoleSystem::ResolveRetailSquadCount("Skirmish", 0), 10u);
+    EXPECT_EQ(RoleSystem::ResolveRetailSquadCount("Territories", -1), 10u);
+}
+
+TEST(RoleSystemLifecycle, RetailConfigurationLimitsActiveStablePrefix) {
+    RoleSystem roles(nullptr);
+    const RetailSquadAssignment before = roles.AutoAssignRetailSquad(900, 1);
+    ASSERT_TRUE(before.IsValid());
+    ASSERT_TRUE(roles.SetRetailSquadLocked(1, 0, true));
+
+    const uint32_t generation =
+        roles.ConfigureRetailSquads("Territories", 12);
+    EXPECT_EQ(roles.GetActiveRetailSquadCount(), 2u);
+    EXPECT_NE(generation, before.generation);
+    EXPECT_FALSE(roles.GetRetailSquadAssignment(900).has_value());
+    EXPECT_FALSE(roles.IsRetailSquadLocked(1, 0));
+
+    for (uint32_t playerId = 1; playerId <= 12; ++playerId) {
+        ASSERT_TRUE(roles.AutoAssignRetailSquad(playerId, 1).IsValid());
+    }
+    EXPECT_TRUE(roles.GetRetailSquad(1, 0)->IsFull());
+    EXPECT_TRUE(roles.GetRetailSquad(1, 1)->IsFull());
+    EXPECT_FALSE(roles.AutoAssignRetailSquad(13, 1).IsValid());
+    EXPECT_FALSE(roles.JoinRetailSquad(13, 1, 2).IsValid());
+
+    // The ten stable replication entries remain addressable but inactive
+    // indices cannot be locked or joined.
+    ASSERT_NE(roles.GetRetailSquad(1, 2), nullptr);
+    EXPECT_EQ(roles.GetRetailSquad(1, 2)->Occupancy(), 0u);
+    EXPECT_FALSE(roles.SetRetailSquadLocked(1, 2, true));
+}
+
+TEST(RoleSystemLifecycle, RetailLocksSkipNewJoinsAndPreserveAssignments) {
+    RoleSystem roles(nullptr);
+    const uint32_t generation =
+        roles.ConfigureRetailSquads("Territories", 12);
+    ASSERT_EQ(generation, roles.GetRetailSquadGeneration());
+
+    ASSERT_TRUE(roles.JoinRetailSquad(1, 1, 0).IsValid());
+    ASSERT_TRUE(roles.JoinRetailSquad(2, 1, 0).IsValid());
+    ASSERT_TRUE(roles.JoinRetailSquad(3, 1, 0).IsValid());
+    ASSERT_TRUE(roles.JoinRetailSquad(10, 1, 1).IsValid());
+    ASSERT_TRUE(roles.SetRetailSquadLocked(1, 0, true));
+    EXPECT_TRUE(roles.IsRetailSquadLocked(1, 0));
+
+    // The fullest squad is locked, so automatic assignment uses squad one.
+    const RetailSquadAssignment automatic =
+        roles.AutoAssignRetailSquad(11, 1);
+    ASSERT_TRUE(automatic.IsValid());
+    EXPECT_EQ(automatic.squadIndex, 1u);
+    EXPECT_EQ(automatic.roleIndex, 1u);
+
+    // Existing ownership remains idempotent after locking. A move into the
+    // locked squad is rejected transactionally and preserves the source slot.
+    const RetailSquadAssignment repeated = roles.JoinRetailSquad(2, 1, 0);
+    ASSERT_TRUE(repeated.IsValid());
+    EXPECT_EQ(repeated.squadIndex, 0u);
+    EXPECT_EQ(repeated.roleIndex, 1u);
+    EXPECT_FALSE(roles.JoinRetailSquad(11, 1, 0).IsValid());
+    const auto retained = roles.GetRetailSquadAssignment(11);
+    ASSERT_TRUE(retained.has_value());
+    EXPECT_EQ(retained->squadIndex, 1u);
+    EXPECT_EQ(retained->roleIndex, 1u);
+
+    ASSERT_TRUE(roles.SetRetailSquadLocked(1, 1, true));
+    EXPECT_FALSE(roles.AutoAssignRetailSquad(12, 1).IsValid());
+    EXPECT_TRUE(roles.AutoAssignRetailSquad(11, 1).IsValid());
+
+    roles.ResetRetailSquads();
+    EXPECT_EQ(roles.GetActiveRetailSquadCount(), 2u);
+    EXPECT_FALSE(roles.IsRetailSquadLocked(1, 0));
+    EXPECT_FALSE(roles.IsRetailSquadLocked(1, 1));
+}
+
+TEST(RoleSystemLifecycle, RetailReconciliationPurgesInactiveRawState) {
+    RoleSystem roles(nullptr);
+    roles.ConfigureRetailSquads("Territories", 12);
+    const uint32_t generation = roles.GetRetailSquadGeneration();
+    RoleSystemLifecycleTestHarness::SeedRetailOwner(roles, 1, 8, 3, 700);
+    RoleSystemLifecycleTestHarness::SeedRetailAssignment(
+        roles, 700, 1, 8, 3, generation);
+    RoleSystemLifecycleTestHarness::SeedRetailLock(roles, 1, 8);
+
+    ASSERT_TRUE(roles.AutoAssignRetailSquad(1, 1).IsValid());
+    EXPECT_FALSE(RoleSystemLifecycleTestHarness::HasRawRetailAssignment(
+        roles, 700));
+    EXPECT_EQ(roles.GetRetailSquad(1, 8)->slotOwnerIds[3], 0u);
+    EXPECT_EQ(roles.GetRetailSquad(1, 8)->leaderId, 0u);
+    EXPECT_FALSE(roles.GetRetailSquad(1, 8)->locked);
 }
 
 TEST(RoleSystemLifecycle, RetailAllocatorPacksFullestSquadWithStableIndices) {

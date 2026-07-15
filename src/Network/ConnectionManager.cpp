@@ -7284,21 +7284,22 @@ void ConnectionManager::DecodeInboundActorBunch(uint32_t clientId,
         }
 
         // Evaluate the live-player guard without lazily freezing any session
-        // metadata. An exact Compound request from a pawn already in play must
-        // be a read-only rejection, including on a partially initialized
-        // control ledger.
-        bool compoundSession = false;
-        if (cs.retailBootstrapProfile.has_value()) {
-            compoundSession =
-                cs.retailBootstrapProfile->mapUrl == "VNSK-Compound" &&
-                cs.retailBootstrapProfile->modeName == "Skirmish";
-        } else {
-            const RetailBootstrap::Profile currentProfile =
-                ResolveRetailBootstrapProfile(m_server);
-            compoundSession = currentProfile.mapUrl == "VNSK-Compound" &&
-                              currentProfile.modeName == "Skirmish";
-        }
-        if (compoundSession) {
+        // metadata. Runtime-squad h175 paths currently apply the role
+        // immediately; accepting one from a pawn already in play would mutate
+        // authority while deliberately skipping the pre-spawn h210 publication.
+        // Keep both exact profiles read-only until next-life role transitions
+        // are independently grounded.
+        const RetailBootstrap::Profile liveGuardProfile =
+            cs.retailBootstrapProfile.has_value()
+                ? *cs.retailBootstrapProfile
+                : ResolveRetailBootstrapProfile(m_server);
+        const bool compoundSession =
+            liveGuardProfile.mapUrl == "VNSK-Compound" &&
+            liveGuardProfile.modeName == "Skirmish";
+        const bool cuChiSession =
+            liveGuardProfile.mapUrl == "VNTE-CuChi" &&
+            liveGuardProfile.modeName == "Territories";
+        if (compoundSession || cuChiSession) {
             bool alreadyLive = cs.spawned;
             if (PlayerManager* players = m_server->GetPlayerManager()) {
                 if (const std::shared_ptr<Player> player =
@@ -7308,9 +7309,9 @@ void ConnectionManager::DecodeInboundActorBunch(uint32_t clientId,
             }
             if (alreadyLive) {
                 Logger::Warn(
-                    "[RoleSelection] client %u rejected Compound h175 while "
-                    "already spawned/live; role, squad and PRI state unchanged",
-                    clientId);
+                    "[RoleSelection] client %u rejected %s h175 while already "
+                    "spawned/live; role, squad and PRI state unchanged",
+                    clientId, compoundSession ? "Compound" : "Cu Chi");
                 return;
             }
         }
@@ -7336,6 +7337,9 @@ void ConnectionManager::DecodeInboundActorBunch(uint32_t clientId,
 
         const bool isCompoundRoleProfile =
             profile.mapUrl == "VNSK-Compound" && profile.modeName == "Skirmish";
+        const bool isCuChiRoleProfile =
+            profile.mapUrl == "VNTE-CuChi" &&
+            profile.modeName == "Territories";
         // The installed artifact's legacy Resort/Cu Chi registry remains
         // intentionally fail-closed. Compound is a narrower exception: all ten
         // h175 UClass refs were re-extracted from the currently installed
@@ -7353,7 +7357,6 @@ void ConnectionManager::DecodeInboundActorBunch(uint32_t clientId,
             return;
         }
         const uint32_t serverTeam = teams->GetPlayerTeam(clientId);
-        const bool isCuChiRoleProfile = profile.mapUrl == "VNTE-CuChi";
         const RoleSelectionRepl::GroundingResult grounded =
             isCompoundRoleProfile
                 ? RoleSelectionRepl::ResolveGroundedCompoundRole(
@@ -7375,7 +7378,9 @@ void ConnectionManager::DecodeInboundActorBunch(uint32_t clientId,
             return;
         }
 
-        if (isCompoundRoleProfile) {
+        if (isCompoundRoleProfile || isCuChiRoleProfile) {
+            const char* roleProfileName =
+                isCompoundRoleProfile ? "Compound" : "Cu Chi";
             const bool finalAutoSelect =
                 decoded.following ==
                     RoleSelectionRepl::FollowingRpcPattern::FinalAutoSelectSquad ||
@@ -7383,37 +7388,46 @@ void ConnectionManager::DecodeInboundActorBunch(uint32_t clientId,
                                          FinalAutoSelectSquadAndDefaultSpectatorLocation;
             if (decoded.rpc.closeMenu != finalAutoSelect) {
                 Logger::Warn(
-                    "[RoleSelection] client %u rejected Compound h175: final "
+                    "[RoleSelection] client %u rejected %s h175: final "
                     "close and ServerAutoSelectSquad must arrive together",
-                    clientId);
+                    clientId, roleProfileName);
                 return;
             }
 
-            const Faction usFaction = roles->GetTeamFaction(
+            const Faction expectedSouthFaction =
+                isCompoundRoleProfile ? Faction::USMC : Faction::USArmy;
+            const Faction southFaction = roles->GetTeamFaction(
                 RoleSelectionRepl::kCompoundUsServerTeam);
-            const Faction nlfFaction = roles->GetTeamFaction(
+            const Faction northFaction = roles->GetTeamFaction(
                 RoleSelectionRepl::kCompoundNlfServerTeam);
-            if (usFaction != Faction::USMC ||
-                nlfFaction != Faction::NLFSV) {
+            if (southFaction != expectedSouthFaction ||
+                northFaction != Faction::NLFSV) {
                 Logger::Warn(
-                    "[RoleSelection] client %u rejected Compound h175: "
-                    "map role authority has factions team1=%u/team2=%u "
-                    "instead of USMC/NLFSV",
-                    clientId, static_cast<unsigned>(usFaction),
-                    static_cast<unsigned>(nlfFaction));
+                    "[RoleSelection] client %u rejected %s h175: map role "
+                    "authority has factions team1=%u/team2=%u instead of "
+                    "%u/NLFSV",
+                    clientId, roleProfileName,
+                    static_cast<unsigned>(southFaction),
+                    static_cast<unsigned>(northFaction),
+                    static_cast<unsigned>(expectedSouthFaction));
                 return;
             }
 
             const Faction configuredFaction =
                 roles->GetTeamFaction(serverTeam);
             const std::optional<CombatRole> combatRole =
-                ResolveCompoundCombatRole(configuredFaction,
-                                          grounded.role.classIndex);
+                isCompoundRoleProfile
+                    ? ResolveCompoundCombatRole(configuredFaction,
+                                                grounded.role.classIndex)
+                    : (grounded.role.classIndex ==
+                               RoleSelectionRepl::kCuChiInfantryClassIndex
+                           ? std::optional<CombatRole>{CombatRole::Rifleman}
+                           : std::nullopt);
             if (!combatRole) {
                 Logger::Warn(
-                    "[RoleSelection] client %u rejected Compound class %u: no "
+                    "[RoleSelection] client %u rejected %s class %u: no "
                     "authoritative combat-role mapping",
-                    clientId,
+                    clientId, roleProfileName,
                     static_cast<unsigned>(grounded.role.classIndex));
                 return;
             }
@@ -7421,7 +7435,7 @@ void ConnectionManager::DecodeInboundActorBunch(uint32_t clientId,
             const bool sameClass =
                 cs.roleSelectionAccepted &&
                 cs.selectedRoleClassIndex == grounded.role.classIndex;
-            if (!sameClass &&
+            if (isCompoundRoleProfile && !sameClass &&
                 grounded.role.roleLimit !=
                     RoleSelectionRepl::kCompoundRiflemanLimit) {
                 size_t occupiedClassSlots = 0;
@@ -7437,9 +7451,9 @@ void ConnectionManager::DecodeInboundActorBunch(uint32_t clientId,
                 }
                 if (occupiedClassSlots >= grounded.role.roleLimit) {
                     Logger::Warn(
-                        "[RoleSelection] client %u denied Compound class %u: "
+                        "[RoleSelection] client %u denied %s class %u: "
                         "human limit %u reached on team %u",
-                        clientId,
+                        clientId, roleProfileName,
                         static_cast<unsigned>(grounded.role.classIndex),
                         static_cast<unsigned>(grounded.role.roleLimit),
                         serverTeam);
@@ -7452,8 +7466,9 @@ void ConnectionManager::DecodeInboundActorBunch(uint32_t clientId,
             bool allocatedForRequest = false;
 
             // Secure the final squad slot before changing the combat role or
-            // publishing h79. Network dispatch is single-threaded, so the
-            // preflight and allocation cannot race another role request.
+            // publishing h79. AutoAssignRetailSquad owns the exact active,
+            // unlocked, non-full preflight transaction; network dispatch is
+            // single-threaded, so it cannot race another role request.
             if (finalAutoSelect) {
                 currentAssignment = roles->GetRetailSquadAssignment(clientId);
                 if (currentAssignment &&
@@ -7465,33 +7480,14 @@ void ConnectionManager::DecodeInboundActorBunch(uint32_t clientId,
                         clientId, currentAssignment->teamId, serverTeam);
                     return;
                 }
-                bool hasRetailSlot =
-                    currentAssignment && currentAssignment->teamId == serverTeam;
-                for (uint8_t squadIndex = 0;
-                     !hasRetailSlot &&
-                     squadIndex < RoleSystem::RETAIL_SQUAD_COUNT;
-                     ++squadIndex) {
-                    const RetailSquad* squad =
-                        roles->GetRetailSquad(serverTeam, squadIndex);
-                    hasRetailSlot = squad && !squad->IsFull();
-                }
-                if (!hasRetailSlot) {
-                    Logger::Warn(
-                        "[RoleSelection] client %u denied final Compound role: "
-                        "all %u retail squads are full on team %u",
-                        clientId,
-                        static_cast<unsigned>(RoleSystem::RETAIL_SQUAD_COUNT),
-                        serverTeam);
-                    return;
-                }
-
                 assignment =
                     roles->AutoAssignRetailSquad(clientId, serverTeam);
                 if (!assignment.IsValid()) {
-                    Logger::Error(
-                        "[RoleSelection] client %u passed Compound squad "
-                        "preflight but allocation failed; role and h79 held",
-                        clientId);
+                    Logger::Warn(
+                        "[RoleSelection] client %u denied final %s role: no "
+                        "active, unlocked retail squad slot on team %u; role "
+                        "and h79 held",
+                        clientId, roleProfileName, serverTeam);
                     return;
                 }
                 allocatedForRequest = !currentAssignment.has_value();
@@ -7503,9 +7499,9 @@ void ConnectionManager::DecodeInboundActorBunch(uint32_t clientId,
                     SynchronizeRetailSquadAssignments();
                 }
                 Logger::Warn(
-                    "[RoleSelection] client %u grounded Compound class %u but "
+                    "[RoleSelection] client %u grounded %s class %u but "
                     "RoleSystem denied %s",
-                    clientId,
+                    clientId, roleProfileName,
                     static_cast<unsigned>(grounded.role.classIndex),
                     roles->GetRoleName(*combatRole).c_str());
                 return;
@@ -7532,22 +7528,32 @@ void ConnectionManager::DecodeInboundActorBunch(uint32_t clientId,
                     m_deploymentCoordinator.ResetClient(clientId);
                 }
                 Logger::Info(
-                    "[RoleSelection] client %u accepted interim Compound class "
+                    "[RoleSelection] client %u accepted interim %s class "
                     "%u object %u for team %u; owner PRI h79 published",
-                    clientId,
+                    clientId, roleProfileName,
                     static_cast<unsigned>(grounded.role.classIndex),
                     grounded.role.roleInfoObjectRef, serverTeam);
                 return;
             }
 
             RoleSelectionRepl::ChangedRoleEvidence transition;
-            transition.squadIndex = 255;
+            // ROPlayerReplicationInfo.ServerAutoSelectSquad only publishes
+            // ChangedSquad when it allocates a previously unassigned player.
+            // A later final-role request keeps the existing squad and passes
+            // that index directly to ChangedRole instead (retail
+            // ROPlayerReplicationInfo.uc 740-741,987-1057 and
+            // ROPlayerController.uc 27164-27167).
+            transition.squadIndex = allocatedForRequest
+                ? static_cast<uint8_t>(255u)
+                : assignment.squadIndex;
             transition.classIndex = grounded.role.classIndex;
             transition.showLobby = false;
             transition.showSpawnSelect = true;
-            transition.followingChangedSquad =
-                RoleSelectionRepl::ChangedSquadEvidence{
-                    assignment.squadIndex, assignment.roleIndex};
+            if (allocatedForRequest) {
+                transition.followingChangedSquad =
+                    RoleSelectionRepl::ChangedSquadEvidence{
+                        assignment.squadIndex, assignment.roleIndex};
+            }
             cs.selectedChangedRole = transition;
             cs.selectedRoleSquadIndex = assignment.squadIndex;
             cs.selectedRoleIndex = assignment.roleIndex;
@@ -7564,34 +7570,19 @@ void ConnectionManager::DecodeInboundActorBunch(uint32_t clientId,
                         clientId,
                         /*includeOwnerPriAssignment=*/false)) {
                     FailCloseCh2Publication(
-                        clientId, "Compound ChangedRole transition");
+                        clientId, "runtime-squad ChangedRole transition");
                     return;
                 }
                 SendOwnerPriRoleAssignment(
                     clientId, assignment.squadIndex, assignment.roleIndex);
             }
             Logger::Info(
-                "[RoleSelection] client %u finalized Compound class %u -> "
+                "[RoleSelection] client %u finalized %s class %u -> "
                 "squad %u slot %u and spawn selection",
-                clientId, static_cast<unsigned>(grounded.role.classIndex),
+                clientId, roleProfileName,
+                static_cast<unsigned>(grounded.role.classIndex),
                 static_cast<unsigned>(assignment.squadIndex),
                 static_cast<unsigned>(assignment.roleIndex));
-            return;
-        }
-
-        if (isCuChiRoleProfile) {
-            // The exact Cu Chi class-0 CDO is now authenticated, but the
-            // emulator's current squad model has no retail lock state or
-            // max-player-derived 2/4/8/10 squad count, and JoinSquad promotes
-            // the first member to a different combat role. Never reuse the
-            // Resort capture's occupancy snapshot or partially mutate role
-            // state while those live allocation inputs are unavailable.
-            Logger::Warn(
-                "[RoleSelection] client %u grounded Cu Chi %s infantry object "
-                "%u at ROGame base %u, but rejected it before mutation: exact "
-                "runtime squad/role-slot allocation is not implemented",
-                clientId, decoded.rpc.southDesired ? "South/US" : "North/NLF",
-                grounded.role.roleInfoObjectRef, profile.roGameObjectBase);
             return;
         }
 

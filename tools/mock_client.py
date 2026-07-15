@@ -25,6 +25,7 @@ Usage:
   python tools/mock_client.py reconnect [--host 127.0.0.1] [--port 7777]
   python tools/mock_client.py spawn [--host 127.0.0.1] [--port 7777] [--linger 30]
   python tools/mock_client.py spawn --team 2
+  python tools/mock_client.py spawn --profile cu-chi  # canonical artifact only
   python tools/mock_client.py spawn --profile hue-city
   python tools/mock_client.py spawn --profile compound
 """
@@ -743,6 +744,16 @@ COMPOUND_ROLE_REQUESTS = {
     2: ("af94561500180000000080c3b300", 107),
 }
 
+# Source-grounded VNTE-CuChi Territories class-0 requests under the historical
+# role-registry base token 39479. The canonical ROGame package's actual
+# ObjectBase is 39478; do not conflate the two. These preserve the captured
+# 57-bit h175+h451 shape, but use Cu Chi's force-substituted US Grunt / NLF
+# Guerilla CDOs instead of Resort's Skirmish role objects.
+CU_CHI_ROLE_REQUESTS = {
+    1: ("af265c150080c301", 57),
+    2: ("af6456150080c301", 57),
+}
+
 # Source-grounded installed PackageMap layout. RetailBootstrapTests pins the
 # ROGameContent +5 export shift for every actor/attachment below and pins the
 # inventory-manager CDO separately at 82737. The payloads are those exact refs
@@ -813,10 +824,11 @@ def resolve_north_role_transition_contract(profile="resort"):
     """Return the exact h210+h211 transition for a clean North spawn."""
     if profile not in SPAWN_PROFILES:
         raise ValueError(f"unknown spawn profile: {profile}")
-    if profile == "compound":
-        # Compound allocates the first free runtime squad/role slot. On a clean
-        # server that is 0/0, so both h211 byte parameters use their defaults.
-        # Do not import Resort capture occupancy (2/3) into this map profile.
+    if profile in ("compound", "cu-chi"):
+        # Compound and Cu Chi allocate the first free runtime squad/role slot.
+        # On a clean server that is 0/0, so both h211 byte parameters use their
+        # defaults. Do not import Resort capture occupancy (2/3) into either
+        # live map profile.
         return 32, "d2fe731a"
     # Resort frame 61989 captured h210(255,0,false,true)+h211(2,3).
     return 48, "d2fe735a8103"
@@ -836,11 +848,12 @@ def build_role_selection_bits(team_id=1, profile="resort"):
     contract = resolve_spawn_team(team_id)
     if profile not in SPAWN_PROFILES:
         raise ValueError(f"unknown spawn profile: {profile}")
-    payload_hex, payload_bits = (
-        COMPOUND_ROLE_REQUESTS[contract.team_id]
-        if profile == "compound"
-        else (contract.role_payload_hex, 57)
-    )
+    if profile == "compound":
+        payload_hex, payload_bits = COMPOUND_ROLE_REQUESTS[contract.team_id]
+    elif profile == "cu-chi":
+        payload_hex, payload_bits = CU_CHI_ROLE_REQUESTS[contract.team_id]
+    else:
+        payload_hex, payload_bits = contract.role_payload_hex, 57
     return packed_bits(payload_hex, payload_bits)
 
 def is_remote_participant_pawn_channel(channel):
@@ -1033,6 +1046,9 @@ def resolve_spawn_profile(profile="resort", expected_objectives=None,
 def spawn(host, port, deployment_wait, expected_objective_values,
           gri_channel, menu_bootstrap_channels, linger=0.0, team=1,
           profile="resort"):
+    if profile == "cu-chi":
+        print("Cu Chi role/spawn validation requires the canonical replication "
+              "artifact (RS2V_REPLICATION_BOOTSTRAP_VARIANT unset).")
     team_contract = resolve_spawn_team(team)
     wire_contract = resolve_spawn_wire_contract(team, profile)
     north_role_transition_bits, north_role_transition_hex = (
@@ -1718,7 +1734,8 @@ def main():
     ap.add_argument("--port", type=int, default=7777)
     ap.add_argument(
         "--profile", choices=tuple(SPAWN_PROFILES), default="resort",
-        help="spawn validation profile (default: resort)")
+        help=("spawn validation profile (default: resort; cu-chi requires "
+              "the canonical replication artifact)"))
     ap.add_argument(
         "--team", type=int, choices=(1, 2), default=1,
         help="spawn faction: 1=South/US (default), 2=North/NVA")

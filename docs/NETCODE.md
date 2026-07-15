@@ -634,6 +634,27 @@ Full RPC timeline (chSeq order, capture-verified): `docs/re/pc_ch2_postjoin_time
 **ClientShowTeamSelect(206) → ClientGotoState(41)**. ChangedTeams/ClientSetHUD/ClientRestart
 are never sent in the menu phase.
 
+### 6.6 Cu Chi h175 uses live squad authority (canonical artifact only)
+
+`VNTE-CuChi` Territories accepts only the source-grounded class-0 role CDO for
+the selected server team: object 87490 for South/US Army Grunt and object 87398
+for North/NLF Guerilla under historical role-registry token 39479. The
+canonical ROGame package's actual ObjectBase is 39478; these values are
+deliberately distinct. The final h175 close must be followed by
+`ServerAutoSelectSquad` in the same bunch.
+
+The server allocates the most populated active, unlocked, non-full retail squad
+and its first free one of six role slots. It then derives h210+h211 and owner-PRI
+h81/h80 from that live assignment; captured Resort occupancy is never copied.
+On a clean session, squad/slot 0/0 produces the exact 32-bit transition
+`d2fe731a`. A live pawn, wrong faction/team/object, locked/full squad set, or
+publication failure leaves deployment unauthorized.
+
+This Cu Chi path requires the canonical artifact. Leave
+`RS2V_REPLICATION_BOOTSTRAP_VARIANT` unset. The installed candidate still has
+`roleRegistryGrounded=false` and therefore rejects Cu Chi role selection before
+role, squad, PRI, or deployment mutation.
+
 ---
 
 ## 7. Quick reference — where each thing lives

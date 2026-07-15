@@ -70,6 +70,17 @@ public:
         server.ActivateRoleAuthorityForMap(mapName);
     }
 
+    static void SetSquadServerSettings(GameServer& server, int maxPlayers,
+                                       const std::string& gameMode) {
+        if (!server.m_configManager) {
+            server.m_configManager = std::make_shared<ConfigManager>();
+            server.m_serverConfig =
+                std::make_shared<ServerConfig>(server.m_configManager);
+        }
+        server.m_configManager->SetInt("General.max_players", maxPlayers);
+        server.m_configManager->SetString("Game.game_mode", gameMode);
+    }
+
     static void InstallVoteWinner(GameServer& server, std::string target) {
         server.m_pendingVoteWinner = std::move(target);
     }
@@ -106,6 +117,7 @@ TEST(GameServerNativeRotation,
             EXPECT_FALSE(roles.GetRetailSquadAssignment(playerId).has_value());
             EXPECT_NE(roles.GetRetailSquadGeneration(), before.generation);
             EXPECT_EQ(roles.GetRetailSquad(1, 0)->Occupancy(), 0u);
+            EXPECT_EQ(roles.GetActiveRetailSquadCount(), 10u);
             EXPECT_EQ(roles.GetTeamFaction(1), teamOne);
             EXPECT_EQ(roles.GetTeamFaction(2), teamTwo);
         };
@@ -116,6 +128,37 @@ TEST(GameServerNativeRotation,
     // An unoverridden map must actively restore both defaults rather than
     // inheriting Compound or Cu Chi's faction state.
     activateAndExpect("VNTE-Resort", Faction::USArmy, Faction::NVA, 13);
+}
+
+TEST(GameServerNativeRotation,
+     MapActivationConfiguresRetailSquadsFromCapacityAndMode) {
+    GameServer server;
+    RoleSystem& roles =
+        GameServerNativeRotationTestHarness::InstallRoleSystem(server);
+
+    GameServerNativeRotationTestHarness::SetSquadServerSettings(
+        server, 24, "Skirmish");
+    GameServerNativeRotationTestHarness::ActivateRoleAuthority(
+        server, "VNSK-Compound");
+    EXPECT_EQ(roles.GetActiveRetailSquadCount(), 2u);
+    EXPECT_TRUE(roles.JoinRetailSquad(1, 1, 1).IsValid());
+    EXPECT_FALSE(roles.JoinRetailSquad(2, 1, 2).IsValid());
+
+    GameServerNativeRotationTestHarness::SetSquadServerSettings(
+        server, 24, "Territories");
+    GameServerNativeRotationTestHarness::ActivateRoleAuthority(
+        server, "VNTE-CuChi");
+    EXPECT_EQ(roles.GetActiveRetailSquadCount(), 4u);
+    EXPECT_FALSE(roles.GetRetailSquadAssignment(1).has_value());
+    EXPECT_TRUE(roles.JoinRetailSquad(3, 1, 3).IsValid());
+    EXPECT_FALSE(roles.JoinRetailSquad(4, 1, 4).IsValid());
+
+    // Invalid configured capacity uses the safe 64-player default.
+    GameServerNativeRotationTestHarness::SetSquadServerSettings(
+        server, 0, "Skirmish");
+    GameServerNativeRotationTestHarness::ActivateRoleAuthority(
+        server, "VNSK-Compound");
+    EXPECT_EQ(roles.GetActiveRetailSquadCount(), 10u);
 }
 
 TEST(GameServerNativeRotation, TerminalObservationQueuesButDoesNotChangeInline) {

@@ -123,6 +123,18 @@ class SpawnProfileTests(unittest.TestCase):
             "af94561500180000000080c3b300")
         self.assertEqual(len(compound_north), 107)
 
+        cu_chi_south = mock_client.build_role_selection_bits(
+            1, profile="cu-chi")
+        self.assertEqual(self._bits_hex(cu_chi_south),
+                         "af265c150080c301")
+        self.assertEqual(len(cu_chi_south), 57)
+
+        cu_chi_north = mock_client.build_role_selection_bits(
+            2, profile="cu-chi")
+        self.assertEqual(self._bits_hex(cu_chi_north),
+                         "af6456150080c301")
+        self.assertEqual(len(cu_chi_north), 57)
+
         # Resort's h211(2,3) values are a captured occupancy snapshot. A clean
         # Compound server allocates its first North player to runtime slot 0/0.
         self.assertEqual(
@@ -130,6 +142,9 @@ class SpawnProfileTests(unittest.TestCase):
             (48, "d2fe735a8103"))
         self.assertEqual(
             mock_client.resolve_north_role_transition_contract("compound"),
+            (32, "d2fe731a"))
+        self.assertEqual(
+            mock_client.resolve_north_role_transition_contract("cu-chi"),
             (32, "d2fe731a"))
         with self.assertRaises(ValueError):
             mock_client.resolve_north_role_transition_contract("unknown")

@@ -163,6 +163,36 @@ TEST(RoleSelectionReplication, DecodesExactNorthFinalRetailCapture) {
   EXPECT_TRUE(decoded.rpc.closeMenu);
 }
 
+TEST(RoleSelectionReplication, DecodesSourceGroundedCuChiFinalRequests) {
+  struct CuChiCase {
+    const char *hex;
+    bool south;
+    uint32_t roleObjectRef;
+  };
+  const CuChiCase cases[] = {
+      {"af265c150080c301", true,
+       RoleSelectionRepl::kCuChiSouthGruntRoleInfoObjectRef},
+      {"af6456150080c301", false,
+       RoleSelectionRepl::kCuChiNorthGuerillaRoleInfoObjectRef},
+  };
+
+  for (const CuChiCase &entry : cases) {
+    const std::vector<uint8_t> payload = Hex(entry.hex);
+    const auto decoded = RoleSelectionRepl::DecodeRoleSelectionBunch(
+        payload.data(), payload.size(), 57u);
+
+    ASSERT_TRUE(decoded.valid());
+    EXPECT_EQ(decoded.following,
+              RoleSelectionRepl::FollowingRpcPattern::FinalAutoSelectSquad);
+    EXPECT_EQ(decoded.rpc.consumedBits, 48u);
+    EXPECT_EQ(decoded.rpc.southDesired, entry.south);
+    EXPECT_FALSE(decoded.rpc.roleInfoClass.isDynamic);
+    EXPECT_EQ(decoded.rpc.roleInfoClass.index, entry.roleObjectRef);
+    EXPECT_FALSE(decoded.rpc.weaponSelection.presentOnWire);
+    EXPECT_TRUE(decoded.rpc.closeMenu);
+  }
+}
+
 TEST(RoleSelectionReplication, DecodesExactInstalledCompoundLivePayloads) {
   struct LiveCase {
     const char *hex;

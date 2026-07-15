@@ -260,6 +260,10 @@ private:
     friend class GameServerBotCombatTestHarness;
     // Narrow lifecycle seam for deterministic deferred/native-rotation tests.
     friend class GameServerNativeRotationTestHarness;
+    // Narrow role-selection seam for ConnectionManager integration tests. It
+    // installs only the concrete player/team/role/spawn authorities and never
+    // opens a production listener.
+    friend class ConnectionTravelLifecycleTestHarness;
 
     enum class ActiveModeDriver : uint8_t {
         Territory,

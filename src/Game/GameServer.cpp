@@ -1416,15 +1416,24 @@ void GameServer::ActivateRoleAuthorityForMap(const std::string& mapName) {
         teamTwoFaction = Faction::NLFSV;
     }
 
-    const uint32_t squadGeneration = m_roleSystem->ResetRetailSquads();
+    const int configuredMaxPlayers =
+        m_serverConfig ? m_serverConfig->GetMaxPlayers() : 64;
+    const int maxPlayers = configuredMaxPlayers > 0 ? configuredMaxPlayers : 64;
+    const std::string gameMode = GetEffectiveGameModeName();
+    const uint32_t squadGeneration =
+        m_roleSystem->ConfigureRetailSquads(gameMode, maxPlayers);
     m_roleSystem->SetTeamFaction(1, teamOneFaction);
     m_roleSystem->SetTeamFaction(2, teamTwoFaction);
     Logger::Info(
         "[GameServer] Activated role authority for map '%s': team 1=%s, "
-        "team 2=%s, retail squad generation=%u",
+        "team 2=%s, mode=%s, max players=%d, active retail squads=%u, "
+        "retail squad generation=%u",
         mapName.c_str(),
         m_roleSystem->GetFactionShortName(teamOneFaction).c_str(),
         m_roleSystem->GetFactionShortName(teamTwoFaction).c_str(),
+        gameMode.c_str(), maxPlayers,
+        static_cast<unsigned int>(
+            m_roleSystem->GetActiveRetailSquadCount()),
         squadGeneration);
 }
 
