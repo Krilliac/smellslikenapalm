@@ -2,7 +2,8 @@
 #include "Utils/Logger.h"
 #include <algorithm>
 
-PhysicsEngine::PhysicsEngine() {
+PhysicsEngine::PhysicsEngine()
+    : m_gravity(), m_timeStep(0.0f) {
     Logger::Trace("[PhysicsEngine::PhysicsEngine] Entry - constructing PhysicsEngine");
     Logger::Info("[PhysicsEngine::PhysicsEngine] PhysicsEngine instance created");
     Logger::Trace("[PhysicsEngine::PhysicsEngine] Exit");

@@ -1,5 +1,16 @@
 # CMake 3.20 is the first version that recognises CMAKE_CXX_STANDARD 23.
 cmake_minimum_required(VERSION 3.20)
+
+# Let CMake select MSVC debug-information flags through the first-class
+# abstraction instead of appending legacy /Zi. Embedded /Z7 keeps Debug builds
+# compatible with the machine-wide sccache launcher and avoids shared PDB races.
+if(POLICY CMP0141)
+    cmake_policy(SET CMP0141 NEW)
+endif()
+set(CMAKE_MSVC_DEBUG_INFORMATION_FORMAT
+    "$<$<CONFIG:Debug,RelWithDebInfo>:Embedded>"
+    CACHE STRING "MSVC debug information format")
+
 project(RS2VServer VERSION 1.0.0 LANGUAGES CXX)
 
 # C++23 is the mandated baseline (was C++17). Toolchains: GCC 12+, Clang 15+,

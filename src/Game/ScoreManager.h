@@ -10,7 +10,7 @@
 class GameServer;
 class TeamManager;
 
-struct TeamScore {
+struct TeamScoreSummary {
     uint32_t kills = 0;
     uint32_t deaths = 0;
     uint32_t objectivesCaptured = 0;
@@ -36,7 +36,7 @@ public:
     void SetPoints(uint32_t teamId, uint32_t points);
 
     // Queries
-    TeamScore GetTeamScore(uint32_t teamId) const;
+    TeamScoreSummary GetTeamScore(uint32_t teamId) const;
     std::vector<uint32_t> GetTeamsByScore() const;
 
     // Reset
@@ -48,7 +48,7 @@ public:
 private:
     GameServer*                 m_server;
     TeamManager*                m_teamManager;
-    std::map<uint32_t, TeamScore> m_scores;
+    std::map<uint32_t, TeamScoreSummary> m_scores;
 
     // Internal helper
     void EnsureTeamExists(uint32_t teamId);

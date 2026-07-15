@@ -77,19 +77,23 @@ bool UDPSocket::Configure(const SocketConfig& cfg) {
     timeval tv{};
     tv.tv_sec  = cfg.recvTimeout.count() / 1000;
     tv.tv_usec = (cfg.recvTimeout.count() % 1000) * 1000;
-    setsockopt(m_sock, SOL_SOCKET, SO_RCVTIMEO, (char*)&tv, sizeof(tv));
+    setsockopt(m_sock, SOL_SOCKET, SO_RCVTIMEO,
+               reinterpret_cast<const char*>(&tv), sizeof(tv));
     Logger::Debug("[UDPSocket::Configure] Set SO_RCVTIMEO: %ld sec, %ld usec on fd=%d",
                   tv.tv_sec, tv.tv_usec, m_sock);
     tv.tv_sec  = cfg.sendTimeout.count() / 1000;
     tv.tv_usec = (cfg.sendTimeout.count() % 1000) * 1000;
-    setsockopt(m_sock, SOL_SOCKET, SO_SNDTIMEO, (char*)&tv, sizeof(tv));
+    setsockopt(m_sock, SOL_SOCKET, SO_SNDTIMEO,
+               reinterpret_cast<const char*>(&tv), sizeof(tv));
     Logger::Debug("[UDPSocket::Configure] Set SO_SNDTIMEO: %ld sec, %ld usec on fd=%d",
                   tv.tv_sec, tv.tv_usec, m_sock);
 
     // Buffer sizes
-    setsockopt(m_sock, SOL_SOCKET, SO_RCVBUF, (char*)&cfg.recvBufferSize, sizeof(cfg.recvBufferSize));
+    setsockopt(m_sock, SOL_SOCKET, SO_RCVBUF,
+               reinterpret_cast<const char*>(&cfg.recvBufferSize), sizeof(cfg.recvBufferSize));
     Logger::Debug("[UDPSocket::Configure] Set SO_RCVBUF=%d on fd=%d", cfg.recvBufferSize, m_sock);
-    setsockopt(m_sock, SOL_SOCKET, SO_SNDBUF, (char*)&cfg.sendBufferSize, sizeof(cfg.sendBufferSize));
+    setsockopt(m_sock, SOL_SOCKET, SO_SNDBUF,
+               reinterpret_cast<const char*>(&cfg.sendBufferSize), sizeof(cfg.sendBufferSize));
     Logger::Debug("[UDPSocket::Configure] Set SO_SNDBUF=%d on fd=%d", cfg.sendBufferSize, m_sock);
 
     // Non-blocking

@@ -66,8 +66,9 @@ public:
 
     // ---- output / state ----
 
-    // Pad the final partial byte with zero bits up to a byte boundary and return
-    // the packed buffer. Does not mutate internal state.
+    // Return a snapshot of the packed buffer; the final partial byte is already
+    // zero-padded. Writers can therefore be reused without mutating prior output.
+    // cppcheck-suppress returnByReference -- snapshot ownership is intentional
     std::vector<uint8_t> GetBytes() const;
 
     // Number of bits written so far.

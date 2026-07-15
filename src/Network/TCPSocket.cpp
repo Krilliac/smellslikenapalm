@@ -72,7 +72,8 @@ bool TCPSocket::Listen(uint16_t listenPort, int backlog, const SocketConfig& cfg
     }
     Logger::Debug("[TCPSocket::Listen] Socket opened, setting SO_REUSEADDR on fd=%d", m_sock);
     int opt = 1;
-    setsockopt(m_sock, SOL_SOCKET, SO_REUSEADDR, (char*)&opt, sizeof(opt));
+    setsockopt(m_sock, SOL_SOCKET, SO_REUSEADDR,
+               reinterpret_cast<const char*>(&opt), sizeof(opt));
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = INADDR_ANY;
@@ -254,7 +255,8 @@ void TCPSocket::SetRecvTimeout(std::chrono::milliseconds timeout) {
     timeval tv{};
     tv.tv_sec  = (long)(timeout.count()/1000);
     tv.tv_usec = (long)((timeout.count()%1000)*1000);
-    setsockopt(m_sock, SOL_SOCKET, SO_RCVTIMEO, (char*)&tv, sizeof(tv));
+    setsockopt(m_sock, SOL_SOCKET, SO_RCVTIMEO,
+               reinterpret_cast<const char*>(&tv), sizeof(tv));
     Logger::Debug("[TCPSocket::SetRecvTimeout] Set SO_RCVTIMEO: %ld sec, %ld usec on fd=%d",
                   tv.tv_sec, tv.tv_usec, m_sock);
     Logger::Trace("[TCPSocket::SetRecvTimeout] Exit");
@@ -265,7 +267,8 @@ void TCPSocket::SetSendTimeout(std::chrono::milliseconds timeout) {
     timeval tv{};
     tv.tv_sec  = (long)(timeout.count()/1000);
     tv.tv_usec = (long)((timeout.count()%1000)*1000);
-    setsockopt(m_sock, SOL_SOCKET, SO_SNDTIMEO, (char*)&tv, sizeof(tv));
+    setsockopt(m_sock, SOL_SOCKET, SO_SNDTIMEO,
+               reinterpret_cast<const char*>(&tv), sizeof(tv));
     Logger::Debug("[TCPSocket::SetSendTimeout] Set SO_SNDTIMEO: %ld sec, %ld usec on fd=%d",
                   tv.tv_sec, tv.tv_usec, m_sock);
     Logger::Trace("[TCPSocket::SetSendTimeout] Exit");
@@ -282,9 +285,11 @@ bool TCPSocket::Configure(const SocketConfig& cfg) {
     Logger::Debug("[TCPSocket::Configure] SetRecvTimeout completed");
     SetSendTimeout(cfg.sendTimeout);
     Logger::Debug("[TCPSocket::Configure] SetSendTimeout completed");
-    setsockopt(m_sock, SOL_SOCKET, SO_RCVBUF, (char*)&cfg.recvBufferSize, sizeof(cfg.recvBufferSize));
+    setsockopt(m_sock, SOL_SOCKET, SO_RCVBUF,
+               reinterpret_cast<const char*>(&cfg.recvBufferSize), sizeof(cfg.recvBufferSize));
     Logger::Debug("[TCPSocket::Configure] Set SO_RCVBUF=%d on fd=%d", cfg.recvBufferSize, m_sock);
-    setsockopt(m_sock, SOL_SOCKET, SO_SNDBUF, (char*)&cfg.sendBufferSize, sizeof(cfg.sendBufferSize));
+    setsockopt(m_sock, SOL_SOCKET, SO_SNDBUF,
+               reinterpret_cast<const char*>(&cfg.sendBufferSize), sizeof(cfg.sendBufferSize));
     Logger::Debug("[TCPSocket::Configure] Set SO_SNDBUF=%d on fd=%d", cfg.sendBufferSize, m_sock);
     Logger::Info("[TCPSocket::Configure] Socket fd=%d fully configured", m_sock);
     Logger::Trace("[TCPSocket::Configure] Exit: returning true");

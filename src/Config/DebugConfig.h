@@ -10,7 +10,7 @@ public:
 
     bool  IsDebugEnabled() const;
     bool  IsLogToFile() const;
-    const std::string& GetDebugLogPath() const;
+    std::string GetDebugLogPath() const;
     int   GetLogMaxSizeMb() const;
     int   GetLogMaxFiles() const;
     int   GetVerbosityLevel() const;

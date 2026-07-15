@@ -133,7 +133,8 @@ bool NetworkInterface::BindSocket(uint16_t port) {
     addr.sin_port = htons(port);
 
     int opt = 1;
-    setsockopt(m_socketFd, SOL_SOCKET, SO_REUSEADDR, (char*)&opt, sizeof(opt));
+    setsockopt(m_socketFd, SOL_SOCKET, SO_REUSEADDR,
+               reinterpret_cast<const char*>(&opt), sizeof(opt));
     Logger::Debug("[NetworkInterface::BindSocket] Set SO_REUSEADDR on fd=%d", m_socketFd);
 
     if (bind(m_socketFd, (sockaddr*)&addr, sizeof(addr)) < 0) {

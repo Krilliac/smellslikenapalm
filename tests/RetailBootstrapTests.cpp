@@ -666,4 +666,14 @@ TEST(RetailBootstrap, MalformedOuterRecordIsRejectedWithoutPartialDocument) {
     EXPECT_TRUE(document.records.empty());
 }
 
+TEST(RetailBootstrap, PackageLookupRejectsExactEndAndTruncatedBoundaries) {
+    RetailBootstrap::Document document;
+    document.records = {{}, {0x07}};
+
+    RetailBootstrap::PackageRecord package;
+    std::string error;
+    EXPECT_FALSE(RetailBootstrap::FindPackage(document, "VNTE-Resort", package, error));
+    EXPECT_FALSE(error.empty());
+}
+
 RS2V_TEST_MAIN()

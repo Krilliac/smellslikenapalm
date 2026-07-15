@@ -40,11 +40,15 @@ public:
     ~MapManager();
 
     bool LoadMap(const std::string& mapName);
+    // These are snapshots. Callers may retain them across a later LoadMap().
+    // cppcheck-suppress returnByReference -- snapshot ownership is intentional
     std::vector<SpawnPoint> GetSpawnPoints() const;
+    // cppcheck-suppress returnByReference -- snapshot ownership is intentional
     std::vector<uint32_t>  GetMapObjectives() const;
     // Full positional objective definitions for the current map, suitable for
     // registering directly with ObjectiveSystem. Empty if the map ships none.
     const std::vector<CaptureZone>& GetObjectiveZones() const;
+    // cppcheck-suppress returnByReference -- snapshot ownership is intentional
     Bounds                 GetMapBounds() const;
     // Returns the next configured map with an exact retail bootstrap profile.
     // Empty means no different safe successor exists; the current map remains.

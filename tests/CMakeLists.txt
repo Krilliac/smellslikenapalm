@@ -108,6 +108,7 @@ rs2v_add_test(CryptoUtilsTests)        # Utils/CryptoUtils: SHA-256/HMAC/Base64 
 rs2v_add_test(ProtocolUtilsTests)      # Protocol/ProtocolUtils: hex/base64/checksum/tag<->type
 rs2v_add_test(NetworkUtilsTests)       # Network/NetworkUtils: IPv4 validate/normalize, ports
 rs2v_add_test(BoundsTests)             # Game/Bounds: AABB contains/center/size
+rs2v_add_test(GameStateSerializationTests) # GameState: legacy wire layout, round-trip, transactional malformed-input rejection
 rs2v_add_test(MapRuntimeTests)         # Config/MapConfig + Game/MapManager: absolute assets with local spawn fallback
 rs2v_add_test(DeploymentCoordinatorTests) # Game/DeploymentCoordinator: role/spawn validation, ready state, countdown deployment
 rs2v_add_test(DeploymentReplicationTests) # Network/DeploymentReplication: exact retail h261/h434 parameter decoding
@@ -118,6 +119,7 @@ rs2v_add_test(CombatAuthorityTests)    # Game/CombatAuthority: ammo/cadence, hit
 rs2v_add_test(MantleAuthorityTests)    # Game/MantleAuthority: bounded h280 geometry, world checks, cooldown/lifecycle
 rs2v_add_test(MovementValidationTests) # Physics/MovementValidator: explicit resets, immutable rejection, bounded lifecycle
 rs2v_add_test(ActorReliableSequencerTests) # Network: bounded per-channel actor reliable ordering/dedup
+rs2v_add_test(OutboundReliableSequencerTests) # Network: modulo-1024 outbound reliable allocation, rollback, ACK release
 rs2v_add_test(TicketSystemTests)       # Game/TicketSystem: unlimited zero pools and one-shot depletion transitions
 rs2v_add_test(PlayerManagerLifecycleTests) # Game/PlayerManager: idempotent death/respawn transitions and fail-closed lifecycle inputs
 rs2v_add_test(ParticipantRosterTests) # tagged human/bot remote actor channel allocation, retirement, generation safety

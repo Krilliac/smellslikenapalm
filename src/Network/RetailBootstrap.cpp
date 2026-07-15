@@ -296,7 +296,7 @@ bool TryParsePackageRecord(const std::vector<uint8_t>& payload,
                            PackageRecord& out) {
     constexpr size_t kFixedPrefix = 1u + 16u;
     constexpr size_t kFixedTail = 4u + 4u + 8u;
-    if (offset > payload.size() || payload.size() - offset < kFixedPrefix) return false;
+    if (offset >= payload.size() || payload.size() - offset < kFixedPrefix) return false;
     if (payload[offset] != 0x07) return false;
 
     PackageRecord parsed;

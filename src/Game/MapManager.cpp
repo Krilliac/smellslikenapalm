@@ -215,7 +215,7 @@ bool MapManager::LoadSpawnPointsFromDisk(const std::string& mapName)
             // inclusive and -1 means unbounded. The final optional value is the
             // static PackageMap object ref for the cooked spawn-group volume.
             auto hash = line.find('#');
-            if (hash != std::string::npos) line = line.substr(0, hash);
+            if (hash != std::string::npos) line.resize(hash);
             std::istringstream iss(line);
             float x, y, z;
             if (!(iss >> x >> y >> z)) continue;  // skip blank/garbage lines
@@ -322,7 +322,7 @@ bool MapManager::LoadObjectivesFromDisk(const std::string& mapName)
             // files remain valid. A metadata-bearing non-tunnel row must include
             // the explicit tunnel value 0 before clientSlot/cookedRepIndex.
             auto hash = line.find('#');
-            if (hash != std::string::npos) line = line.substr(0, hash);
+            if (hash != std::string::npos) line.resize(hash);
             std::istringstream iss(line);
             std::string name;
             float x, y, z;

@@ -89,7 +89,7 @@ bool WorkshopManager::Reload()
         ++lineNo;
         // Strip inline comments (everything after the first '#') and trim.
         auto hash = line.find('#');
-        if (hash != std::string::npos) line = line.substr(0, hash);
+        if (hash != std::string::npos) line.resize(hash);
         line = StringUtils::Trim(line);
         if (line.empty()) continue;
 

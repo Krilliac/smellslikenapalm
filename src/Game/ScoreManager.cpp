@@ -39,7 +39,7 @@ void ScoreManager::Shutdown() {
 void ScoreManager::EnsureTeamExists(uint32_t teamId) {
     Logger::Trace("[ScoreManager::EnsureTeamExists] Entry, teamId=%u", teamId);
     if (m_scores.find(teamId) == m_scores.end()) {
-        m_scores[teamId] = TeamScore{};
+        m_scores[teamId] = TeamScoreSummary{};
         Logger::Debug("[ScoreManager::EnsureTeamExists] Created new TeamScore entry for team %u", teamId);
     } else {
         Logger::Debug("[ScoreManager::EnsureTeamExists] Team %u already exists", teamId);
@@ -101,7 +101,7 @@ void ScoreManager::SetPoints(uint32_t teamId, uint32_t points) {
     Logger::Trace("[ScoreManager::SetPoints] Exit");
 }
 
-TeamScore ScoreManager::GetTeamScore(uint32_t teamId) const {
+TeamScoreSummary ScoreManager::GetTeamScore(uint32_t teamId) const {
     Logger::Trace("[ScoreManager::GetTeamScore] Entry, teamId=%u", teamId);
     auto it = m_scores.find(teamId);
     if (it != m_scores.end()) {
@@ -112,7 +112,7 @@ TeamScore ScoreManager::GetTeamScore(uint32_t teamId) const {
     }
     Logger::Debug("[ScoreManager::GetTeamScore] No score found for team %u, returning default", teamId);
     Logger::Trace("[ScoreManager::GetTeamScore] Exit, return default TeamScore");
-    return TeamScore{};
+    return TeamScoreSummary{};
 }
 
 std::vector<uint32_t> ScoreManager::GetTeamsByScore() const {
@@ -137,7 +137,7 @@ void ScoreManager::ResetAll() {
         uint32_t teamCount = m_teamManager->GetTeamCount();
         Logger::Debug("[ScoreManager::ResetAll] Initializing scores for %u teams", teamCount);
         for (uint32_t teamId = 1; teamId <= teamCount; ++teamId) {
-            m_scores[teamId] = TeamScore{};
+            m_scores[teamId] = TeamScoreSummary{};
             Logger::Debug("[ScoreManager::ResetAll] Team %u score entry created", teamId);
         }
     } else {

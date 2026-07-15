@@ -61,7 +61,9 @@ public:
     std::vector<Item>        GetItemsByType(ItemType type) const;
 
     // The items a connecting client is required to have (all maps/mods/assets).
-    std::vector<Item>        GetRequiredClientItems() const { return m_items; }
+    // Return a snapshot so callers may retain it across Reload().
+    // cppcheck-suppress returnByReference -- snapshot ownership is intentional
+    std::vector<Item> GetRequiredClientItems() const { return m_items; }
 
     bool   AllItemsPresent() const;
     void   LogSummary() const;

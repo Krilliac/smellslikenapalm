@@ -62,8 +62,11 @@ PacketRecorder& PacketRecorder::Instance() {
 PacketRecorder::PacketRecorder() {
     // Default ON; disabled only if RS2V_PKTLOG is explicitly "0"/"false"/"off".
     const char* env = std::getenv("RS2V_PKTLOG");
-    m_enabled = !(env && (std::string(env) == "0" || std::string(env) == "false" ||
-                          std::string(env) == "off"));
+    m_enabled.store(
+        !(env && (std::string(env) == "0" ||
+                  std::string(env) == "false" ||
+                  std::string(env) == "off")),
+        std::memory_order_relaxed);
 }
 
 PacketRecorder::~PacketRecorder() {
@@ -86,7 +89,7 @@ void PacketRecorder::EnsureOpen() {
     m_nullOut.open("packetlog/nulls_" + std::to_string(stamp) + ".jsonl",
                    std::ios::out | std::ios::app);
     if (!m_pktOut.is_open()) {
-        m_enabled = false;
+        m_enabled.store(false, std::memory_order_relaxed);
         Logger::Warn("[PacketRecorder] could not open packetlog/session_%llu.jsonl — recording disabled",
                      static_cast<unsigned long long>(stamp));
         return;
@@ -97,11 +100,11 @@ void PacketRecorder::EnsureOpen() {
 
 void PacketRecorder::RecordDatagram(PktDir dir, uint32_t clientId, const std::string& peer,
                                     const uint8_t* data, size_t len) {
-    if (!m_enabled) return;
+    if (!m_enabled.load(std::memory_order_relaxed)) return;
     std::lock_guard<std::mutex> lk(m_mu);
-    if (!m_enabled) return;
+    if (!m_enabled.load(std::memory_order_relaxed)) return;
     EnsureOpen();
-    if (!m_enabled || !m_pktOut.is_open()) return;
+    if (!m_enabled.load(std::memory_order_relaxed) || !m_pktOut.is_open()) return;
 
     std::string line;
     line.reserve(len * 2 + 96);
@@ -128,11 +131,11 @@ void PacketRecorder::RecordNull(const char* context, const std::string& detail, 
     // Always surface in the main log (greppable) regardless of file state.
     Logger::Warn("[NULLREC] client %u: null/missing at %s: %s",
                  clientId, context ? context : "?", detail.c_str());
-    if (!m_enabled) return;
+    if (!m_enabled.load(std::memory_order_relaxed)) return;
     std::lock_guard<std::mutex> lk(m_mu);
-    if (!m_enabled) return;
+    if (!m_enabled.load(std::memory_order_relaxed)) return;
     EnsureOpen();
-    if (!m_enabled || !m_nullOut.is_open()) return;
+    if (!m_enabled.load(std::memory_order_relaxed) || !m_nullOut.is_open()) return;
 
     std::string line = "{\"t\":";
     line += std::to_string(NowMs());

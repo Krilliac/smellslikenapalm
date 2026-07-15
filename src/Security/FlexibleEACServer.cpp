@@ -103,7 +103,7 @@ void FlexibleEACServer::ValidateClient(uint32_t clientId,
     Logger::Info("[FlexibleEACServer::ValidateClient] Starting anti-cheat validation for client %u (%s:%u, exe='%s')",
                  clientId, ip.c_str(), port, exePath.c_str());
 
-    Session sess;
+    Session sess{};
     sess.clientId       = clientId;
     sess.ip             = ip;
     sess.port           = port;

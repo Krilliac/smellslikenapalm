@@ -96,6 +96,7 @@ public:
     // Win conditions
     bool CheckWinCondition();
     uint32_t GetWinningTeam() const;
+    // cppcheck-suppress returnByReference -- callers receive an owned snapshot
     std::string GetWinReason() const;
 
     // State broadcasting

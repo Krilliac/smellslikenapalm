@@ -218,7 +218,7 @@ size_t NetFieldRegistry::LoadDirectory(const std::string& dir) {
 
         std::string cls = fname.substr(prefix.size());
         if (cls.size() > 4 && cls.substr(cls.size() - 4) == ".txt")
-            cls = cls.substr(0, cls.size() - 4);
+            cls.resize(cls.size() - 4);
 
         NetFieldTable table;
         if (table.LoadFromFile(entry.path().string(), cls)) {
