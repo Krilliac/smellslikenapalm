@@ -238,6 +238,12 @@ private:
     //   * reassembler - orders/dedups inbound reliable control bunches and peels
     //                   complete messages into the handshake (receive side).
     struct ControlState {
+        struct PendingTeamReinforcementPublication {
+            int32_t wireValue = 0;
+            std::vector<uint32_t> packetIds;
+            uint64_t lastSendMs = 0;
+        };
+
         PacketCodec::PacketAssembler outbound;
         std::unique_ptr<PacketCodec::ControlReassembler> reassembler;
         // Reliable actor traffic has an independent ChSequence cursor per actor
@@ -258,6 +264,14 @@ private:
         // Retail TeamInfo actor channels indexed by retail team (0=NVA, 1=US).
         // Captured Resort bootstrap uses {76,56}; the live builder uses {4,5}.
         std::array<uint32_t, 2> teamInfoChannels{};
+        // Last h62 values packet-ACKed by this connection. Retail property
+        // deltas remain wire-unreliable, but unretired values are resent until
+        // one carrying packet is acknowledged, mirroring UE3's dirty-property
+        // retirement instead of mistaking local UDP handoff for delivery.
+        std::array<std::optional<int32_t>, 2>
+            publishedTeamReinforcements{};
+        std::array<std::optional<PendingTeamReinforcementPublication>, 2>
+            pendingTeamReinforcements{};
         bool     teamSelected = false;
         bool     roleFinalized = false; // persists across deployment generations
         bool     roleSelectionAccepted = false;
@@ -664,6 +678,8 @@ private:
     std::vector<uint32_t> GetCurrentAdvertisedSpawnIds(uint32_t clientId) const;
     std::vector<uint32_t> GetAdvertisedSpawnIds(uint32_t clientId) const;
     void RefreshAdvertisedSpawnIds(uint32_t clientId);
+    int32_t ResolveRetailWireReinforcements(uint8_t retailTeam) const noexcept;
+    void SynchronizeRetailTeamReinforcements();
     bool SendRetailSpawnLocations(uint32_t clientId);
     void SendOwnerPriClassIndex(uint32_t clientId, uint8_t classIndex);
     void SendOwnerPriRoleAssignment(uint32_t clientId, uint8_t squadIndex,
@@ -762,8 +778,9 @@ private:
     // ---- Reliable retransmission ------------------------------------------------
     // Build ONE packet from `bunches`, send it, and record any reliable bunches for
     // retransmission until acked. The single choke-point for sending actor bunches.
-    bool SendReliableBunches(uint32_t clientId,
-                             const std::vector<PacketCodec::Bunch>& bunches);
+    bool SendReliableBunches(
+        uint32_t clientId, const std::vector<PacketCodec::Bunch>& bunches,
+        uint32_t* sentPacketId = nullptr);
     std::optional<PacketCodec::OutboundReliableSequencer::Reservation>
     ReserveCh2Reliable(ControlState& state, uint32_t clientId, size_t count,
                        const char* context);

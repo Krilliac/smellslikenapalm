@@ -369,6 +369,18 @@ maps such as Compound, the repaired scene intentionally auto-selects normal slot
 closes on first render; a persistent selection map is expected on Territories maps such
 as Resort.
 
+After either live or captured TeamInfo opens retire, the end-of-tick retail sync publishes
+dirty h62 values as the capture-grounded unreliable actor deltas on both viewer-local team
+channels (`4/5` live, `76/56` captured). The cache is indexed in retail order (NVA, US), so
+the emulator's inverted server ids cannot swap the pools. It also waits for each reliable
+actor open to be acknowledged. Each h62 remains dirty until the client ACKs a carrying
+packet; an unacknowledged wire-unreliable delta is retried at a bounded interval, while a
+failed socket handoff remains immediately retryable. Retirement state clears at
+ClientTravel. If authority returns to the last ACKed count while a conflicting value is
+still in flight, the sync forces a new corrective current-value delta rather than assuming
+the old datagram can be recalled. Deaths, bleed, rewards, finite depletion, refill, and
+reset therefore converge without emitting unchanged values every frame.
+
 Maps without an exact bounded retail profile no longer borrow Resort's Welcome/actor
 stream. Both PackageMap and actor bootstrap fail closed for such a map, preventing the
 client from loading Resort while the server is authoritative for a different world.

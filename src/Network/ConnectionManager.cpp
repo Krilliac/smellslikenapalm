@@ -636,6 +636,126 @@ void ConnectionManager::BroadcastRetailObjectiveState() {
     }
 }
 
+int32_t ConnectionManager::ResolveRetailWireReinforcements(
+    uint8_t retailTeam) const noexcept {
+    uint32_t current = 0;
+    uint32_t initial = 0;
+    if (retailTeam < 2u && m_server) {
+        if (const TicketSystem* tickets = m_server->GetTicketSystem()) {
+            const uint32_t serverTeam =
+                TeamMapping::RetailToServer(retailTeam);
+            current = tickets->GetTickets(serverTeam);
+            initial = tickets->GetInitialTickets(serverTeam);
+        }
+    }
+    return SpawnRepl::ResolveWireReinforcementCount(current, initial);
+}
+
+void ConnectionManager::SynchronizeRetailTeamReinforcements() {
+    constexpr uint64_t kRetryDelayMs = 1000u;
+    constexpr size_t kMaximumTrackedPacketIds = 8u;
+    const uint64_t now = NowMs();
+
+    for (auto& [clientId, state] : m_controlState) {
+        const std::shared_ptr<ClientConnection> connection =
+            GetConnection(clientId);
+        if (!connection || connection->IsDisconnected() ||
+            !connection->IsUE3Client() ||
+            !connection->IsHandshakeComplete() || state.mapTravelPending) {
+            continue;
+        }
+
+        std::vector<PacketCodec::Bunch> deltas;
+        std::array<std::optional<int32_t>, 2> stagedValues{};
+        for (uint8_t retailTeam = 0; retailTeam < 2u; ++retailTeam) {
+            const uint32_t teamChannel = state.teamInfoChannels[retailTeam];
+            if (teamChannel == 0u ||
+                teamChannel >= state.outboundActorChannels.size() ||
+                !state.outboundActorChannels.test(teamChannel)) {
+                continue;
+            }
+            const bool openingReliablePending = std::any_of(
+                state.pendingReliable.begin(), state.pendingReliable.end(),
+                [teamChannel](const ControlState::SentReliable& pending) {
+                    return std::any_of(
+                        pending.bunches.begin(), pending.bunches.end(),
+                        [teamChannel](const PacketCodec::Bunch& bunch) {
+                            return bunch.bReliable && bunch.bOpen &&
+                                   !bunch.bClose &&
+                                   bunch.chIndex == teamChannel;
+                        });
+                });
+            if (openingReliablePending) {
+                // An unreliable delta that overtakes a lost actor open cannot
+                // be buffered safely by UE3. Wait for the opening packet ACK;
+                // the still-dirty cache will publish on the next frame.
+                continue;
+            }
+
+            const int32_t wireCount =
+                ResolveRetailWireReinforcements(retailTeam);
+            auto& pending = state.pendingTeamReinforcements[retailTeam];
+            if (state.publishedTeamReinforcements[retailTeam] == wireCount) {
+                if (!pending || pending->wireValue == wireCount) {
+                    // A delayed same-value packet cannot regress the client.
+                    pending.reset();
+                    continue;
+                }
+
+                // The conflicting datagram is already in flight and cannot be
+                // recalled. Returning authority to the last ACKed value still
+                // requires a corrective write after that old packet, so
+                // invalidate both retirement identities and fall through to
+                // publish the current value again.
+                pending.reset();
+                state.publishedTeamReinforcements[retailTeam].reset();
+            }
+            if (pending && pending->wireValue != wireCount) {
+                // A newer authoritative value supersedes every in-flight
+                // packet carrying the old value. Its ACKs are ignored.
+                pending.reset();
+            }
+            if (pending && now >= pending->lastSendMs &&
+                now - pending->lastSendMs < kRetryDelayMs) {
+                continue;
+            }
+
+            BitWriter writer;
+            SpawnRepl::WriteReinforcementsRemaining(writer, wireCount);
+
+            PacketCodec::Bunch bunch;
+            bunch.bReliable = false; // capture: h62 is an unreliable TeamInfo delta
+            bunch.chIndex = teamChannel;
+            bunch.chType = state.actorChType;
+            bunch.payload = writer.GetBytes();
+            bunch.payloadBits = static_cast<uint32_t>(writer.NumBits());
+            deltas.push_back(std::move(bunch));
+            stagedValues[retailTeam] = wireCount;
+        }
+
+        uint32_t sentPacketId = 0u;
+        if (deltas.empty() ||
+            !SendReliableBunches(clientId, deltas, &sentPacketId)) {
+            continue;
+        }
+        for (uint8_t retailTeam = 0; retailTeam < 2u; ++retailTeam) {
+            if (!stagedValues[retailTeam].has_value()) continue;
+
+            auto& pending = state.pendingTeamReinforcements[retailTeam];
+            if (!pending ||
+                pending->wireValue != *stagedValues[retailTeam]) {
+                pending = ControlState::PendingTeamReinforcementPublication{};
+                pending->wireValue = *stagedValues[retailTeam];
+            }
+            pending->lastSendMs = now;
+            if (pending->packetIds.size() >= kMaximumTrackedPacketIds) {
+                pending->packetIds.erase(pending->packetIds.begin());
+            }
+            pending->packetIds.push_back(sentPacketId);
+        }
+    }
+}
+
 std::shared_ptr<ClientConnection> ConnectionManager::GetConnection(uint32_t clientId) const {
     Logger::Trace("[ConnectionManager::GetConnection] Entry: clientId=%u", clientId);
     for (auto& kv : m_clients) {
@@ -1572,6 +1692,8 @@ void ConnectionManager::SendActorBootstrap(uint32_t clientId) {
     // The captured Resort bootstrap opens retail NVA TeamInfo on ch76 and US
     // TeamInfo on ch56. h59 deltas must target the already-open team actor.
     cs.teamInfoChannels = {76u, 56u};
+    cs.publishedTeamReinforcements.fill(std::nullopt);
+    cs.pendingTeamReinforcements.fill(std::nullopt);
 
     // Capture frame 1484 orders the local PlayerController open first, then one NMT
     // 0x24 (payload int32 LE = 1; bytes 24 01 00 00 00), then the remaining actor
@@ -1830,6 +1952,8 @@ void ConnectionManager::SendLiveActorBootstrap(uint32_t clientId) {
     constexpr uint32_t kMaxGRI = 184, kMaxPC = 531, kMaxPRI = 98, kMaxTeam = 78;
     constexpr uint32_t kChGRI = 3, kChTeam0 = 4, kChTeam1 = 5, kChPC = 2, kChPRI = 26;
     cs.teamInfoChannels = {kChTeam0, kChTeam1};
+    cs.publishedTeamReinforcements.fill(std::nullopt);
+    cs.pendingTeamReinforcements.fill(std::nullopt);
     const uint32_t kGameClassIx = *gameClassRef; // GRI.GameClass h33
     uint8_t maxPlayers = 64;
     if (m_server) {
@@ -1891,23 +2015,10 @@ void ConnectionManager::SendLiveActorBootstrap(uint32_t clientId) {
     if (name.empty()) name = "Player" + std::to_string(clientId);
     const int32_t playerId = static_cast<int32_t>(clientId);
 
-    const auto wireReinforcements = [this](uint8_t retailTeam) {
-        uint32_t current = 0;
-        uint32_t initial = 0;
-        if (m_server) {
-            if (const TicketSystem* tickets = m_server->GetTicketSystem()) {
-                const uint32_t serverTeam =
-                    TeamMapping::RetailToServer(retailTeam);
-                current = tickets->GetTickets(serverTeam);
-                initial = tickets->GetInitialTickets(serverTeam);
-            }
-        }
-        return SpawnRepl::ResolveWireReinforcementCount(current, initial);
-    };
     const int32_t team0Reinforcements =
-        wireReinforcements(TeamMapping::kRetailNva);
+        ResolveRetailWireReinforcements(TeamMapping::kRetailNva);
     const int32_t team1Reinforcements =
-        wireReinforcements(TeamMapping::kRetailUs);
+        ResolveRetailWireReinforcements(TeamMapping::kRetailUs);
 
     std::vector<PacketCodec::Bunch> batch;
     batch.push_back(MakeOpeningActorBunch(kChGRI, 1, hdrFor(kClsGRI, false), [&](BitWriter& w) {
@@ -1932,7 +2043,10 @@ void ConnectionManager::SendLiveActorBootstrap(uint32_t clientId) {
         ActorRepl::WritePropInt   (w, 36, kMaxPRI, playerId);   // PlayerID
         ActorRepl::WritePropString(w, 37, kMaxPRI, name);       // PlayerName
     }));
-    SendReliableBunches(clientId, batch);
+    if (SendReliableBunches(clientId, batch)) {
+        cs.publishedTeamReinforcements = {
+            team0Reinforcements, team1Reinforcements};
+    }
     cs.griChannel = kChGRI;
     cs.griOutReliable = 1;
     SendRetailObjectiveState(clientId, /*baseline=*/true);
@@ -2990,7 +3104,8 @@ void ConnectionManager::TransportKeepAliveTick() {
 }
 
 bool ConnectionManager::SendReliableBunches(
-    uint32_t clientId, const std::vector<PacketCodec::Bunch>& bunches) {
+    uint32_t clientId, const std::vector<PacketCodec::Bunch>& bunches,
+    uint32_t* sentPacketId) {
     auto conn = GetConnection(clientId);
     if (!conn || conn->IsDisconnected() || bunches.empty()) return false;
     ControlState& cs = GetControlState(clientId);
@@ -3020,6 +3135,7 @@ bool ConnectionManager::SendReliableBunches(
         PacketCodec::Encode(pkt, PacketCodec::kServerSendMaxPacketBytes);
     const bool sent = conn->SendRaw(wire.data(), wire.size());
     if (sent) {
+        if (sentPacketId) *sentPacketId = pkt.packetId;
         cs.lastServerSendMs = NowMs();
     }
     // Record the reliable bunches so we can retransmit until the client acks this packet.
@@ -3151,6 +3267,25 @@ void ConnectionManager::OnClientAck(uint32_t clientId, uint32_t ackedPacketId) {
     auto it = m_controlState.find(clientId);
     if (it == m_controlState.end()) return;
     ControlState& cs = it->second;
+
+    for (uint8_t retailTeam = 0; retailTeam < 2u; ++retailTeam) {
+        auto& publication = cs.pendingTeamReinforcements[retailTeam];
+        if (!publication ||
+            std::find(publication->packetIds.begin(),
+                      publication->packetIds.end(),
+                      ackedPacketId) == publication->packetIds.end()) {
+            continue;
+        }
+        cs.publishedTeamReinforcements[retailTeam] =
+            publication->wireValue;
+        Logger::Trace(
+            "[ReinforcementReplication] client %u ACKed retail team %u "
+            "h62=%d in packet %u",
+            clientId, static_cast<unsigned>(retailTeam),
+            publication->wireValue, ackedPacketId);
+        publication.reset();
+    }
+
     auto& pending = cs.pendingReliable;
     auto packetWasAcked = [ackedPacketId](
                               const ControlState::SentReliable& reliable) {
@@ -3525,6 +3660,8 @@ size_t ConnectionManager::BroadcastRetailClientTravel(
     for (const TravelRecipient& recipient : recipients) {
         recipient.state->mapTravelPending = true;
         recipient.state->mapTravelStartedMs = travelStartedAt;
+        recipient.state->publishedTeamReinforcements.fill(std::nullopt);
+        recipient.state->pendingTeamReinforcements.fill(std::nullopt);
         recipient.state->spawned = false;
         ClearActiveDeploymentDeadline(*recipient.state);
         recipient.state->deferredOwningPawnGraphDeployment.reset();
@@ -4821,6 +4958,11 @@ void ConnectionManager::BeginDeploymentGeneration() {
 }
 
 void ConnectionManager::UpdateRetailDeploymentCountdown() {
+    // This is the existing post-authority, once-per-game-tick retail sync seam.
+    // Publish dirty TeamInfo pools after deaths, rewards, bleed, and mode
+    // transitions have all committed for the frame.
+    SynchronizeRetailTeamReinforcements();
+
     const DeploymentPhaseState phase = GetDeploymentPhaseState();
     const bool enteredActive =
         phase.phase == DeploymentCountdown::Phase::Active &&

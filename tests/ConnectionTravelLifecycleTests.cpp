@@ -589,6 +589,76 @@ public:
         manager.UpdateRetailDeploymentCountdown();
     }
 
+    static void SynchronizeRetailTeamReinforcements(
+        ConnectionManager& manager) {
+        manager.SynchronizeRetailTeamReinforcements();
+    }
+
+    static void MarkTeamInfoChannelsOpen(ConnectionManager& manager,
+                                         uint32_t clientId) {
+        auto& state = manager.m_controlState.at(clientId);
+        for (const uint32_t channel : state.teamInfoChannels) {
+            if (channel != 0u && channel < state.outboundActorChannels.size()) {
+                state.outboundActorChannels.set(channel);
+            }
+        }
+    }
+
+    static void SeedPendingTeamInfoOpen(ConnectionManager& manager,
+                                        uint32_t clientId,
+                                        uint32_t channel) {
+        ConnectionManager::ControlState::SentReliable pending;
+        pending.packetIds.push_back(900u);
+        PacketCodec::Bunch open;
+        open.bOpen = true;
+        open.bReliable = true;
+        open.chIndex = channel;
+        open.chType = 2u;
+        open.chSequence = 1u;
+        pending.bunches.push_back(std::move(open));
+        manager.m_controlState.at(clientId).pendingReliable.push_back(
+            std::move(pending));
+    }
+
+    static void ClearPendingReliables(ConnectionManager& manager,
+                                      uint32_t clientId) {
+        manager.m_controlState.at(clientId).pendingReliable.clear();
+    }
+
+    static void UseCapturedTeamInfoChannels(ConnectionManager& manager,
+                                            uint32_t clientId) {
+        auto& state = manager.m_controlState.at(clientId);
+        state.teamInfoChannels = {76u, 56u};
+        state.publishedTeamReinforcements.fill(std::nullopt);
+    }
+
+    static std::array<std::optional<int32_t>, 2>
+    PublishedTeamReinforcements(const ConnectionManager& manager,
+                                uint32_t clientId) {
+        return manager.m_controlState.at(clientId)
+            .publishedTeamReinforcements;
+    }
+
+    static std::array<std::optional<int32_t>, 2>
+    PendingTeamReinforcements(const ConnectionManager& manager,
+                              uint32_t clientId) {
+        std::array<std::optional<int32_t>, 2> values{};
+        const auto& pending = manager.m_controlState.at(clientId)
+                                  .pendingTeamReinforcements;
+        for (size_t team = 0; team < pending.size(); ++team) {
+            if (pending[team]) values[team] = pending[team]->wireValue;
+        }
+        return values;
+    }
+
+    static void ExpireTeamReinforcementRetry(ConnectionManager& manager,
+                                             uint32_t clientId,
+                                             uint8_t retailTeam) {
+        auto& pending = manager.m_controlState.at(clientId)
+                            .pendingTeamReinforcements.at(retailTeam);
+        if (pending) pending->lastSendMs = 0u;
+    }
+
     static uint64_t OwningPawnGeneration(
         const ConnectionManager& manager, uint32_t clientId) {
         return manager.m_controlState.at(clientId).owningPawnGeneration;
@@ -788,6 +858,14 @@ public:
     static void Acknowledge(ConnectionManager& manager, uint32_t clientId,
                             uint32_t packetId) {
         manager.OnClientAck(clientId, packetId);
+    }
+
+    static void AcknowledgePackets(
+        ConnectionManager& manager, uint32_t clientId,
+        const std::vector<PacketCodec::Packet>& packets) {
+        for (const PacketCodec::Packet& packet : packets) {
+            manager.OnClientAck(clientId, packet.packetId);
+        }
     }
 
     static void AcknowledgeAllPendingReliables(
@@ -1490,6 +1568,19 @@ protected:
         return bunch;
     }
 
+    static PacketCodec::Bunch ExpectedTeamReinforcements(
+        uint32_t teamInfoChannel, int32_t reinforcements) {
+        BitWriter writer;
+        SpawnRepl::WriteReinforcementsRemaining(writer, reinforcements);
+
+        PacketCodec::Bunch bunch;
+        bunch.bReliable = false;
+        bunch.chIndex = teamInfoChannel;
+        bunch.payload = writer.GetBytes();
+        bunch.payloadBits = static_cast<uint32_t>(writer.NumBits());
+        return bunch;
+    }
+
     bool PublishCuChiSpawnSelection(size_t receiverIndex,
                                     uint32_t clientId,
                                     bool south) {
@@ -1545,6 +1636,14 @@ protected:
     GameServer server_;
     ConnectionManager manager_{&server_};
 
+    void CloseSenderSocketForTest() {
+        if (sender_) sender_->Close();
+    }
+
+    bool RebindSenderSocketForTest() {
+        return sender_ && sender_->Bind(0u);
+    }
+
 private:
     UDPSocket* Receiver(size_t receiverIndex) {
         if (receiverIndex == 0u) return &receiverOne_;
@@ -1573,6 +1672,316 @@ private:
 };
 
 } // namespace
+
+TEST_F(ConnectionTravelCuChiRoleIntegrationTest,
+       AuthoritativeReinforcementsReachLiveAndCapturedTeamInfoChannels) {
+    using Harness = ConnectionTravelLifecycleTestHarness;
+    constexpr uint32_t kLiveViewer = 90u;
+    constexpr uint32_t kCapturedViewer = 91u;
+
+    TicketSystem* tickets = Harness::InstallTicketSystem(
+        server_, /*south/US=*/300u, /*north/NVA=*/200u);
+    ASSERT_TRUE(tickets != nullptr);
+    ASSERT_TRUE(Connect(0u, kLiveViewer, TeamMapping::kServerUs) != nullptr);
+    ASSERT_TRUE(Connect(1u, kCapturedViewer, TeamMapping::kServerNva) !=
+                nullptr);
+    Harness::UseCapturedTeamInfoChannels(manager_, kCapturedViewer);
+    Harness::MarkTeamInfoChannelsOpen(manager_, kLiveViewer);
+    Harness::MarkTeamInfoChannelsOpen(manager_, kCapturedViewer);
+
+    // Exercise the production end-of-tick seam, not only the private helper.
+    Harness::UpdateRetailDeploymentCountdown(manager_);
+    const std::vector<PacketCodec::Packet> liveBaselinePackets =
+        DrainDecodedPackets(0u);
+    const std::vector<PacketCodec::Packet> capturedBaselinePackets =
+        DrainDecodedPackets(1u);
+    const std::vector<PacketCodec::Bunch> liveBaseline =
+        FlattenBunches(liveBaselinePackets);
+    const std::vector<PacketCodec::Bunch> capturedBaseline =
+        FlattenBunches(capturedBaselinePackets);
+    // The public countdown seam may also publish unrelated phase/UI state;
+    // isolate the two exact h62 bunches within that complete end-of-tick batch.
+    ASSERT_GE(liveBaseline.size(), static_cast<size_t>(2));
+    ASSERT_GE(capturedBaseline.size(), static_cast<size_t>(2));
+    EXPECT_LT(FindWireBunch(
+                  liveBaseline, ExpectedTeamReinforcements(4u, 200)),
+              liveBaseline.size());
+    EXPECT_LT(FindWireBunch(
+                  liveBaseline, ExpectedTeamReinforcements(5u, 300)),
+              liveBaseline.size());
+    EXPECT_LT(FindWireBunch(
+                  capturedBaseline, ExpectedTeamReinforcements(76u, 200)),
+              capturedBaseline.size());
+    EXPECT_LT(FindWireBunch(
+                  capturedBaseline, ExpectedTeamReinforcements(56u, 300)),
+              capturedBaseline.size());
+    Harness::AcknowledgePackets(
+        manager_, kLiveViewer, liveBaselinePackets);
+    Harness::AcknowledgePackets(
+        manager_, kCapturedViewer, capturedBaselinePackets);
+    EXPECT_EQ(Harness::PublishedTeamReinforcements(
+                  manager_, kLiveViewer),
+              (std::array<std::optional<int32_t>, 2>{200, 300}));
+
+    const uint32_t livePacketAfterBaseline =
+        Harness::NextOutboundPacketId(manager_, kLiveViewer);
+    const uint32_t capturedPacketAfterBaseline =
+        Harness::NextOutboundPacketId(manager_, kCapturedViewer);
+    Harness::SynchronizeRetailTeamReinforcements(manager_);
+    EXPECT_EQ(Harness::NextOutboundPacketId(manager_, kLiveViewer),
+              livePacketAfterBaseline);
+    EXPECT_EQ(Harness::NextOutboundPacketId(manager_, kCapturedViewer),
+              capturedPacketAfterBaseline);
+    EXPECT_TRUE(DrainDecodedPackets(0u).empty());
+    EXPECT_TRUE(DrainDecodedPackets(1u).empty());
+
+    // Server team 1 is retail US/ch5 or ch56; server team 2 is retail
+    // NVA/ch4 or ch76. Commit both mutations before the sync and require each
+    // viewer to receive one final snapshot of both pools.
+    tickets->OnPlayerKilled(TeamMapping::kServerUs);
+    tickets->SetTickets(TeamMapping::kServerNva, 0u);
+    Harness::SynchronizeRetailTeamReinforcements(manager_);
+    const std::vector<PacketCodec::Packet> liveDepletionPackets =
+        DrainDecodedPackets(0u);
+    const std::vector<PacketCodec::Packet> capturedDepletionPackets =
+        DrainDecodedPackets(1u);
+    const std::vector<PacketCodec::Bunch> liveDepletion =
+        FlattenBunches(liveDepletionPackets);
+    const std::vector<PacketCodec::Bunch> capturedDepletion =
+        FlattenBunches(capturedDepletionPackets);
+    ASSERT_EQ(liveDepletion.size(), static_cast<size_t>(2));
+    ASSERT_EQ(capturedDepletion.size(), static_cast<size_t>(2));
+    EXPECT_LT(FindWireBunch(
+                  liveDepletion, ExpectedTeamReinforcements(4u, 0)),
+              liveDepletion.size());
+    EXPECT_LT(FindWireBunch(
+                  liveDepletion, ExpectedTeamReinforcements(5u, 299)),
+              liveDepletion.size());
+    EXPECT_LT(FindWireBunch(
+                  capturedDepletion, ExpectedTeamReinforcements(76u, 0)),
+              capturedDepletion.size());
+    EXPECT_LT(FindWireBunch(
+                  capturedDepletion, ExpectedTeamReinforcements(56u, 299)),
+              capturedDepletion.size());
+    Harness::AcknowledgePackets(
+        manager_, kLiveViewer, liveDepletionPackets);
+    Harness::AcknowledgePackets(
+        manager_, kCapturedViewer, capturedDepletionPackets);
+
+    tickets->AddTickets(TeamMapping::kServerNva, 7u);
+    Harness::SynchronizeRetailTeamReinforcements(manager_);
+    const std::vector<PacketCodec::Packet> liveRefillPackets =
+        DrainDecodedPackets(0u);
+    const std::vector<PacketCodec::Packet> capturedRefillPackets =
+        DrainDecodedPackets(1u);
+    const std::vector<PacketCodec::Bunch> liveRefill =
+        FlattenBunches(liveRefillPackets);
+    const std::vector<PacketCodec::Bunch> capturedRefill =
+        FlattenBunches(capturedRefillPackets);
+    ASSERT_EQ(liveRefill.size(), static_cast<size_t>(1));
+    ASSERT_EQ(capturedRefill.size(), static_cast<size_t>(1));
+    EXPECT_LT(FindWireBunch(
+                  liveRefill, ExpectedTeamReinforcements(4u, 7)),
+              liveRefill.size());
+    EXPECT_LT(FindWireBunch(
+                  capturedRefill, ExpectedTeamReinforcements(76u, 7)),
+              capturedRefill.size());
+    Harness::AcknowledgePackets(
+        manager_, kLiveViewer, liveRefillPackets);
+    Harness::AcknowledgePackets(
+        manager_, kCapturedViewer, capturedRefillPackets);
+
+    tickets->Reset();
+    Harness::SynchronizeRetailTeamReinforcements(manager_);
+    const std::vector<PacketCodec::Packet> liveResetPackets =
+        DrainDecodedPackets(0u);
+    const std::vector<PacketCodec::Packet> capturedResetPackets =
+        DrainDecodedPackets(1u);
+    const std::vector<PacketCodec::Bunch> liveReset =
+        FlattenBunches(liveResetPackets);
+    const std::vector<PacketCodec::Bunch> capturedReset =
+        FlattenBunches(capturedResetPackets);
+    ASSERT_EQ(liveReset.size(), static_cast<size_t>(2));
+    ASSERT_EQ(capturedReset.size(), static_cast<size_t>(2));
+    EXPECT_LT(FindWireBunch(
+                  liveReset, ExpectedTeamReinforcements(4u, 200)),
+              liveReset.size());
+    EXPECT_LT(FindWireBunch(
+                  liveReset, ExpectedTeamReinforcements(5u, 300)),
+              liveReset.size());
+    EXPECT_LT(FindWireBunch(
+                  capturedReset, ExpectedTeamReinforcements(76u, 200)),
+              capturedReset.size());
+    EXPECT_LT(FindWireBunch(
+                  capturedReset, ExpectedTeamReinforcements(56u, 300)),
+              capturedReset.size());
+    Harness::AcknowledgePackets(manager_, kLiveViewer, liveResetPackets);
+    Harness::AcknowledgePackets(
+        manager_, kCapturedViewer, capturedResetPackets);
+}
+
+TEST_F(ConnectionTravelCuChiRoleIntegrationTest,
+       ReinforcementSyncHonorsUnlimitedPoolsOpenChannelsAndTravelBoundary) {
+    using Harness = ConnectionTravelLifecycleTestHarness;
+    constexpr uint32_t kClientId = 92u;
+
+    TicketSystem* tickets = Harness::InstallTicketSystem(
+        server_, /*south/US unlimited=*/0u, /*north/NVA=*/5u);
+    ASSERT_TRUE(tickets != nullptr);
+    ASSERT_TRUE(Connect(0u, kClientId, TeamMapping::kServerUs) != nullptr);
+
+    // Frozen channel numbers alone are insufficient: no delta may target a
+    // TeamInfo actor whose reliable open was never queued.
+    Harness::SynchronizeRetailTeamReinforcements(manager_);
+    EXPECT_TRUE(DrainDecodedPackets(0u).empty());
+    EXPECT_EQ(Harness::PublishedTeamReinforcements(manager_, kClientId),
+              (std::array<std::optional<int32_t>, 2>{
+                  std::nullopt, std::nullopt}));
+
+    Harness::MarkTeamInfoChannelsOpen(manager_, kClientId);
+    CloseSenderSocketForTest();
+    Harness::SynchronizeRetailTeamReinforcements(manager_);
+    EXPECT_TRUE(DrainDecodedPackets(0u).empty());
+    EXPECT_EQ(Harness::PublishedTeamReinforcements(manager_, kClientId),
+              (std::array<std::optional<int32_t>, 2>{
+                  std::nullopt, std::nullopt}));
+    EXPECT_EQ(Harness::PendingTeamReinforcements(manager_, kClientId),
+              (std::array<std::optional<int32_t>, 2>{
+                  std::nullopt, std::nullopt}));
+    ASSERT_TRUE(RebindSenderSocketForTest());
+
+    Harness::SeedPendingTeamInfoOpen(manager_, kClientId, 4u);
+    Harness::SynchronizeRetailTeamReinforcements(manager_);
+    const std::vector<PacketCodec::Packet> partialBaselinePackets =
+        DrainDecodedPackets(0u);
+    const std::vector<PacketCodec::Bunch> partialBaseline =
+        FlattenBunches(partialBaselinePackets);
+    ASSERT_EQ(partialBaselinePackets.size(), static_cast<size_t>(1));
+    ASSERT_EQ(partialBaseline.size(), static_cast<size_t>(1));
+    EXPECT_LT(FindWireBunch(
+                  partialBaseline,
+                  ExpectedTeamReinforcements(
+                      5u, SpawnRepl::kUnlimitedReinforcementsDisplay)),
+              partialBaseline.size());
+    EXPECT_EQ(Harness::PublishedTeamReinforcements(manager_, kClientId),
+              (std::array<std::optional<int32_t>, 2>{
+                  std::nullopt, std::nullopt}));
+    EXPECT_EQ(Harness::PendingTeamReinforcements(manager_, kClientId),
+              (std::array<std::optional<int32_t>, 2>{
+                  std::nullopt,
+                  SpawnRepl::kUnlimitedReinforcementsDisplay}));
+
+    // The first wire-unreliable packet is intentionally left unacknowledged.
+    // Expiring its retirement timer must re-emit the same dirty property, and
+    // an ACK for either carrying packet retires the value exactly once.
+    Harness::ExpireTeamReinforcementRetry(
+        manager_, kClientId, TeamMapping::kRetailUs);
+    Harness::SynchronizeRetailTeamReinforcements(manager_);
+    const std::vector<PacketCodec::Packet> retryPackets =
+        DrainDecodedPackets(0u);
+    const std::vector<PacketCodec::Bunch> retryBunches =
+        FlattenBunches(retryPackets);
+    ASSERT_EQ(retryPackets.size(), static_cast<size_t>(1));
+    ASSERT_EQ(retryBunches.size(), static_cast<size_t>(1));
+    EXPECT_NE(retryPackets.front().packetId,
+              partialBaselinePackets.front().packetId);
+    EXPECT_LT(FindWireBunch(
+                  retryBunches,
+                  ExpectedTeamReinforcements(
+                      5u, SpawnRepl::kUnlimitedReinforcementsDisplay)),
+              retryBunches.size());
+    Harness::Acknowledge(
+        manager_, kClientId, partialBaselinePackets.front().packetId);
+    EXPECT_EQ(Harness::PublishedTeamReinforcements(manager_, kClientId),
+              (std::array<std::optional<int32_t>, 2>{
+                  std::nullopt,
+                  SpawnRepl::kUnlimitedReinforcementsDisplay}));
+    EXPECT_EQ(Harness::PendingTeamReinforcements(manager_, kClientId),
+              (std::array<std::optional<int32_t>, 2>{
+                  std::nullopt, std::nullopt}));
+
+    // Once the reliable open retires, the still-dirty finite pool publishes
+    // without redundantly resending the already-synchronized other team.
+    Harness::ClearPendingReliables(manager_, kClientId);
+    Harness::SynchronizeRetailTeamReinforcements(manager_);
+    const std::vector<PacketCodec::Packet> completedBaselinePackets =
+        DrainDecodedPackets(0u);
+    const std::vector<PacketCodec::Bunch> completedBaseline =
+        FlattenBunches(completedBaselinePackets);
+    ASSERT_EQ(completedBaseline.size(), static_cast<size_t>(1));
+    EXPECT_LT(FindWireBunch(
+                  completedBaseline, ExpectedTeamReinforcements(4u, 5)),
+              completedBaseline.size());
+    Harness::AcknowledgePackets(
+        manager_, kClientId, completedBaselinePackets);
+
+    // Returning authority to the last ACKed value cannot merely discard a
+    // conflicting in-flight datagram: that old zero may still arrive later.
+    // Force a new current-value write, ignore the delayed old ACK, and retire
+    // only when a packet carrying the corrective five is acknowledged.
+    tickets->SetTickets(TeamMapping::kServerNva, 0u);
+    Harness::SynchronizeRetailTeamReinforcements(manager_);
+    const std::vector<PacketCodec::Packet> staleZeroPackets =
+        DrainDecodedPackets(0u);
+    const std::vector<PacketCodec::Bunch> staleZeroBunches =
+        FlattenBunches(staleZeroPackets);
+    ASSERT_EQ(staleZeroPackets.size(), static_cast<size_t>(1));
+    EXPECT_LT(FindWireBunch(
+                  staleZeroBunches, ExpectedTeamReinforcements(4u, 0)),
+              staleZeroBunches.size());
+
+    tickets->SetTickets(TeamMapping::kServerNva, 5u);
+    Harness::SynchronizeRetailTeamReinforcements(manager_);
+    const std::vector<PacketCodec::Packet> correctivePackets =
+        DrainDecodedPackets(0u);
+    const std::vector<PacketCodec::Bunch> correctiveBunches =
+        FlattenBunches(correctivePackets);
+    ASSERT_EQ(correctivePackets.size(), static_cast<size_t>(1));
+    EXPECT_LT(FindWireBunch(
+                  correctiveBunches,
+                  ExpectedTeamReinforcements(4u, 5)),
+              correctiveBunches.size());
+    Harness::Acknowledge(
+        manager_, kClientId, staleZeroPackets.front().packetId);
+    EXPECT_EQ(Harness::PublishedTeamReinforcements(manager_, kClientId),
+              (std::array<std::optional<int32_t>, 2>{
+                  std::nullopt,
+                  SpawnRepl::kUnlimitedReinforcementsDisplay}));
+    EXPECT_EQ(Harness::PendingTeamReinforcements(manager_, kClientId),
+              (std::array<std::optional<int32_t>, 2>{
+                  5, std::nullopt}));
+    Harness::AcknowledgePackets(manager_, kClientId, correctivePackets);
+    EXPECT_EQ(Harness::PublishedTeamReinforcements(manager_, kClientId),
+              (std::array<std::optional<int32_t>, 2>{
+                  5, SpawnRepl::kUnlimitedReinforcementsDisplay}));
+
+    // Diagnostic writes to an initial-zero pool never alter its retail wire
+    // sentinel and therefore must not create a redundant property delta.
+    tickets->SetTickets(TeamMapping::kServerUs, 123u);
+    const uint32_t packetBeforeUnlimitedNoop =
+        Harness::NextOutboundPacketId(manager_, kClientId);
+    Harness::SynchronizeRetailTeamReinforcements(manager_);
+    EXPECT_EQ(Harness::NextOutboundPacketId(manager_, kClientId),
+              packetBeforeUnlimitedNoop);
+    EXPECT_TRUE(DrainDecodedPackets(0u).empty());
+
+    const ClientTravelRepl::EncodedRpc travel = MakeTravelRpc();
+    ASSERT_TRUE(ClientTravelRepl::IsValid(travel));
+    ASSERT_EQ(manager_.BroadcastRetailClientTravel(
+                  travel, "VNSK-Compound"),
+              static_cast<size_t>(1));
+    EXPECT_EQ(Harness::PublishedTeamReinforcements(manager_, kClientId),
+              (std::array<std::optional<int32_t>, 2>{
+                  std::nullopt, std::nullopt}));
+    EXPECT_EQ(Harness::PendingTeamReinforcements(manager_, kClientId),
+              (std::array<std::optional<int32_t>, 2>{
+                  std::nullopt, std::nullopt}));
+    (void)DrainDecodedPackets(0u);
+
+    tickets->SetTickets(TeamMapping::kServerNva, 4u);
+    Harness::SynchronizeRetailTeamReinforcements(manager_);
+    EXPECT_TRUE(DrainDecodedPackets(0u).empty());
+}
 
 TEST(ConnectionTravelLifecycle,
      ActiveTerritoryDeadlineUsesRetailIntegerCoordinateAndCarriesResidual) {
