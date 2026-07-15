@@ -342,6 +342,11 @@ public:
         return manager.m_controlState.at(clientId).teamSelected;
     }
 
+    static bool Spawned(const ConnectionManager& manager,
+                        uint32_t clientId) {
+        return manager.m_controlState.at(clientId).spawned;
+    }
+
     static uint64_t OwningPawnGeneration(
         const ConnectionManager& manager, uint32_t clientId) {
         return manager.m_controlState.at(clientId).owningPawnGeneration;
@@ -978,6 +983,28 @@ protected:
                 : std::vector<uint8_t>{
                       0xaf, 0x64, 0x56, 0x15, 0x00, 0x80, 0xc3, 0x01},
             57u);
+    }
+
+    static PacketCodec::Bunch SpawnSelectBunch(uint8_t slot = 0u) {
+        BitWriter writer;
+        writer.SerializeInt(
+            DeploymentRepl::kServerSetSpawnSelectHandle,
+            DeploymentRepl::kRoPlayerControllerMaxHandle);
+        writer.WriteBit(true);
+        writer.WriteByte(static_cast<uint8_t>(
+            DeploymentCoordinator::kNormalSpawnSelectionBase + slot));
+        return MakeCapturedPcBunch(
+            writer.GetBytes(), static_cast<uint32_t>(writer.NumBits()));
+    }
+
+    static PacketCodec::Bunch ReadyBunch() {
+        BitWriter writer;
+        writer.SerializeInt(
+            DeploymentRepl::kServerSetReadyToSpawnHandle,
+            DeploymentRepl::kRoPlayerControllerMaxHandle);
+        writer.WriteBit(false); // Default-omitted enum value is Ready.
+        return MakeCapturedPcBunch(
+            writer.GetBytes(), static_cast<uint32_t>(writer.NumBits()));
     }
 
     std::vector<PacketCodec::Packet> DrainDecodedPackets(
@@ -2138,6 +2165,126 @@ TEST_F(ConnectionTravelCuChiRoleIntegrationTest,
         EXPECT_EQ(Harness::PendingReliableCount(manager_, entry.clientId),
                   static_cast<size_t>(1));
     }
+}
+
+TEST_F(ConnectionTravelCuChiRoleIntegrationTest,
+       FreshFinalAfterDeathResetsAuthorizationAndRequiresFreshReady) {
+    using Harness = ConnectionTravelLifecycleTestHarness;
+    constexpr uint32_t kClientId = 41u;
+    constexpr uint32_t kTeamId = RoleSelectionRepl::kCuChiUsServerTeam;
+
+    RoleSystem* roles = server_.GetRoleSystem();
+    PlayerManager* players = server_.GetPlayerManager();
+    ASSERT_TRUE(roles != nullptr);
+    ASSERT_TRUE(players != nullptr);
+    ASSERT_TRUE(Connect(0u, kClientId, kTeamId) != nullptr);
+    const auto player = players->GetPlayer(kClientId);
+    ASSERT_TRUE(player != nullptr);
+
+    // Establish the first complete Cu Chi role -> spawn authorization using the
+    // same standalone h175, h261, and h434 RPCs sent by the retail client.
+    Harness::DeliverActorBunch(manager_, kClientId, CuChiFinalRoleBunch(true));
+    (void)DrainDecodedPackets(0u);
+    const auto initialAssignment = roles->GetRetailSquadAssignment(kClientId);
+    ASSERT_TRUE(initialAssignment.has_value());
+    ASSERT_EQ(initialAssignment->teamId, kTeamId);
+    ASSERT_EQ(initialAssignment->squadIndex, 0u);
+    ASSERT_EQ(initialAssignment->roleIndex, 0u);
+
+    Harness::DeliverActorBunch(manager_, kClientId, SpawnSelectBunch());
+    (void)DrainDecodedPackets(0u);
+    auto deployment = Harness::DeploymentState(manager_, kClientId);
+    ASSERT_TRUE(deployment.has_value());
+    ASSERT_EQ(deployment->selectedSlot, std::optional<uint8_t>{0u});
+    ASSERT_TRUE(deployment->selectedSpawnId.has_value());
+    const uint32_t selectedSpawnId = *deployment->selectedSpawnId;
+    EXPECT_EQ(deployment->readyStatus,
+              DeploymentCoordinator::ReadyStatus::ForceOnly);
+    EXPECT_FALSE(deployment->deploymentAuthorized);
+
+    Harness::DeliverActorBunch(manager_, kClientId, ReadyBunch());
+    deployment = Harness::DeploymentState(manager_, kClientId);
+    ASSERT_TRUE(deployment.has_value());
+    ASSERT_EQ(deployment->selectedSlot, std::optional<uint8_t>{0u});
+    ASSERT_EQ(deployment->selectedSpawnId,
+              std::optional<uint32_t>{selectedSpawnId});
+    EXPECT_EQ(deployment->readyStatus,
+              DeploymentCoordinator::ReadyStatus::Ready);
+    EXPECT_TRUE(deployment->deploymentAuthorized);
+    EXPECT_TRUE(Harness::DeploymentPrepared(manager_, kClientId));
+
+    // The detached fixture has no live game-mode clock, so model the completed
+    // authoritative spawn boundary while retaining the coordinator state that
+    // ExecutePreparedDeployment intentionally keeps after a successful spawn.
+    players->OnPlayerSpawn(kClientId);
+    player->SetReadyToSpawn(true);
+    Harness::SetPossessionRecoveryEligibility(
+        manager_, kClientId, true, true, false, 1u);
+    ASSERT_TRUE(player->IsAlive());
+    ASSERT_TRUE(player->IsReadyToSpawn());
+    ASSERT_TRUE(Harness::Spawned(manager_, kClientId));
+
+    players->OnPlayerDeath(kClientId);
+    manager_.ReplicateRetailParticipantCombatState(
+        ParticipantId::Human(kClientId), 0, 0, 1, 0,
+        /*isDead=*/true, /*sendHealth=*/false, /*sendDeathRpc=*/true);
+    (void)DrainDecodedPackets(0u);
+    EXPECT_FALSE(player->IsAlive());
+    EXPECT_FALSE(Harness::Spawned(manager_, kClientId));
+    // Death ends the pawn lifecycle, not the already-completed deployment
+    // transaction. This is the stale authorization the next final must clear.
+    deployment = Harness::DeploymentState(manager_, kClientId);
+    ASSERT_TRUE(deployment.has_value());
+    ASSERT_TRUE(deployment->deploymentAuthorized);
+    ASSERT_TRUE(player->IsReadyToSpawn());
+
+    Harness::DeliverActorBunch(manager_, kClientId, CuChiFinalRoleBunch(true));
+    (void)DrainDecodedPackets(0u);
+
+    deployment = Harness::DeploymentState(manager_, kClientId);
+    ASSERT_TRUE(deployment.has_value());
+    EXPECT_TRUE(deployment->roleFinalized);
+    EXPECT_FALSE(deployment->selectedSlot.has_value());
+    EXPECT_FALSE(deployment->selectedSpawnId.has_value());
+    EXPECT_EQ(deployment->readyStatus,
+              DeploymentCoordinator::ReadyStatus::ForceOnly);
+    EXPECT_FALSE(deployment->deploymentAuthorized);
+    EXPECT_FALSE(Harness::DeploymentPrepared(manager_, kClientId));
+    EXPECT_FALSE(player->IsReadyToSpawn());
+
+    const auto assignmentAfterFinal =
+        roles->GetRetailSquadAssignment(kClientId);
+    ASSERT_TRUE(assignmentAfterFinal.has_value());
+    EXPECT_EQ(assignmentAfterFinal->teamId, initialAssignment->teamId);
+    EXPECT_EQ(assignmentAfterFinal->squadIndex,
+              initialAssignment->squadIndex);
+    EXPECT_EQ(assignmentAfterFinal->roleIndex,
+              initialAssignment->roleIndex);
+    EXPECT_EQ(assignmentAfterFinal->generation,
+              initialAssignment->generation);
+    EXPECT_EQ(roles->GetRoleCount(kTeamId, CombatRole::Rifleman), 1);
+
+    Harness::DeliverActorBunch(manager_, kClientId, SpawnSelectBunch());
+    (void)DrainDecodedPackets(0u);
+    deployment = Harness::DeploymentState(manager_, kClientId);
+    ASSERT_TRUE(deployment.has_value());
+    ASSERT_EQ(deployment->selectedSlot, std::optional<uint8_t>{0u});
+    ASSERT_EQ(deployment->selectedSpawnId,
+              std::optional<uint32_t>{selectedSpawnId});
+    EXPECT_EQ(deployment->readyStatus,
+              DeploymentCoordinator::ReadyStatus::ForceOnly);
+    EXPECT_FALSE(deployment->deploymentAuthorized);
+
+    Harness::DeliverActorBunch(manager_, kClientId, ReadyBunch());
+    deployment = Harness::DeploymentState(manager_, kClientId);
+    ASSERT_TRUE(deployment.has_value());
+    EXPECT_EQ(deployment->selectedSlot, std::optional<uint8_t>{0u});
+    EXPECT_EQ(deployment->selectedSpawnId,
+              std::optional<uint32_t>{selectedSpawnId});
+    EXPECT_EQ(deployment->readyStatus,
+              DeploymentCoordinator::ReadyStatus::Ready);
+    EXPECT_TRUE(deployment->deploymentAuthorized);
+    EXPECT_TRUE(Harness::DeploymentPrepared(manager_, kClientId));
 }
 
 TEST_F(ConnectionTravelCuChiRoleIntegrationTest,

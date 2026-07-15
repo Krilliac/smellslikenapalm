@@ -7565,6 +7565,11 @@ void ConnectionManager::DecodeInboundActorBunch(uint32_t clientId,
             }
             if (!cs.spawned) {
                 cs.roleFinalized = true;
+                // Every accepted final role for an unspawned client starts a
+                // fresh spawn-selection transaction. Squad/role ownership
+                // lives in RoleSystem and survives this reset; stale slot,
+                // Ready, and authorization do not.
+                m_deploymentCoordinator.ResetClient(clientId);
                 m_deploymentCoordinator.FinalizeRole(clientId);
                 if (!SendChangedRoleSpawnSelect(
                         clientId,
@@ -7625,6 +7630,10 @@ void ConnectionManager::DecodeInboundActorBunch(uint32_t clientId,
         }
         if (!cs.spawned) {
             cs.roleFinalized = true;
+            // Resort reaches the same fresh unspawned role-selection boundary:
+            // preserve its accepted role ledger while discarding the prior
+            // deployment transaction.
+            m_deploymentCoordinator.ResetClient(clientId);
             m_deploymentCoordinator.FinalizeRole(clientId);
             Logger::Info(
                 "[RoleSelection] client %u final Resort infantry for server "
