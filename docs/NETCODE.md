@@ -769,6 +769,15 @@ map/mode/artifact/class-0 pair is admitted through its narrower grounded
 profile. That exception does not unlock installed Resort, either Hue City
 layout, canonical Compound, or any other role class.
 
+The read-only `tools/audit_installed_role_refs.py` evidence path now resolves
+the other twelve effective first-round infantry UClasses from the pinned
+installed package, pinned Cu Chi map, and source force-substitution table. Its
+checked-in JSONL report authorizes no new runtime behavior, separately marks
+the two class-0 rows above as supported, and keeps the other twelve blocked.
+Every additional role still needs a live h175 plus a role/loadout-specific
+owning-pawn graph, and the current graph is fixed by team rather than selected
+role.
+
 ---
 
 ## 7. Quick reference — where each thing lives

@@ -9,6 +9,14 @@ The tool opens the package with `FileAccess.Read`. It writes only its requested
 JSONL output and a compiled helper under the current user's LocalAppData cache;
 it never rewrites the `.roe` file or `config/maps.ini`.
 
+The helper cache is addressed by a SHA-256 over the exact C# source, wrapper
+script, and a path/size/SHA-256 manifest of every file in the Roslyn compiler
+directory. Compilation targets a unique staging directory; the executable and
+its SHA-256 manifest are atomically promoted and rechecked before execution.
+Different checkouts, compiler revisions, interrupted builds, or concurrent
+builds therefore cannot silently reuse a merely newer timestamp-compatible
+executable.
+
 ## Prerequisites
 
 - An installed Visual Studio Roslyn C# compiler. The wrapper locates it with
@@ -131,7 +139,54 @@ It deliberately does **not** emit squad indices or role-slot indices.
 `GetEmptySlot` chooses the first open role slot. Those values are runtime state,
 not cooked map definitions. Likewise, the map's import `FPackageIndex` is not a
 wire PackageMap object index: a wire role object still requires the agreed
-PackageMap package base plus the exact `ROGame.u` role CDO export index.
+PackageMap package base plus the exact `ROGame.u` `RoleInfoClass` UClass linker
+export index. The adjacent CDO index is not the h175 object kind.
+
+## Exact installed role exports
+
+`-RoleExports` is the table-only companion to `-RoleInfo`. It accepts only the
+root `ROGame.u`, requires the caller to pin the complete SHA-256 and package
+GUID, and validates every `RORoleInfo*` UClass against its exact in-package
+`Default__RORoleInfo*` CDO. It never initializes actors or authorizes a runtime
+role. An optional PackageMap base derives candidate static references with
+checked `ObjectBase + linker index` arithmetic below `0x80000000`:
+
+```powershell
+powershell -NoProfile -File tools\extract_cooked_map_metadata.ps1 `
+  'D:\SteamLibrary\steamapps\common\Rising Storm 2\ROGame\BrewedPC\ROGame.u' `
+  -RoleExports `
+  -ExpectedPackageGuid 16A6CC8D446C4A9FD5B688B3210DCC82 `
+  -ExpectedSha256 AED4E60D406880D048EB579A082F4A44BE3D0B39CFEC47F9FCEF828A40C44961 `
+  -ObjectBase 39478 `
+  -MaxInputMiB 64 `
+  -OutputPath "$env:TEMP\ROGame-role-exports.jsonl"
+```
+
+The higher-level Cu Chi audit independently hashes `ROGame.u`,
+`VNTE-CuChi.roe`, Eliot.UELib, its exact
+`System.Runtime.CompilerServices.Unsafe.dll` 6.0.3 dependency, `ROMapInfo.uc`,
+root `RORoleInfo.uc`, and all fourteen base role source files before and after
+its serialized extractors run. It also pins the wrapper and C# extractor source
+and forces a fresh content-keyed compile for every serialized extraction. The
+fresh executable must match the audit's exact byte count and SHA-256. The
+extractor preloads only the exact Unsafe sibling path and rejects every other
+unresolved assembly request.
+It validates the root zero-default `ClassIndex` contract, cooked role arrays,
+live map-force properties, derived source `ClassIndex` declarations, and the
+force-substitution table, then joins those facts to the paired package exports.
+It cross-checks both previously known class-0 references and emits only evidence
+records:
+
+```powershell
+python tools\audit_installed_role_refs.py `
+  --output "$env:TEMP\installed-cuchi-role-refs.jsonl"
+```
+
+The checked-in reproducible result is
+`data/installed_cuchi_role_refs.jsonl`. Every row carries
+`authorizedByReport=false`; the report separately identifies the two class-0
+roles already supported by the emulator and the twelve roles still blocked on
+live h175 and owning-pawn graph evidence.
 
 ## Source-verified brush bounds diagnostics
 
@@ -212,6 +267,9 @@ whole map inventory in memory:
 - `role`: exact `ROMapInfo.RORoleCount` team/ordinal, map import reference,
   resolved role class, normal/reversed limits, and per-element serialized size
   (`-RoleInfo`).
+- `roleExport`: an exact paired `RORoleInfo*` UClass/CDO linker identity and,
+  when supplied, checked PackageMap static-reference candidates
+  (`-RoleExports`).
 - `actor`: class name/path, object name/path, export offset/size, selected
   serialized property tags, and a parsed `{x,y,z}` convenience field when a
   valid `Location` struct is present.

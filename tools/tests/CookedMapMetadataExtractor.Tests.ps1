@@ -4,6 +4,7 @@ param(
     [string]$MapPath = 'D:\SteamLibrary\steamapps\common\Rising Storm 2\ROGame\BrewedPC\Maps\VNTE-CampaignStart.roe',
     [string]$RoleMapPath = 'D:\SteamLibrary\steamapps\common\Rising Storm 2\ROGame\BrewedPC\Maps\CuChi\VNTE-CuChi.roe',
     [string]$CollisionMapPath = 'D:\SteamLibrary\steamapps\common\Rising Storm 2\ROGame\BrewedPC\Maps\Resort\VNTE-Resort.roe',
+    [string]$RolePackagePath = 'D:\SteamLibrary\steamapps\common\Rising Storm 2\ROGame\BrewedPC\ROGame.u',
     [switch]$RequireIntegration
 )
 
@@ -49,6 +50,53 @@ try {
     Assert-True ($LASTEXITCODE -eq 0) 'wrapper compilation must succeed'
     $executable = [string]($buildOutput | Select-Object -Last 1)
     Assert-True (Test-Path -LiteralPath $executable -PathType Leaf) 'compiled extractor must exist'
+    $cacheKey = Split-Path -Leaf (Split-Path -Parent $executable)
+    Assert-True ($cacheKey -match '^[0-9A-F]{64}$') `
+        'compiled extractor cache must be content-addressed'
+    $secondBuildOutput = @(& $wrapper -BuildOnly -UELibPath $UELibPath)
+    Assert-True ([string]($secondBuildOutput | Select-Object -Last 1) -eq $executable) `
+        'identical source, wrapper, and compiler bytes must reuse one cache identity'
+    $executableHash = (Get-FileHash -LiteralPath $executable -Algorithm SHA256).Hash
+    $hashManifest = $executable + '.sha256'
+    Assert-True (Test-Path -LiteralPath $hashManifest -PathType Leaf) `
+        'compiled extractor cache must include an executable-hash manifest'
+    Assert-True ([IO.File]::ReadAllText($hashManifest).Trim() -eq $executableHash) `
+        'compiled extractor cache manifest must match the executable bytes'
+    $forcedBuildOutput = @(
+        & $wrapper -BuildOnly -ForceRebuild -UELibPath $UELibPath `
+            -ExpectedExecutableSha256 $executableHash
+    )
+    Assert-True ([string]($forcedBuildOutput | Select-Object -Last 1) -eq $executable) `
+        'forced build must atomically republish the same deterministic executable'
+    Assert-True (@(Get-ChildItem -LiteralPath (Split-Path -Parent $executable) `
+            -Directory -Filter 'build-*').Count -eq 0) `
+        'successful cache publication must leave no staging directories'
+    [IO.File]::WriteAllText(
+        $hashManifest,
+        ('0' * 64) + "`n",
+        (New-Object Text.UTF8Encoding($false))
+    )
+    $repairedBuildOutput = @(
+        & $wrapper -BuildOnly -UELibPath $UELibPath `
+            -ExpectedExecutableSha256 $executableHash
+    )
+    Assert-True ([string]($repairedBuildOutput | Select-Object -Last 1) -eq $executable) `
+        'a stale executable-hash manifest must trigger a known-good rebuild'
+    Assert-True ([IO.File]::ReadAllText($hashManifest).Trim() -eq $executableHash) `
+        'cache rebuild must repair the executable-hash manifest'
+    $wrongExecutableHash = Invoke-Extractor 'powershell' @(
+        '-NoProfile',
+        '-File', $wrapper,
+        '-BuildOnly',
+        '-ForceRebuild',
+        '-ExpectedExecutableSha256', ('F' * 64)
+    ) 'wrong-executable-hash'
+    Assert-True ($wrongExecutableHash.ExitCode -ne 0) `
+        'forced build must reject an unexpected executable SHA-256'
+    Assert-True ($wrongExecutableHash.Stderr -match 'mismatch before publication') `
+        'unexpected executable rejection must occur before cache publication'
+    Assert-True ((Get-FileHash -LiteralPath $executable -Algorithm SHA256).Hash -eq $executableHash) `
+        'unexpected staged executable must not replace the known-good cache entry'
 
     $help = Invoke-Extractor $executable @('--help') 'help'
     Assert-True ($help.ExitCode -eq 0) '--help must exit zero'
@@ -59,6 +107,12 @@ try {
         'synthetic exact-role-schema checks must succeed'
     Assert-True ($roleSchema.Stdout -match 'rejects unknown fields and nonzero scalar ArrayIndex') `
         'role-schema self-test must cover unknown fields and nonzero scalar ArrayIndex values'
+
+    $roleExportSchema = Invoke-Extractor $executable @('--self-test-role-export-schema') 'role-export-schema'
+    Assert-True ($roleExportSchema.ExitCode -eq 0) `
+        'synthetic exact-role-export checks must succeed'
+    Assert-True ($roleExportSchema.Stdout -match 'checked static references') `
+        'role-export self-test must cover checked PackageMap reference arithmetic'
 
     $missing = Invoke-Extractor $executable @(
         '--input', (Join-Path $tempRoot 'missing.roe'),
@@ -77,6 +131,48 @@ try {
     }
 
     $beforeHash = (Get-FileHash -LiteralPath $MapPath -Algorithm SHA256).Hash
+
+    $wrongDependencyRoot = Join-Path $tempRoot 'wrong-dependency'
+    [IO.Directory]::CreateDirectory($wrongDependencyRoot) | Out-Null
+    $copiedUELib = Join-Path $wrongDependencyRoot 'Eliot.UELib.dll'
+    $wrongUnsafe = Join-Path $wrongDependencyRoot 'System.Runtime.CompilerServices.Unsafe.dll'
+    Copy-Item -LiteralPath $UELibPath -Destination $copiedUELib
+    Copy-Item -LiteralPath $UELibPath -Destination $wrongUnsafe
+    $wrongDependency = Invoke-Extractor $executable @(
+        '--input', $MapPath,
+        '--uelib', $copiedUELib,
+        '--max-actors', '1'
+    ) 'wrong-dependency'
+    Assert-True ($wrongDependency.ExitCode -eq 65) `
+        'extractor must reject a sibling dependency with the wrong assembly identity'
+    Assert-True ($wrongDependency.Stderr -match 'exact pinned UELib dependency') `
+        'dependency rejection must identify the pinned-load contract'
+
+    $unsafeSource = Join-Path (Split-Path -Parent $UELibPath) `
+        'System.Runtime.CompilerServices.Unsafe.dll'
+    Assert-True (Test-Path -LiteralPath $unsafeSource -PathType Leaf) `
+        'installed UELib dependency must exist for integration checks'
+    $protectedDependencyRoot = Join-Path $tempRoot 'protected-dependency'
+    [IO.Directory]::CreateDirectory($protectedDependencyRoot) | Out-Null
+    $protectedUELib = Join-Path $protectedDependencyRoot 'Eliot.UELib.dll'
+    $protectedUnsafe = Join-Path $protectedDependencyRoot `
+        'System.Runtime.CompilerServices.Unsafe.dll'
+    Copy-Item -LiteralPath $UELibPath -Destination $protectedUELib
+    Copy-Item -LiteralPath $unsafeSource -Destination $protectedUnsafe
+    $protectedUnsafeHash = (Get-FileHash -LiteralPath $protectedUnsafe -Algorithm SHA256).Hash
+    $dependencyOutput = Invoke-Extractor $executable @(
+        '--input', $MapPath,
+        '--uelib', $protectedUELib,
+        '--output', $protectedUnsafe,
+        '--overwrite',
+        '--max-actors', '1'
+    ) 'dependency-output'
+    Assert-True ($dependencyOutput.ExitCode -eq 65) `
+        'extractor output must not alias the pinned UELib dependency'
+    Assert-True ($dependencyOutput.Stderr -match 'UELib dependency file') `
+        'dependency output rejection must identify the protected input'
+    Assert-True ((Get-FileHash -LiteralPath $protectedUnsafe -Algorithm SHA256).Hash -eq $protectedUnsafeHash) `
+        'dependency output rejection must leave the pinned bytes unchanged'
 
     $wrapperOutput = Join-Path $tempRoot 'wrapper-classes.jsonl'
     & $wrapper $MapPath -UELibPath $UELibPath -ClassesOnly `
@@ -174,6 +270,67 @@ try {
     }
     elseif ($RequireIntegration) {
         throw "Role integration map is required but missing: $RoleMapPath"
+    }
+
+    if (Test-Path -LiteralPath $RolePackagePath -PathType Leaf) {
+        $rolePackageBeforeHash = (Get-FileHash -LiteralPath $RolePackagePath -Algorithm SHA256).Hash
+        $expectedRolePackageHash = 'AED4E60D406880D048EB579A082F4A44BE3D0B39CFEC47F9FCEF828A40C44961'
+        Assert-True ($rolePackageBeforeHash -eq $expectedRolePackageHash) `
+            'installed ROGame.u must match the pinned role-export artifact'
+
+        $roleExportOutput = Join-Path $tempRoot 'role-exports.jsonl'
+        & $wrapper $RolePackagePath -UELibPath $UELibPath -RoleExports `
+            -ExpectedPackageGuid '16A6CC8D446C4A9FD5B688B3210DCC82' `
+            -ExpectedSha256 $expectedRolePackageHash -ObjectBase 39478 `
+            -MaxInputMiB 64 -OutputPath $roleExportOutput
+        Assert-True ($LASTEXITCODE -eq 0) 'pinned ROGame role-export audit must succeed'
+
+        $roleExportRecords = @([IO.File]::ReadAllLines($roleExportOutput) | ForEach-Object { $_ | ConvertFrom-Json })
+        $roleExports = @($roleExportRecords | Where-Object record -eq 'roleExport')
+        Assert-True ($roleExportRecords[0].inputSha256 -eq $expectedRolePackageHash) `
+            'role-export header must preserve the verified artifact SHA-256'
+        Assert-True ($roleExportRecords[0].sha256StableAcrossTableRead) `
+            'role-export audit must recheck SHA-256 after reading package tables'
+        Assert-True ($roleExportRecords[0].packageGuid -eq '16A6CC8D446C4A9FD5B688B3210DCC82') `
+            'role-export header must preserve the exact package GUID'
+        Assert-True ($roleExportRecords[0].packageName -eq 'ROGame') `
+            'role-export header must preserve the exact internal package name'
+        Assert-True ($roleExportRecords[0].packageFlags -eq '0x20204001' -and $roleExportRecords[0].finalGenerationNetObjects -eq 64476) `
+            'role-export header must preserve exact script/generation provenance'
+        Assert-True ($roleExports.Count -eq 94) `
+            'pinned ROGame.u must expose 94 exact UClass/CDO role pairs'
+        $northGuerilla = @($roleExports | Where-Object roleClass -eq 'RORoleInfoNorthernGuerilla')
+        $southGrunt = @($roleExports | Where-Object roleClass -eq 'RORoleInfoSouthernGrunt')
+        $southMachineGunner = @($roleExports | Where-Object roleClass -eq 'RORoleInfoSouthernMachineGunner')
+        Assert-True ($northGuerilla.Count -eq 1 -and $northGuerilla[0].uclassLinkerIndex -eq 47921 -and $northGuerilla[0].uclassStaticReference -eq 87399) `
+            'North Cu Chi class-0 UClass identity must remain exact'
+        Assert-True ($southGrunt.Count -eq 1 -and $southGrunt[0].uclassLinkerIndex -eq 48013 -and $southGrunt[0].uclassStaticReference -eq 87491) `
+            'South Cu Chi class-0 UClass identity must remain exact'
+        Assert-True ($southMachineGunner.Count -eq 1 -and $southMachineGunner[0].uclassLinkerIndex -eq 48019 -and $southMachineGunner[0].uclassStaticReference -eq 87497) `
+            'South MachineGunner evidence candidate must remain exact but disabled'
+        Assert-True (@($roleExports | Where-Object authorizedByExtractor).Count -eq 0) `
+            'evidence extraction must never authorize runtime role support'
+        Assert-True ($roleExportRecords[-1].pairsValidatedExactly -and -not $roleExportRecords[-1].runtimeRolesAuthorized) `
+            'role-export summary must preserve exact pairing and fail-closed runtime state'
+
+        $badGuid = Invoke-Extractor $executable @(
+            '--input', $RolePackagePath,
+            '--uelib', $UELibPath,
+            '--mode', 'role-exports',
+            '--expected-package-guid', '11111111111111111111111111111111',
+            '--expected-sha256', $expectedRolePackageHash
+        ) 'role-export-bad-guid'
+        Assert-True ($badGuid.ExitCode -eq 65) `
+            'role-export audit must fail closed on package GUID drift'
+        Assert-True ($badGuid.Stderr -match 'package GUID mismatch') `
+            'role-export GUID rejection must identify the drift'
+
+        $rolePackageAfterHash = (Get-FileHash -LiteralPath $RolePackagePath -Algorithm SHA256).Hash
+        Assert-True ($rolePackageBeforeHash -eq $rolePackageAfterHash) `
+            'the audited ROGame.u source must remain byte-identical'
+    }
+    elseif ($RequireIntegration) {
+        throw "Role package integration input is required but missing: $RolePackagePath"
     }
 
     if (Test-Path -LiteralPath $CollisionMapPath -PathType Leaf) {

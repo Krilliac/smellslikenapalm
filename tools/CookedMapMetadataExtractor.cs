@@ -8,6 +8,7 @@ using System.Diagnostics;
 using System.Globalization;
 using System.IO;
 using System.Reflection;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.RegularExpressions;
 
@@ -48,8 +49,19 @@ internal sealed class Options
     public int MaxValueChars = 1024;
     public int MaxErrors = 25;
     public int MaxClasses = 512;
+    public long ObjectBase = -1;
+    public string ExpectedPackageGuid;
+    public string ExpectedSha256;
+    public string VerifiedSha256;
     public bool Overwrite;
     public bool ClassPatternSpecified;
+}
+
+internal sealed class RoleExportPair
+{
+    public string RoleClass;
+    public int UClassLinkerIndex;
+    public int CdoLinkerIndex;
 }
 
 internal sealed class ExtractedProperty
@@ -115,6 +127,11 @@ internal static class Program
     private const int ExitPackage = 66;
     private const int ExitPartial = 67;
     private const int ExitInternal = 70;
+    private const string UnsafeAssemblySimpleName =
+        "System.Runtime.CompilerServices.Unsafe";
+    private const string UnsafeAssemblyFullName =
+        "System.Runtime.CompilerServices.Unsafe, Version=6.0.3.0, " +
+        "Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a";
 
     public static int Main(string[] args)
     {
@@ -122,6 +139,11 @@ internal static class Program
             string.Equals(args[0], "--self-test-role-schema", StringComparison.Ordinal))
         {
             return RunRoleSchemaSelfTest();
+        }
+        if (args != null && args.Length == 1 &&
+            string.Equals(args[0], "--self-test-role-export-schema", StringComparison.Ordinal))
+        {
+            return RunRoleExportSchemaSelfTest();
         }
         if (HasHelp(args))
         {
@@ -160,23 +182,74 @@ internal static class Program
 
     private static int Extract(Options options)
     {
+        if (string.Equals(options.Mode, "role-exports", StringComparison.Ordinal))
+        {
+            options.VerifiedSha256 = ComputeSha256(options.InputPath);
+            if (!string.Equals(
+                    options.VerifiedSha256, options.ExpectedSha256,
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                throw new ValidationException(
+                    "role-exports SHA-256 mismatch: expected " +
+                    options.ExpectedSha256 + " but found " + options.VerifiedSha256);
+            }
+        }
+
         Regex classFilter = CreateRegex(options.ClassPattern, "class");
         Regex propertyFilter = CreateRegex(options.PropertyPattern, "property");
         string libraryDirectory = Path.GetDirectoryName(options.UELibPath);
+        string unsafePath = Path.GetFullPath(Path.Combine(
+            libraryDirectory, UnsafeAssemblySimpleName + ".dll"));
+        if (!File.Exists(unsafePath))
+        {
+            throw new ValidationException(
+                "pinned UELib dependency does not exist: " + unsafePath);
+        }
+        AssemblyName unsafeIdentity;
+        Assembly pinnedUnsafe;
+        try
+        {
+            unsafeIdentity = AssemblyName.GetAssemblyName(unsafePath);
+            if (!string.Equals(
+                    unsafeIdentity.FullName, UnsafeAssemblyFullName,
+                    StringComparison.Ordinal))
+            {
+                throw new InvalidDataException(
+                    "expected " + UnsafeAssemblyFullName + " but found " +
+                    unsafeIdentity.FullName);
+            }
+            pinnedUnsafe = Assembly.LoadFrom(unsafePath);
+            if (!string.Equals(
+                    pinnedUnsafe.GetName().FullName, UnsafeAssemblyFullName,
+                    StringComparison.Ordinal) ||
+                !string.Equals(
+                    Path.GetFullPath(pinnedUnsafe.Location), unsafePath,
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                throw new InvalidDataException(
+                    "the CLR did not load the exact pinned UELib dependency path");
+            }
+        }
+        catch (Exception ex)
+        {
+            throw new ValidationException(
+                "could not load the exact pinned UELib dependency: " +
+                ExceptionMessage(ex));
+        }
         ResolveEventHandler resolver = delegate(object sender, ResolveEventArgs eventArgs)
         {
-            string assemblyName;
+            AssemblyName requested;
             try
             {
-                assemblyName = new AssemblyName(eventArgs.Name).Name;
+                requested = new AssemblyName(eventArgs.Name);
             }
             catch
             {
                 return null;
             }
-
-            string candidate = Path.Combine(libraryDirectory, assemblyName + ".dll");
-            return File.Exists(candidate) ? Assembly.LoadFrom(candidate) : null;
+            return string.Equals(
+                requested.FullName, UnsafeAssemblyFullName,
+                StringComparison.Ordinal) ? pinnedUnsafe : null;
         };
 
         AppDomain.CurrentDomain.AssemblyResolve += resolver;
@@ -191,6 +264,32 @@ internal static class Program
             try
             {
                 library = Assembly.LoadFrom(options.UELibPath);
+                int unsafeReferences = 0;
+                foreach (AssemblyName reference in library.GetReferencedAssemblies())
+                {
+                    if (!string.Equals(
+                            reference.Name, UnsafeAssemblySimpleName,
+                            StringComparison.Ordinal))
+                    {
+                        continue;
+                    }
+                    unsafeReferences++;
+                    if (!string.Equals(
+                            reference.FullName, UnsafeAssemblyFullName,
+                            StringComparison.Ordinal) ||
+                        !AssemblyName.ReferenceMatchesDefinition(
+                            reference, unsafeIdentity))
+                    {
+                        throw new InvalidDataException(
+                            "UELib dependency reference identity drifted: " +
+                            reference.FullName);
+                    }
+                }
+                if (unsafeReferences != 1)
+                {
+                    throw new InvalidDataException(
+                        "UELib must reference the pinned Unsafe dependency exactly once");
+                }
                 packageType = library.GetType("UELib.UnrealPackage", true);
                 MethodInfo deserialize = packageType.GetMethod(
                     "DeserializePackage",
@@ -223,11 +322,53 @@ internal static class Program
             int nameCount = CollectionCount(packageView.Names, "name table");
             int importCount = CollectionCount(packageView.Imports, "import table");
             int exportCount = CollectionCount(packageView.Exports, "export table");
+            bool roleExportsMode = string.Equals(
+                options.Mode, "role-exports", StringComparison.Ordinal);
+            long packageFlags = 0;
+            int generationCount = 0;
+            long finalGenerationExports = 0;
+            long finalGenerationNames = 0;
+            long finalGenerationNetObjects = 0;
+            if (roleExportsMode)
+            {
+                packageFlags = Convert.ToInt64(packageView.PackageFlags, Invariant);
+                generationCount = CollectionCount(
+                    packageView.Generations, "generation table");
+                foreach (object rawGeneration in (IEnumerable)packageView.Generations)
+                {
+                    dynamic generation = rawGeneration;
+                    finalGenerationExports = Convert.ToInt64(
+                        generation.ExportsCount, Invariant);
+                    finalGenerationNames = Convert.ToInt64(
+                        generation.NamesCount, Invariant);
+                    finalGenerationNetObjects = Convert.ToInt64(
+                        generation.NetObjectsCount, Invariant);
+                }
+            }
             if (exportCount > options.MaxExports)
             {
                 throw new ValidationException(
                     "package export count " + exportCount.ToString(Invariant) +
                     " exceeds --max-exports " + options.MaxExports.ToString(Invariant));
+            }
+
+            string packageGuid = SafeString(packageView.GUID);
+            string packageName = SafeString(packageView.PackageName);
+            bool isMap = Quiet(delegate { return (bool)packageView.IsMap(); });
+            bool isCooked = Quiet(delegate { return (bool)packageView.IsCooked(); });
+            if (roleExportsMode)
+            {
+                ValidateRoleExportPackage(
+                    options, packageName, packageGuid, isMap, packageFlags,
+                    generationCount, exportCount, finalGenerationNetObjects);
+                string recheckedSha256 = ComputeSha256(options.InputPath);
+                if (!string.Equals(
+                        recheckedSha256, options.VerifiedSha256,
+                        StringComparison.Ordinal))
+                {
+                    throw new ValidationException(
+                        "role-exports input changed while package tables were read");
+                }
             }
 
             if (options.OutputPath == null)
@@ -254,20 +395,32 @@ internal static class Program
                 options,
                 library.GetName().Version == null ? null : library.GetName().Version.ToString(),
                 libraryVersion.ProductVersion,
-                SafeString(packageView.GUID),
+                packageName,
+                packageGuid,
                 Convert.ToInt64(packageView.Version, Invariant),
                 Convert.ToInt64(packageView.LicenseeVersion, Invariant),
                 Convert.ToInt64(packageView.EngineVersion, Invariant),
-                Quiet(delegate { return (bool)packageView.IsMap(); }),
-                Quiet(delegate { return (bool)packageView.IsCooked(); }),
+                isMap,
+                isCooked,
                 nameCount,
                 importCount,
-                exportCount);
+                exportCount,
+                packageFlags,
+                generationCount,
+                finalGenerationExports,
+                finalGenerationNames,
+                finalGenerationNetObjects);
 
             int result;
             if (string.Equals(options.Mode, "classes", StringComparison.Ordinal))
             {
                 result = ExtractClasses(output, packageView, options, classFilter);
+            }
+            else if (string.Equals(options.Mode, "role-exports", StringComparison.Ordinal))
+            {
+                result = ExtractRoleExports(
+                    output, packageView, options, exportCount,
+                    finalGenerationNetObjects);
             }
             else if (string.Equals(options.Mode, "brush-bounds", StringComparison.Ordinal))
             {
@@ -337,6 +490,290 @@ internal static class Program
 
         EmitClassSummary(output, counts.Count, emitted, counts.Count > emitted);
         return 0;
+    }
+
+    private static void ValidateRoleExportPackage(
+        Options options, string packageName, string packageGuid, bool isMap,
+        long packageFlags, int generationCount, int exportCount,
+        long finalGenerationNetObjects)
+    {
+        if (!string.Equals(packageName, "ROGame", StringComparison.Ordinal) ||
+            !string.Equals(
+                Path.GetFileNameWithoutExtension(options.InputPath), "ROGame",
+                StringComparison.OrdinalIgnoreCase))
+        {
+            throw new ValidationException(
+                "role-exports requires the root ROGame.u package");
+        }
+        if (isMap)
+        {
+            throw new ValidationException(
+                "role-exports requires the non-map root ROGame.u package");
+        }
+        // UELib 1.12.1 reports IsCooked=false for the pinned retail ROGame.u,
+        // despite its exact 0x20204001 cooked-script flags. Validate the source
+        // table invariants directly instead of trusting that helper.
+        if ((packageFlags & 0x00200000L) == 0 || generationCount <= 0 ||
+            finalGenerationNetObjects != exportCount)
+        {
+            throw new ValidationException(
+                "role-exports requires a script package whose final NetObjectCount " +
+                "matches its export table");
+        }
+        if (!IsExactHex(packageGuid, 32) || IsAllZeroHex(packageGuid))
+        {
+            throw new ValidationException(
+                "role-exports requires a valid nonzero 32-digit package GUID");
+        }
+        if (!string.Equals(
+                packageGuid, options.ExpectedPackageGuid,
+                StringComparison.OrdinalIgnoreCase))
+        {
+            throw new ValidationException(
+                "role-exports package GUID mismatch: expected " +
+                options.ExpectedPackageGuid + " but found " + packageGuid);
+        }
+    }
+
+    private static int ExtractRoleExports(
+        TextWriter output, dynamic package, Options options,
+        int exportCount, long finalGenerationNetObjects)
+    {
+        Dictionary<string, object> uclasses =
+            new Dictionary<string, object>(StringComparer.Ordinal);
+        Dictionary<string, object> cdos =
+            new Dictionary<string, object>(StringComparer.Ordinal);
+        HashSet<int> matchedIndices = new HashSet<int>();
+
+        int exportOrdinal = 0;
+        foreach (object rawExport in (IEnumerable)package.Exports)
+        {
+            dynamic export = rawExport;
+            string objectName = SafeString(export.ObjectName);
+            string className = SafeString(export.ClassName);
+            string roleClass = null;
+            bool isUClass =
+                string.Equals(className, "Class", StringComparison.Ordinal) &&
+                IsRoleClassName(objectName);
+            bool isCdo = objectName.StartsWith(
+                    "Default__", StringComparison.Ordinal) &&
+                IsRoleClassName(className) &&
+                string.Equals(
+                    objectName, "Default__" + className,
+                    StringComparison.Ordinal);
+            if (!isUClass && !isCdo)
+            {
+                exportOrdinal++;
+                continue;
+            }
+
+            roleClass = isUClass ? objectName : className;
+            int linkerIndex = Convert.ToInt32(export.Index, Invariant);
+            if (linkerIndex <= 0 || linkerIndex != exportOrdinal ||
+                linkerIndex >= exportCount ||
+                linkerIndex >= finalGenerationNetObjects ||
+                !matchedIndices.Add(linkerIndex))
+            {
+                throw new PackageException(
+                    "role-exports found an invalid, out-of-range, or duplicate linker index",
+                    new InvalidDataException(
+                        roleClass + " index=" + linkerIndex.ToString(Invariant) +
+                        " ordinal=" + exportOrdinal.ToString(Invariant)));
+            }
+            if (export.OuterTable != null)
+            {
+                throw new PackageException(
+                    "role-exports found a nested role object",
+                    new InvalidDataException(roleClass));
+            }
+
+            Dictionary<string, object> target = isUClass ? uclasses : cdos;
+            AddUniqueRoleExport(target, roleClass, rawExport);
+            exportOrdinal++;
+        }
+        if (exportOrdinal != exportCount)
+        {
+            throw new PackageException(
+                "role-exports did not consume the exact export table",
+                new InvalidDataException(
+                    "enumerated=" + exportOrdinal.ToString(Invariant) +
+                    " expected=" + exportCount.ToString(Invariant)));
+        }
+
+        ValidateRolePairNameSets(uclasses, cdos);
+
+        List<RoleExportPair> pairs = new List<RoleExportPair>();
+        foreach (KeyValuePair<string, object> entry in uclasses)
+        {
+            object rawCdo;
+            if (!cdos.TryGetValue(entry.Key, out rawCdo))
+            {
+                throw new PackageException(
+                    "role-exports found a UClass without its exact CDO",
+                    new InvalidDataException(entry.Key));
+            }
+
+            dynamic uclass = entry.Value;
+            dynamic cdo = rawCdo;
+            int uclassIndex = Convert.ToInt32(uclass.Index, Invariant);
+            int cdoIndex = Convert.ToInt32(cdo.Index, Invariant);
+            object rawClassTable = cdo.ClassTable;
+            if (rawClassTable == null)
+            {
+                throw new PackageException(
+                    "role-exports found a CDO without an in-package class table",
+                    new InvalidDataException(entry.Key));
+            }
+            dynamic classTable = rawClassTable;
+            int cdoClassIndex = Convert.ToInt32(classTable.Index, Invariant);
+            dynamic uclassPackageIndex = uclass.ClassIndex;
+            if (!(bool)uclassPackageIndex.IsNull || uclass.ClassTable != null)
+            {
+                throw new PackageException(
+                    "role-exports UClass does not use the exact UELib Class identity",
+                    new InvalidDataException(entry.Key));
+            }
+            dynamic cdoClassPackageIndex = cdo.ClassIndex;
+            ValidateRolePairIndices(
+                entry.Key, uclassIndex, cdoIndex, cdoClassIndex,
+                Convert.ToInt32(cdoClassPackageIndex.Index, Invariant),
+                (bool)cdoClassPackageIndex.IsExport);
+            if (!object.ReferenceEquals(rawClassTable, entry.Value))
+            {
+                throw new PackageException(
+                    "role-exports CDO does not reference its exact UClass",
+                    new InvalidDataException(
+                        entry.Key + " expected=" + uclassIndex.ToString(Invariant) +
+                        " actual=" + cdoClassIndex.ToString(Invariant)));
+            }
+            pairs.Add(new RoleExportPair
+            {
+                RoleClass = entry.Key,
+                UClassLinkerIndex = uclassIndex,
+                CdoLinkerIndex = cdoIndex
+            });
+        }
+
+        pairs.Sort(delegate(RoleExportPair left, RoleExportPair right)
+        {
+            return left.UClassLinkerIndex.CompareTo(right.UClassLinkerIndex);
+        });
+        foreach (RoleExportPair pair in pairs)
+        {
+            long? uclassStaticReference = null;
+            long? cdoStaticReference = null;
+            if (options.ObjectBase >= 0)
+            {
+                uclassStaticReference = CheckedStaticReference(
+                    options.ObjectBase, pair.UClassLinkerIndex);
+                cdoStaticReference = CheckedStaticReference(
+                    options.ObjectBase, pair.CdoLinkerIndex);
+            }
+            EmitRoleExport(
+                output, pair, options.ObjectBase,
+                uclassStaticReference, cdoStaticReference);
+        }
+        EmitRoleExportSummary(
+            output, pairs.Count, options.ObjectBase >= 0);
+        return 0;
+    }
+
+    private static void AddUniqueRoleExport(
+        Dictionary<string, object> target, string roleClass, object export)
+    {
+        if (target.ContainsKey(roleClass))
+        {
+            throw new PackageException(
+                "role-exports found a duplicate role object",
+                new InvalidDataException(roleClass));
+        }
+        target.Add(roleClass, export);
+    }
+
+    private static void ValidateRolePairNameSets(
+        Dictionary<string, object> uclasses,
+        Dictionary<string, object> cdos)
+    {
+        if (uclasses.Count == 0 || uclasses.Count != cdos.Count)
+        {
+            throw new PackageException(
+                "role-exports found an incomplete UClass/CDO role table",
+                new InvalidDataException(
+                    "uclasses=" + uclasses.Count.ToString(Invariant) +
+                    " cdos=" + cdos.Count.ToString(Invariant)));
+        }
+        foreach (string roleClass in uclasses.Keys)
+        {
+            if (!cdos.ContainsKey(roleClass))
+            {
+                throw new PackageException(
+                    "role-exports found a UClass without its exact CDO",
+                    new InvalidDataException(roleClass));
+            }
+        }
+        foreach (string roleClass in cdos.Keys)
+        {
+            if (!uclasses.ContainsKey(roleClass))
+            {
+                throw new PackageException(
+                    "role-exports found a CDO without its exact UClass",
+                    new InvalidDataException(roleClass));
+            }
+        }
+    }
+
+    private static void ValidateRolePairIndices(
+        string roleClass, int uclassIndex, int cdoIndex,
+        int cdoClassTableIndex, int cdoClassPackageIndex,
+        bool cdoClassPackageIsExport)
+    {
+        if (uclassIndex <= 0 || cdoIndex <= 0 ||
+            cdoIndex != uclassIndex + 1 ||
+            cdoClassTableIndex != uclassIndex ||
+            !cdoClassPackageIsExport ||
+            cdoClassPackageIndex != uclassIndex + 1)
+        {
+            throw new PackageException(
+                "role-exports CDO does not reference its exact UClass",
+                new InvalidDataException(
+                    roleClass + " uclass=" + uclassIndex.ToString(Invariant) +
+                    " cdo=" + cdoIndex.ToString(Invariant) +
+                    " classTable=" + cdoClassTableIndex.ToString(Invariant) +
+                    " classPackage=" + cdoClassPackageIndex.ToString(Invariant)));
+        }
+    }
+
+    private static bool IsRoleClassName(string value)
+    {
+        const string prefix = "RORoleInfo";
+        if (string.IsNullOrEmpty(value) ||
+            !value.StartsWith(prefix, StringComparison.Ordinal))
+        {
+            return false;
+        }
+        for (int index = prefix.Length; index < value.Length; index++)
+        {
+            char character = value[index];
+            if (!((character >= 'A' && character <= 'Z') ||
+                  (character >= 'a' && character <= 'z') ||
+                  (character >= '0' && character <= '9') ||
+                  character == '_'))
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private static long CheckedStaticReference(long objectBase, int linkerIndex)
+    {
+        long result = checked(objectBase + linkerIndex);
+        if (objectBase < 0 || linkerIndex <= 0 || result >= 0x80000000L)
+        {
+            throw new ValidationException(
+                "role-exports ObjectBase + linker index must remain below 0x80000000");
+        }
+        return result;
     }
 
     // UELib 1.12.1 cannot infer the custom element type of
@@ -776,6 +1213,180 @@ internal static class Program
         catch (PackageException)
         {
             return true;
+        }
+    }
+
+    private static int RunRoleExportSchemaSelfTest()
+    {
+        string[] accepted =
+        {
+            "RORoleInfo",
+            "RORoleInfoNorthernGuerilla",
+            "RORoleInfoSouthernMachineGunner_SK"
+        };
+        string[] rejected =
+        {
+            null,
+            string.Empty,
+            "Default__RORoleInfoNorthernGuerilla",
+            "RORoleInfo/NorthernGuerilla",
+            "OtherRoleInfo"
+        };
+        foreach (string value in accepted)
+        {
+            if (!IsRoleClassName(value))
+            {
+                WriteError("self-test", "valid role class was rejected: " + value);
+                return ExitInternal;
+            }
+        }
+        foreach (string value in rejected)
+        {
+            if (IsRoleClassName(value))
+            {
+                WriteError("self-test", "invalid role class was accepted: " + value);
+                return ExitInternal;
+            }
+        }
+        if (CheckedStaticReference(39478, 47921) != 87399)
+        {
+            WriteError("self-test", "static-reference derivation drifted");
+            return ExitInternal;
+        }
+        bool overflowRejected = false;
+        try
+        {
+            CheckedStaticReference(0x7FFFFFF0L, 32);
+        }
+        catch (ValidationException)
+        {
+            overflowRejected = true;
+        }
+        if (!overflowRejected)
+        {
+            WriteError("self-test", "out-of-range static reference was accepted");
+            return ExitInternal;
+        }
+        ValidateRolePairIndices(
+            "RORoleInfoNorthernGuerilla", 47921, 47922,
+            47921, 47922, true);
+        if (!RolePairRejects(47921, 47922, 47920, 47922, true) ||
+            !RolePairRejects(47921, 47923, 47921, 47922, true) ||
+            !RolePairRejects(47921, 47922, 47921, 47921, true) ||
+            !RolePairRejects(47921, 47922, 47921, 47922, false))
+        {
+            WriteError("self-test", "mismatched UClass/CDO pair was accepted");
+            return ExitInternal;
+        }
+        object syntheticUClass = new object();
+        object syntheticCdo = new object();
+        Dictionary<string, object> syntheticUClasses =
+            new Dictionary<string, object>(StringComparer.Ordinal);
+        Dictionary<string, object> syntheticCdos =
+            new Dictionary<string, object>(StringComparer.Ordinal);
+        AddUniqueRoleExport(
+            syntheticUClasses, "RORoleInfoSynthetic", syntheticUClass);
+        AddUniqueRoleExport(
+            syntheticCdos, "RORoleInfoSynthetic", syntheticCdo);
+        ValidateRolePairNameSets(syntheticUClasses, syntheticCdos);
+        bool missingPairRejected = false;
+        try
+        {
+            ValidateRolePairNameSets(
+                syntheticUClasses,
+                new Dictionary<string, object>(StringComparer.Ordinal));
+        }
+        catch (PackageException)
+        {
+            missingPairRejected = true;
+        }
+        bool duplicateRejected = false;
+        try
+        {
+            AddUniqueRoleExport(
+                syntheticUClasses, "RORoleInfoSynthetic", new object());
+        }
+        catch (PackageException)
+        {
+            duplicateRejected = true;
+        }
+        if (!missingPairRejected || !duplicateRejected)
+        {
+            WriteError("self-test", "missing or duplicate role pair was accepted");
+            return ExitInternal;
+        }
+
+        Console.Out.WriteLine(
+            "PASS: role-export schema pins names, UClass/CDO pairs, and checked static references.");
+        return 0;
+    }
+
+    private static bool RolePairRejects(
+        int uclassIndex, int cdoIndex, int classTableIndex,
+        int classPackageIndex, bool classPackageIsExport)
+    {
+        try
+        {
+            ValidateRolePairIndices(
+                "SyntheticRole", uclassIndex, cdoIndex,
+                classTableIndex, classPackageIndex, classPackageIsExport);
+            return false;
+        }
+        catch (PackageException)
+        {
+            return true;
+        }
+    }
+
+    private static bool IsExactHex(string value, int digits)
+    {
+        if (value == null || value.Length != digits)
+        {
+            return false;
+        }
+        for (int index = 0; index < value.Length; index++)
+        {
+            char character = value[index];
+            if (!((character >= '0' && character <= '9') ||
+                  (character >= 'A' && character <= 'F') ||
+                  (character >= 'a' && character <= 'f')))
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private static bool IsAllZeroHex(string value)
+    {
+        if (string.IsNullOrEmpty(value))
+        {
+            return false;
+        }
+        for (int index = 0; index < value.Length; index++)
+        {
+            if (value[index] != '0')
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private static string ComputeSha256(string path)
+    {
+        using (FileStream input = new FileStream(
+            path, FileMode.Open, FileAccess.Read, FileShare.Read, 1024 * 1024,
+            FileOptions.SequentialScan))
+        using (SHA256 hash = SHA256.Create())
+        {
+            byte[] digest = hash.ComputeHash(input);
+            StringBuilder rendered = new StringBuilder(digest.Length * 2);
+            foreach (byte value in digest)
+            {
+                rendered.Append(value.ToString("X2", Invariant));
+            }
+            return rendered.ToString();
         }
     }
 
@@ -1488,6 +2099,9 @@ internal static class Program
                 case "--max-value-chars": options.MaxValueChars = ParseInt(NextValue(args, ref index, argument), argument, 16, 65536); break;
                 case "--max-errors": options.MaxErrors = ParseInt(NextValue(args, ref index, argument), argument, 1, 1000); break;
                 case "--max-classes": options.MaxClasses = ParseInt(NextValue(args, ref index, argument), argument, 1, 10000); break;
+                case "--object-base": options.ObjectBase = ParseLong(NextValue(args, ref index, argument), argument, 0, 0x7FFFFFFF); break;
+                case "--expected-package-guid": options.ExpectedPackageGuid = NextValue(args, ref index, argument); break;
+                case "--expected-sha256": options.ExpectedSha256 = NextValue(args, ref index, argument); break;
                 case "--overwrite": options.Overwrite = true; break;
                 default: throw new UsageException("unknown argument: " + argument);
             }
@@ -1508,10 +2122,37 @@ internal static class Program
         if (!string.Equals(options.Mode, "actors", StringComparison.Ordinal) &&
             !string.Equals(options.Mode, "classes", StringComparison.Ordinal) &&
             !string.Equals(options.Mode, "role-info", StringComparison.Ordinal) &&
+            !string.Equals(options.Mode, "role-exports", StringComparison.Ordinal) &&
             !string.Equals(options.Mode, "brush-bounds", StringComparison.Ordinal))
         {
             throw new ValidationException(
-                "--mode must be actors, classes, role-info, or brush-bounds");
+                "--mode must be actors, classes, role-info, role-exports, or brush-bounds");
+        }
+        bool roleExports = string.Equals(
+            options.Mode, "role-exports", StringComparison.Ordinal);
+        if (roleExports)
+        {
+            if (!IsExactHex(options.ExpectedPackageGuid, 32) ||
+                IsAllZeroHex(options.ExpectedPackageGuid))
+            {
+                throw new ValidationException(
+                    "role-exports requires --expected-package-guid with 32 nonzero hex digits");
+            }
+            if (!IsExactHex(options.ExpectedSha256, 64) ||
+                IsAllZeroHex(options.ExpectedSha256))
+            {
+                throw new ValidationException(
+                    "role-exports requires --expected-sha256 with 64 nonzero hex digits");
+            }
+            options.ExpectedPackageGuid = options.ExpectedPackageGuid.ToUpperInvariant();
+            options.ExpectedSha256 = options.ExpectedSha256.ToUpperInvariant();
+        }
+        else if (options.ObjectBase >= 0 ||
+                 options.ExpectedPackageGuid != null ||
+                 options.ExpectedSha256 != null)
+        {
+            throw new ValidationException(
+                "--object-base and expected package identity arguments require role-exports mode");
         }
         if (string.Equals(options.Mode, "brush-bounds", StringComparison.Ordinal) &&
             !options.ClassPatternSpecified)
@@ -1527,6 +2168,9 @@ internal static class Program
 
         options.InputPath = FullPath(options.InputPath, "input");
         options.UELibPath = FullPath(options.UELibPath, "UELib");
+        string unsafeDependencyPath = Path.GetFullPath(Path.Combine(
+            Path.GetDirectoryName(options.UELibPath),
+            UnsafeAssemblySimpleName + ".dll"));
         if (options.OutputPath != null)
         {
             options.OutputPath = FullPath(options.OutputPath, "output");
@@ -1534,11 +2178,16 @@ internal static class Program
 
         if (!File.Exists(options.InputPath))
         {
-            throw new ValidationException("input map does not exist: " + options.InputPath);
+            throw new ValidationException("input package does not exist: " + options.InputPath);
         }
-        if (!string.Equals(Path.GetExtension(options.InputPath), ".roe", StringComparison.OrdinalIgnoreCase))
+        string expectedExtension = roleExports ? ".u" : ".roe";
+        if (!string.Equals(
+                Path.GetExtension(options.InputPath), expectedExtension,
+                StringComparison.OrdinalIgnoreCase))
         {
-            throw new ValidationException("input must be a .roe package: " + options.InputPath);
+            throw new ValidationException(
+                "input must be a " + expectedExtension + " package in " +
+                options.Mode + " mode: " + options.InputPath);
         }
         if (!File.Exists(options.UELibPath))
         {
@@ -1556,9 +2205,11 @@ internal static class Program
         if (options.OutputPath != null)
         {
             if (SamePath(options.OutputPath, options.InputPath) ||
-                SamePath(options.OutputPath, options.UELibPath))
+                SamePath(options.OutputPath, options.UELibPath) ||
+                SamePath(options.OutputPath, unsafeDependencyPath))
             {
-                throw new ValidationException("output must not overwrite an input file");
+                throw new ValidationException(
+                    "output must not overwrite an input or UELib dependency file");
             }
             if (File.Exists(options.OutputPath))
             {
@@ -1652,6 +2303,7 @@ internal static class Program
         Options options,
         string assemblyVersion,
         string productVersion,
+        string packageName,
         string packageGuid,
         long packageVersion,
         long licenseeVersion,
@@ -1660,14 +2312,26 @@ internal static class Program
         bool isCooked,
         int names,
         int imports,
-        int exports)
+        int exports,
+        long packageFlags,
+        int generationCount,
+        long finalGenerationExports,
+        long finalGenerationNames,
+        long finalGenerationNetObjects)
     {
         StringBuilder json = BeginRecord("header");
         AddString(json, "input", options.InputPath);
         AddLong(json, "inputBytes", new FileInfo(options.InputPath).Length);
+        if (options.VerifiedSha256 != null)
+        {
+            AddString(json, "inputSha256", options.VerifiedSha256);
+            AddBool(json, "sha256MatchedExpectation", true);
+            AddBool(json, "sha256StableAcrossTableRead", true);
+        }
         AddString(json, "mode", options.Mode);
         AddString(json, "uelibAssemblyVersion", assemblyVersion);
         AddString(json, "uelibProductVersion", productVersion);
+        AddString(json, "packageName", packageName);
         AddString(json, "packageGuid", packageGuid);
         AddLong(json, "packageVersion", packageVersion);
         AddLong(json, "licenseeVersion", licenseeVersion);
@@ -1677,11 +2341,62 @@ internal static class Program
         AddLong(json, "names", names);
         AddLong(json, "imports", imports);
         AddLong(json, "exports", exports);
+        if (string.Equals(options.Mode, "role-exports", StringComparison.Ordinal))
+        {
+            AddString(
+                json, "packageFlags",
+                "0x" + packageFlags.ToString("X8", Invariant));
+            AddLong(json, "generationCount", generationCount);
+            AddLong(json, "finalGenerationExports", finalGenerationExports);
+            AddLong(json, "finalGenerationNames", finalGenerationNames);
+            AddLong(json, "finalGenerationNetObjects", finalGenerationNetObjects);
+        }
         AddString(json, "classPattern", options.ClassPattern);
         AddString(json, "propertyPattern", options.PropertyPattern);
         AddLong(json, "maxActors", options.MaxActors);
         AddLong(json, "maxProperties", options.MaxProperties);
         AddLong(json, "maxValueChars", options.MaxValueChars);
+        EndRecord(output, json);
+    }
+
+    private static void EmitRoleExport(
+        TextWriter output,
+        RoleExportPair pair,
+        long objectBase,
+        long? uclassStaticReference,
+        long? cdoStaticReference)
+    {
+        StringBuilder json = BeginRecord("roleExport");
+        AddLong(json, "schemaVersion", 1);
+        AddString(json, "roleClass", pair.RoleClass);
+        AddLong(json, "uclassLinkerIndex", pair.UClassLinkerIndex);
+        AddLong(json, "cdoLinkerIndex", pair.CdoLinkerIndex);
+        if (objectBase >= 0)
+        {
+            AddLong(json, "objectBase", objectBase);
+            AddLong(json, "uclassStaticReference", uclassStaticReference.Value);
+            AddLong(json, "cdoStaticReference", cdoStaticReference.Value);
+            AddString(
+                json, "referenceDerivation",
+                "PackageMap ObjectBase + linker export index");
+        }
+        AddBool(json, "derivedOnly", true);
+        AddBool(json, "authorizedByExtractor", false);
+        EndRecord(output, json);
+    }
+
+    private static void EmitRoleExportSummary(
+        TextWriter output, int pairedRoles, bool objectBaseSupplied)
+    {
+        StringBuilder json = BeginRecord("summary");
+        AddString(json, "mode", "role-exports");
+        AddLong(json, "pairedRoles", pairedRoles);
+        AddLong(json, "uclassExports", pairedRoles);
+        AddLong(json, "cdoExports", pairedRoles);
+        AddBool(json, "pairsValidatedExactly", true);
+        AddBool(json, "tableOnly", true);
+        AddBool(json, "objectBaseSupplied", objectBaseSupplied);
+        AddBool(json, "runtimeRolesAuthorized", false);
         EndRecord(output, json);
     }
 
@@ -2154,16 +2869,16 @@ internal static class Program
 
     private static void PrintUsage(TextWriter output)
     {
-        output.WriteLine("CookedMapMetadataExtractor - bounded, read-only RS2 .roe metadata extraction");
+        output.WriteLine("CookedMapMetadataExtractor - bounded, read-only RS2 package metadata extraction");
         output.WriteLine();
         output.WriteLine("Required:");
-        output.WriteLine("  --input PATH              Cooked .roe package to inspect");
+        output.WriteLine("  --input PATH              Cooked .roe map or ROGame.u package to inspect");
         output.WriteLine("  --uelib PATH              Eliot.UELib.dll (tested with 1.12.1)");
         output.WriteLine();
         output.WriteLine("Selection/output:");
-        output.WriteLine("  --mode actors|classes|role-info|brush-bounds");
+        output.WriteLine("  --mode actors|classes|role-info|role-exports|brush-bounds");
         output.WriteLine("                           Actor records (default), class inventory,");
-        output.WriteLine("                           exact ROMapInfo RORoleCount arrays, or");
+        output.WriteLine("                           exact ROMapInfo arrays, paired ROGame role exports, or");
         output.WriteLine("                           source-verified UModel bounds diagnostics");
         output.WriteLine("  --output PATH             JSONL file; stdout when omitted");
         output.WriteLine("  --overwrite               Replace an existing output file");
@@ -2179,5 +2894,12 @@ internal static class Program
         output.WriteLine("  --max-errors N            Default 25");
         output.WriteLine("  --max-classes N           Default 512 in classes mode");
         output.WriteLine("  --self-test-role-schema   Run synthetic exact-role-schema checks");
+        output.WriteLine("  --self-test-role-export-schema");
+        output.WriteLine("                           Run role-name/static-reference checks");
+        output.WriteLine();
+        output.WriteLine("Role-export artifact pinning:");
+        output.WriteLine("  --expected-package-guid H Exact nonzero 32-digit ROGame package GUID");
+        output.WriteLine("  --expected-sha256 H       Exact nonzero 64-digit ROGame.u SHA-256");
+        output.WriteLine("  --object-base N           Optional PackageMap base for derived references");
     }
 }

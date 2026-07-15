@@ -17,6 +17,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   `ROGame.u` role UClass NetIndices and installed PackageMap base, and the mock
   validator uses the installed pawn/loadout/attachment graph; this is not a
   claim of a live Cu Chi role-selection capture.
+- Artifact-pinned, read-only Cu Chi role-reference evidence tooling. The
+  table-only extractor verifies every `RORoleInfo*` UClass/CDO pair in the exact
+  installed `ROGame.u`; `audit_installed_role_refs.py` validates the pinned Cu
+  Chi map, source substitutions, root class-index default, UELib binary, and
+  UELib dependency closure, then emits fourteen UClass references in
+  `data/installed_cuchi_role_refs.jsonl` without authorizing new gameplay. The
+  extractor helper cache is keyed by the exact source, wrapper, and complete
+  Roslyn-directory manifest, then atomically published with a verified hash;
+  the audit also requires an exact freshly compiled executable SHA-256. The
+  report distinguishes the two supported class-0 roles from twelve blocked
+  candidates.
 
 ### Changed
 - **Breaking configuration validation:** `[General].server_name` now follows the

@@ -10,12 +10,18 @@ Validated read-only inputs on 2026-07-14 and 2026-07-15:
 
 | package | bytes | SHA-256 | package GUID |
 |---|---:|---|---|
-| `Maps\CuChi\VNTE-CuChi.roe` | 283,465,712 | `0410B83DB9E34FB145E0418EE634BA924E3BE41A8570502A8717DE19CEA5E2E2` | `1BE145E5457B54A941963282D62E012B` |
+| `Maps\CuChi\VNTE-CuChi.roe` | 283,465,712 | `F5D5E9DB687DC45889CC8C2C795904C467FF81285B06338E4F176A09C011687E` | `1BE145E5457B54A941963282D62E012B` |
 | capture-compatible `BrewedPCServer\ROGame.u` | 40,986,800 | `34093C828DBB9DA9E709C2845BB9AFF0ED747A7BC954FEC4D76970FF4832305F` | `33EE724F43F851351795FD975E8D5AC1` |
 | current retail-client `BrewedPC\ROGame.u` | 40,989,134 | `AED4E60D406880D048EB579A082F4A44BE3D0B39CFEC47F9FCEF828A40C44961` | `16A6CC8D446C4A9FD5B688B3210DCC82` |
 
 Read-only inspection left all input hashes unchanged. The map has one `ROMapInfo`
 export: linker index 10022, serial offset 36,844,352, serial size 3,002.
+The evidence audit also pins UELib's only non-framework runtime dependency,
+`System.Runtime.CompilerServices.Unsafe.dll` 6.0.3.0, at 19,256 bytes and
+SHA-256 `08CBD7278B66F1E68425A82D4B97181A4130D93E3DD91831407ABA7212CCDACF`.
+The wrapper and C# extractor source are identity-pinned before and after the
+audit, every extraction forces a fresh content-keyed compile, and the CLR must
+load that exact Unsafe identity from that exact sibling path.
 
 Reproduce the exact two role arrays with:
 
@@ -122,6 +128,38 @@ Grunt classes for Territories. Together, source selection, exact current
 UClass NetIndices, the frozen installed base, and those adjacent live refs
 ground 87399/87491. The resulting h175 payloads are source-exact constructions,
 not Cu Chi live-capture observations.
+
+The artifact-pinned table audit now resolves all fourteen effective first-round
+infantry UClasses without promoting them into gameplay. Reproduce it with
+`python tools\audit_installed_role_refs.py`; the exact JSONL result is
+`data/installed_cuchi_role_refs.jsonl`.
+
+| side | ordinal | effective Territories class | class index | normal limit | current UClass NetIndex | installed static ref |
+|---|---:|---|---:|---:|---:|---:|
+| North | 0 | `RORoleInfoNorthernGuerilla` | 0 | 255 | 47921 | 87399 |
+| North | 1 | `RORoleInfoNorthernScoutNLF` | 1 | 3 | 47963 | 87441 |
+| North | 2 | `RORoleInfoNorthernMachineGunnerNLF` | 2 | 4 | 47929 | 87407 |
+| North | 3 | `RORoleInfoNorthernSniperNLF` | 3 | 2 | 47969 | 87447 |
+| North | 4 | `RORoleInfoNorthernRPGNLF` | 6 | 2 | 47945 | 87423 |
+| North | 5 | `RORoleInfoNorthernSapperNLF` | 4 | 3 | 47955 | 87433 |
+| North | 6 | `RORoleInfoNorthernRadiomanNLF` | 7 | 2 | 47935 | 87413 |
+| South | 0 | `RORoleInfoSouthernGrunt` | 0 | 255 | 48013 | 87491 |
+| South | 1 | `RORoleInfoSouthernPointman` | 1 | 5 | 48053 | 87531 |
+| South | 2 | `RORoleInfoSouthernMachineGunner` | 2 | 5 | 48019 | 87497 |
+| South | 3 | `RORoleInfoSouthernMarksman` | 3 | 2 | 48031 | 87509 |
+| South | 4 | `RORoleInfoSouthernGrenadier` | 5 | 3 | 47999 | 87477 |
+| South | 5 | `RORoleInfoSouthernEngineer` | 4 | 3 | 47985 | 87463 |
+| South | 6 | `RORoleInfoSouthernRadioman` | 7 | 2 | 48065 | 87543 |
+
+The RPG/Sapper and Grenadier/Engineer rows demonstrate why cooked ordinal must
+not be treated as protocol class index. `InitRolesForGametype` selects the force
+substitute by the role's source `ClassIndex`. The audit validates exact
+UClass/CDO pairing, package identity, generation metadata, checked reference
+arithmetic, uniqueness, and the two live-adjacent class-0 cross-checks. The
+report authorizes no gameplay by itself (`authorizedByReport=false`), while
+correctly marking the two class-0 rows as already supported. The other twelve
+remain blocked because no non-class-0 Cu Chi live h175 or role/loadout-specific
+owning-pawn graph has been captured.
 
 The identity source is artifact-specific. A map import `FPackageIndex` such as
 `-92` is not a wire object reference, and a linker NetIndex without the frozen
@@ -249,9 +287,13 @@ tagged bot participation and reflected the emulator's then-missing AI squad
 owners. Current deterministic coverage pins the default filled-roster result at
 1/1 and separately keeps the empty-roster 0/0 fixture for wire encoding.
 
-Remaining evidence work for full role coverage is mechanical but must stay
-exact: extract the artifact-appropriate `ROGame.u` role UClass or CDO exports,
-apply the source force/game-mode substitution tables, and confirm each
-connection's PackageMap base. Vehicle and pilot roles additionally need
-tank-selection and spawn-class evidence and are not unlocked by the infantry
-table alone.
+Remaining evidence work for full role coverage is now capture-bound rather than
+index-bound. Each non-class-0 infantry role needs an exact accepted h175 and a
+role/loadout-keyed owning-pawn graph before runtime authorization. The current
+spawn path selects one fixed graph per team, so accepting a different role from
+UClass identity alone would publish the wrong weapons. South MachineGunner is
+the smallest next candidate (class 2, limit 5, default M60 plus M61), but still
+needs its M60 graph captured and implemented. Commander, vehicle, and pilot
+roles additionally need their separate ownership, tank-selection, seat,
+possession, and spawn-class evidence and are not unlocked by the infantry
+table.
