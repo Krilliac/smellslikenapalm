@@ -1,0 +1,16 @@
+# VNSU-HueCity cooked initial deployment starts
+# Evidence package SHA-256: 664180871B9CB7C46221E34C9CCE1B29C10984EF8D8E64B9B469BEECB71E2F1D
+# Format: x y z teamId minTerritoryPhase maxTerritoryPhase retailSpawnVolumeRef
+# Server team 1 = South/US; server team 2 = North/NVA. Starts are unbounded
+# because Supremacy has no linear Territory phase progression. Coordinates are
+# the cooked ROPlayerStart actors in "Spawns : US_Initial" / "Spawns : NVA_Initial".
+
+# Team 1 / South
+1689.666 2269.615 310.126 1 -1 -1 289565
+1139.503 2466.039 218.456 1 -1 -1 289565
+1795.860 2282.713 335.119 1 -1 -1 289565
+
+# Team 2 / North
+-1347.104 -9861.735 30.020 2 -1 -1 289566
+-1578.855 -9881.448 29.000 2 -1 -1 289566
+-1389.988 -9966.304 36.895 2 -1 -1 289566

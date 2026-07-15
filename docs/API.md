@@ -273,7 +273,7 @@ bool      ApplySnapshot(const Snapshot&);          // client-side
 | Method | Effect |
 |--------|--------|
 | `Initialize(TelemetryConfig)` | mkdir, init reporters |
-| `AddReporter(unique_ptr)` | attach |
+| `AddReporter(unique_ptr)` | take ownership and initialize once; returns success |
 | `StartSampling()` | bg thread, default 1 Hz |
 | `ForceSample()` | sync snapshot |
 | `Shutdown()` | stop thread, flush |

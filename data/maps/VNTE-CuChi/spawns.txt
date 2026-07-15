@@ -1,0 +1,31 @@
+# VNTE-CuChi cooked deployment starts
+#
+# Format: x y z teamId minTerritoryPhase maxTerritoryPhase retailSpawnVolumeRef
+# Server team 1 = US/Allies; server team 2 = NVA/Axis. These starts are
+# intentionally unbounded so both sides remain deployable throughout the
+# Territory chain while phase-specific deployment switching is still evolving.
+#
+# Retail's authentic initial US island group is:
+#   -19526.750 -2227.931 23.000
+#   -19474.290 -2051.564 23.000
+#   -19393.790 -2161.674 23.000
+#   -19513.990 -2327.292 23.000
+#   -19144.340  -977.641 27.750
+#   -19545.340 -2044.641 23.000
+# Those starts depend on helicopter insertion. Until vehicle transport is
+# implemented, the active US entries below use the extracted inland deployment
+# phase-1 group behind Cu Chi Town so infantry can walk into the first objective.
+
+# US inland walk-in group behind A / Cu Chi Town
+-15622.340 -1602.186  45.000 1 -1 -1 299107
+-15404.830 -1370.842  92.737 1 -1 -1 299107
+-15381.770   306.924 156.425 1 -1 -1 299107
+-15298.750   349.054 162.561 1 -1 -1 299107
+
+# NVA initial defense starts
+-7083.615 3496.033  45.000 2 -1 -1 299103
+-7094.999 1488.034 157.562 2 -1 -1 299103
+-7178.582 1680.861 157.000 2 -1 -1 299103
+-7051.308 1769.307 157.000 2 -1 -1 299103
+-7267.034 3968.861  45.000 2 -1 -1 299103
+-7270.308 4219.307  45.000 2 -1 -1 299103

@@ -126,9 +126,24 @@ void HandshakeState::HandleControlMessage(const uint8_t* data, size_t len) {
             OnLogin(data, len);
             break;
         case NMT::Join:
-        case NMT::JoinGuidRebind:
-        case NMT::JoinSplit:
             OnJoin(data, len);
+            break;
+        case NMT::Have:
+            // NMT_Have (0x08) is the client's package-availability report. A retail
+            // client sends dozens of these while loading the map, then sends the real
+            // zero-body NMT_Join (0x09) only after package verification and LoadMap are
+            // complete. Treating Have as Join fires actor replication ~30 seconds too
+            // early; the client tears down ch2 and every retransmit expires before it
+            // can adopt its PlayerController. Package validation is intentionally
+            // stubbed, so accepting/ignoring the report is sufficient here.
+            Logger::Trace("[HandshakeState] client %u: NMT_Have package inventory accepted (stub)",
+                          m_clientId);
+            break;
+        case NMT::JoinSplit:
+            // Split-screen needs a child connection and must not promote the main
+            // connection through the ordinary Join path. It is not implemented yet.
+            Logger::Debug("[HandshakeState] client %u: NMT_JoinSplit unsupported; ignoring",
+                          m_clientId);
             break;
         case NMT::SteamAuth:
         case NMT::SteamLogin:
@@ -155,6 +170,18 @@ void HandshakeState::HandleHandshakeMessage(const uint8_t* data, size_t len) {
     const uint8_t subtype = data[0];
     switch (subtype) {
         case ControlChannel::Handshake::kStart: {  // 0x1d  C->S HandshakeStart
+            if (m_handshakeChallengeIssued) {
+                // A genuine retransmit carries the already-consumed reliable
+                // ChSequence and never reaches this state machine. A new
+                // sequential Start is not another handshake transition; do not
+                // amplify it into another outbound reliable challenge.
+                Logger::Debug(
+                    "[HandshakeState] client %u: sequential HandshakeStart "
+                    "after challenge issuance, ignoring",
+                    m_clientId);
+                break;
+            }
+            m_handshakeChallengeIssued = true;
             m_handshakeNonce = MakeServerNonce(m_clientId);
             Emit(ControlChannel::BuildHandshakeChallenge(m_handshakeNonce));
             Logger::Info("[HandshakeState] client %u: HandshakeStart -> sent HandshakeChallenge (nonce=0x%06X)",

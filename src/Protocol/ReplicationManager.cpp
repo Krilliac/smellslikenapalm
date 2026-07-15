@@ -2,14 +2,19 @@
 #include "Protocol/ReplicationManager.h"
 #include "Utils/Logger.h"
 #include "Protocol/MessageEncoder.h"
+#include <exception>
 
-ReplicationManager::ReplicationManager(ProtocolHandler& protocol)
-    : m_protocol(protocol)
+ReplicationManager::ReplicationManager(PacketSink packetSink)
+    : m_packetSink(std::move(packetSink))
 {
-    Logger::Trace("[ReplicationManager::ReplicationManager] entry — constructing with ProtocolHandler reference");
+    Logger::Trace("[ReplicationManager::ReplicationManager] entry — constructing with outbound packet sink");
     Logger::Info("ReplicationManager initialized");
     Logger::Debug("[ReplicationManager::ReplicationManager] initial state: compressionAlgo=NONE, compressionLevel=0, actorStates empty, propertyQueue empty");
     Logger::Trace("[ReplicationManager::ReplicationManager] exit — construction complete");
+}
+
+void ReplicationManager::SetPacketSink(PacketSink packetSink) {
+    m_packetSink = std::move(packetSink);
 }
 
 ReplicationManager::~ReplicationManager() {
@@ -92,10 +97,44 @@ void ReplicationManager::Tick(float /*deltaTime*/) {
     Logger::Trace("[ReplicationManager::Tick] exit — replication tick finished");
 }
 
+bool ReplicationManager::DispatchPacket(const Packet& packet) {
+    if (!m_packetSink) {
+        Logger::Debug(
+            "[ReplicationManager] no outbound packet sink for tag '%s'; "
+            "retaining pending replication",
+            packet.GetTag().c_str());
+        return false;
+    }
+
+    try {
+        if (!m_packetSink(packet)) {
+            Logger::Warn(
+                "[ReplicationManager] outbound packet sink rejected tag '%s'; "
+                "retaining pending replication",
+                packet.GetTag().c_str());
+            return false;
+        }
+    } catch (const std::exception& error) {
+        Logger::Error(
+            "[ReplicationManager] outbound packet sink threw for tag '%s': %s; "
+            "retaining pending replication",
+            packet.GetTag().c_str(), error.what());
+        return false;
+    } catch (...) {
+        Logger::Error(
+            "[ReplicationManager] outbound packet sink threw for tag '%s'; "
+            "retaining pending replication",
+            packet.GetTag().c_str());
+        return false;
+    }
+    return true;
+}
+
 void ReplicationManager::BuildAndSendActorReplication() {
     Logger::Trace("[ReplicationManager::BuildAndSendActorReplication] entry — scanning %zu actor dirty flags",
                   m_actorDirtyFlags.size());
     std::vector<ActorState> toSend;
+    std::vector<std::pair<uint32_t, uint32_t>> sentFlags;
     for (auto& kv : m_actorDirtyFlags) {
         uint32_t actorId = kv.first;
         uint32_t flags   = kv.second;
@@ -120,8 +159,11 @@ void ReplicationManager::BuildAndSendActorReplication() {
         st.stateFlags = flags;
         // Assume external game logic has updated st.position, orientation, etc.
         toSend.push_back(st);
-        m_actorDirtyFlags[actorId] = 0;
-        Logger::Trace("[ReplicationManager::BuildAndSendActorReplication] actorId=%u dirty flags cleared to 0", actorId);
+        sentFlags.emplace_back(actorId, flags);
+        // Remove this packet's snapshot before entering the transport callback.
+        // A re-entrant producer can now mark even the same bit again without it
+        // being lost. Failed dispatch restores the snapshot below.
+        kv.second &= ~flags;
     }
     if (toSend.empty()) {
         Logger::Trace("[ReplicationManager::BuildAndSendActorReplication] exit — no dirty actors to replicate");
@@ -146,7 +188,16 @@ void ReplicationManager::BuildAndSendActorReplication() {
     } else {
         Logger::Debug("[ReplicationManager::BuildAndSendActorReplication] compression disabled — sending %zu raw bytes", raw.size());
     }
-    m_protocol.Handle(0, pkt, {});  // clientId=0 means broadcast
+    if (!DispatchPacket(pkt)) {
+        for (const auto& sent : sentFlags) {
+            auto dirty = m_actorDirtyFlags.find(sent.first);
+            if (dirty != m_actorDirtyFlags.end()) {
+                dirty->second |= sent.second;
+            }
+        }
+        Logger::Trace("[ReplicationManager::BuildAndSendActorReplication] exit — actor replication retained for retry");
+        return;
+    }
     Logger::Info("[ReplicationManager::BuildAndSendActorReplication] sent actor replication for %zu actors (broadcast)",
                  toSend.size());
     Logger::Trace("[ReplicationManager::BuildAndSendActorReplication] exit — actor replication sent");
@@ -177,9 +228,15 @@ void ReplicationManager::BuildAndSendPropertyReplication() {
     } else {
         Logger::Debug("[ReplicationManager::BuildAndSendPropertyReplication] compression disabled — sending %zu raw bytes", raw.size());
     }
-    m_protocol.Handle(0, pkt, {});
-    size_t sentCount = m_propertyQueue.size();
-    m_propertyQueue.clear();
+    const size_t sentCount = m_propertyQueue.size();
+    if (!DispatchPacket(pkt)) {
+        Logger::Trace("[ReplicationManager::BuildAndSendPropertyReplication] exit — property replication retained for retry");
+        return;
+    }
+    // Remove exactly the accepted prefix so updates appended by a future
+    // re-entrant sink are not discarded.
+    m_propertyQueue.erase(m_propertyQueue.begin(),
+                          m_propertyQueue.begin() + sentCount);
     Logger::Info("[ReplicationManager::BuildAndSendPropertyReplication] sent property replication for %zu properties (broadcast), queue cleared",
                  sentCount);
     Logger::Trace("[ReplicationManager::BuildAndSendPropertyReplication] exit — property replication sent and queue cleared");

@@ -21,7 +21,7 @@
 namespace PacketCodec {
 
 // ---- Wire constants (spec §2/§3) ------------------------------------------
-// kMaxPacketId (16384) and kMaxChannels (1023) live in NetMessages.h.
+// kMaxPacketId (16384) and kMaxChannels (1024) live in NetMessages.h.
 constexpr uint32_t kMaxChSequence = 1024;   // ReadInt bound for ChSequence (0x400)
 constexpr uint32_t kChTypeMax     = 8;      // ReadInt bound for ChType (CHTYPE_MAX)
 constexpr uint32_t kControlChannelType = 1; // ChType for the control channel [UE3]
@@ -36,23 +36,23 @@ constexpr uint32_t kControlChannelType = 1; // ChType for the control channel [U
 // and thus where the payload starts - changes with MaxPacket. The caller passes
 // the right value per connection phase (see PacketCodec::Decode/Encode).
 constexpr uint32_t kHandshakeMaxPacketBytes = 8;     // StatelessConnect phase
-// 2048 is the bit-exact value (reversed from VNGame.exe [conn+0x10c] and proven
-// against the real capture): BunchDataBits = SerializeInt(2048*8 = 16384), which
-// is 14 bits wide. The Hello version fields (MinVer=7038, Ver=7258), the SteamId
-// (0x0110000103E8DBBB), the rate (80000) and the login URL all decode byte-exactly
-// ONLY at this width. 1024 (bound 8192, width 13) is one bit too narrow and
-// right-shifts the whole NMT-phase payload by one bit per bunch, mis-reading every
-// NMT byte (Hello 0x00 -> 0x20, Login 0x10 -> 0x08, etc). (Binary static default
-// is 512; the live connection's MaxPacket is negotiated up to 2048 by the NMT phase.)
-constexpr uint32_t kNmtMaxPacketBytes       = 2048;  // established / NMT phase (CLIENT->server decode)
+// Retail RS2 C2S traffic uses MaxPacket=1280 (BunchDataBits bound 10240). This is
+// pinned by the package-inventory burst: saturated 1258-1279 byte datagrams decode
+// exactly into consecutive ch0 NMT_Have bunches only at 10240. The old 2048-byte
+// bound misaligned those same packets, fabricated actor channels (notably ch512),
+// and left reliable ch0 sequence gaps that prevented the eventual NMT_Join.
+// Small handshake/Login packets can happen to decode at several 14-bit bounds, so
+// the saturated post-login packets are the authoritative discriminator.
+constexpr uint32_t kClientSendMaxPacketBytes = 1280;  // client -> server decode
+// Compatibility name used throughout the established-phase tests/callers.
+constexpr uint32_t kNmtMaxPacketBytes = kClientSendMaxPacketBytes;
 
-// MaxPacket is per-connection and ASYMMETRIC on this build: the CLIENT encodes its
-// C2S bunches with MaxPacket 2048 (bound 16384 - kNmtMaxPacketBytes, validated
-// byte-exact against the login version fields), but the dedicated SERVER encodes
+// MaxPacket is per-direction and ASYMMETRIC on this build: the CLIENT encodes its
+// C2S bunches with MaxPacket 1280, while the dedicated SERVER encodes
 // its S2C bunches with a smaller MaxPacket ~1500 (Ethernet MTU; bound ~12000) -
 // reversed from the official server's PackageMap export (frames f167-f185), whose
 // 20 bunches only decode with consumesAll when the bound is in (10088, 13928].
-// So we DECODE inbound at kNmtMaxPacketBytes but ENCODE our outbound (we are the
+// So we DECODE inbound at kClientSendMaxPacketBytes but ENCODE our outbound (we are the
 // server) at this value, matching what the retail client expects from a server.
 // Any value in (1261, 1741] bytes frames the PackageMap chunks identically; 1500
 // is the principled MTU choice. See docs/RS2V_PostJoin_Replication_7258.md.
@@ -83,7 +83,7 @@ struct Packet {
 
 // Decode a raw UDP datagram (one UE3 packet) into its structure. `maxPacketBytes`
 // is the connection's MaxPacket for the current phase (kHandshakeMaxPacketBytes
-// during StatelessConnect, kNmtMaxPacketBytes once established) - it sets the
+// during StatelessConnect, kClientSendMaxPacketBytes once established) - it sets the
 // SerializeInt bound for BunchDataBits. Never reads out of bounds; sets
 // Packet::ok = false on any malformed/truncated input.
 Packet Decode(const uint8_t* data, size_t numBytes,

@@ -1,0 +1,20 @@
+# VNTE-Hill937 cooked ROObjective metadata
+#
+# Source package: VNTE-Hill937.roe
+# Retail package GUID: AA60EC4F4122050844CDBE9843969C90
+# Positions are exact ROPlaceableVolume.VolumeCenter values. Objective slots,
+# replication indices, initial Axis ownership, capture durations, and the
+# A/B -> C/D -> HeadQuarters phase chain are reconstructed from cooked actors
+# and Kismet links. Axis maps to server team 2.
+#
+# UE3 brush collision cannot currently be represented by this server's circular
+# objective format, so radius 30.0 is an explicit runtime approximation. It is
+# not presented as extracted brush geometry.
+#
+# Format: "name" x y z radius phase tunnel clientSlot cookedRepIndex
+#         enabled connectedToBase initialOwner captureSeconds
+"Abandoned Settlement" -6904.670 -3043.355 1978.360 30.0 0 0 0 0 1 1 2 32.0
+"Trenchline"            -6337.971  8734.924 2041.773 30.0 0 0 1 1 1 1 2 32.0
+"Trenchline 2"           364.2725 -567.6939 3659.504 30.0 1 0 2 2 1 1 2 38.0
+"Supply Bunkers"         590.8539 7881.1850 3943.802 30.0 1 0 3 3 1 1 2 38.0
+"HeadQuarters"           7007.174  4968.201 5820.355 30.0 2 0 4 4 1 1 2 32.0

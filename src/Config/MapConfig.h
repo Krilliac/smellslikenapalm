@@ -27,7 +27,8 @@ struct MapDefinition {
     std::string defaultMode;             // fallback ModeID when rotation omits one
     int         voteWeight        = 50;  // 1-100 likelihood weight for map voting
 
-    // Spawn point and bounds data (loaded from map file)
+    // Spawn-point and configured bounds data. Cooked UE3 package bounds require
+    // export-table parsing; MapManager does not infer them from summary bytes.
     std::vector<Vector3> spawnPoints;
     std::vector<int>     objectiveIds;
     struct Bounds { Vector3 min, max; } bounds = {};
@@ -79,6 +80,11 @@ public:
     // Resolve a maps.ini 'file' value to a usable path (relative to the maps
     // assets directory unless it is absolute or already has a directory).
     std::string ResolveMapFilePath(const std::string& file) const;
+
+    // Directory that owns repo-local per-map/global auxiliary data such as
+    // spawns.txt and objectives.txt. This can differ from an absolute retail
+    // .roe asset's parent directory.
+    const std::string& GetMapsDirectory() const { return m_mapsDir; }
 
 private:
     void ApplyProperty(MapDefinition& def, const std::string& key, const std::string& val);

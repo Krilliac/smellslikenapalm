@@ -17,6 +17,7 @@
 #include <thread>
 #include <atomic>
 #include <mutex>
+#include <condition_variable>
 #include <chrono>
 #include <unordered_map>
 
@@ -174,8 +175,12 @@ public:
     void Shutdown();
     bool IsRunning() const { return m_running.load(); }
     
-    // Reporter management
-    void AddReporter(std::unique_ptr<MetricsReporter> reporter);
+    // Reporter management. The manager takes exclusive ownership of reporter
+    // lifecycle: callers pass a newly constructed, uninitialized reporter and
+    // the manager initializes it exactly once (immediately when the manager is
+    // active, or during Initialize when registered beforehand). Returns false
+    // for null reporters or when reporter initialization fails.
+    bool AddReporter(std::unique_ptr<MetricsReporter> reporter);
     void RemoveAllReporters();
     
     // Metrics collection control
@@ -193,11 +198,11 @@ public:
     
     // Configuration
     void UpdateConfig(const TelemetryConfig& config);
-    TelemetryConfig GetConfig() const { return m_config; }
+    TelemetryConfig GetConfig() const;
     
     // Statistics
     uint64_t GetTotalSamplesTaken() const { return m_totalSamples.load(); }
-    std::chrono::steady_clock::time_point GetStartTime() const { return m_startTime; }
+    std::chrono::steady_clock::time_point GetStartTime() const;
     
     // Error handling
     std::vector<std::string> GetLastErrors() const;
@@ -215,7 +220,7 @@ private:
     void SamplingLoop();
     
     // Metrics collection methods
-    MetricsSnapshot CollectSnapshot();
+    MetricsSnapshot CollectSnapshot(const TelemetryConfig& config);
     void CollectSystemMetrics(MetricsSnapshot& snapshot);
     void CollectApplicationMetrics(MetricsSnapshot& snapshot);
     
@@ -227,27 +232,66 @@ private:
     
     // Error reporting
     void ReportError(const std::string& error);
+
+    // Sampling is serialized without holding a mutex across reporter callbacks.
+    // The gate mutex only protects acquisition/release of the logical lease.
+    bool BeginSampleOperation();
+    void EndSampleOperation();
+    bool IsCurrentSampleOperationOwner() const;
+    void BlockAndDrainSamples();
+    void UnblockSamples();
+    void LatchPendingShutdown();
+    void ProcessPendingShutdown();
+
+    struct ReporterRecord;
+    bool InitializeReporter(const std::shared_ptr<ReporterRecord>& record,
+                            const std::string& outputDirectory);
+    bool BeginReporterReport(const std::shared_ptr<ReporterRecord>& record,
+                             std::shared_ptr<MetricsReporter>& reporter);
+    void EndReporterReport(const std::shared_ptr<ReporterRecord>& record);
+    void RequestReporterShutdown(const std::shared_ptr<ReporterRecord>& record);
+    void InvokeReporterShutdown(const std::shared_ptr<ReporterRecord>& record);
     
     // Configuration and state
     TelemetryConfig m_config;
+    mutable std::mutex m_configMutex;
+    // Serializes manager/reporter lifecycle transitions so AddReporter cannot
+    // observe m_initialized before Initialize has published its configuration.
+    mutable std::mutex m_lifecycleMutex;
+    bool m_initializing = false;
+    bool m_removingReporters = false;
+    bool m_updatingConfig = false;
+    std::atomic<bool> m_shutdownPending{false};
     std::atomic<bool> m_initialized{false};
+    std::atomic<bool> m_shuttingDown{false};
     std::atomic<bool> m_running{false};
     std::chrono::steady_clock::time_point m_startTime;
     
     // Sampling thread
     std::thread m_samplingThread;
+    mutable std::mutex m_samplingThreadMutex;
+    std::mutex m_samplingWaitMutex;
+    std::condition_variable m_samplingWaitCv;
+    std::atomic<uint64_t> m_configGeneration{0};
+
+    mutable std::mutex m_sampleGateMutex;
+    std::condition_variable m_sampleGateCv;
+    bool m_sampleOperationActive = false;
+    bool m_samplesBlocked = false;
+    std::thread::id m_sampleOperationOwner;
     
     // Metrics storage
     CustomMetrics m_customMetrics;
     mutable std::mutex m_snapshotMutex;
     std::vector<MetricsSnapshot> m_snapshots;
     size_t m_snapshotIndex = 0;
+    size_t m_snapshotCapacity = 1;
     
     // Statistics
     std::atomic<uint64_t> m_totalSamples{0};
     
     // Reporters
-    std::vector<std::unique_ptr<MetricsReporter>> m_reporters;
+    std::vector<std::shared_ptr<ReporterRecord>> m_reporters;
     mutable std::mutex m_reporterMutex;
     
     // Error tracking
@@ -268,6 +312,12 @@ private:
     };
     CPUTimes m_lastCPUTimes;
     bool m_hasPreviousCPUTimes = false;
+
+#ifdef _WIN32
+    struct WindowsCpuCounterState;
+    std::unique_ptr<WindowsCpuCounterState> m_windowsCpuCounter;
+#endif
+
 };
 
 // Convenience macros for common telemetry operations

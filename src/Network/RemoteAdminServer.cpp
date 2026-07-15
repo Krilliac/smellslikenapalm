@@ -10,7 +10,9 @@
 #include "Utils/CrashHandler.h"
 
 #include <chrono>
+#include <future>
 #include <thread>
+#include <utility>
 
 namespace {
 // Hard cap on a single request. Remote input is hostile until proven otherwise;
@@ -172,17 +174,43 @@ void RemoteAdminServer::HandleConnection(TCPSocket& client)
         return;
     }
 
-    std::string output;
     CommandContext ctx;
     ctx.source  = CommandSource::Remote;
     ctx.level   = CommandManager::LevelFromInt(m_config.defaultLevel);
     ctx.invoker = "remote";
     ctx.server  = m_server;
     ctx.machine = true; // tooling/AI consumer — prefer terse output
-    ctx.out = [&output](std::string_view line) { output.append(line); output.push_back('\n'); };
 
-    bool ok = cmdMgr->Execute(ctx, command);
-    sendHttp(200, "OK", BuildSoapResponse(ok, output));
+    std::future<QueuedCommandResult> resultFuture =
+        cmdMgr->Enqueue(std::move(ctx), command);
+    // Keep the synchronous SOAP contract, but poll so Stop() can always join the
+    // accept thread if the authoritative game loop has stopped or stalled.
+    while (m_running.load() &&
+           resultFuture.wait_for(std::chrono::milliseconds(100)) !=
+               std::future_status::ready) {
+    }
+    if (resultFuture.wait_for(std::chrono::milliseconds(0)) !=
+        std::future_status::ready) {
+        sendHttp(503, "Service Unavailable",
+                 BuildSoapResponse(false, "server shutting down\n"));
+        return;
+    }
+
+    QueuedCommandResult result;
+    bool gotResult = rs2v::Guard("remote admin command result", [&] {
+        result = resultFuture.get();
+    });
+    if (!gotResult) {
+        sendHttp(503, "Service Unavailable",
+                 BuildSoapResponse(false, "command result unavailable\n"));
+        return;
+    }
+    if (!result.executed) {
+        sendHttp(503, "Service Unavailable",
+                 BuildSoapResponse(false, result.output));
+        return;
+    }
+    sendHttp(200, "OK", BuildSoapResponse(result.ok, result.output));
 }
 
 std::string RemoteAdminServer::BuildSoapResponse(bool ok, const std::string& output)

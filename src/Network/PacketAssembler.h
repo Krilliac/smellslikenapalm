@@ -56,8 +56,8 @@ public:
     // `maxBunchDataBits` is the largest payload bit count one bunch may carry,
     // i.e. MaxPacket*8 - 1 for the phase. It defaults to the small handshake
     // value (63, from MaxPacket=8); once the connection is established the caller
-    // passes the NMT value (kNmtMaxPacketBytes*8 - 1 = 16383) so a large message
-    // - e.g. NMT_Welcome or the PackageMap export - goes out as ONE big bunch,
+    // passes the direction-appropriate negotiated MaxPacket bound so a large message
+    // - e.g. NMT_Welcome or a PackageMap export chunk - goes out as ONE big bunch,
     // exactly as the retail server frames it, instead of hundreds of 63-bit
     // fragments. The BunchDataBits SerializeInt bound used when ENCODING must
     // match (see PacketCodec::Encode's maxPacketBytes) or the peer mis-reads it.

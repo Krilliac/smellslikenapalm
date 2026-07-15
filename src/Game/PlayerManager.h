@@ -22,6 +22,9 @@ public:
     // Player events
     void OnPlayerConnect(std::shared_ptr<ClientConnection> conn);
     void OnPlayerDisconnect(uint32_t clientId);
+    // Lifecycle notifications are idempotent. Death only transitions Alive -> Dead,
+    // while spawn only transitions Dead -> Alive; duplicate and spectator events are
+    // ignored so they cannot restart respawn timers or re-run spawn side effects.
     void OnPlayerDeath(uint32_t clientId);
     void OnPlayerSpawn(uint32_t clientId);
 

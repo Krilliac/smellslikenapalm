@@ -3,8 +3,14 @@
 #include "Utils/Logger.h"
 #include <thread>
 
+namespace {
+double ToMilliseconds(GameClock::Duration duration) {
+    return std::chrono::duration<double, std::milli>(duration).count();
+}
+} // namespace
+
 GameClock::GameClock()
-    : m_startTime(std::chrono::steady_clock::now()),
+    : m_startTime(Clock::now()),
       m_lastTick(m_startTime)
 {
     Logger::Trace("[GameClock::GameClock] Constructor entered, initializing start time and last tick to current steady_clock time");
@@ -25,9 +31,10 @@ void GameClock::SetTickRate(uint32_t ticksPerSecond) {
         return;
     }
     m_ticksPerSecond = ticksPerSecond;
-    m_tickInterval = Duration(1000 / ticksPerSecond);
-    Logger::Info("[GameClock::SetTickRate] Tick rate updated to %u ticks/sec, tick interval set to %lld ms",
-                 ticksPerSecond, static_cast<long long>(m_tickInterval.count()));
+    m_tickInterval = std::chrono::duration_cast<Duration>(
+        std::chrono::duration<double>(1.0 / static_cast<double>(ticksPerSecond)));
+    Logger::Info("[GameClock::SetTickRate] Tick rate updated to %u ticks/sec, tick interval set to %.3f ms",
+                 ticksPerSecond, ToMilliseconds(m_tickInterval));
     Logger::Trace("[GameClock::SetTickRate] Exit — tick rate configured successfully");
 }
 
@@ -41,48 +48,50 @@ void GameClock::RegisterTickCallback(TickCallback cb) {
 
 GameClock::Duration GameClock::GetElapsed() const {
     Logger::Trace("[GameClock::GetElapsed] Entry");
-    auto elapsed = std::chrono::duration_cast<Duration>(
-        std::chrono::steady_clock::now() - m_startTime);
-    Logger::Trace("[GameClock::GetElapsed] Exit — elapsed=%lld ms", static_cast<long long>(elapsed.count()));
+    auto elapsed = Clock::now() - m_startTime;
+    Logger::Trace("[GameClock::GetElapsed] Exit — elapsed=%.3f ms", ToMilliseconds(elapsed));
     return elapsed;
 }
 
 GameClock::Duration GameClock::GetLastDelta() const {
     Logger::Trace("[GameClock::GetLastDelta] Entry");
-    Logger::Trace("[GameClock::GetLastDelta] Exit — lastDelta=%lld ms", static_cast<long long>(m_lastDelta.count()));
+    Logger::Trace("[GameClock::GetLastDelta] Exit — lastDelta=%.3f ms", ToMilliseconds(m_lastDelta));
     return m_lastDelta;
 }
 
 void GameClock::RunLoop() {
     Logger::Trace("[GameClock::RunLoop] Entry — starting main game clock loop");
     m_running = true;
-    m_startTime = std::chrono::steady_clock::now();
+    m_startTime = Clock::now();
     m_lastTick  = m_startTime;
     Logger::Info("[GameClock::RunLoop] Game clock loop started, m_running=true, start time and last tick reset");
 
     while (m_running) {
-        auto now = std::chrono::steady_clock::now();
-        auto delta = std::chrono::duration_cast<Duration>(now - m_lastTick);
+        auto now = Clock::now();
+        auto delta = now - m_lastTick;
         if (delta < m_tickInterval) {
             auto sleepTime = m_tickInterval - delta;
-            Logger::Trace("[GameClock::RunLoop] Delta %lld ms < tick interval %lld ms, sleeping for %lld ms",
-                          static_cast<long long>(delta.count()),
-                          static_cast<long long>(m_tickInterval.count()),
-                          static_cast<long long>(sleepTime.count()));
+            Logger::Trace("[GameClock::RunLoop] Delta %.3f ms < tick interval %.3f ms, sleeping for %.3f ms",
+                          ToMilliseconds(delta),
+                          ToMilliseconds(m_tickInterval),
+                          ToMilliseconds(sleepTime));
             std::this_thread::sleep_for(sleepTime);
             continue;
         }
 
         m_lastDelta = delta;
         m_lastTick  = now;
-        Logger::Debug("[GameClock::RunLoop] Tick fired — delta=%lld ms, updating lastDelta and lastTick",
-                      static_cast<long long>(delta.count()));
+        // Per-frame timing is intentionally trace-only. Emitting two DEBUG log
+        // records every tick can itself throttle a Windows server doing
+        // synchronous console/file logging.
+        Logger::Trace("[GameClock::RunLoop] Tick fired — delta=%.3f ms, updating lastDelta and lastTick",
+                      ToMilliseconds(delta));
 
         // Invoke callbacks
         {
             std::lock_guard<std::mutex> lock(m_mutex);
-            Logger::Debug("[GameClock::RunLoop] Invoking %zu registered tick callbacks with delta=%lld ms",
-                          m_callbacks.size(), static_cast<long long>(m_lastDelta.count()));
+            Logger::Trace("[GameClock::RunLoop] Invoking %zu registered tick callbacks with delta=%.3f ms",
+                          m_callbacks.size(), ToMilliseconds(m_lastDelta));
             for (auto& cb : m_callbacks) {
                 cb(m_lastDelta);
             }

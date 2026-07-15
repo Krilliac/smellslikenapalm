@@ -1,12 +1,16 @@
 # RS2V global objective / capture-zone templates
 # Used as a fallback when a map provides no per-map objectives.txt.
-# Format: name x y z [radius] [order] [tunnel 0/1] [tunnelX tunnelY tunnelZ]
+# Format: name x y z [radius] [phase] [tunnel 0/1] [tunnelX tunnelY tunnelZ]
+#         [clientSlot cookedRepIndex [enabled 0/1] [connectedToBase 0/1]]
 #   name     - short capture-zone label (no spaces)
 #   x y z    - world position of the zone centre
 #   radius   - capture radius in metres (optional, default 30)
-#   order    - linear capture order for Territory mode (optional, default = line order)
+#   phase    - Territory activation phase/order (optional, default = line order)
 #   tunnel   - 1 if a VC/NVA tunnel spawn sits at this objective (optional)
 #   tunnelX/Y/Z - tunnel spawn position (optional; defaults to the zone centre)
+#   clientSlot/cookedRepIndex - optional retail GRI ObjIndex/ObjRepIndex pair.
+#              Generic fallback zones intentionally omit it and remain server-only.
+#   enabled/connectedToBase - optional retail objective flags (defaults 1/0)
 #
 # These are generic, evenly-spread points; authored maps should ship their own
 # maps/<MapID>/objectives.txt for balanced, in-world placement.

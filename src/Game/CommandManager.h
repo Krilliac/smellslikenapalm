@@ -10,23 +10,26 @@
 //   * Remote (SOAP)  — an HTTP/SOAP request from a tool or AI   (RemoteAdminServer)
 //
 // Every transport builds a CommandContext (who is asking, at what permission
-// level, and where output should go) and calls Execute(). Permission is checked
-// centrally against the command's minimum level before the handler runs, so a
-// new transport cannot accidentally bypass authorization — the gate lives here,
-// not in the caller.
+// level, and where output should go) and dispatches directly or through the
+// main-thread queue. Permission is checked centrally against the command's
+// minimum level before the handler runs, so a new transport cannot accidentally
+// bypass authorization — the gate lives here, not in the caller.
 //
-// Threading: Execute() may be called from the game thread (chat), the console
-// thread, and a remote-server worker thread. The command registry is built once
-// during Initialize() and is read-only afterwards, so lookups are lock-free.
-// Handlers that mutate game state must respect the locking owned by the
-// subsystems they call (PlayerManager, ConfigManager, ...). Handlers that need
-// the game thread should keep their work short; this matches how chat commands
-// already run inline on the tick.
+// Threading: Execute() is an authoritative-game-thread API. In-game chat already
+// reaches it from GameServer::Run; worker-thread transports (console and remote
+// admin) must use Enqueue() and wait for the result. GameServer drains the
+// bounded queue before ticking mutable subsystems. This keeps handlers from
+// racing PlayerManager, BotManager, ConfigManager, and the other single-threaded
+// game-state owners.
 
 #pragma once
 
 #include <cstdint>
+#include <cstddef>
+#include <deque>
 #include <functional>
+#include <future>
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -110,9 +113,21 @@ struct CommandDef {
     CommandHandler           handler;
 };
 
+// Result returned to worker-thread transports after the authoritative game
+// thread has executed (or rejected) a queued command.
+struct QueuedCommandResult {
+    // False means the request never ran (queue full or server shutting down).
+    bool executed = false;
+    bool ok = false;
+    // Newline-delimited Reply() output, ready for stdout or a SOAP body.
+    std::string output;
+};
+
 class CommandManager {
 public:
     static constexpr uint32_t INVALID_CLIENT_ID = UINT32_MAX;
+    static constexpr size_t MAX_QUEUED_COMMANDS = 64;
+    static constexpr size_t MAX_COMMANDS_PER_TICK = 16;
 
     explicit CommandManager(GameServer* server);
     ~CommandManager();
@@ -132,6 +147,22 @@ public:
     // and dispatch. Returns the handler result, or false on unknown command /
     // permission denial (a reply explaining which is sent through ctx.out).
     bool Execute(CommandContext& ctx, std::string_view commandLine);
+
+    // Copy a transport request into the bounded main-thread queue. The caller's
+    // output callback and server pointer are intentionally not retained; output
+    // is collected in QueuedCommandResult so worker-local captures cannot outlive
+    // their transport request. Rejection returns an already-ready future.
+    std::future<QueuedCommandResult> Enqueue(CommandContext ctx,
+                                              std::string commandLine);
+
+    // Drain queued work in FIFO order. Must be called only by the authoritative
+    // GameServer::Run thread. The per-tick cap prevents command floods from
+    // starving simulation/network work.
+    size_t ProcessQueued(size_t limit = MAX_COMMANDS_PER_TICK);
+
+    // Reject queued and future submissions. Idempotent and safe from any thread;
+    // GameServer calls this before joining command transports during shutdown.
+    void StopAccepting(std::string_view reason = "server shutting down");
 
     // Dispatch an already-parsed command. ctx.args must be populated.
     bool ExecuteParsed(CommandContext& ctx, std::string_view name);
@@ -153,6 +184,12 @@ public:
     const std::vector<CommandDef>& Commands() const { return m_commands; }
 
 private:
+    struct PendingCommand {
+        CommandContext context;
+        std::string commandLine;
+        std::promise<QueuedCommandResult> completion;
+    };
+
     // Registration helpers split across translation units to keep each file a
     // single coherent job (engine here, handlers in CommandHandlers.cpp).
     void RegisterBuiltins();
@@ -162,4 +199,8 @@ private:
 
     GameServer* m_server;
     std::vector<CommandDef> m_commands;
+
+    std::mutex m_queueMutex;
+    std::deque<PendingCommand> m_queuedCommands;
+    bool m_acceptingQueuedCommands = false;
 };

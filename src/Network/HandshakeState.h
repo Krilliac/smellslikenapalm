@@ -161,6 +161,11 @@ private:
     // completes, inbound control messages are routed to HandleHandshakeMessage
     // (by subtype), not the NMT switch.
     bool              m_controlHandshakeComplete = false;
+    // The opening HandshakeStart is a one-shot transition. Legitimate wire
+    // retransmits reuse the same reliable ChSequence and are removed by the
+    // ControlReassembler; accepting later sequential Starts would let an
+    // unauthenticated endpoint manufacture an unbounded challenge/retry ledger.
+    bool              m_handshakeChallengeIssued = false;
     uint32_t          m_handshakeNonce = 0; // the rand() nonce we sent in 0x1e
 
     HandshakePhase    m_phase = HandshakePhase::AwaitingHello;

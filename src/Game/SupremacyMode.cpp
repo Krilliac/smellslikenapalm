@@ -1,12 +1,18 @@
 // src/Game/SupremacyMode.cpp
-// RS2V Supremacy game mode implementation
+// RS2V Supremacy game mode implementation.
 
 #include "Game/SupremacyMode.h"
+
+#include "Game/BotManager.h"
 #include "Game/GameServer.h"
-#include "Game/TeamManager.h"
+#include "Game/ObjectiveSystem.h"
 #include "Game/PlayerManager.h"
+#include "Game/TeamManager.h"
 #include "Utils/Logger.h"
+
 #include <algorithm>
+#include <cmath>
+#include <limits>
 
 SupremacyMode::SupremacyMode(GameServer* server)
     : m_server(server)
@@ -19,10 +25,11 @@ SupremacyMode::~SupremacyMode() {
 
 void SupremacyMode::Initialize() {
     m_phase = Phase::WarmUp;
-    m_team1Points = m_startingPoints;
-    m_team2Points = m_startingPoints;
-    m_drainTimer = 0.0f;
-    Logger::Info("SupremacyMode initialized (%.0f starting points per team)", m_startingPoints);
+    m_score = 0;
+    m_winningTeam = 0;
+    m_scoreTickTimer = 0.0;
+    ResetObjectivesToInitialOwners();
+    Logger::Info("SupremacyMode initialized (signed target +/-%d)", m_scoreTarget);
 }
 
 void SupremacyMode::Shutdown() {
@@ -30,24 +37,33 @@ void SupremacyMode::Shutdown() {
 }
 
 void SupremacyMode::StartRound() {
-    m_team1Points = m_startingPoints;
-    m_team2Points = m_startingPoints;
-    m_drainTimer = 0.0f;
+    m_score = 0;
+    m_winningTeam = 0;
+    m_scoreTickTimer = 0.0;
+    ResetObjectivesToInitialOwners();
+    if (m_server) {
+        if (auto* objectives = m_server->GetObjectiveSystem()) {
+            objectives->ResetObjectivesToInitialOwners();
+        }
+    }
     SetPhase(Phase::Preparation);
     Logger::Info("Supremacy round started");
 }
 
 void SupremacyMode::EndRound() {
-    DetermineWinner();
-    SetPhase(Phase::PostRound);
+    FinishRoundWithWinner(DetermineWinner());
 }
 
 void SupremacyMode::Update(float deltaSeconds) {
-    m_phaseTimer -= deltaSeconds;
+    if (!std::isfinite(deltaSeconds) || deltaSeconds < 0.0f) return;
+
+    const float phaseTimeBeforeUpdate = m_phaseTimer;
+    m_phaseTimer = std::max(0.0f, m_phaseTimer - deltaSeconds);
 
     switch (m_phase) {
         case Phase::WarmUp:
-            if (m_server->GetTeamManager()->HasEnoughPlayers()) {
+            if (m_server && m_server->GetTeamManager() &&
+                m_server->GetTeamManager()->HasEnoughPlayers()) {
                 StartRound();
             }
             break;
@@ -59,15 +75,23 @@ void SupremacyMode::Update(float deltaSeconds) {
             break;
 
         case Phase::Active:
-            ProcessPointDrain(deltaSeconds);
+            // A delayed frame may extend beyond the round deadline. Only the
+            // portion that actually occurred while Active contributes score;
+            // this makes one large update equivalent to updates split exactly
+            // at the phase boundary.
+            ProcessScoreFlow(std::min(
+                deltaSeconds, std::max(0.0f, phaseTimeBeforeUpdate)));
             CheckWinConditions();
-            if (m_phaseTimer <= 0.0f) {
+            if (m_phaseTimer <= 0.0f && m_phase == Phase::Active) {
                 EndRound();
             }
             break;
 
         case Phase::SuddenDeath:
-            // No point drain, wait for elimination
+            // Bot deaths do not have client ids and therefore do not travel
+            // through OnPlayerKilled. Poll the unified liveness view while
+            // respawns are disabled so a headless final kill resolves.
+            CheckSuddenDeathElimination();
             break;
 
         case Phase::PostRound:
@@ -81,191 +105,467 @@ void SupremacyMode::Update(float deltaSeconds) {
     }
 }
 
-void SupremacyMode::ProcessPointDrain(float deltaSeconds) {
-    m_drainTimer += deltaSeconds;
-    if (m_drainTimer < m_pointDrainInterval) return;
-    m_drainTimer -= m_pointDrainInterval;
+void SupremacyMode::ProcessScoreFlow(float deltaSeconds) {
+    if (!std::isfinite(deltaSeconds) || deltaSeconds <= 0.0f) return;
 
-    // Calculate linked objective value for each team
-    int team1Value = CalculateLinkedObjectiveValue(1);
-    int team2Value = CalculateLinkedObjectiveValue(2);
+    m_scoreTickTimer += static_cast<double>(deltaSeconds);
+    const double elapsedTicks =
+        std::floor(m_scoreTickTimer / static_cast<double>(m_scoringInterval));
+    if (elapsedTicks < 1.0) return;
 
-    int diff = team1Value - team2Value;
+    m_scoreTickTimer = std::fmod(
+        m_scoreTickTimer, static_cast<double>(m_scoringInterval));
 
-    if (diff > 0) {
-        // Team 1 has more connected objective value — drain from team 2
-        float drain = static_cast<float>(diff);
-        m_team2Points -= drain;
-        m_team1Points += drain;
-    } else if (diff < 0) {
-        // Team 2 has more
-        float drain = static_cast<float>(-diff);
-        m_team1Points -= drain;
-        m_team2Points += drain;
+    const int64_t southConnectedValue =
+        CalculateLinkedObjectiveValue(kSouthTeamId);
+    const int64_t northConnectedValue =
+        CalculateLinkedObjectiveValue(kNorthTeamId);
+    const int64_t scorePerTick = southConnectedValue - northConnectedValue;
+    if (scorePerTick == 0) return;
+
+    // Decide whether the accumulated ticks reach a target before converting
+    // the double tick count. If they do not, the exact int64 product is known
+    // to be smaller than the at-most-2*INT32_MAX distance to that target. This
+    // avoids both a narrowing conversion of a large catch-up delta and signed
+    // overflow when adding it to a score near the opposite bound.
+    const int64_t currentScore = static_cast<int64_t>(m_score);
+    const int64_t target = static_cast<int64_t>(m_scoreTarget);
+    int64_t finalScore = currentScore;
+
+    if (scorePerTick > 0) {
+        const int64_t distance = target - currentScore;
+        const int64_t ticksToTarget =
+            distance / scorePerTick + (distance % scorePerTick != 0 ? 1 : 0);
+        if (elapsedTicks >= static_cast<double>(ticksToTarget)) {
+            finalScore = target;
+        } else {
+            const int64_t tickCount = static_cast<int64_t>(elapsedTicks);
+            finalScore = currentScore + scorePerTick * tickCount;
+        }
+    } else {
+        // CalculateLinkedObjectiveValue is non-negative and saturates at
+        // INT64_MAX, so scorePerTick can never be INT64_MIN.
+        const int64_t scorePerTickMagnitude = -scorePerTick;
+        const int64_t distance = currentScore + target;
+        const int64_t ticksToTarget =
+            distance / scorePerTickMagnitude +
+            (distance % scorePerTickMagnitude != 0 ? 1 : 0);
+        if (elapsedTicks >= static_cast<double>(ticksToTarget)) {
+            finalScore = -target;
+        } else {
+            const int64_t tickCount = static_cast<int64_t>(elapsedTicks);
+            finalScore = currentScore - scorePerTickMagnitude * tickCount;
+        }
     }
 
-    m_team1Points = std::max(0.0f, m_team1Points);
-    m_team2Points = std::max(0.0f, m_team2Points);
+    finalScore = std::clamp(finalScore, -target, target);
+    m_score = static_cast<int32_t>(finalScore);
 }
 
-int SupremacyMode::CalculateLinkedObjectiveValue(uint32_t teamId) const {
-    int total = 0;
-    uint32_t hq = (teamId == 1) ? m_team1HQ : m_team2HQ;
+int64_t SupremacyMode::CalculateLinkedObjectiveValue(uint32_t teamId) const {
+    const auto hq = GetTeamHQ(teamId);
+    if (!hq) return 0;
 
-    // Check if team still controls their HQ
-    auto hqIt = m_objectiveGraph.find(hq);
-    if (hqIt == m_objectiveGraph.end() || hqIt->second.controllingTeam != teamId) {
-        return 0;  // Lost HQ — zero points
+    const auto hqIt = m_objectiveGraph.find(*hq);
+    if (hqIt == m_objectiveGraph.end() ||
+        hqIt->second.controllingTeam != teamId) {
+        return 0;
     }
 
-    // BFS/DFS to find all objectives connected back to HQ through team-controlled nodes
+    int64_t total = 0;
     for (const auto& [id, node] : m_objectiveGraph) {
         if (node.controllingTeam != teamId) continue;
 
         std::vector<uint32_t> visited;
         if (HasPathToHQ(id, teamId, visited)) {
-            total += node.pointValue;
+            const int64_t pointValue = static_cast<int64_t>(node.pointValue);
+            if (total > std::numeric_limits<int64_t>::max() - pointValue) {
+                total = std::numeric_limits<int64_t>::max();
+            } else {
+                total += pointValue;
+            }
         }
     }
     return total;
 }
 
-bool SupremacyMode::HasPathToHQ(uint32_t objectiveId, uint32_t teamId,
-                                  std::vector<uint32_t>& visited) const {
-    uint32_t hq = (teamId == 1) ? m_team1HQ : m_team2HQ;
-    if (objectiveId == hq) return true;
+bool SupremacyMode::HasPathToHQ(uint32_t objectiveId,
+                                uint32_t teamId,
+                                std::vector<uint32_t>& visited) const {
+    const auto hq = GetTeamHQ(teamId);
+    if (!hq) return false;
+
+    const auto it = m_objectiveGraph.find(objectiveId);
+    if (it == m_objectiveGraph.end() ||
+        it->second.controllingTeam != teamId) {
+        return false;
+    }
+    if (objectiveId == *hq) return true;
 
     visited.push_back(objectiveId);
-
-    auto it = m_objectiveGraph.find(objectiveId);
-    if (it == m_objectiveGraph.end()) return false;
-
     for (uint32_t linked : it->second.linkedTo) {
-        if (std::find(visited.begin(), visited.end(), linked) != visited.end()) continue;
+        if (std::find(visited.begin(), visited.end(), linked) !=
+            visited.end()) {
+            continue;
+        }
 
-        auto linkIt = m_objectiveGraph.find(linked);
-        if (linkIt == m_objectiveGraph.end()) continue;
-        if (linkIt->second.controllingTeam != teamId) continue;
+        const auto linkIt = m_objectiveGraph.find(linked);
+        if (linkIt == m_objectiveGraph.end() ||
+            linkIt->second.controllingTeam != teamId) {
+            continue;
+        }
 
         if (HasPathToHQ(linked, teamId, visited)) return true;
     }
     return false;
 }
 
-void SupremacyMode::OnObjectiveCaptured(uint32_t objectiveId, uint32_t capturingTeam) {
-    auto it = m_objectiveGraph.find(objectiveId);
-    if (it != m_objectiveGraph.end()) {
-        it->second.controllingTeam = capturingTeam;
+void SupremacyMode::OnObjectiveCaptured(uint32_t objectiveId,
+                                        uint32_t capturingTeam) {
+    if (m_phase != Phase::Active ||
+        (capturingTeam != kSouthTeamId && capturingTeam != kNorthTeamId)) {
+        return;
     }
-    Logger::Info("Supremacy objective %u captured by team %u", objectiveId, capturingTeam);
+
+    auto it = m_objectiveGraph.find(objectiveId);
+    if (it == m_objectiveGraph.end()) return;
+    if (it->second.controllingTeam == capturingTeam) return;
+    it->second.controllingTeam = capturingTeam;
+    Logger::Info("Supremacy objective %u captured by team %u",
+                 objectiveId, capturingTeam);
 }
 
 void SupremacyMode::OnTicketsDepleted(uint32_t teamId) {
-    Logger::Info("Team %u tickets depleted in Supremacy — sudden death", teamId);
+    if (m_phase != Phase::Active ||
+        (teamId != kSouthTeamId && teamId != kNorthTeamId)) {
+        return;
+    }
+    Logger::Info("Team %u tickets depleted in Supremacy - sudden death",
+                 teamId);
     SetPhase(Phase::SuddenDeath);
 }
 
-void SupremacyMode::OnPlayerKilled(uint32_t /*killerId*/, uint32_t /*victimId*/) {
-    // Check sudden death elimination
-    if (m_phase == Phase::SuddenDeath) {
-        auto* pm = m_server->GetPlayerManager();
-        for (uint32_t teamId = 1; teamId <= 2; teamId++) {
-            bool anyAlive = false;
-            for (uint32_t pid : m_server->GetTeamManager()->GetTeamPlayers(teamId)) {
-                auto p = pm->GetPlayer(pid);
-                if (p && p->IsAlive()) { anyAlive = true; break; }
-            }
-            if (!anyAlive) {
-                Logger::Info("Team %u eliminated in sudden death", teamId);
-                EndRound();
-                return;
-            }
-        }
+void SupremacyMode::OnPlayerKilled(uint32_t /*killerId*/,
+                                   uint32_t /*victimId*/) {
+    CheckSuddenDeathElimination();
+}
+
+void SupremacyMode::OnTeamEliminated(uint32_t eliminatedTeamId) {
+    if (m_phase != Phase::SuddenDeath ||
+        (eliminatedTeamId != kSouthTeamId &&
+         eliminatedTeamId != kNorthTeamId)) {
+        return;
     }
+
+    // A human-only roster notification is not an authoritative elimination
+    // while this team still has a living headless participant.
+    if (m_server && TeamHasLivingParticipant(eliminatedTeamId)) {
+        Logger::Info("Ignoring Supremacy team %u elimination; participants remain alive",
+                     eliminatedTeamId);
+        return;
+    }
+
+    const uint32_t winningTeam = eliminatedTeamId == kSouthTeamId
+        ? kNorthTeamId
+        : kSouthTeamId;
+    Logger::Info("Team %u eliminated in Supremacy sudden death; team %u wins",
+                 eliminatedTeamId, winningTeam);
+    FinishRoundWithWinner(winningTeam);
 }
 
 float SupremacyMode::GetRoundTimeRemaining() const {
     return std::max(0.0f, m_phaseTimer);
 }
 
+float SupremacyMode::GetPhaseDuration() const {
+    switch (m_phase) {
+        case Phase::WarmUp:      return 0.0f;
+        case Phase::Preparation: return m_preparationTime;
+        case Phase::Active:      return m_roundTime;
+        case Phase::SuddenDeath: return 0.0f;
+        case Phase::PostRound:   return m_postRoundTime;
+        case Phase::Finished:    return 0.0f;
+    }
+    return 0.0f;
+}
+
+float SupremacyMode::GetPhaseTimeRemaining() const {
+    return std::max(0.0f, m_phaseTimer);
+}
+
 float SupremacyMode::GetTeamPoints(uint32_t teamId) const {
-    return teamId == 1 ? m_team1Points : m_team2Points;
+    if (teamId == kSouthTeamId) {
+        return static_cast<float>(
+            (static_cast<double>(m_scoreTarget) + static_cast<double>(m_score)) *
+            0.5);
+    }
+    if (teamId == kNorthTeamId) {
+        return static_cast<float>(
+            (static_cast<double>(m_scoreTarget) - static_cast<double>(m_score)) *
+            0.5);
+    }
+    return 0.0f;
 }
 
 float SupremacyMode::GetPointBarProgress() const {
-    float total = m_team1Points + m_team2Points;
-    if (total <= 0.0f) return 0.5f;
-    return m_team2Points / total;  // 0=team2 depleted, 1=team1 depleted
+    return static_cast<float>(
+        (static_cast<double>(m_scoreTarget) + static_cast<double>(m_score)) /
+        (2.0 * static_cast<double>(m_scoreTarget)));
 }
 
 int SupremacyMode::GetTeamObjectiveValue(uint32_t teamId) const {
-    return CalculateLinkedObjectiveValue(teamId);
+    return static_cast<int>(std::min(
+        CalculateLinkedObjectiveValue(teamId),
+        static_cast<int64_t>(std::numeric_limits<int>::max())));
 }
 
-bool SupremacyMode::IsObjectiveLinked(uint32_t objectiveId, uint32_t teamId) const {
+int SupremacyMode::GetSouthConnectedObjectiveValue() const {
+    return GetTeamObjectiveValue(kSouthTeamId);
+}
+
+int SupremacyMode::GetNorthConnectedObjectiveValue() const {
+    return GetTeamObjectiveValue(kNorthTeamId);
+}
+
+bool SupremacyMode::IsObjectiveLinked(uint32_t objectiveId,
+                                      uint32_t teamId) const {
     std::vector<uint32_t> visited;
     return HasPathToHQ(objectiveId, teamId, visited);
 }
 
-void SupremacyMode::SetStartingPoints(float points) { m_startingPoints = points; }
-void SupremacyMode::SetPointDrainInterval(float seconds) { m_pointDrainInterval = seconds; }
-void SupremacyMode::SetRoundTime(float seconds) { m_roundTime = seconds; }
+bool SupremacyMode::HasObjective(uint32_t objectiveId) const {
+    return m_objectiveGraph.find(objectiveId) != m_objectiveGraph.end();
+}
 
-void SupremacyMode::SetObjectiveLinks(const std::map<uint32_t, std::vector<uint32_t>>& links) {
+uint32_t SupremacyMode::GetObjectiveControllingTeam(
+    uint32_t objectiveId) const {
+    const auto it = m_objectiveGraph.find(objectiveId);
+    return it == m_objectiveGraph.end() ? 0 : it->second.controllingTeam;
+}
+
+int SupremacyMode::GetObjectivePointValue(uint32_t objectiveId) const {
+    const auto it = m_objectiveGraph.find(objectiveId);
+    return it == m_objectiveGraph.end() ? 0 : it->second.pointValue;
+}
+
+std::vector<uint32_t> SupremacyMode::GetObjectiveLinks(
+    uint32_t objectiveId) const {
+    const auto it = m_objectiveGraph.find(objectiveId);
+    return it == m_objectiveGraph.end()
+               ? std::vector<uint32_t>{}
+               : it->second.linkedTo;
+}
+
+std::optional<uint32_t> SupremacyMode::GetTeamHQ(
+    uint32_t teamId) const {
+    if (teamId == kSouthTeamId) return m_southHQ;
+    if (teamId == kNorthTeamId) return m_northHQ;
+    return std::nullopt;
+}
+
+void SupremacyMode::SetScoreTarget(int32_t target) {
+    if (target <= 0) return;
+    m_scoreTarget = target;
+    m_score = std::clamp(m_score, -m_scoreTarget, m_scoreTarget);
+}
+
+void SupremacyMode::SetScoringInterval(float seconds) {
+    if (!std::isfinite(seconds) || seconds <= 0.0f) return;
+    m_scoringInterval = std::max(0.01f, seconds);
+    m_scoreTickTimer = std::fmod(
+        m_scoreTickTimer, static_cast<double>(m_scoringInterval));
+}
+
+void SupremacyMode::SetStartingPoints(float points) {
+    if (!std::isfinite(points) || points <= 0.0f) return;
+
+    const double doubled = std::min(
+        static_cast<double>(points) * 2.0,
+        static_cast<double>(std::numeric_limits<int32_t>::max()));
+    SetScoreTarget(static_cast<int32_t>(std::lround(doubled)));
+}
+
+void SupremacyMode::SetPointDrainInterval(float seconds) {
+    SetScoringInterval(seconds);
+}
+
+void SupremacyMode::SetRoundTime(float seconds) {
+    if (std::isfinite(seconds) && seconds > 0.0f) {
+        m_roundTime = seconds;
+    }
+}
+
+void SupremacyMode::ClearObjectives() {
+    m_objectiveGraph.clear();
+    m_southHQ.reset();
+    m_northHQ.reset();
+}
+
+void SupremacyMode::SetObjectiveMetadata(uint32_t objectiveId,
+                                         uint32_t controllingTeam,
+                                         int pointValue) {
+    auto& node = m_objectiveGraph[objectiveId];
+    node.id = objectiveId;
+    node.pointValue = std::max(0, pointValue);
+    node.initialControllingTeam =
+        controllingTeam <= kNorthTeamId ? controllingTeam : 0;
+    node.controllingTeam = node.initialControllingTeam;
+}
+
+void SupremacyMode::SetObjectiveLinks(
+    const std::map<uint32_t, std::vector<uint32_t>>& links) {
+    for (auto& [id, node] : m_objectiveGraph) {
+        (void)id;
+        node.linkedTo.clear();
+    }
+
     for (const auto& [id, linkedIds] : links) {
         m_objectiveGraph[id].id = id;
         m_objectiveGraph[id].linkedTo = linkedIds;
+        for (uint32_t linkedId : linkedIds) {
+            m_objectiveGraph[linkedId].id = linkedId;
+        }
     }
 }
 
 void SupremacyMode::SetTeamHQ(uint32_t teamId, uint32_t objectiveId) {
-    if (teamId == 1) m_team1HQ = objectiveId;
-    else m_team2HQ = objectiveId;
+    if (teamId == kSouthTeamId) {
+        m_southHQ = objectiveId;
+    } else if (teamId == kNorthTeamId) {
+        m_northHQ = objectiveId;
+    }
+}
+
+void SupremacyMode::ResetObjectivesToInitialOwners() {
+    for (auto& [id, node] : m_objectiveGraph) {
+        (void)id;
+        node.controllingTeam = node.initialControllingTeam;
+    }
+}
+
+bool SupremacyMode::TeamHasLivingParticipant(uint32_t teamId) const {
+    if (!m_server ||
+        (teamId != kSouthTeamId && teamId != kNorthTeamId)) {
+        return false;
+    }
+
+    auto* players = m_server->GetPlayerManager();
+    auto* teams = m_server->GetTeamManager();
+    if (players && teams) {
+        for (const uint32_t playerId : teams->GetTeamPlayers(teamId)) {
+            const auto player = players->GetPlayer(playerId);
+            if (player && player->IsAlive()) return true;
+        }
+    }
+
+    if (const auto* bots = m_server->GetBotManager()) {
+        return bots->CountAliveBots(static_cast<uint8_t>(teamId)) > 0;
+    }
+    return false;
+}
+
+void SupremacyMode::CheckSuddenDeathElimination() {
+    if (m_phase != Phase::SuddenDeath || !m_server) return;
+
+    const bool southAlive = TeamHasLivingParticipant(kSouthTeamId);
+    const bool northAlive = TeamHasLivingParticipant(kNorthTeamId);
+    if (!southAlive && !northAlive) {
+        Logger::Info("Both teams eliminated in Supremacy sudden death");
+        FinishRoundWithWinner(0);
+    } else if (!southAlive) {
+        OnTeamEliminated(kSouthTeamId);
+    } else if (!northAlive) {
+        OnTeamEliminated(kNorthTeamId);
+    }
 }
 
 void SupremacyMode::SetPhase(Phase newPhase) {
     m_phase = newPhase;
     switch (newPhase) {
-        case Phase::WarmUp:      m_phaseTimer = 0.0f; break;
-        case Phase::Preparation: m_phaseTimer = m_preparationTime; break;
-        case Phase::Active:      m_phaseTimer = m_roundTime; break;
-        case Phase::SuddenDeath: m_phaseTimer = 0.0f; break;
-        case Phase::PostRound:   m_phaseTimer = m_postRoundTime; break;
-        case Phase::Finished:    m_phaseTimer = 0.0f; break;
+        case Phase::WarmUp:
+            m_phaseTimer = 0.0f;
+            break;
+        case Phase::Preparation:
+            m_phaseTimer = m_preparationTime;
+            break;
+        case Phase::Active:
+            m_phaseTimer = m_roundTime;
+            break;
+        case Phase::SuddenDeath:
+            m_phaseTimer = 0.0f;
+            break;
+        case Phase::PostRound:
+            m_phaseTimer = m_postRoundTime;
+            break;
+        case Phase::Finished:
+            m_phaseTimer = 0.0f;
+            break;
     }
     BroadcastPhaseChange();
 }
 
 void SupremacyMode::CheckWinConditions() {
-    if (m_team1Points <= 0.0f) {
-        Logger::Info("Team 2 wins Supremacy — Team 1 points depleted");
+    if (m_score <= -m_scoreTarget) {
+        Logger::Info("North wins Supremacy (score %d)", m_score);
         EndRound();
-    } else if (m_team2Points <= 0.0f) {
-        Logger::Info("Team 1 wins Supremacy — Team 2 points depleted");
+    } else if (m_score >= m_scoreTarget) {
+        Logger::Info("South wins Supremacy (score %+d)", m_score);
         EndRound();
     }
 }
 
-void SupremacyMode::DetermineWinner() {
-    if (m_team1Points > m_team2Points) {
-        Logger::Info("Team 1 wins Supremacy (%.0f vs %.0f points)", m_team1Points, m_team2Points);
-    } else if (m_team2Points > m_team1Points) {
-        Logger::Info("Team 2 wins Supremacy (%.0f vs %.0f points)", m_team2Points, m_team1Points);
-    } else {
-        Logger::Info("Supremacy draw (%.0f points each)", m_team1Points);
+uint32_t SupremacyMode::DetermineWinner() const {
+    if (m_score > 0) {
+        return kSouthTeamId;
     }
-    m_server->BroadcastChatMessage("[Supremacy] Match complete!");
+    if (m_score < 0) {
+        return kNorthTeamId;
+    }
+    return 0;
+}
+
+void SupremacyMode::FinishRoundWithWinner(uint32_t winningTeam) {
+    if (winningTeam > kNorthTeamId ||
+        (m_phase != Phase::Active && m_phase != Phase::SuddenDeath)) {
+        return;
+    }
+
+    m_winningTeam = winningTeam;
+    if (m_winningTeam == kSouthTeamId) {
+        Logger::Info("South wins Supremacy (score %+d)", m_score);
+    } else if (m_winningTeam == kNorthTeamId) {
+        Logger::Info("North wins Supremacy (score %d)", m_score);
+    } else {
+        Logger::Info("Supremacy draw (score %+d)", m_score);
+    }
+
+    SetPhase(Phase::PostRound);
 }
 
 void SupremacyMode::BroadcastPhaseChange() const {
-    std::string msg;
+    std::string message;
     switch (m_phase) {
-        case Phase::WarmUp:      msg = "Waiting for players..."; break;
-        case Phase::Preparation: msg = "Round starting soon!"; break;
-        case Phase::Active:      msg = "Fight for objectives!"; break;
-        case Phase::SuddenDeath: msg = "SUDDEN DEATH — No respawns!"; break;
-        case Phase::PostRound:   msg = "Round over!"; break;
-        case Phase::Finished:    msg = "Match complete!"; break;
+        case Phase::WarmUp:
+            message = "Waiting for players...";
+            break;
+        case Phase::Preparation:
+            message = "Round starting soon!";
+            break;
+        case Phase::Active:
+            message = "Fight for objectives!";
+            break;
+        case Phase::SuddenDeath:
+            message = "SUDDEN DEATH - No respawns!";
+            break;
+        case Phase::PostRound:
+            message = "Round over!";
+            break;
+        case Phase::Finished:
+            message = "Match complete!";
+            break;
     }
-    m_server->BroadcastChatMessage("[Supremacy] " + msg);
+
+    if (m_server) {
+        m_server->BroadcastChatMessage("[Supremacy] " + message);
+    }
 }

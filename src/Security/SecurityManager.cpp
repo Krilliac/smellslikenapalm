@@ -1,5 +1,6 @@
 #include "Security/SecurityManager.h"
 #include "Utils/Logger.h"
+#include "Utils/StringUtils.h"
 #include "../../telemetry/TelemetryManager.h"
 #include <chrono>
 
@@ -22,31 +23,90 @@ SecurityManager::~SecurityManager() {
 bool SecurityManager::Initialize() {
     Logger::Trace("[SecurityManager::Initialize] Entry");
     Logger::Info("[SecurityManager::Initialize] Beginning SecurityManager initialization");
+
+    // Initialize is idempotent. Re-entering EnhancedEACAntiCheat while its
+    // emulator socket/thread is live can leak the original socket and corrupt
+    // its running state.
+    if (m_initialized) {
+        Logger::Info("[SecurityManager::Initialize] SecurityManager is already initialized");
+        return true;
+    }
+
+    // Shutdown clears authentication sessions by reconstructing the module.
+    // Restore the real configuration on every fresh/retry initialization; a
+    // null-config Authentication later dereferences its config during backend
+    // validation.
+    m_shutdownComplete = false;
+    {
+        std::lock_guard<std::mutex> authLock(m_authMutex);
+        m_auth = Authentication(m_config);
+    }
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_connections.clear();
+    }
+
     // Authentication has no separate Initialize; it's ready after construction
     Logger::Debug("[SecurityManager::Initialize] Authentication module ready (no separate init required)");
 
     Logger::Debug("[SecurityManager::Initialize] Loading ban list...");
-    if (!m_banManager.LoadBans()) {
+    bool bansLoaded = false;
+    {
+        std::lock_guard<std::mutex> banLock(m_banMutex);
+        bansLoaded = m_banManager.LoadBans();
+    }
+    if (!bansLoaded) {
         Logger::Warn("SecurityManager: could not load bans (proceeding)");
         Logger::Debug("[SecurityManager::Initialize] Ban list load failed, continuing without pre-existing bans");
     } else {
         Logger::Debug("[SecurityManager::Initialize] Ban list loaded successfully");
     }
 
-    Logger::Debug("[SecurityManager::Initialize] Initializing EAC AntiCheat subsystem...");
-    if (!m_eac.Initialize()) {
-        Logger::Error("SecurityManager: EAC AntiCheat init failed");
-        Logger::Error("[SecurityManager::Initialize] Failed to initialize EnhancedEACAntiCheat - aborting SecurityManager init");
-        Logger::Trace("[SecurityManager::Initialize] Exit, returning false");
-        return false;
+    const std::string antiCheatMode = m_config
+        ? StringUtils::ToLower(StringUtils::Trim(m_config->GetAntiCheatMode()))
+        : std::string("off");
+    const bool antiCheatRequested = m_config &&
+        m_config->IsAntiCheatEnabled() && antiCheatMode != "off";
+
+    if (antiCheatRequested) {
+        const int configuredEACListenPort = m_config->GetEACListenPort();
+        if (!SecurityConfig::IsValidEACListenPort(configuredEACListenPort)) {
+            Logger::Error("[SecurityManager::Initialize] EAC listen port must be in range 1-65535, got %d",
+                          configuredEACListenPort);
+            Logger::Trace("[SecurityManager::Initialize] Exit, returning false (invalid EAC listen port)");
+            return false;
+        }
+
+        const auto eacListenPort = static_cast<uint16_t>(configuredEACListenPort);
+        Logger::Debug("[SecurityManager::Initialize] Initializing EAC AntiCheat subsystem on port %u...",
+                      eacListenPort);
+        m_eacInitialized = false;
+        if (!m_eac.Initialize(eacListenPort)) {
+            // EnhancedEACAntiCheat initializes several components before the
+            // final emulator bind. Roll them all back so a retry starts clean.
+            m_eac.Shutdown();
+            Logger::Error("SecurityManager: EAC AntiCheat init failed");
+            Logger::Error("[SecurityManager::Initialize] Failed to initialize EnhancedEACAntiCheat - aborting SecurityManager init");
+            Logger::Trace("[SecurityManager::Initialize] Exit, returning false");
+            return false;
+        }
+        m_eacInitialized = true;
+        Logger::Debug("[SecurityManager::Initialize] EAC AntiCheat subsystem initialized successfully on port %u",
+                      eacListenPort);
+
+        m_eac.SetReportCallback([this](const EnhancedEACReport& rpt){
+            HandleEACReport(rpt);
+        });
+        Logger::Debug("[SecurityManager::Initialize] EAC report callback registered");
+    } else {
+        m_eacInitialized = false;
+        Logger::Info("[SecurityManager::Initialize] EAC AntiCheat disabled by configuration "
+                     "(enable_anti_cheat=%s, mode='%s'); emulator socket not started",
+                     (m_config && m_config->IsAntiCheatEnabled()) ? "true" : "false",
+                     antiCheatMode.c_str());
     }
-    Logger::Debug("[SecurityManager::Initialize] EAC AntiCheat subsystem initialized successfully");
 
-    m_eac.SetReportCallback([this](const EnhancedEACReport& rpt){
-        HandleEACReport(rpt);
-    });
-    Logger::Debug("[SecurityManager::Initialize] EAC report callback registered");
-
+    m_initialized = true;
     Logger::Info("SecurityManager initialized");
     Logger::Info("[SecurityManager::Initialize] All security subsystems initialized successfully");
     Logger::Trace("[SecurityManager::Initialize] Exit, returning true");
@@ -57,17 +117,43 @@ void SecurityManager::Shutdown() {
     Logger::Trace("[SecurityManager::Shutdown] Entry");
     Logger::Info("[SecurityManager::Shutdown] Beginning SecurityManager shutdown");
 
-    Logger::Debug("[SecurityManager::Shutdown] Shutting down EAC AntiCheat subsystem...");
-    m_eac.Shutdown();
-    Logger::Debug("[SecurityManager::Shutdown] EAC AntiCheat shutdown complete");
+    // ConnectionLoginBridge explicitly shuts down its owned manager before the
+    // SecurityManager destructor runs. Keep that double path a true no-op.
+    if (m_shutdownComplete) {
+        Logger::Debug("[SecurityManager::Shutdown] Shutdown already complete");
+        return;
+    }
+
+    if (m_eacInitialized) {
+        Logger::Debug("[SecurityManager::Shutdown] Shutting down EAC AntiCheat subsystem...");
+        m_eac.Shutdown();
+        m_eacInitialized = false;
+        Logger::Debug("[SecurityManager::Shutdown] EAC AntiCheat shutdown complete");
+    } else {
+        Logger::Debug("[SecurityManager::Shutdown] EAC AntiCheat was not initialized; skipping shutdown");
+    }
 
     Logger::Debug("[SecurityManager::Shutdown] Saving ban list...");
-    m_banManager.SaveBans();
+    {
+        std::lock_guard<std::mutex> banLock(m_banMutex);
+        m_banManager.SaveBans();
+    }
     Logger::Debug("[SecurityManager::Shutdown] Ban list saved");
 
     Logger::Debug("[SecurityManager::Shutdown] Resetting authentication module...");
-    m_auth = Authentication(nullptr);
+    {
+        std::lock_guard<std::mutex> authLock(m_authMutex);
+        m_auth = Authentication(m_config);
+    }
     Logger::Debug("[SecurityManager::Shutdown] Authentication module reset");
+
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_connections.clear();
+    }
+
+    m_initialized = false;
+    m_shutdownComplete = true;
 
     Logger::Info("SecurityManager shutdown complete");
     Logger::Trace("[SecurityManager::Shutdown] Exit");
@@ -75,18 +161,31 @@ void SecurityManager::Shutdown() {
 
 void SecurityManager::OnClientConnect(std::shared_ptr<ClientConnection> conn) {
     Logger::Trace("[SecurityManager::OnClientConnect] Entry, conn=%p", static_cast<void*>(conn.get()));
+    if (!conn) {
+        Logger::Warn("[SecurityManager::OnClientConnect] Ignoring null connection");
+        return;
+    }
     uint32_t id = conn->GetClientId();
     Logger::Debug("[SecurityManager::OnClientConnect] Client ID resolved to %u", id);
-    std::lock_guard<std::mutex> lock(m_mutex);
-    m_connections[id] = conn;
+    std::size_t connectionCount = 0;
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_connections[id] = conn;
+        connectionCount = m_connections.size();
+    }
     Logger::Debug("[SecurityManager::OnClientConnect] Client %u added to connections map, total connections=%zu",
-                  id, m_connections.size());
+                  id, connectionCount);
 
     // Check ban
     const std::string steamId = conn->GetSteamID();
     Logger::Debug("[SecurityManager::OnClientConnect] Checking ban status for SteamID '%s' (client %u)",
                   steamId.c_str(), id);
-    if (m_banManager.IsBanned(steamId)) {
+    bool isBanned = false;
+    {
+        std::lock_guard<std::mutex> banLock(m_banMutex);
+        isBanned = m_banManager.IsBanned(steamId);
+    }
+    if (isBanned) {
         Logger::Warn("SecurityManager: connection from banned SteamID %s", steamId.c_str());
         Logger::Info("[SecurityManager::OnClientConnect] Rejecting connection from banned SteamID '%s' (client %u)",
                      steamId.c_str(), id);
@@ -99,27 +198,61 @@ void SecurityManager::OnClientConnect(std::shared_ptr<ClientConnection> conn) {
                   steamId.c_str());
 
     // Begin authentication handshake
-    Logger::Info("[SecurityManager::OnClientConnect] Initiating authentication handshake for client %u (SteamID '%s')",
-                 id, steamId.c_str());
-    m_auth.SendChallenge(conn);
-    Logger::Debug("[SecurityManager::OnClientConnect] Authentication challenge sent to client %u", id);
+    if (conn->IsUE3Client()) {
+        Logger::Info("[SecurityManager::OnClientConnect] Client %u uses UE3 control-channel "
+                     "authentication; skipping incompatible legacy AUTH_CHALLENGE",
+                     id);
+    } else {
+        Logger::Info("[SecurityManager::OnClientConnect] Initiating legacy authentication "
+                     "handshake for client %u (SteamID '%s')",
+                     id, steamId.c_str());
+        bool sent = false;
+        {
+            std::lock_guard<std::mutex> authLock(m_authMutex);
+            sent = m_auth.SendChallenge(conn);
+        }
+        if (!sent) {
+            Logger::Warn("[SecurityManager::OnClientConnect] Legacy authentication "
+                         "challenge could not be sent to client %u", id);
+        }
+    }
 
-    // Schedule EAC validation (after auth)
-    Logger::Debug("[SecurityManager::OnClientConnect] Scheduling EAC validation for client %u, IP='%s'",
-                  id, conn->GetIP().c_str());
-    m_eac.ValidateClient(conn, /*processHandle=*/0, conn->GetIP());
-    Logger::Info("[SecurityManager::OnClientConnect] Client %u connection processing complete - auth and EAC validation initiated",
-                 id);
+    // Schedule EAC validation (after auth) only when the subsystem was
+    // explicitly enabled and initialized.  An off/disabled configuration must
+    // not touch the fixed emulator port or create detector sessions.
+    if (m_eacInitialized) {
+        Logger::Debug("[SecurityManager::OnClientConnect] Scheduling EAC validation for client %u, IP='%s'",
+                      id, conn->GetIP().c_str());
+        m_eac.ValidateClient(conn, /*processHandle=*/0, conn->GetIP());
+        Logger::Info("[SecurityManager::OnClientConnect] Client %u connection processing complete - auth and EAC validation initiated",
+                     id);
+    } else {
+        Logger::Debug("[SecurityManager::OnClientConnect] EAC disabled; skipping validation for client %u", id);
+        Logger::Info("[SecurityManager::OnClientConnect] Client %u connection processing complete - auth initiated, EAC disabled",
+                     id);
+    }
     Logger::Trace("[SecurityManager::OnClientConnect] Exit");
 }
 
 void SecurityManager::OnClientDisconnect(uint32_t clientId) {
     Logger::Trace("[SecurityManager::OnClientDisconnect] Entry, clientId=%u", clientId);
-    std::lock_guard<std::mutex> lock(m_mutex);
-    auto erased = m_connections.erase(clientId);
+    // The challenge/session store is keyed by the monotonic network client id.
+    // Same-endpoint reconnects deliberately allocate a new id, so revoke the old
+    // authentication session now rather than retaining it until expiry.
+    {
+        std::lock_guard<std::mutex> authLock(m_authMutex);
+        m_auth.RevokeSession(clientId);
+    }
+    std::size_t erased = 0;
+    std::size_t remaining = 0;
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        erased = m_connections.erase(clientId);
+        remaining = m_connections.size();
+    }
     if (erased > 0) {
         Logger::Info("[SecurityManager::OnClientDisconnect] Client %u disconnected, removed from connections (remaining=%zu)",
-                     clientId, m_connections.size());
+                     clientId, remaining);
     } else {
         Logger::Debug("[SecurityManager::OnClientDisconnect] Client %u was not in connections map", clientId);
     }
@@ -130,14 +263,19 @@ bool SecurityManager::ValidatePacket(uint32_t clientId, const std::vector<uint8_
     Logger::Trace("[SecurityManager::ValidatePacket] Entry, clientId=%u, rawData size=%zu bytes",
                   clientId, rawData.size());
     // Drop if client address blocked
-    auto it = m_connections.find(clientId);
-    if (it == m_connections.end()) {
+    std::shared_ptr<ClientConnection> connection;
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        const auto it = m_connections.find(clientId);
+        if (it != m_connections.end()) connection = it->second;
+    }
+    if (!connection) {
         Logger::Debug("[SecurityManager::ValidatePacket] Client %u not found in connections map, rejecting packet",
                       clientId);
         Logger::Trace("[SecurityManager::ValidatePacket] Exit, returning false (unknown client)");
         return false;
     }
-    ClientAddress addr{ it->second->GetIP(), it->second->GetPort() };
+    ClientAddress addr{ connection->GetIP(), connection->GetPort() };
     Logger::Debug("[SecurityManager::ValidatePacket] Checking if address %s:%u is blocked for client %u",
                   addr.ip.c_str(), addr.port, clientId);
     if (m_blocker.IsBlocked(addr)) {
@@ -156,12 +294,17 @@ bool SecurityManager::ValidatePacket(uint32_t clientId, const std::vector<uint8_
 
 void SecurityManager::Update() {
     Logger::Trace("[SecurityManager::Update] Entry");
-    Logger::Debug("[SecurityManager::Update] Updating EAC AntiCheat subsystem");
-    m_eac.Update();
+    if (m_eacInitialized) {
+        Logger::Debug("[SecurityManager::Update] Updating EAC AntiCheat subsystem");
+        m_eac.Update();
+    }
     Logger::Debug("[SecurityManager::Update] Updating NetworkBlocker");
     m_blocker.Update();
     Logger::Debug("[SecurityManager::Update] Cleaning up expired bans");
-    m_banManager.CleanupExpired();
+    {
+        std::lock_guard<std::mutex> banLock(m_banMutex);
+        m_banManager.CleanupExpired();
+    }
     // Additional periodic security checks can go here
     Logger::Trace("[SecurityManager::Update] Exit");
 }
@@ -181,17 +324,26 @@ void SecurityManager::BanClient(const std::string& steamId,
                  type == BanType::Permanent ? "permanent" : "temporary",
                  static_cast<long long>(duration.count()),
                  reason.c_str());
-    m_banManager.AddBan(steamId, type, duration, reason);
+    {
+        std::lock_guard<std::mutex> banLock(m_banMutex);
+        m_banManager.AddBan(steamId, type, duration, reason);
+    }
     Logger::Debug("[SecurityManager::BanClient] Ban added, now checking for online clients with SteamID '%s'", steamId.c_str());
     // Disconnect any online matching client
-    std::lock_guard<std::mutex> lock(m_mutex);
-    for (auto& kv : m_connections) {
-        if (kv.second->GetSteamID() == steamId) {
-            Logger::Info("[SecurityManager::BanClient] Found online client %u with SteamID '%s', disconnecting",
-                         kv.first, steamId.c_str());
-            DisconnectClient(kv.first, "Banned: " + reason);
-            break;
+    uint32_t matchingClientId = 0;
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        for (const auto& kv : m_connections) {
+            if (kv.second && kv.second->GetSteamID() == steamId) {
+                matchingClientId = kv.first;
+                break;
+            }
         }
+    }
+    if (matchingClientId != 0) {
+        Logger::Info("[SecurityManager::BanClient] Found online client %u with SteamID '%s', disconnecting",
+                     matchingClientId, steamId.c_str());
+        DisconnectClient(matchingClientId, "Banned: " + reason);
     }
     Logger::Trace("[SecurityManager::BanClient] Exit");
 }
@@ -199,7 +351,11 @@ void SecurityManager::BanClient(const std::string& steamId,
 bool SecurityManager::UnbanClient(const std::string& steamId) {
     Logger::Trace("[SecurityManager::UnbanClient] Entry, steamId='%s'", steamId.c_str());
     Logger::Info("[SecurityManager::UnbanClient] Attempting to unban SteamID '%s'", steamId.c_str());
-    bool result = m_banManager.RemoveBan(steamId);
+    bool result = false;
+    {
+        std::lock_guard<std::mutex> banLock(m_banMutex);
+        result = m_banManager.RemoveBan(steamId);
+    }
     if (result) {
         Logger::Info("[SecurityManager::UnbanClient] Successfully unbanned SteamID '%s'", steamId.c_str());
     } else {
@@ -211,7 +367,11 @@ bool SecurityManager::UnbanClient(const std::string& steamId) {
 
 bool SecurityManager::IsBanned(const std::string& steamId) const {
     Logger::Trace("[SecurityManager::IsBanned] Entry, steamId='%s'", steamId.c_str());
-    bool result = m_banManager.IsBanned(steamId);
+    bool result = false;
+    {
+        std::lock_guard<std::mutex> banLock(m_banMutex);
+        result = m_banManager.IsBanned(steamId);
+    }
     Logger::Debug("[SecurityManager::IsBanned] Ban check for SteamID '%s': %s",
                   steamId.c_str(), result ? "BANNED" : "not banned");
     Logger::Trace("[SecurityManager::IsBanned] Exit, returning %s", result ? "true" : "false");
@@ -220,6 +380,7 @@ bool SecurityManager::IsBanned(const std::string& steamId) const {
 
 std::vector<BanEntry> SecurityManager::GetAllBans() const {
     Logger::Trace("[SecurityManager::GetAllBans] Entry");
+    std::lock_guard<std::mutex> banLock(m_banMutex);
     return m_banManager.GetAllBans();
 }
 
@@ -236,9 +397,14 @@ void SecurityManager::HandleEACReport(const EnhancedEACReport& report) {
                      report.clientId);
         TELEMETRY_INCREMENT_SECURITY_VIOLATION();
         // Ban or block on cheat detection
-        auto it = m_connections.find(report.clientId);
-        if (it != m_connections.end()) {
-            ClientAddress addr{ it->second->GetIP(), it->second->GetPort() };
+        std::shared_ptr<ClientConnection> connection;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            const auto it = m_connections.find(report.clientId);
+            if (it != m_connections.end()) connection = it->second;
+        }
+        if (connection) {
+            ClientAddress addr{ connection->GetIP(), connection->GetPort() };
             Logger::Debug("[SecurityManager::HandleEACReport] Blocking address %s:%u for 60 seconds due to cheat detection",
                           addr.ip.c_str(), addr.port);
             m_blocker.Block(addr, std::chrono::seconds(60));
@@ -257,15 +423,24 @@ void SecurityManager::HandleEACReport(const EnhancedEACReport& report) {
 
 void SecurityManager::DisconnectClient(uint32_t clientId, const std::string& reason) {
     Logger::Trace("[SecurityManager::DisconnectClient] Entry, clientId=%u, reason='%s'", clientId, reason.c_str());
-    auto it = m_connections.find(clientId);
-    if (it != m_connections.end()) {
+    std::shared_ptr<ClientConnection> connection;
+    std::size_t remaining = 0;
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        const auto it = m_connections.find(clientId);
+        if (it != m_connections.end()) {
+            connection = it->second;
+            m_connections.erase(it);
+        }
+        remaining = m_connections.size();
+    }
+    if (connection) {
         Logger::Info("SecurityManager: disconnecting client %u (%s)", clientId, reason.c_str());
         Logger::Debug("[SecurityManager::DisconnectClient] Marking client %u as disconnected (IP='%s', SteamID='%s')",
-                      clientId, it->second->GetIP().c_str(), it->second->GetSteamID().c_str());
-        it->second->MarkDisconnected();
-        m_connections.erase(it);
+                      clientId, connection->GetIP().c_str(), connection->GetSteamID().c_str());
+        connection->MarkDisconnected();
         Logger::Debug("[SecurityManager::DisconnectClient] Client %u removed from connections map, remaining=%zu",
-                      clientId, m_connections.size());
+                      clientId, remaining);
     } else {
         Logger::Debug("[SecurityManager::DisconnectClient] Client %u not found in connections map, nothing to disconnect",
                       clientId);

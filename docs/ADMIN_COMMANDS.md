@@ -233,7 +233,7 @@ Aliases are shown in parentheses.
 |---|---|---|
 | `timescale` | Dev | `timescale <scale>` — sim speed 0.05-8.0 (1.0 = normal). |
 | `regen` (`regenhandlers`) | Dev | Regenerate + reload packet handlers. |
-| `spawnbot` (`bot`) | Dev | Spawn AI bots — **not implemented** (no bot subsystem yet). |
+| `spawnbot` (`bot`, `botfill`) | Dev | `spawnbot [fill-per-team]` sets the total participant fill target for each side (humans reduce the bots needed); `0` removes fill bots. Without an argument it raises the target by one, up to the configured per-team limit. |
 
 > Players may be referenced by **SteamID** (canonical) or by **`#<clientId>`**
 > when they are connected.

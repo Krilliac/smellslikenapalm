@@ -8,6 +8,7 @@
 
 #include "Game/PlayerManager.h"
 #include "Game/TeamManager.h"
+#include "Game/TeamMapping.h"
 #include "Game/SpawnSystem.h"
 #include "Game/Player.h"
 #include "Security/SecurityManager.h"
@@ -78,6 +79,10 @@ void ConnectionLoginBridge::OnClientLoggedIn(const ClientLoggedInEvent& ev)
         // bridge defensive.
         Logger::Warn("[LoginBridge] client=%u passed PreLogin but has no resolvable connection; cannot promote",
                      ev.clientId);
+        if (m_deps.dropConnection) {
+            m_deps.dropConnection(
+                ev.clientId, "internal login error: connection unavailable");
+        }
         return;
     }
 
@@ -89,7 +94,7 @@ void ConnectionLoginBridge::OnClientLoggedIn(const ClientLoggedInEvent& ev)
 
     // PickTeam (Engine/GameInfo::PickTeam, called from Login). We honour the
     // requested team when valid; otherwise leave 255 ("no preference") for the
-    // join-time team pick. RS2 teams are 0/1 (US/NVA); accept either 0/1 or the
+    // join-time team pick. RS2 teams are 0/1 (NVA/US); accept either 0/1 or the
     // 1/2 ids TeamManager uses, leaving everything else as "no preference".
     int pickedTeam = inTeam;
 
@@ -98,17 +103,22 @@ void ConnectionLoginBridge::OnClientLoggedIn(const ClientLoggedInEvent& ev)
     // (conn->GetPlayerName()/GetTeamId()). This is the wiring that was missing.
     conn->SetPlayerName(inName);
     conn->SetTeamId(pickedTeam == 255 ? 0u : (uint32_t)pickedTeam);
-    // Stamp the authenticated Steam64 so admin/ban lookups (keyed on Steam64) can match.
-    // Only when a real id was resolved (non-zero); RS2's minimal Hello often omits it, in
-    // which case GetSteamID keeps falling back to the clientId string (no behavior change).
+    // Stamp the client-presented Steam64 so admin/ban lookups (keyed on
+    // Steam64) can match. Platform authentication is still a separate missing
+    // boundary. Minimal Hello often omits it, in which case GetSteamID keeps
+    // falling back to the clientId string.
     if (ev.steamId != 0) {
-        conn->SetSteamID(std::to_string(ev.steamId));
+        conn->SetPresentedSteamID(std::to_string(ev.steamId));
     }
 
     // *** WIRE UP the dead PlayerManager::OnPlayerConnect ***
     // (src/Game/PlayerManager.cpp:33 — previously had no caller). This is the
     // connection->Player promotion: it creates the Player keyed by clientId.
     if (!m_deps.playerManager) {
+        if (m_deps.dropConnection) {
+            m_deps.dropConnection(
+                ev.clientId, "internal login error: player system unavailable");
+        }
         Logger::Error("[LoginBridge] No PlayerManager — cannot promote client %u", ev.clientId);
         return;
     }
@@ -116,6 +126,10 @@ void ConnectionLoginBridge::OnClientLoggedIn(const ClientLoggedInEvent& ev)
 
     auto player = m_deps.playerManager->GetPlayer(ev.clientId);
     if (!player) {
+        if (m_deps.dropConnection) {
+            m_deps.dropConnection(
+                ev.clientId, "internal login error: player creation failed");
+        }
         Logger::Error("[LoginBridge] PlayerManager::OnPlayerConnect did not yield a Player for client %u",
                       ev.clientId);
         return;
@@ -173,9 +187,9 @@ void ConnectionLoginBridge::OnClientJoined(const ClientJoinedEvent& ev)
 
     // PickTeam (final): if the client expressed no preference (255), pick the
     // smaller team via TeamManager; otherwise honour the request. RS2 team ids
-    // 0/1 map onto TeamManager's 1/2.
+    // Retail 0/1 map onto TeamManager's deliberately reversed 2/1 ids.
     uint32_t finalTeam;
-    if (pri.team == 255 || pri.team < 0) {
+    if (pri.team == 255 || pri.team < 0 || pri.team > 2) {
         if (m_deps.teamManager) {
             uint32_t t1 = (uint32_t)m_deps.teamManager->GetTeamSize(1);
             uint32_t t2 = (uint32_t)m_deps.teamManager->GetTeamSize(2);
@@ -184,9 +198,11 @@ void ConnectionLoginBridge::OnClientJoined(const ClientJoinedEvent& ev)
             finalTeam = 1u;
         }
     } else {
-        // Map RS2/UE3 team ids 0/1 onto TeamManager 1/2. (Was passing 1 through unchanged,
-        // landing UE3 team 1 / NVA on TeamManager team 1 / US Army - the wrong faction.)
-        finalTeam = (pri.team == 0) ? 1u : 2u;
+        // A value of 2 can only be an already-normalized TeamManager NVA id.
+        // Retail values 0/1 are NVA/US respectively.
+        finalTeam = pri.team == 2
+            ? TeamMapping::kServerNva
+            : TeamMapping::RetailToServer(static_cast<uint8_t>(pri.team));
     }
     pri.team = (int32_t)finalTeam;
 
@@ -196,34 +212,57 @@ void ConnectionLoginBridge::OnClientJoined(const ClientJoinedEvent& ev)
         player->SetTeam(finalTeam);
     }
 
-    // RestartPlayer: FindPlayerStart + spawn via the existing SpawnSystem.
-    bool spawned = false;
-    if (!pri.bIsSpectator && m_deps.spawnSystem) {
-        spawned = m_deps.spawnSystem->SpawnPlayerAtDefault(ev.clientId);
-        if (!spawned) {
-            // No spawn locations registered yet (e.g. map not loaded). Still mark
-            // the player active so the join completes; an actual pawn will follow
-            // a later SPAWN_REQUEST. TODO: tie into FindPlayerStart once map
-            // PlayerStart actors are loaded for the current map.
-            Logger::Warn("[LoginBridge] No spawn available for client %u; marking active without pawn", ev.clientId);
-            m_deps.playerManager->OnPlayerSpawn(ev.clientId);
-        }
-    } else if (pri.bIsSpectator) {
+    // NMT_Join establishes the local player and opens the team/role menus; it
+    // is not deployment authorization.  Spawning here marked the Player Alive
+    // while the retail client was still in team select, allowing that invisible
+    // menu player to capture an objective.  Non-spectators remain Dead until
+    // SelectRoleByClass(bCloseMenu=true) performs FindPlayerStart and pawn
+    // possession in ConnectionManager.
+    if (pri.bIsSpectator) {
         Logger::Info("[LoginBridge] client %u joined as spectator — no spawn", ev.clientId);
         player->SetState(PlayerState::Spectating);
     } else {
-        // No SpawnSystem wired; still mark active.
-        m_deps.playerManager->OnPlayerSpawn(ev.clientId);
+        player->SetReadyToSpawn(false);
+        player->SetState(PlayerState::Dead);
     }
 
-    m_spawnAttempted[ev.clientId] = true;
+    m_spawnAttempted[ev.clientId] = false;
 
     // Re-queue the PRI now that team/score are finalized (bNetDirty group).
     RegisterReplicatedPRI(pri);
 
-    Logger::Info("[LoginBridge] Join complete: client=%u team=%u spawned=%s state=%d",
-                 ev.clientId, finalTeam, spawned ? "true" : "false",
+    Logger::Info("[LoginBridge] Join complete: client=%u team=%u awaitingDeploy=%s state=%d",
+                 ev.clientId, finalTeam, pri.bIsSpectator ? "false" : "true",
                  (int)player->GetState());
+}
+
+void ConnectionLoginBridge::OnClientDisconnected(uint32_t clientId)
+{
+    // Drop the replicated PRI before forgetting its bookkeeping entry.  GRI is
+    // server-global and intentionally survives individual client sessions.
+    auto priIt = m_playerInfos.find(clientId);
+    if (priIt != m_playerInfos.end()) {
+        if (m_deps.replicationManager && priIt->second.actorId != 0) {
+            m_deps.replicationManager->UnregisterActor(priIt->second.actorId);
+        }
+        m_playerInfos.erase(priIt);
+    }
+    m_spawnAttempted.erase(clientId);
+
+    if (m_security) {
+        m_security->OnClientDisconnect(clientId);
+    }
+
+    // PlayerManager also removes TeamManager membership.  If login never
+    // promoted this connection to a Player, still scrub a possible partial team
+    // assignment directly.
+    if (m_deps.playerManager && m_deps.playerManager->GetPlayer(clientId)) {
+        m_deps.playerManager->OnPlayerDisconnect(clientId);
+    } else if (m_deps.teamManager) {
+        m_deps.teamManager->RemovePlayer(clientId);
+    }
+
+    Logger::Info("[LoginBridge] ClientDisconnected: client=%u state removed", clientId);
 }
 
 // ===========================================================================

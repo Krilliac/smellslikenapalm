@@ -2,6 +2,8 @@
 
 This guide covers **production deployment**, **security hardening**, **monitoring setup**, and **operational maintenance** for the RS2V Custom Server.  
 For development workflow and API details, see **DEVELOPMENT.md** and **API.md**.
+For the safe start/stop/restart/watch workflow on Windows, see
+**[WINDOWS_CONTROL.md](WINDOWS_CONTROL.md)**.
 
 > ⚠️ **Status:** This is a forward-looking guide. The server is still an in-development **emulator** — the live UE3 handshake is not finished and a stock client cannot fully connect yet (see the README's *Current status* section). Treat the procedures below as the intended production-deployment workflow, not a description of a battle-tested production service.
 
@@ -311,6 +313,26 @@ CompressionThreshold=256
 SamplingInterval=500  # More frequent sampling
 MaxSamplesInMemory=7200  # 1 hour at 500ms
 ```
+
+### 8.3 Empty-Server Round Startup
+
+Public and interactive retail servers should keep the default readiness gate:
+
+```ini
+[Gameplay]
+wait_for_ready_player=true
+```
+
+This keeps retail-native modes in Preparation until a joined retail client has
+finished the handshake and map travel and finalized a role. The full mode-owned
+preparation countdown then begins. Bots, objectives, combat, respawns, and ticket
+progression remain held by the existing Preparation-phase gates while the server
+waits.
+
+Set `wait_for_ready_player=false` only for deliberate headless simulations or
+empty-server bot soak tests. That compatibility setting allows the round clock to
+advance without a retail client, so rounds may already be active or complete when
+a player later joins.
 
 ## 9 · Troubleshooting
 

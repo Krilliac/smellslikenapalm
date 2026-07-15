@@ -258,6 +258,15 @@ Administrative access and RCON (Remote Console) configuration.
 | `admin_list_file` | path | `config/admin_list.txt` | Path to the admin list file, relative to server root. This file maps SteamIDs to permission levels. See [Section 10.1](#101-admin_listtxt). |
 | `chat_auth_enabled` | boolean | `true` | When `true`, in-game admin commands (chat-based) require the issuing player to be listed in `admin_list.txt` with the appropriate permission level. When `false`, chat-based admin commands are disabled entirely (use RCON instead). |
 
+### 2.13 [Gameplay]
+
+Global gameplay startup behavior. Mode-specific scoring, timing, and respawn
+rules remain in `game_modes.ini`.
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `wait_for_ready_player` | boolean | `true` | When `true`, a retail-native round remains in Preparation until at least one joined retail client finishes the handshake and map travel and finalizes a role. The mode's full preparation countdown begins after that point, preventing bots and objectives from consuming the round before a player is ready. Set to `false` for intentional empty-server or headless bot simulation, which preserves automatic round-clock progression with no retail clients connected. |
+
 ---
 
 ## 3 · server_production.ini — Production Overrides

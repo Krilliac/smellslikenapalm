@@ -1,0 +1,14 @@
+# VNTE-Resort cooked ROObjective metadata
+#
+# Positions are ROPlaceableVolume.VolumeCenter values extracted from the retail
+# VNTE-Resort.roe package. Radius 35 follows the server's existing authored
+# objective-template convention. Slots 2/3 share phase 2 because the captured
+# retail GRI snapshot shows Villa and Farm active together after Beach/Temple;
+# the exact activation behavior remains owned by Territory-mode game logic.
+#
+# name x y z radius phase tunnel clientSlot cookedRepIndex enabled connectedToBase
+Beach  -11950.550  5238.709 -544.1218 35 0 0 0 0 1 0
+Temple  -3587.457  7545.831  -80.9672 35 1 0 1 1 1 0
+Villa    1517.340  3289.679   59.9254 35 2 0 2 2 1 0
+Farm     1262.218 13525.040  -20.8450 35 2 0 3 3 1 0
+Hotel    8320.872  8080.492  607.2889 35 3 0 4 4 1 0

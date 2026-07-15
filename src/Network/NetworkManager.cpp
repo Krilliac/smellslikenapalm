@@ -88,6 +88,10 @@ void NetworkManager::PollNetwork() {
     m_connMgr->PumpNetwork();
     Logger::Debug("[NetworkManager::PollNetwork] Calling RemoveStaleConnections");
     m_connMgr->RemoveStaleConnections();
+    // ConnectionManager owns the BandwidthManager that actually gates recvfrom.
+    // Refresh that window, not only NetworkManager's legacy bookkeeping copy;
+    // otherwise its 64 KiB/sec allowance becomes a lifetime cap for the session.
+    m_connMgr->UpdateBandwidthWindows();
     if (m_bwManager) {
         Logger::Debug("[NetworkManager::PollNetwork] Calling BandwidthManager::Update");
         m_bwManager->Update();
@@ -153,6 +157,101 @@ void NetworkManager::BroadcastPacket(const std::string& tag, const std::vector<u
                   tag.c_str(), data.size());
     BroadcastPacket(pkt);
     Logger::Trace("[NetworkManager::BroadcastPacket(tag,data)] Exit");
+}
+
+void NetworkManager::BroadcastRetailObjectiveState() {
+    if (m_connMgr) {
+        m_connMgr->BroadcastRetailObjectiveState();
+    }
+}
+
+size_t NetworkManager::BroadcastRetailClientTravel(
+    const ClientTravelRepl::EncodedRpc& rpc,
+    const std::string& mapUrl) {
+    return m_connMgr
+        ? m_connMgr->BroadcastRetailClientTravel(rpc, mapUrl)
+        : 0u;
+}
+
+bool NetworkManager::CanBroadcastRetailClientTravel(
+    const ClientTravelRepl::EncodedRpc& rpc,
+    const std::string& mapUrl,
+    size_t* eligibleClients) const {
+    if (!m_connMgr) {
+        if (eligibleClients) *eligibleClients = 0;
+        return true;
+    }
+    return m_connMgr->CanBroadcastRetailClientTravel(
+        rpc, mapUrl, eligibleClients);
+}
+
+void NetworkManager::UpdateRetailDeploymentCountdown() {
+    if (m_connMgr) {
+        m_connMgr->UpdateRetailDeploymentCountdown();
+    }
+}
+
+bool NetworkManager::ShouldAdvanceRetailRoundClock() const {
+    return !m_connMgr || m_connMgr->ShouldAdvanceRetailRoundClock();
+}
+
+void NetworkManager::ReplicateRetailCombatState(
+    uint32_t clientId, int health, int kills, int deaths, int score,
+    bool isDead, bool sendHealth, bool sendDeathRpc) {
+    if (m_connMgr) {
+        m_connMgr->ReplicateRetailCombatState(
+            clientId, health, kills, deaths, score, isDead,
+            sendHealth, sendDeathRpc);
+    }
+}
+
+bool NetworkManager::ResetRetailMovementValidation(
+    uint32_t clientId, const Vector3& authoritativePosition) {
+    return m_connMgr && m_connMgr->ResetRetailMovementValidation(
+        clientId, authoritativePosition);
+}
+
+void NetworkManager::ReplicateRetailParticipantCombatState(
+    const ParticipantId& participant, int health, int kills, int deaths,
+    int score, bool isDead, bool sendHealth, bool sendDeathRpc) {
+    if (m_connMgr) {
+        m_connMgr->ReplicateRetailParticipantCombatState(
+            participant, health, kills, deaths, score, isDead, sendHealth,
+            sendDeathRpc);
+    }
+}
+
+void NetworkManager::RemoveRetailParticipant(
+    const ParticipantId& participant) {
+    if (m_connMgr) m_connMgr->RemoveRetailParticipant(participant);
+}
+
+void NetworkManager::BroadcastRetailM61Spawn(
+    uint64_t projectileKey, uint32_t shooterClientId,
+    const WeaponCombatRepl::M61VisualSnapshot& snapshot) {
+    if (m_connMgr) {
+        m_connMgr->BroadcastRetailM61Spawn(
+            projectileKey, shooterClientId, snapshot);
+    }
+}
+
+void NetworkManager::BroadcastRetailM61Update(
+    uint64_t projectileKey,
+    const WeaponCombatRepl::M61VisualSnapshot& snapshot) {
+    if (m_connMgr) {
+        m_connMgr->BroadcastRetailM61Update(projectileKey, snapshot);
+    }
+}
+
+void NetworkManager::BroadcastRetailM61Detonate(uint64_t projectileKey,
+                                                 float fuseSeconds) {
+    if (m_connMgr) {
+        m_connMgr->BroadcastRetailM61Detonate(projectileKey, fuseSeconds);
+    }
+}
+
+void NetworkManager::BroadcastRetailM61Remove(uint64_t projectileKey) {
+    if (m_connMgr) m_connMgr->BroadcastRetailM61Remove(projectileKey);
 }
 
 uint32_t NetworkManager::GetClientId(const ClientAddress& addr) const {
@@ -229,9 +328,6 @@ void NetworkManager::OnPacketReceived(uint32_t clientId, const Packet& pkt, cons
     // Dump for analysis
     Logger::Debug("[NetworkManager::OnPacketReceived] Dumping packet for analysis: tag='%s'", pkt.GetTag().c_str());
     DumpPacketForAnalysis(pkt.RawData(), "NetworkManager_OnReceive");
-
-    // Track packet processing in telemetry
-    TELEMETRY_INCREMENT_PACKETS_PROCESSED();
 
     // Enqueue into GameServer's receive queue
     // HARDENING: this fires from the inbound dispatch path; guard against a null

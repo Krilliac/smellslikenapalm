@@ -11,8 +11,9 @@
 //        -> initial replication (GRI ensured + per-player PRI registered)
 //
 //   ClientJoined (after NMT_Join)
-//        -> PostLogin      (Engine/GameInfo.uc::PostLogin: PickTeam, spawn,
-//                           mark active)
+//        -> PostLogin      (pick provisional team, remain undeployed)
+//   SelectRoleByClass(true)
+//        -> RestartPlayer  (FindPlayerStart, spawn and mark active)
 //
 // This class OWNS no networking. It reaches the Network layer only through a
 // connection-resolver callback (so it is trivially unit-testable without a live
@@ -77,9 +78,15 @@ public:
     // (promotes the connection to a Player) and initial replication.
     void OnClientLoggedIn(const ClientLoggedInEvent& ev);
 
-    // Fired when a client sends NMT_Join. Runs PostLogin: team pick + spawn +
-    // mark active.
+    // Fired when a client sends NMT_Join. Runs the pre-deploy portion of
+    // PostLogin: pick a provisional team but remain Dead/Spectating until the
+    // final role/deploy RPC authorizes RestartPlayer.
     void OnClientJoined(const ClientJoinedEvent& ev);
+
+    // Remove every per-client game/login object when the network session ends.
+    // This is also used by same-endpoint reconnects, where the new handshake may
+    // arrive before the old connection reaches its inactivity timeout.
+    void OnClientDisconnected(uint32_t clientId);
 
     // ---- Ban administration (forwards to the owned SecurityManager) ----------
     //
@@ -110,7 +117,8 @@ public:
     // through the single ENFORCED ban store rather than a parallel one.
     SecurityManager* GetSecurityManager() const { return m_security; }
 
-    // True once OnClientJoined successfully attempted a spawn for the client.
+    // Legacy diagnostic: false for the retail pre-deploy flow because NMT_Join
+    // intentionally no longer attempts a spawn.
     bool WasSpawnAttempted(uint32_t clientId) const;
 
 private:
@@ -141,7 +149,8 @@ private:
     // Per-client PRI state, keyed by network clientId.
     std::unordered_map<uint32_t, PlayerReplicationInfo> m_playerInfos;
 
-    // Clients for which a spawn was attempted in OnClientJoined.
+    // Legacy per-client spawn-at-join diagnostic. Retail entries remain false;
+    // deployment is owned by ConnectionManager's final role-selection path.
     std::unordered_map<uint32_t, bool> m_spawnAttempted;
 
     // Monotonic PlayerID allocator (UE3 PlayerReplicationInfo.PlayerID).

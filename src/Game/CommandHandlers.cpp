@@ -14,6 +14,7 @@
 #include "Game/Player.h"
 #include "Game/MapManager.h"
 #include "Game/MapVoteManager.h"
+#include "Game/BotManager.h"
 #include "Game/WorkshopManager.h"
 #include "Game/ModManager.h"
 #include "Game/MutatorManager.h"
@@ -21,6 +22,7 @@
 #include "Config/ServerConfig.h"
 #include "Config/ConfigManager.h"
 #include "Network/ClientConnection.h"
+#include "Network/NetworkManager.h"
 #include "Math/Vector3.h"
 #include "Utils/Logger.h"
 #include "Utils/StringUtils.h"
@@ -53,7 +55,14 @@ uint32_t ResolveTarget(GameServer* server, const std::string& token)
 
 bool ParseFloat(const std::string& s, float& out)
 {
-    try { size_t pos = 0; out = std::stof(s, &pos); return pos == s.size(); }
+    try {
+        size_t pos = 0;
+        out = std::stof(s, &pos);
+        if (pos == s.size() && std::isfinite(out)) return true;
+        Logger::Debug("[CommandHandlers::ParseFloat] Non-finite or trailing float token: '%s'",
+                      s.c_str());
+        return false;
+    }
     catch (...) {
         // Don't lose the failure silently: the caller turns this into an
         // "invalid argument" reply, but record the offending token for anyone
@@ -202,13 +211,50 @@ void CommandManager::RegisterBuiltins()
             return true;
         }});
 
-    Register({"spawnbot", {"bot"}, CommandLevel::Dev, CommandCategory::Dev,
-        "spawnbot [count]", "Spawn AI bots (not yet implemented).",
+    Register({"spawnbot", {"bot", "botfill"}, CommandLevel::Dev, CommandCategory::Dev,
+        "spawnbot [fill-per-team]", "Set the total participant fill target per team.",
         [](CommandContext& ctx) {
-            // STUB: no AI bot subsystem exists yet; surface honestly rather than
-            // pretend success. Revisit when a BotManager lands.
-            ctx.Reply("spawnbot: no AI bot subsystem is implemented on this server.");
-            return false;
+            if (ctx.args.size() > 1) {
+                ctx.Reply("Usage: spawnbot [fill-per-team]");
+                return false;
+            }
+
+            BotManager* bots = ctx.server ? ctx.server->GetBotManager() : nullptr;
+            if (!bots) {
+                ctx.Reply("BotManager unavailable.");
+                return false;
+            }
+
+            const std::size_t maximum = bots->GetConfig().maxBotsPerTeam;
+            std::size_t target = bots->GetConfig().fillTargetPerTeam;
+            if (ctx.args.empty()) {
+                // The no-argument form adds one fill slot to each side, capped
+                // by the same limit enforced by BotManager::ReconcileFill().
+                if (target < maximum) ++target;
+            } else {
+                const auto parsed = StringUtils::ToInt(ctx.args[0]);
+                if (!parsed || *parsed < 0 ||
+                    static_cast<std::size_t>(*parsed) > maximum) {
+                    ctx.Reply("Usage: spawnbot [fill-per-team 0-" +
+                              std::to_string(maximum) + "]");
+                    return false;
+                }
+                target = static_cast<std::size_t>(*parsed);
+            }
+
+            // Keep the manager-side invariant authoritative even though the
+            // command already validates against the same configured maximum.
+            if (!bots->SetFillTargetPerTeam(target)) {
+                ctx.Reply("Bot fill target was rejected.");
+                return false;
+            }
+            ctx.Reply(
+                "Bot fill target set to " + std::to_string(target) +
+                " participants per team (bots now team1=" +
+                std::to_string(bots->CountBots(BotManager::kTeamOne)) +
+                ", team2=" +
+                std::to_string(bots->CountBots(BotManager::kTeamTwo)) + ").");
+            return true;
         }});
 
     // ---------------------------------------------------------------------
@@ -367,7 +413,14 @@ void CommandManager::RegisterBuiltins()
             if (!ParseFloat(ctx.args[1], x) || !ParseFloat(ctx.args[2], y) || !ParseFloat(ctx.args[3], z)) {
                 ctx.Reply("Invalid coordinates."); return false;
             }
-            player->SetPosition(Vector3(x, y, z));
+            const Vector3 destination(x, y, z);
+            if (auto* network = s->GetNetworkManager();
+                network &&
+                !network->ResetRetailMovementValidation(cid, destination)) {
+                ctx.Reply("Teleport rejected: movement authority reset failed.");
+                return false;
+            }
+            player->SetPosition(destination);
             ctx.Reply("Teleported " + ctx.args[0]);
             return true;
         }});
@@ -420,17 +473,19 @@ void CommandManager::RegisterBuiltins()
     // Map management
     // ---------------------------------------------------------------------
     Register({"changemap", {"map"}, CommandLevel::Admin, CommandCategory::Map,
-        "changemap <mapName>", "Load a different map immediately.",
+        "changemap <mapName>", "Queue a validated map change.",
         [](CommandContext& ctx) {
             if (ctx.args.empty()) { ctx.Reply("Usage: changemap <mapName>"); return false; }
-            auto* mm = ctx.server ? ctx.server->GetMapManager() : nullptr;
-            if (!mm) { ctx.Reply("MapManager unavailable."); return false; }
-            if (mm->LoadMap(ctx.args[0])) {
-                ctx.server->BroadcastChatMessage("Admin changed map to " + ctx.args[0]);
-                ctx.Reply("Changed map to " + ctx.args[0]);
+            if (!ctx.server) { ctx.Reply("MapManager unavailable."); return false; }
+            std::string error;
+            if (ctx.server->RequestMapChange(ctx.args[0], error)) {
+                ctx.server->BroadcastChatMessage(
+                    "Admin is changing map to " + ctx.args[0]);
+                ctx.Reply("Map change queued: " + ctx.args[0]);
                 return true;
             }
-            ctx.Reply("Failed to load map: " + ctx.args[0]);
+            ctx.Reply("Failed to change map: " + ctx.args[0] +
+                      (error.empty() ? std::string{} : " (" + error + ")"));
             return false;
         }});
 

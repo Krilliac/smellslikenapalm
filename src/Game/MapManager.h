@@ -7,6 +7,7 @@
 #include <memory>
 #include "Game/SpawnPoint.h"
 #include "Game/Bounds.h"
+#include "Game/BotNavigation.h"
 #include "Game/ObjectiveSystem.h"   // CaptureZone
 #include "Config/MapConfig.h"
 
@@ -22,6 +23,17 @@ struct MapLighting {
     int         ambientColor[3] = {255, 255, 255};
 };
 
+// Optional, map-local authored bot routing data. The sidecar declares the
+// exact game mode it applies to; GameServer ignores it for any other mode.
+struct MapBotNavigationMetadata {
+    bool loaded = false;
+    std::string mode;
+    BotNavigationConfig config;
+    bool allowDirectFallback = true;
+    BotNavigationGraph graph;
+    std::string sourcePath;
+};
+
 class MapManager {
 public:
     MapManager(GameServer* server, std::shared_ptr<MapConfig> mapConfig);
@@ -34,6 +46,8 @@ public:
     // registering directly with ObjectiveSystem. Empty if the map ships none.
     const std::vector<CaptureZone>& GetObjectiveZones() const;
     Bounds                 GetMapBounds() const;
+    // Returns the next configured map with an exact retail bootstrap profile.
+    // Empty means no different safe successor exists; the current map remains.
     std::string            GetNextMap();
     void                   LogSummary() const;
 
@@ -41,12 +55,17 @@ public:
     const MapDefinition&   GetCurrentMap() const { return m_currentMap; }
     const std::string&     GetCurrentMapName() const { return m_currentMap.name; }
     const MapLighting&     GetLighting() const { return m_lighting; }
+    const MapBotNavigationMetadata& GetBotNavigationMetadata() const {
+        return m_botNavigation;
+    }
 
 private:
     bool LoadGeometry(const std::string& path);
     void GenerateFallbackSpawns();
     bool LoadSpawnPointsFromDisk(const std::string& mapName);
     bool LoadObjectivesFromDisk(const std::string& mapName);
+    bool LoadObjectiveLockdownMetadata(const std::string& mapName);
+    bool LoadBotNavigationMetadata(const std::string& mapName);
     void BuildObjectiveZones();
     void LoadLighting(const std::string& mapName);
     std::string MapAssetDir(const std::string& mapName) const;
@@ -59,4 +78,5 @@ private:
     std::vector<CaptureZone>        m_objectiveZones;
     Bounds                          m_bounds;
     MapLighting                     m_lighting;
+    MapBotNavigationMetadata        m_botNavigation;
 };

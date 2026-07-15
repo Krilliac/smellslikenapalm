@@ -3,8 +3,10 @@
 
 #include "Network/ActorReplication.h"
 
-#include <vector>
 #include <cmath>
+#include <limits>
+#include <utility>
+#include <vector>
 
 #include "Utils/Logger.h"
 
@@ -182,6 +184,204 @@ void WriteActorOpenHeader(BitWriter& w, const ActorOpenHeader& hdr) {
     }
 }
 
+bool RewriteCapturedActorOpenClassAndLocation(
+    const uint8_t* payload, size_t payloadBytes, uint32_t payloadBits,
+    uint32_t expectedClassRef, uint32_t replacementClassRef,
+    float locX, float locY, float locZ,
+    std::vector<uint8_t>& rewrittenPayload, uint32_t& rewrittenPayloadBits) {
+    auto fail = [&]() {
+        rewrittenPayload.clear();
+        rewrittenPayloadBits = 0;
+        return false;
+    };
+
+    if (payload == nullptr || payloadBits == 0 ||
+        expectedClassRef == 0 || expectedClassRef >= kStaticObjectMax ||
+        replacementClassRef == 0 || replacementClassRef >= kStaticObjectMax ||
+        payloadBits > BitWriter::kMaxSaneBunchBits) {
+        return fail();
+    }
+
+    const size_t requiredBytes = (static_cast<size_t>(payloadBits) + 7u) / 8u;
+    if (requiredBytes > payloadBytes) {
+        return fail();
+    }
+
+    // WriteCompressedVector's largest field has Bias=2^20, so its exact signed
+    // integer domain is [-2^20, 2^20-1]. Check in double precision before the
+    // float-to-int conversion performed by the codec.
+    auto validComponent = [](float value) {
+        if (!std::isfinite(value)) return false;
+        const double rounded = std::floor(static_cast<double>(value) + 0.5);
+        return rounded >= -1048576.0 && rounded <= 1048575.0;
+    };
+    if (!validComponent(locX) || !validComponent(locY) || !validComponent(locZ)) {
+        return fail();
+    }
+
+    // Pass only the bytes actually covered by payloadBits. Besides documenting
+    // the bound, this avoids overflow in BitReader's numBytes*8 calculation if a
+    // hostile caller supplies an unrelated, enormous payloadBytes value.
+    BitReader source(payload, requiredBytes, payloadBits);
+    source.SetOverflowHandler([](const char*, size_t, size_t, size_t) {});
+
+    const NetGUIDRef classRef = ReadNetGUID(source);
+    if (source.IsOverflowed() || classRef.isDynamic || classRef.index == 0 ||
+        classRef.index != expectedClassRef) {
+        return fail();
+    }
+
+    float oldX = 0.f, oldY = 0.f, oldZ = 0.f;
+    ReadCompressedVector(source, oldX, oldY, oldZ);
+    if (source.IsOverflowed()) {
+        return fail();
+    }
+    (void)oldX;
+    (void)oldY;
+    (void)oldZ;
+
+    const size_t tailBits = source.BitsLeft();
+    BitWriter rewritten;
+    WriteNetGUID(
+        rewritten,
+        NetGUIDRef{/*isDynamic=*/false, replacementClassRef});
+    WriteCompressedVector(rewritten, locX, locY, locZ);
+
+    // Reject growth before copying the opaque tail. Besides keeping the result
+    // inside the project's sane bunch bound, this avoids asking BitWriter to
+    // cross the limit (and emitting an avoidable diagnostic for hostile input).
+    if (rewritten.HadInvariantViolation() || rewritten.ExceededBunchLimit() ||
+        rewritten.NumBits() > BitWriter::kMaxSaneBunchBits ||
+        tailBits > BitWriter::kMaxSaneBunchBits - rewritten.NumBits()) {
+        return fail();
+    }
+    for (size_t i = 0; i < tailBits; ++i) {
+        rewritten.WriteBit(source.ReadBit());
+    }
+    if (source.IsOverflowed() || rewritten.HadInvariantViolation() ||
+        rewritten.ExceededBunchLimit() ||
+        rewritten.NumBits() > std::numeric_limits<uint32_t>::max()) {
+        return fail();
+    }
+
+    // Build the replacement fully before assigning so input may safely point
+    // into rewrittenPayload's current storage.
+    rewrittenPayload = rewritten.GetBytes();
+    rewrittenPayloadBits = static_cast<uint32_t>(rewritten.NumBits());
+    return true;
+}
+
+bool RewriteCapturedActorOpenLocation(
+    const uint8_t* payload, size_t payloadBytes, uint32_t payloadBits,
+    float locX, float locY, float locZ,
+    std::vector<uint8_t>& rewrittenPayload, uint32_t& rewrittenPayloadBits) {
+    auto fail = [&]() {
+        rewrittenPayload.clear();
+        rewrittenPayloadBits = 0;
+        return false;
+    };
+
+    if (payload == nullptr || payloadBits == 0 ||
+        payloadBits > BitWriter::kMaxSaneBunchBits) {
+        return fail();
+    }
+    const size_t requiredBytes = (static_cast<size_t>(payloadBits) + 7u) / 8u;
+    if (requiredBytes > payloadBytes) {
+        return fail();
+    }
+
+    BitReader source(payload, requiredBytes, payloadBits);
+    source.SetOverflowHandler([](const char*, size_t, size_t, size_t) {});
+    const NetGUIDRef classRef = ReadNetGUID(source);
+    if (source.IsOverflowed() || classRef.isDynamic || classRef.index == 0) {
+        return fail();
+    }
+
+    return RewriteCapturedActorOpenClassAndLocation(
+        payload, payloadBytes, payloadBits,
+        classRef.index, classRef.index,
+        locX, locY, locZ, rewrittenPayload, rewrittenPayloadBits);
+}
+
+bool RewriteCapturedDynamicChannelRefs(
+    const uint8_t* payload, size_t payloadBytes, uint32_t payloadBits,
+    const std::vector<CapturedDynamicChannelRewrite>& rewrites,
+    std::vector<uint8_t>& rewrittenPayload) {
+    auto fail = [&]() {
+        rewrittenPayload.clear();
+        return false;
+    };
+
+    if (payload == nullptr || payloadBits == 0 ||
+        payloadBits > BitWriter::kMaxSaneBunchBits) {
+        return fail();
+    }
+    const size_t requiredBytes = (static_cast<size_t>(payloadBits) + 7u) / 8u;
+    if (requiredBytes > payloadBytes) {
+        return fail();
+    }
+
+    constexpr size_t kDynamicRefBits = 11u;
+    for (size_t i = 0; i < rewrites.size(); ++i) {
+        const CapturedDynamicChannelRewrite& rewrite = rewrites[i];
+        if (rewrite.bitOffset > payloadBits ||
+            payloadBits - rewrite.bitOffset < kDynamicRefBits ||
+            rewrite.expectedChannel == 0 ||
+            rewrite.expectedChannel >= kDynamicChannelMax ||
+            rewrite.replacementChannel == 0 ||
+            rewrite.replacementChannel >= kDynamicChannelMax) {
+            return fail();
+        }
+
+        const size_t rewriteEnd = rewrite.bitOffset + kDynamicRefBits;
+        for (size_t j = 0; j < i; ++j) {
+            const size_t priorStart = rewrites[j].bitOffset;
+            const size_t priorEnd = priorStart + kDynamicRefBits;
+            if (rewrite.bitOffset < priorEnd && priorStart < rewriteEnd) {
+                return fail();
+            }
+        }
+    }
+
+    auto readBit = [payload](size_t bit) {
+        return static_cast<uint8_t>(
+            (payload[bit >> 3u] >> (bit & 7u)) & 1u);
+    };
+    for (const CapturedDynamicChannelRewrite& rewrite : rewrites) {
+        if (readBit(rewrite.bitOffset) == 0) {
+            return fail();
+        }
+        uint32_t channel = 0;
+        for (uint32_t bit = 0; bit < 10u; ++bit) {
+            channel |= static_cast<uint32_t>(
+                           readBit(rewrite.bitOffset + 1u + bit))
+                       << bit;
+        }
+        if (channel != rewrite.expectedChannel) {
+            return fail();
+        }
+    }
+
+    // Copy every source byte, including the unused high padding bits of the
+    // final byte. Only the ten channel-value bits below are permitted to move.
+    std::vector<uint8_t> candidate(payload, payload + requiredBytes);
+    auto writeBit = [&candidate](size_t bit, bool value) {
+        const uint8_t mask = static_cast<uint8_t>(1u << (bit & 7u));
+        uint8_t& byte = candidate[bit >> 3u];
+        if (value) byte = static_cast<uint8_t>(byte | mask);
+        else byte = static_cast<uint8_t>(byte & static_cast<uint8_t>(~mask));
+    };
+    for (const CapturedDynamicChannelRewrite& rewrite : rewrites) {
+        for (uint32_t bit = 0; bit < 10u; ++bit) {
+            writeBit(rewrite.bitOffset + 1u + bit,
+                     ((rewrite.replacementChannel >> bit) & 1u) != 0);
+        }
+    }
+
+    rewrittenPayload = std::move(candidate);
+    return true;
+}
+
 // ---- property serialization (handle + typed value) --------------------------
 namespace {
 #if RS2V_ACTORREPL_SELFCHECK
@@ -302,7 +502,12 @@ PacketCodec::Bunch MakeOpeningActorBunch(
         writeProps(w);
     }
     PacketCodec::Bunch b;
-    b.bControl = false;
+    // UE3 only serializes bOpen/bClose when bControl is set. Leaving bControl
+    // false while setting bOpen merely looks correct in memory: PacketCodec drops
+    // the open bit on the wire and the client rejects the reliable payload as data
+    // for a nonexistent actor channel. Real actor opens use flags 0xD
+    // (bControl|bOpen|bReliable).
+    b.bControl = true;
     b.bOpen = true;       // opening an actor channel
     b.bClose = false;
     b.bReliable = true;

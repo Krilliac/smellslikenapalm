@@ -38,6 +38,7 @@ void RoleSystem::Shutdown() {
     m_playerRoles.clear();
     m_squads.clear();
     m_playerSquadMap.clear();
+    ResetRetailSquads();
     m_teamCommanders.clear();
     m_teamFactions.clear();
 }
@@ -104,6 +105,77 @@ bool RoleSystem::AssignRole(uint32_t playerId, CombatRole role) {
     m_playerRoles[playerId] = role;
     Logger::Info("Player %u assigned role: %s", playerId, GetRoleName(role).c_str());
     return true;
+}
+
+void RoleSystem::RemovePlayer(uint32_t playerId) {
+    ReleaseRetailSquadAssignment(playerId);
+
+    // Do not rely solely on the reverse maps here. Disconnect cleanup is also
+    // the recovery boundary for modest state drift, so remove every commander
+    // entry and squad reference that still names this player.
+    for (auto it = m_teamCommanders.begin(); it != m_teamCommanders.end();) {
+        if (it->second == playerId) {
+            it = m_teamCommanders.erase(it);
+        } else {
+            ++it;
+        }
+    }
+
+    uint32_t mappedSquadId = 0;
+    const auto mappedSquad = m_playerSquadMap.find(playerId);
+    if (mappedSquad != m_playerSquadMap.end()) {
+        mappedSquadId = mappedSquad->second;
+        m_playerSquadMap.erase(mappedSquad);
+    }
+
+    for (auto squadIt = m_squads.begin(); squadIt != m_squads.end();) {
+        Squad& squad = squadIt->second;
+        const uint32_t squadId = squadIt->first;
+        auto& members = squad.memberIds;
+        const auto newEnd = std::remove(members.begin(), members.end(), playerId);
+        const bool removedMembership = newEnd != members.end();
+        members.erase(newEnd, members.end());
+
+        const bool removedLeader =
+            playerId != 0 && squad.leaderId == playerId;
+        const bool affected = removedMembership || removedLeader ||
+                              (mappedSquadId != 0 &&
+                               mappedSquadId == squadId);
+        if (!affected) {
+            ++squadIt;
+            continue;
+        }
+
+        if (members.empty()) {
+            for (auto mapIt = m_playerSquadMap.begin();
+                 mapIt != m_playerSquadMap.end();) {
+                if (mapIt->second == squadId) {
+                    mapIt = m_playerSquadMap.erase(mapIt);
+                } else {
+                    ++mapIt;
+                }
+            }
+            squadIt = m_squads.erase(squadIt);
+            continue;
+        }
+
+        const bool leaderIsMember =
+            squad.leaderId != 0 &&
+            std::find(members.begin(), members.end(), squad.leaderId) !=
+                members.end();
+        if (!leaderIsMember) {
+            // memberIds preserves join order, making promotion deterministic.
+            squad.leaderId = members.front();
+            Logger::Info("Player %u promoted to Squad Leader of '%s'",
+                         squad.leaderId, squad.name.c_str());
+        }
+        m_playerRoles[squad.leaderId] = CombatRole::SquadLeader;
+        ++squadIt;
+    }
+
+    // Erase last so even corrupted duplicate squad membership can never
+    // reintroduce the departing player's role during leader repair.
+    m_playerRoles.erase(playerId);
 }
 
 CombatRole RoleSystem::GetPlayerRole(uint32_t playerId) const {
@@ -276,6 +348,353 @@ void RoleSystem::DisbandSquad(uint32_t squadId) {
     m_squads.erase(it);
 }
 
+RetailSquadAssignment RoleSystem::AutoAssignRetailSquad(uint32_t playerId,
+                                                        uint32_t teamId) {
+    RetailSquadAssignment invalid;
+    invalid.generation = m_retailSquadGeneration;
+    if (playerId == 0 || teamId == 0 || teamId > RETAIL_TEAM_COUNT) {
+        return invalid;
+    }
+
+    ReconcileRetailSquads();
+    if (const auto current = GetRetailSquadAssignment(playerId)) {
+        if (current->teamId == teamId) {
+            return *current;
+        }
+    }
+
+    // Select target capacity while the source assignment is still intact. A
+    // failed cross-team move must leave the player's current squad untouched.
+    const RetailSquadAssignment selected = FindRetailSquadSlot(teamId);
+    if (!selected.IsValid()) {
+        return invalid;
+    }
+
+    // No other thread mutates RoleSystem between selection and placement. The
+    // release reconciles all fixed rosters, but cannot consume a free slot on
+    // a different team.
+    const auto squadsBeforeMove = m_retailSquads;
+    const auto assignmentsBeforeMove = m_retailSquadAssignments;
+    ReleaseRetailSquadAssignment(playerId);
+
+    RetailSquad& squad =
+        m_retailSquads[selected.teamId - 1][selected.squadIndex];
+    if (squad.slotOwnerIds[selected.roleIndex] != 0) {
+        // Restore the complete clean snapshot if an invariant violation ever
+        // invalidates the preselected target during source release.
+        m_retailSquads = squadsBeforeMove;
+        m_retailSquadAssignments = assignmentsBeforeMove;
+        return invalid;
+    }
+    squad.slotOwnerIds[selected.roleIndex] = playerId;
+
+    RetailSquadAssignment assignment = selected;
+    m_retailSquadAssignments[playerId] = assignment;
+    RepairRetailSquad(assignment.teamId, assignment.squadIndex);
+    return assignment;
+}
+
+RetailSquadAssignment RoleSystem::JoinRetailSquad(
+    uint32_t playerId, uint32_t authoritativeTeamId,
+    uint8_t requestedSquadIndex) {
+    RetailSquadAssignment invalid;
+    invalid.generation = m_retailSquadGeneration;
+    if (playerId == 0 || authoritativeTeamId == 0 ||
+        authoritativeTeamId > RETAIL_TEAM_COUNT ||
+        requestedSquadIndex >= RETAIL_SQUAD_COUNT) {
+        return invalid;
+    }
+
+    ReconcileRetailSquads();
+    const auto current = GetRetailSquadAssignment(playerId);
+    if (current && current->teamId == authoritativeTeamId &&
+        current->squadIndex == requestedSquadIndex) {
+        return *current;
+    }
+
+    RetailSquadAssignment selected;
+    selected.teamId = authoritativeTeamId;
+    selected.squadIndex = requestedSquadIndex;
+    selected.generation = m_retailSquadGeneration;
+
+    // Preflight the exact target while the source assignment is still intact.
+    // In particular, a full target cannot evict a player from their current
+    // squad before the request is rejected.
+    const RetailSquad& target =
+        m_retailSquads[authoritativeTeamId - 1][requestedSquadIndex];
+    for (uint8_t roleIndex = 0; roleIndex < RetailSquad::SLOT_COUNT;
+         ++roleIndex) {
+        if (target.slotOwnerIds[roleIndex] == 0) {
+            selected.roleIndex = roleIndex;
+            break;
+        }
+    }
+    if (!selected.IsValid()) {
+        return invalid;
+    }
+
+    // Keep a complete clean snapshot so a future invariant change cannot turn
+    // an otherwise transactional move into a partial release.
+    const auto squadsBeforeMove = m_retailSquads;
+    const auto assignmentsBeforeMove = m_retailSquadAssignments;
+    ReleaseRetailSquadAssignment(playerId);
+
+    RetailSquad& destination =
+        m_retailSquads[selected.teamId - 1][selected.squadIndex];
+    if (destination.slotOwnerIds[selected.roleIndex] != 0) {
+        m_retailSquads = squadsBeforeMove;
+        m_retailSquadAssignments = assignmentsBeforeMove;
+        return invalid;
+    }
+
+    destination.slotOwnerIds[selected.roleIndex] = playerId;
+    m_retailSquadAssignments[playerId] = selected;
+    RepairRetailSquad(selected.teamId, selected.squadIndex);
+    return selected;
+}
+
+bool RoleSystem::LeaveRetailSquad(uint32_t playerId) {
+    return ReleaseRetailSquadAssignment(playerId);
+}
+
+RetailSquadAssignment RoleSystem::FindRetailSquadSlot(uint32_t teamId) const {
+    RetailSquadAssignment selected;
+    selected.generation = m_retailSquadGeneration;
+    if (teamId == 0 || teamId > RETAIL_TEAM_COUNT) return selected;
+
+    const RetailSquadTeam& squads = m_retailSquads[teamId - 1];
+    size_t selectedOccupancy = 0;
+    for (uint8_t squadIndex = 0; squadIndex < RETAIL_SQUAD_COUNT;
+         ++squadIndex) {
+        const RetailSquad& squad = squads[squadIndex];
+        const size_t occupancy = squad.Occupancy();
+        if (occupancy >= RetailSquad::SLOT_COUNT) continue;
+        if (selected.squadIndex !=
+                RetailSquadAssignment::UNASSIGNED_INDEX &&
+            occupancy <= selectedOccupancy) {
+            continue;
+        }
+
+        uint8_t firstHole = RetailSquadAssignment::UNASSIGNED_INDEX;
+        for (uint8_t roleIndex = 0; roleIndex < RetailSquad::SLOT_COUNT;
+             ++roleIndex) {
+            if (squad.slotOwnerIds[roleIndex] == 0) {
+                firstHole = roleIndex;
+                break;
+            }
+        }
+        if (firstHole == RetailSquadAssignment::UNASSIGNED_INDEX) continue;
+
+        selected.teamId = teamId;
+        selected.squadIndex = squadIndex;
+        selected.roleIndex = firstHole;
+        selectedOccupancy = occupancy;
+    }
+    return selected;
+}
+
+std::optional<RetailSquadAssignment>
+RoleSystem::GetRetailSquadAssignment(uint32_t playerId) const {
+    const auto it = m_retailSquadAssignments.find(playerId);
+    if (it == m_retailSquadAssignments.end()) return std::nullopt;
+
+    const RetailSquadAssignment& assignment = it->second;
+    if (!assignment.IsValid() ||
+        assignment.generation != m_retailSquadGeneration ||
+        assignment.teamId > RETAIL_TEAM_COUNT ||
+        assignment.squadIndex >= RETAIL_SQUAD_COUNT ||
+        assignment.roleIndex >= RetailSquad::SLOT_COUNT) {
+        return std::nullopt;
+    }
+
+    const RetailSquad& squad =
+        m_retailSquads[assignment.teamId - 1][assignment.squadIndex];
+    if (squad.slotOwnerIds[assignment.roleIndex] != playerId) {
+        return std::nullopt;
+    }
+    return assignment;
+}
+
+const RetailSquad* RoleSystem::GetRetailSquad(uint32_t teamId,
+                                              uint8_t squadIndex) const {
+    if (teamId == 0 || teamId > RETAIL_TEAM_COUNT ||
+        squadIndex >= RETAIL_SQUAD_COUNT) {
+        return nullptr;
+    }
+    return &m_retailSquads[teamId - 1][squadIndex];
+}
+
+uint32_t RoleSystem::GetRetailSquadLeader(uint32_t teamId,
+                                          uint8_t squadIndex) const {
+    const RetailSquad* squad = GetRetailSquad(teamId, squadIndex);
+    return squad ? squad->leaderId : 0;
+}
+
+bool RoleSystem::IsRetailSquadLeader(uint32_t playerId) const {
+    const auto assignment = GetRetailSquadAssignment(playerId);
+    return assignment &&
+           GetRetailSquadLeader(assignment->teamId,
+                                assignment->squadIndex) == playerId;
+}
+
+uint32_t RoleSystem::ResetRetailSquads() {
+    m_retailSquads = {};
+    m_retailSquadAssignments.clear();
+    ++m_retailSquadGeneration;
+    if (m_retailSquadGeneration == 0) {
+        // Keep zero reserved for default/invalid assignment values.
+        m_retailSquadGeneration = 1;
+    }
+    return m_retailSquadGeneration;
+}
+
+bool RoleSystem::ReleaseRetailSquadAssignment(uint32_t playerId) {
+    bool found = m_retailSquadAssignments.find(playerId) !=
+                 m_retailSquadAssignments.end();
+    for (const RetailSquadTeam& team : m_retailSquads) {
+        for (const RetailSquad& squad : team) {
+            if (std::find(squad.slotOwnerIds.begin(),
+                          squad.slotOwnerIds.end(), playerId) !=
+                squad.slotOwnerIds.end()) {
+                found = true;
+            }
+        }
+    }
+    ReconcileRetailSquads(playerId);
+    return found;
+}
+
+void RoleSystem::ReconcileRetailSquads(uint32_t removingPlayerId) {
+    if (removingPlayerId != 0) {
+        m_retailSquadAssignments.erase(removingPlayerId);
+    }
+
+    // Reject invalid reverse records first. Their owner slots become orphans
+    // and are removed by the following grid sweep.
+    for (auto it = m_retailSquadAssignments.begin();
+         it != m_retailSquadAssignments.end();) {
+        const RetailSquadAssignment& assignment = it->second;
+        if (it->first == 0 || !assignment.IsValid() ||
+            assignment.generation != m_retailSquadGeneration ||
+            assignment.teamId > RETAIL_TEAM_COUNT ||
+            assignment.squadIndex >= RETAIL_SQUAD_COUNT ||
+            assignment.roleIndex >= RetailSquad::SLOT_COUNT) {
+            it = m_retailSquadAssignments.erase(it);
+        } else {
+            ++it;
+        }
+    }
+
+    // Every retained owner slot must have a live reverse record. Also remove
+    // every occurrence of the departing player, including stale duplicates.
+    for (RetailSquadTeam& team : m_retailSquads) {
+        for (RetailSquad& squad : team) {
+            for (uint32_t& ownerId : squad.slotOwnerIds) {
+                if (ownerId == 0) continue;
+                if (ownerId == removingPlayerId ||
+                    m_retailSquadAssignments.find(ownerId) ==
+                        m_retailSquadAssignments.end()) {
+                    ownerId = 0;
+                }
+            }
+        }
+    }
+
+    // Canonicalize each reverse record against the fixed owner grid. A unique
+    // owner occurrence repairs stale coordinates. For duplicates, preserve the
+    // recorded exact slot when possible; otherwise keep the lowest coordinate.
+    for (auto it = m_retailSquadAssignments.begin();
+         it != m_retailSquadAssignments.end();) {
+        const uint32_t playerId = it->first;
+        RetailSquadAssignment& assignment = it->second;
+        uint32_t occurrenceCount = 0;
+        uint32_t chosenTeam = 0;
+        uint8_t chosenSquad = RetailSquadAssignment::UNASSIGNED_INDEX;
+        uint8_t chosenRole = RetailSquadAssignment::UNASSIGNED_INDEX;
+        bool choseRecordedSlot = false;
+
+        for (uint32_t teamId = 1; teamId <= RETAIL_TEAM_COUNT; ++teamId) {
+            RetailSquadTeam& team = m_retailSquads[teamId - 1];
+            for (uint8_t squadIndex = 0; squadIndex < RETAIL_SQUAD_COUNT;
+                 ++squadIndex) {
+                RetailSquad& squad = team[squadIndex];
+                for (uint8_t roleIndex = 0;
+                     roleIndex < RetailSquad::SLOT_COUNT; ++roleIndex) {
+                    if (squad.slotOwnerIds[roleIndex] != playerId) continue;
+                    ++occurrenceCount;
+                    const bool recorded =
+                        assignment.teamId == teamId &&
+                        assignment.squadIndex == squadIndex &&
+                        assignment.roleIndex == roleIndex;
+                    if (chosenTeam == 0 || (recorded && !choseRecordedSlot)) {
+                        chosenTeam = teamId;
+                        chosenSquad = squadIndex;
+                        chosenRole = roleIndex;
+                        choseRecordedSlot = recorded;
+                    }
+                }
+            }
+        }
+
+        if (occurrenceCount == 0) {
+            it = m_retailSquadAssignments.erase(it);
+            continue;
+        }
+
+        for (uint32_t teamId = 1; teamId <= RETAIL_TEAM_COUNT; ++teamId) {
+            RetailSquadTeam& team = m_retailSquads[teamId - 1];
+            for (uint8_t squadIndex = 0; squadIndex < RETAIL_SQUAD_COUNT;
+                 ++squadIndex) {
+                RetailSquad& squad = team[squadIndex];
+                for (uint8_t roleIndex = 0;
+                     roleIndex < RetailSquad::SLOT_COUNT; ++roleIndex) {
+                    if (squad.slotOwnerIds[roleIndex] == playerId &&
+                        (teamId != chosenTeam || squadIndex != chosenSquad ||
+                         roleIndex != chosenRole)) {
+                        squad.slotOwnerIds[roleIndex] = 0;
+                    }
+                }
+            }
+        }
+
+        assignment.teamId = chosenTeam;
+        assignment.squadIndex = chosenSquad;
+        assignment.roleIndex = chosenRole;
+        assignment.generation = m_retailSquadGeneration;
+        ++it;
+    }
+
+    for (uint32_t teamId = 1; teamId <= RETAIL_TEAM_COUNT; ++teamId) {
+        for (uint8_t squadIndex = 0; squadIndex < RETAIL_SQUAD_COUNT;
+             ++squadIndex) {
+            RepairRetailSquad(teamId, squadIndex);
+        }
+    }
+}
+
+void RoleSystem::RepairRetailSquad(uint32_t teamId, uint8_t squadIndex) {
+    RetailSquad& squad = m_retailSquads[teamId - 1][squadIndex];
+    if (squad.slotOwnerIds[0] == 0) {
+        for (uint8_t roleIndex = 1; roleIndex < RetailSquad::SLOT_COUNT;
+             ++roleIndex) {
+            const uint32_t promotedId = squad.slotOwnerIds[roleIndex];
+            if (promotedId == 0) continue;
+
+            squad.slotOwnerIds[0] = promotedId;
+            squad.slotOwnerIds[roleIndex] = 0;
+            auto assignment = m_retailSquadAssignments.find(promotedId);
+            if (assignment != m_retailSquadAssignments.end()) {
+                assignment->second.teamId = teamId;
+                assignment->second.squadIndex = squadIndex;
+                assignment->second.roleIndex = 0;
+                assignment->second.generation = m_retailSquadGeneration;
+            }
+            break;
+        }
+    }
+    squad.leaderId = squad.slotOwnerIds[0];
+}
+
 // --- Commander Management ---
 
 bool RoleSystem::VolunteerAsCommander(uint32_t playerId) {
@@ -412,6 +831,7 @@ void RoleSystem::InitializeRoleDefinitions() {
     addRole(Faction::USMC, CombatRole::Grenadier,         "Grenadier",         3, "M16A1/M203", "M1911", 5, 1);
     addRole(Faction::USMC, CombatRole::Marksman,          "Marksman",          2, "M14 Scoped", "M1911", 6, 1);
     addRole(Faction::USMC, CombatRole::Pointman,          "Pointman",          3, "Ithaca 37", "M1911", 6, 2);
+    addRole(Faction::USMC, CombatRole::CombatEngineer,    "Combat Engineer",   2, "M16A1", "M1911", 5, 1);
     addRole(Faction::USMC, CombatRole::Radioman,          "Radioman",          2, "M16A1", "M1911", 7, 1);
 
     // === Australian Army Roles ===
@@ -440,6 +860,7 @@ void RoleSystem::InitializeRoleDefinitions() {
     addRole(Faction::NLFSV, CombatRole::Commander,         "Commander",         1, "AK-47", "TT-33", 6, 1);
     addRole(Faction::NLFSV, CombatRole::SquadLeader,       "Squad Leader",     -1, "SKS", "TT-33", 8, 2);
     addRole(Faction::NLFSV, CombatRole::Rifleman,          "Rifleman",         -1, "Mosin-Nagant M91/30", "TT-33", 8, 2);
+    addRole(Faction::NLFSV, CombatRole::Pointman,          "Scout",              3, "MAT-49", "TT-33", 4, 2);
     addRole(Faction::NLFSV, CombatRole::AutomaticRifleman, "Automatic Rifleman",3, "RPD", "TT-33", 3, 1);
     addRole(Faction::NLFSV, CombatRole::MachineGunner,     "Machine Gunner",    2, "DP-28", "TT-33", 3, 0);
     addRole(Faction::NLFSV, CombatRole::Sapper,            "Sapper",            4, "MAT-49", "TT-33", 4, 1);

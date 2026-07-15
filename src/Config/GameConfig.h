@@ -25,6 +25,7 @@ public:
     bool  IsScoreLimitEnabled() const;
     int   GetScoreLimit() const;
     bool  IsVehicleSpawningEnabled() const;
+    bool  WaitForReadyPlayer() const;
 
     // Data file paths
     std::string GetMapsIniPath() const;

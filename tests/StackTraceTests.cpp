@@ -57,7 +57,9 @@ __attribute__((noinline))
 #endif
 rs2v::StackTrace
 DistinctlyNamedCaptureFunction() {
-    rs2v::StackTrace trace = rs2v::StackTrace::Capture();
+    // Preserve this caller in the trace. Capture's default intentionally skips
+    // one user frame, which is useful to crash-handler wrappers but not here.
+    rs2v::StackTrace trace = rs2v::StackTrace::Capture(/*skipFrames=*/0);
     // Touch the result so the compiler cannot elide the call entirely.
     volatile int sink = trace.GetFrameCount();
     (void)sink;

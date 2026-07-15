@@ -10,10 +10,12 @@
 #include "TestFramework.h"
 
 #include "Network/PacketCodec.h"
+#include "Network/PeerControlClose.h"
 
 #include <cstddef>
 #include <vector>
 #include <cstdint>
+#include <utility>
 
 using PacketCodec::Decode;
 using PacketCodec::Encode;
@@ -194,6 +196,161 @@ TEST(PacketFraming, SyntheticAcksAndBunchesRoundTrip) {
 
     // Re-encoding the decoded packet reproduces the same wire bytes.
     EXPECT_EQ(Encode(decoded), wire);
+}
+
+// UE3's transport keepalive is not an NMT/control bunch. FlushNet emits only
+// the rolling PacketId followed by the packet terminator. Official capture
+// frame f1439 carries PacketId 34 as the exact two bytes 22 40.
+TEST(PacketFraming, EmptyTransportKeepAliveMatchesCapture) {
+    PacketCodec::Packet keepalive;
+    keepalive.packetId = 34;
+    keepalive.ok = true;
+
+    const std::vector<uint8_t> wire = Encode(
+        keepalive, PacketCodec::kServerSendMaxPacketBytes);
+    EXPECT_EQ(wire, (std::vector<uint8_t>{0x22, 0x40}));
+
+    const PacketCodec::Packet decoded = Decode(
+        wire.data(), wire.size(), PacketCodec::kServerSendMaxPacketBytes);
+    ASSERT_TRUE(decoded.ok);
+    EXPECT_EQ(decoded.packetId, 34u);
+    EXPECT_TRUE(decoded.acks.empty());
+    EXPECT_TRUE(decoded.bunches.empty());
+}
+
+// Retail C2S MaxPacket is 1280 bytes (BunchDataBits bound 10240). The decisive
+// traffic is the near-MTU package-inventory burst: several large NMT_Have bunches
+// share one datagram. A 2048-byte bound has the same apparent width for many small
+// values but misdecodes this saturated layout, fabricating actor channels.
+TEST(PacketFraming, RetailClientMaxPacketDecodesNearMtuHaveBatch) {
+    PacketCodec::Packet packet;
+    packet.packetId = 6;
+    packet.acks = {2u, 3u, 4u, 5u, 6u};
+
+    const uint32_t payloadBits[] = {3192u, 2856u, 2856u, 1008u};
+    for (size_t i = 0; i < 4; ++i) {
+        PacketCodec::Bunch bunch;
+        bunch.bReliable = true;
+        bunch.chIndex = 0;
+        bunch.chSequence = static_cast<uint32_t>(7 + i);
+        bunch.chType = PacketCodec::kControlChannelType;
+        bunch.payloadBits = payloadBits[i];
+        bunch.payload.assign((payloadBits[i] + 7u) / 8u, 0u);
+        bunch.payload[0] = NMTByte(NMT::Have);
+        packet.bunches.push_back(std::move(bunch));
+    }
+
+    const std::vector<uint8_t> wire = Encode(packet, /*MaxPacket=*/1280u);
+    ASSERT_TRUE(wire.size() <= 1280u);
+    const PacketCodec::Packet decoded = Decode(
+        wire.data(), wire.size(), PacketCodec::kClientSendMaxPacketBytes);
+    ASSERT_TRUE(decoded.ok);
+    EXPECT_EQ(decoded.packetId, 6u);
+    EXPECT_EQ(decoded.acks, packet.acks);
+    ASSERT_EQ(decoded.bunches.size(), 4u);
+    for (size_t i = 0; i < decoded.bunches.size(); ++i) {
+        EXPECT_EQ(decoded.bunches[i].chIndex, 0u);
+        EXPECT_EQ(decoded.bunches[i].chSequence, static_cast<uint32_t>(7 + i));
+        EXPECT_EQ(decoded.bunches[i].payloadBits, payloadBits[i]);
+        ASSERT_FALSE(decoded.bunches[i].payload.empty());
+        EXPECT_EQ(decoded.bunches[i].payload[0], NMTByte(NMT::Have));
+    }
+}
+
+static PacketCodec::Bunch CanonicalPeerControlClose() {
+    PacketCodec::Bunch close;
+    close.bControl = true;
+    close.bClose = true;
+    close.bReliable = true;
+    close.chIndex = 0;
+    close.chSequence = 17;
+    close.chType = PacketCodec::kControlChannelType;
+    return close;
+}
+
+TEST(PacketFraming, ClassifiesCanonicalPeerControlCloseOnTheWire) {
+    PacketCodec::Packet packet;
+    packet.packetId = 41;
+    packet.acks = {12u, 13u};
+    packet.bunches.push_back(CanonicalPeerControlClose());
+
+    const std::vector<uint8_t> wire = Encode(
+        packet, PacketCodec::kClientSendMaxPacketBytes);
+    const PacketCodec::Packet decoded = Decode(
+        wire.data(), wire.size(), PacketCodec::kClientSendMaxPacketBytes);
+    ASSERT_TRUE(decoded.ok);
+    ASSERT_EQ(decoded.bunches.size(), 1u);
+    EXPECT_TRUE(PacketCodec::ClassifyPeerClose(decoded.bunches.front()) ==
+                PacketCodec::PeerCloseClassification::GracefulControlClose);
+    EXPECT_TRUE(PacketCodec::ClassifyPeerClose(decoded) ==
+                PacketCodec::PeerCloseClassification::GracefulControlClose);
+}
+
+TEST(PacketFraming, RejectsMalformedControlCloseShapes) {
+    std::vector<PacketCodec::Bunch> malformed;
+
+    PacketCodec::Bunch unreliable = CanonicalPeerControlClose();
+    unreliable.bReliable = false;
+    malformed.push_back(unreliable);
+
+    PacketCodec::Bunch openAndClose = CanonicalPeerControlClose();
+    openAndClose.bOpen = true;
+    malformed.push_back(openAndClose);
+
+    PacketCodec::Bunch wrongType = CanonicalPeerControlClose();
+    wrongType.chType = 2;
+    malformed.push_back(wrongType);
+
+    PacketCodec::Bunch payload = CanonicalPeerControlClose();
+    payload.payloadBits = 8;
+    payload.payload = {0x04};
+    malformed.push_back(payload);
+
+    PacketCodec::Bunch contradictoryPayload = CanonicalPeerControlClose();
+    contradictoryPayload.payload = {0x00};
+    malformed.push_back(contradictoryPayload);
+
+    PacketCodec::Bunch missingControlFlag = CanonicalPeerControlClose();
+    missingControlFlag.bControl = false;
+    malformed.push_back(missingControlFlag);
+
+    for (const PacketCodec::Bunch& close : malformed) {
+        EXPECT_TRUE(PacketCodec::ClassifyPeerClose(close) ==
+                    PacketCodec::PeerCloseClassification::MalformedControlClose);
+    }
+}
+
+TEST(PacketFraming, ActorCloseIsNotAConnectionClose) {
+    PacketCodec::Bunch actorClose = CanonicalPeerControlClose();
+    actorClose.chIndex = 209;
+    actorClose.chType = 2;
+    EXPECT_TRUE(PacketCodec::ClassifyPeerClose(actorClose) ==
+                PacketCodec::PeerCloseClassification::OtherChannelClose);
+
+    actorClose.bClose = false;
+    EXPECT_TRUE(PacketCodec::ClassifyPeerClose(actorClose) ==
+                PacketCodec::PeerCloseClassification::None);
+}
+
+TEST(PacketFraming, MalformedControlCloseDominatesMixedPacket) {
+    PacketCodec::Packet packet;
+    PacketCodec::Bunch actorClose = CanonicalPeerControlClose();
+    actorClose.chIndex = 210;
+    actorClose.chType = 2;
+    packet.bunches.push_back(actorClose);
+    EXPECT_TRUE(PacketCodec::ClassifyPeerClose(packet) ==
+                PacketCodec::PeerCloseClassification::OtherChannelClose);
+
+    packet.bunches.push_back(CanonicalPeerControlClose());
+    EXPECT_TRUE(PacketCodec::ClassifyPeerClose(packet) ==
+                PacketCodec::PeerCloseClassification::GracefulControlClose);
+
+    PacketCodec::Bunch malformed = CanonicalPeerControlClose();
+    malformed.payloadBits = 1;
+    malformed.payload = {0x01};
+    packet.bunches.push_back(malformed);
+    EXPECT_TRUE(PacketCodec::ClassifyPeerClose(packet) ==
+                PacketCodec::PeerCloseClassification::MalformedControlClose);
 }
 
 RS2V_TEST_MAIN()

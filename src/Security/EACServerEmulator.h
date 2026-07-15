@@ -23,8 +23,8 @@ public:
     void SetSafeMode(bool safe);                    // respond with "all clients safe"
     void SetAlwaysAccept(bool accept);              // automatically accept all handshakes
 
-    // Initialize listening on the EAC port (default 7957)
-    bool Initialize(uint16_t listenPort = 7957);
+    // Initialize listening on the explicitly selected EAC port.
+    bool Initialize(uint16_t listenPort);
 
     // Process any pending client requests (should be called each tick)
     void ProcessRequests();

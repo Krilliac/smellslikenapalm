@@ -82,11 +82,21 @@ public:
     //   skipFrames : caller frames to skip beyond Capture() itself
     //                (default 1 = skip Capture()'s immediate caller's bookkeeping).
     //   maxFrames  : cap on number of frames.
+    // Keep the two capture helpers as real stack frames.  If either helper is
+    // inlined, the fixed skip count below starts discarding user frames instead
+    // of the capture implementation; optimized builds would then produce a
+    // different trace from Debug builds.
+#if defined(_MSC_VER)
+    __declspec(noinline)
+#elif defined(__GNUC__) || defined(__clang__)
+    __attribute__((noinline))
+#endif
     static StackTrace Capture(int skipFrames = 1, int maxFrames = MAX_FRAMES) {
         StackTrace trace;
-        // +1 to drop CaptureRaw/Capture's own frame.
+        // +2 drops CaptureRaw and Capture themselves.  The noinline contract
+        // above makes that internal-frame count stable in optimized builds.
         trace.m_capturedFrames =
-            CaptureRaw(trace.m_rawAddresses, skipFrames + 1, maxFrames);
+            CaptureRaw(trace.m_rawAddresses, skipFrames + 2, maxFrames);
         trace.ResolveSymbols();
         return trace;
     }
@@ -108,13 +118,20 @@ private:
     void*                   m_rawAddresses[MAX_FRAMES] = {};
     int                     m_capturedFrames           = 0;
 
+#if defined(_MSC_VER)
+    __declspec(noinline)
+#elif defined(__GNUC__) || defined(__clang__)
+    __attribute__((noinline))
+#endif
     static int CaptureRaw(void** addresses, int skipFrames, int maxFrames) {
         if (maxFrames > MAX_FRAMES) maxFrames = MAX_FRAMES;
         if (skipFrames < 0) skipFrames = 0;
 
 #ifdef _WIN32
         // CaptureStackBackTrace skips its own frame internally.
-        USHORT captured = CaptureStackBackTrace(
+        // The volatile result also prevents an optimized tail call from
+        // erasing CaptureRaw's stack frame after noinline kept it separate.
+        volatile USHORT captured = CaptureStackBackTrace(
             static_cast<DWORD>(skipFrames), static_cast<DWORD>(maxFrames),
             addresses, nullptr);
         return static_cast<int>(captured);

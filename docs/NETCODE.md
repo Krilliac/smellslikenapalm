@@ -275,6 +275,87 @@ control-channel message (e.g. an NMT 0x07 PackageMap chunk) sent as one reliable
 bunch via `SendRawToClient`. No-op (logged) if the file is absent — the handshake is
 unaffected.
 
+Every reliable control packet is also entered separately in the connection retransmission
+ledger. This is not optional even on loopback: the 29-datagram PackageMap burst repeatedly
+lost only its final ch0 sequence 33 while every earlier packet was acknowledged. The client
+then omitted the six packages carried by that packet and waited forever before `NMT_Join`.
+The original and official payloads were byte-identical; retrying the same bunch with a new
+PacketId produced the final six `NMT_Have` records and an immediate Join. Control traffic
+uses an 8-second retry delay with 64 seconds of cold-start headroom, while actor traffic
+retains its shorter retry schedule.
+
+The canonical artifact remains the unconditional default. For bounded installed-package
+GUID testing only, start the process with
+`RS2V_REPLICATION_BOOTSTRAP_VARIANT=installed` to select the separate
+`data/replication_bootstrap_installed.bin` candidate. The selector accepts only that exact
+lowercase value; every other non-empty value fails closed with post-Welcome replication
+disabled. Startup logs include the exact selected variant and artifact path, and a missing
+candidate never falls back to canonical implicitly.
+
+Both complete 34,199-byte PackageMap/control artifacts are identity-pinned before parsing:
+canonical SHA-256 `A8EA6DCA...D5E53D6`, installed SHA-256
+`519D7594...DA596F`. A swapped, corrupted, or merely structurally valid wrong artifact is
+rejected before it can be paired with the selected numeric object layout.
+
+This is an integrity pin for emulator-owned artifacts, **not client attestation**. The
+minimal retail `NMT_Hello` carries neither a binary hash nor package hashes, and the runtime
+does not read or authenticate the connected client's files. The installed cohort was
+rechecked against `VNGame.exe` SHA-256 `E578DDE4...AAF7E11` and `ROGame.u` SHA-256
+`AED4E60D...C44961`; the JSONL audit records package headers and paths but not those full-file
+hashes. A future installed-build gate must therefore compare an independently supplied
+local/build fingerprint and fail closed on mismatch; it still cannot prove a remote client
+without a new authenticated attestation protocol.
+
+This installed candidate is deliberately **not** treated as a new canonical capture. Its
+provenance is recorded in `data/replication_bootstrap_installed.audit.jsonl`: all 473
+package identities match the installed retail build after the nine GUID replacements, but
+the final generation rows grew by four network objects in `ROGame.u` and one in
+`OnlineSubsystemSteamworks.u`. Passing UE3's package-identity gate therefore proves only
+that the client may proceed past `NMT_Uses`; downstream `ObjectBase`/static references must
+still be validated from the retail packet trace before this artifact can be promoted.
+
+The 2026-07-14 retail dogfood runs prove this candidate clears PackageMap reconciliation,
+loads `VNTE-Resort`, reaches `NMT_Join`, creates all six menu-critical actors, and adopts
+ch2 as the local `ROPlayerController`. Source-grounded installed-package indices provide
+the actor-side candidate under the same `installed` selector. Actor opens reference their
+`Default__` archetypes, while HUD/GameInfo values are UClass refs:
+`Default__ROPlayerController=57522`, `Default__ROTeamInfo=90248`,
+`Default__ROPlayerReplicationInfo=86704`, `Default__ROGameReplicationInfo=70889`,
+embedded Territory `GameClass=69603`, and
+`ClientSetHUD`'s `ROHUD` UClass `76594`. The installed Resort PackageMap base is five
+objects later than the capture (`288295 -> 288300`), so six `MapBoundaries` plus the Axis
+and Allies spawn-protection references also move by exactly +5. Three of those eight stale
+map refs resolved to a wrong object of the expected class and produced no client warning;
+all eight are therefore patched as one decoded cohort. The server derives the candidate in
+memory from canonical `data/actor_bootstrap.bin` using 19 pinned byte changes representing
+16 semantic static-reference corrections. Derivation requires the 14,537-byte source
+capture SHA-256 `AF0CA556...0522B3E0` and verifies candidate SHA-256
+`6DF1E41B...851418`; a wrong source, unsupported selector, or unavailable SHA-256 support
+disables actor replication instead of falling back. Installed full-world replay remains
+disabled because only the menu-critical Resort records have been completely grounded.
+
+Authored `spawns.txt` h59 references follow that same canonical map layout. The
+connection's frozen artifact selection now carries a map-object offset (`0` for canonical,
+`+5` for installed), and `SendRetailSpawnLocations` rebases each nonzero
+`ROVolumePlayerStartGroup` reference with a widened, fail-closed bounds check. This keeps one
+grounded map fixture valid for both artifacts; it also prevents Compound's installed US SK
+slot from resolving five exports early as `ROVolumeMapBoundary_9`.
+
+The playable `ROTeamInfo` opens must also seed h62 `ReinforcementsRemaining` with a
+positive value before h59/h210 can open spawn selection. Retail
+`ROUISceneSpawnSelect.UpdateReinforcements()` treats the cooked/default zero as an
+exhausted team and closes the scene during initialization. Official opens carry h62
+(`243` and `299` in the grounded capture); the live builder publishes the authoritative
+`TicketSystem` count, clamped to `int32`. An initial-zero emulator pool means unlimited,
+so it uses a positive display sentinel instead of retail's destructive zero. On Skirmish
+maps such as Compound, the repaired scene intentionally auto-selects normal slot 0 and
+closes on first render; a persistent selection map is expected on Territories maps such
+as Resort.
+
+Maps without an exact bounded retail profile no longer borrow Resort's Welcome/actor
+stream. Both PackageMap and actor bootstrap fail closed for such a map, preventing the
+client from loading Resort while the server is authoritative for a different world.
+
 ### 4.2 Actor channel burst — on ClientJoined
 
 `SendActorBootstrap` (`ConnectionManager.cpp:656`) is called from `FireClientJoined`
@@ -479,7 +560,27 @@ fw.WriteBit(false);                       // bool bShowLobby (value bit)
 if Send==1; bool param ⇒ value bit only, no Send bit. This applies symmetrically to both the
 encode (`SendCh2Rpc` callers) and decode (`DecodeInboundActorBunch`) sides.
 
-### 6.4 The SelectTeam → role-select advance (server-side team persist)
+### 6.4 Compound h434 readiness bunches are ordered RPC sequences
+
+`ServerSetReadyToSpawn` (h434) is not always alone. A 2026-07-14 installed
+Compound trace carried the exact 41-bit payload `b2d192bd8900`:
+
+```text
+h434 Ready(default) + h180 ServerSetThirdPersonSpectate()
+  + h434 ForceOnly(explicit) + h275 ServerStopVoiceChat(false)
+```
+
+The local capture corpus also grounds a 62-bit variant ending in
+`h44 ServerAcknowledgePossession(dynamic ch209) + h284 ServerEnableFocus(false)`
+and a 65-bit `h434 NotReady + h89 ServerSetSpectatorLocation(Vector)` variant.
+`DeploymentReplication` validates only those exact schemas (plus standalone
+h434) before the coordinator mutates. Readiness transitions are applied in wire
+order, and deployment is deferred until the full sequence is processed. Thus
+the transient leading Ready in the 41/62-bit forms cannot briefly authorize a
+spawn before the final ForceOnly revokes it. Unknown companions, true companion
+bools, malformed object refs, truncation, and extra bits remain fail-closed.
+
+### 6.5 The SelectTeam → role-select advance (server-side team persist)
 
 When SelectTeam arrives, the server (`:927-1000`):
 1. Clamps `teamId` to 0/1 and sets `teamSelected`.

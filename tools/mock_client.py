@@ -10,20 +10,31 @@ Modes:
              packets, so it does not require us to fully understand the protocol.
   drive    - act as a UE3 client: send Hello, decode the server's Challenge, and
              (best-effort) proceed. Useful once the protocol is understood.
+  reconnect - complete two handshakes on the same UDP socket, resetting client
+               PacketId/ChSequence between them. Validates same-endpoint teardown.
+  spawn    - drive menu-to-spawn replication and require at least one empty UE3
+             transport keepalive while collecting the server's responses.
 
 The bit codec mirrors src/Network/{BitReader,BitWriter,PacketCodec}: LSB-first
-bits, UE3 variable-length ReadInt(Max), terminator = high bit of the packet's
-last byte, BunchDataBits = ReadInt(16384) (MaxPacket=2048 for the live connection).
+bits, UE3 value-dependent SerializeInt(Max), terminator = high bit of the packet's
+last byte, and direction-specific live bounds (C2S=10240, S2C=12000).
 
 Usage:
   python tools/mock_client.py replay [--host 127.0.0.1] [--port 7777]
   python tools/mock_client.py drive  [--host 127.0.0.1] [--port 7777]
+  python tools/mock_client.py reconnect [--host 127.0.0.1] [--port 7777]
+  python tools/mock_client.py spawn [--host 127.0.0.1] [--port 7777] [--linger 30]
+  python tools/mock_client.py spawn --team 2
+  python tools/mock_client.py spawn --profile hue-city
+  python tools/mock_client.py spawn --profile compound
 """
 import argparse
+import math
 import socket
 import subprocess
 import sys
 import time
+from dataclasses import dataclass
 
 TSHARK = r"C:\Program Files\Wireshark\tshark.exe"
 ORIG_PCAP = r"D:\RE-Tools\rs2_handshake_capture.pcapng"
@@ -71,9 +82,17 @@ class BitWriter:
         self.bits.append(1 if b else 0)
 
     def wint(self, val, maxv):
+        newval = 0
         mask = 1
-        while mask < maxv:
-            self.bit(val & mask)
+        # UE3 FBitWriter::SerializeInt is value-dependent, matching FBitReader:
+        # once val+mask reaches Max, that bit cannot affect a valid value and is
+        # omitted. A fixed ceil(log2(Max)) writer silently inserts padding for
+        # low handles (the exact bug that turned ClientRestart(NewPawn) into None).
+        while (newval + mask) < maxv:
+            is_set = bool(val & mask)
+            self.bit(is_set)
+            if is_set:
+                newval |= mask
             mask <<= 1
 
     def wu(self, val, k):
@@ -100,12 +119,13 @@ def terminator_bit(data):
 # ----------------------------------------------------------------------------
 # Packet decode (PacketId, acks, bunches)
 # ----------------------------------------------------------------------------
-def decode_packet(data, bd_max=16384):
+def decode_packet(data, bd_max=12000):
     """Return dict {pid, acks:[], bunches:[{flags, chIndex, chSeq, chType, bits, nmt, payloadHex}], ok}.
 
-    bd_max is the BunchDataBits SerializeInt bound = MaxPacket*8 for the phase:
-    64 during the StatelessConnect handshake, 16384 (MaxPacket=2048) in the NMT
-    phase. Pass the phase-appropriate value or the bunch payload misaligns.
+    bd_max is the BunchDataBits SerializeInt bound = MaxPacket*8 for the wire
+    direction. Retail RS2 uses 10240 (1280-byte MaxPacket) C2S and 12000
+    (1500-byte MaxPacket) S2C. Pass the direction-appropriate value or payloads
+    misalign; the default is S2C because this harness mostly decodes server replies.
     """
     t = terminator_bit(data)
     if t < 0:
@@ -124,7 +144,7 @@ def decode_packet(data, bd_max=16384):
         bO = r.bit() if bC else 0
         bCl = r.bit() if bC else 0
         bR = r.bit()
-        ci = r.rint(1023)
+        ci = r.rint(1024)
         sq = r.rint(1024) if bR else 0
         ct = r.rint(8) if (bR or bO) else 0
         bd = r.rint(bd_max)
@@ -288,7 +308,7 @@ def encode_packet(pid, bunches, max_packet_bytes, acks=None):
             w.bit(b.get("bClose", 0))
         bR = b.get("bReliable", 1)
         w.bit(bR)
-        w.wint(b["chIndex"], 1023)
+        w.wint(b["chIndex"], 1024)
         if bR:
             w.wint(b["chSeq"], 1024)
         if bR or b.get("bOpen", 0):
@@ -310,16 +330,66 @@ def encode_packet(pid, bunches, max_packet_bytes, acks=None):
     w.bit(1)               # terminator (high set bit of the last byte)
     return w.to_bytes()
 
+
+def make_control_close(sequence):
+    """Build UE3's canonical empty reliable close for control channel zero."""
+    return {
+        "bControl": 1,
+        "bOpen": 0,
+        "bClose": 1,
+        "bReliable": 1,
+        "chIndex": 0,
+        "chType": 1,
+        "chSeq": sequence,
+        "payload": b"",
+    }
+
+
+def acknowledge_server_bunch_packet(sock, server, packet_id, decoded,
+                                     max_packet_bytes=1280):
+    """ACK one decoded server packet iff it carried bunch data.
+
+    UE3 does not ACK pure ACK or empty keepalive packets.  Keeping this rule in
+    one helper prevents the live mock modes from either starting an ACK-of-ACK
+    loop or abandoning a server reliable ledger when their socket exits.
+    Returns ``(next_packet_id, acknowledged)``.
+    """
+    if (not decoded.get("ok") or not decoded.get("bunches") or
+            "pid" not in decoded):
+        return packet_id, False
+
+    wire = encode_packet(
+        packet_id % MAX_PACKETID, [], max_packet_bytes,
+        acks=[decoded["pid"]])
+    sock.sendto(wire, server)
+    return (packet_id + 1) % MAX_PACKETID, True
+
+
+def send_graceful_control_close(sock, server, packet_id, sequence,
+                                max_packet_bytes=1280):
+    """Send UE3's empty reliable ch0 close and return wrapped cursors."""
+    close = make_control_close(sequence % 1024)
+    wire = encode_packet(
+        packet_id % MAX_PACKETID, [close], max_packet_bytes)
+    sock.sendto(wire, server)
+    return ((packet_id + 1) % MAX_PACKETID, (sequence + 1) % 1024)
+
+
 def sint_bits(val, maxv):
     """Return SerializeInt(val, maxv) as a list of LSB-first bits (UE3 FBitWriter::WriteInt)."""
     w = BitWriter()
     w.wint(val, maxv)
     return list(w.bits)
 
+def packed_bits(hex_payload, nbits):
+    """Expand an LSB-first packed payload to the exact number of wire bits."""
+    raw = bytes.fromhex(hex_payload)
+    return [(raw[i >> 3] >> (i & 7)) & 1 for i in range(nbits)]
+
 # ----------------------------------------------------------------------------
 # Reactive mode: act as a real UE3 client - drive the StatelessConnect handshake
 # and the NMT login LIVE against our server, decoding/validating each response
-# phase-aware (bound 64 during the handshake, 16384 once in the NMT phase). This
+# direction-aware (C2S bound 10240, S2C bound 12000). This
 # is the ONLY harness that validates our SEND path (replay only tests receive).
 # ----------------------------------------------------------------------------
 def react(host, port):
@@ -343,17 +413,30 @@ def react(host, port):
         pid += 1
         got = []
         payloads = []
-        try:
-            while True:
+        # A healthy server sends an empty UE3 transport keepalive every second,
+        # so waiting for socket silence makes this validation hang forever. Use
+        # a hard response window and retire reliable server packets as they are
+        # observed; otherwise the mock itself creates a retransmission storm
+        # that can obscure the next handshake step.
+        deadline = time.monotonic() + 2.0
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            sock.settimeout(remaining)
+            try:
                 resp, _ = sock.recvfrom(4096)
-                dec = decode_packet(resp, bd_max=bd_decode)
-                got.append(dec)
-                for b2 in dec.get("bunches", []):
-                    if b2["payloadHex"]:
-                        payloads.append(b2["payloadHex"])
-                print(f"     <- {fmt_packet(dec)}")
-        except socket.timeout:
-            pass
+            except socket.timeout:
+                break
+            dec = decode_packet(resp, bd_max=bd_decode)
+            got.append(dec)
+            for b2 in dec.get("bunches", []):
+                if b2["payloadHex"]:
+                    payloads.append(b2["payloadHex"])
+            print(f"     <- {fmt_packet(dec)}")
+            pid, _ = acknowledge_server_bunch_packet(
+                sock, (host, port), pid, dec, max_pkt)
+        sock.settimeout(1.5)
         if expect_prefix is not None:
             pref = expect_prefix.hex()
             if any(ph.startswith(pref) for ph in payloads):
@@ -365,17 +448,17 @@ def react(host, port):
 
     print(f"react: live handshake against {host}:{port}\n")
     # The whole connection uses the established bound from packet 1 (NO small-bound
-    # phase): the client (us) sends C2S at MaxPacket 2048; the server sends S2C at
+    # phase): the client (us) sends C2S at MaxPacket 1280; the server sends S2C at
     # ~1500 (bound 12000). The handshake NMT byte (0x1d/0x1f) is the FIRST payload
     # byte - there is NO 0x00 family prefix.
     SERVER_BD = 1500 * 8
     # 1. StatelessConnect: HandshakeStart [1d 01] -> HandshakeChallenge [1e + nonce].
-    step("HandshakeStart 0x1d", bytes([0x1d, 0x01]), 2048, bytes([0x1e]), SERVER_BD, want_open=True)
+    step("HandshakeStart 0x1d", bytes([0x1d, 0x01]), 1280, bytes([0x1e]), SERVER_BD, want_open=True)
     # 2. HandshakeResponse [1f ...] -> HandshakeComplete [20].
-    step("HandshakeResponse 0x1f", bytes([0x1f, 0x00, 0x00, 0x00, 0x00]), 2048, bytes([0x20]), SERVER_BD)
+    step("HandshakeResponse 0x1f", bytes([0x1f, 0x00, 0x00, 0x00, 0x00]), 1280, bytes([0x20]), SERVER_BD)
     # 3. NMT phase: Steam login (0x10) -> the server sends NMT 0x11 (then 0x03 then
     #    PackageMap) - NOT NMT_Welcome(0x01).
-    login_got = step("SteamLogin 0x10", bytes([0x10, 0x00, 0x00, 0x00]), 2048, bytes([0x11]), SERVER_BD)
+    login_got = step("SteamLogin 0x10", bytes([0x10, 0x00, 0x00, 0x00]), 1280, bytes([0x11]), SERVER_BD)
     pkgmap = sum(1 for d in login_got for b2 in d.get("bunches", [])
                  if b2["chIndex"] == 0 and b2["nmt"] == 0x07)
     if pkgmap:
@@ -386,7 +469,7 @@ def react(host, port):
     #    world-replication bootstrap (PackageMap export = NMT 0x07 bunches). If the
     #    server has no bootstrap data loaded, this is just an ack (no 0x07) - which
     #    is still a PASS for the handshake, with a note.
-    join_got = step("Join 0x09", bytes([0x09]), 2048, None, SERVER_BD)
+    join_got = step("Join 0x09", bytes([0x09]), 1280, None, SERVER_BD)
     actor_chans = sorted({b2["chIndex"] for d in join_got for b2 in d.get("bunches", [])
                           if b2["chIndex"] >= 2 and b2["bOpen"]})
     if actor_chans:
@@ -394,66 +477,538 @@ def react(host, port):
     else:
         print("     (no actor channels opened after Join - actor bootstrap not loaded)")
 
+    close_pid = pid
+    close_seq = seq
+    pid, seq = send_graceful_control_close(
+        sock, (host, port), pid, seq)
+    print(f"  -> graceful control close: pid={close_pid} seq={close_seq}")
     sock.close()
     print("\n=== react: " + ("PASS - handshake sends are well-formed" if ok else "FAIL - see above") + " ===")
     return 0 if ok else 1
 
 # ----------------------------------------------------------------------------
+# Reconnect mode: finish a session, then reuse the exact same UDP endpoint for a
+# fresh ch0 open whose PacketId/ChSequence restart at 0/1. This reproduces the
+# retail client's "disconnect/reopen still stuck until hard server restart" case.
+# The second HandshakeStart must receive a new 0x1e challenge, and the replacement
+# session must still reach Join (proving stale player/capacity state was removed).
+# ----------------------------------------------------------------------------
+def reconnect(host, port):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.settimeout(0.1)
+    SERVER_BD = 1500 * 8
+    ok = True
+
+    def exchange(state, label, payload, expect_prefix=None, want_open=False):
+        nonlocal ok
+        bunch = {
+            "bControl": 1 if want_open else 0,
+            "bOpen": 1 if want_open else 0,
+            "bClose": 0,
+            "bReliable": 1,
+            "chIndex": 0,
+            "chType": 1,
+            "chSeq": state["seq"],
+            "payload": payload,
+        }
+        dg = encode_packet(state["pid"], [bunch], 1280)
+        sock.sendto(dg, (host, port))
+        print(f"  -> {label}: pid={state['pid']} seq={state['seq']} payload={payload.hex()}")
+        state["pid"] += 1
+        state["seq"] += 1
+
+        payloads = []
+        decoded = []
+        packets = 0
+        deadline = time.time() + 1.0
+        quiet_since = None
+        while time.time() < deadline:
+            try:
+                resp, _ = sock.recvfrom(4096)
+            except socket.timeout:
+                if quiet_since is None:
+                    quiet_since = time.time()
+                if time.time() - quiet_since >= 0.15:
+                    break
+                continue
+            quiet_since = None
+            dec = decode_packet(resp, bd_max=SERVER_BD)
+            decoded.append(dec)
+            packets += 1
+            for b2 in dec.get("bunches", []):
+                if b2["payloadHex"]:
+                    payloads.append(b2["payloadHex"])
+            state["pid"], acknowledged = acknowledge_server_bunch_packet(
+                sock, (host, port), state["pid"], dec)
+            if acknowledged:
+                state["acked_server_packets"] += 1
+
+        if expect_prefix is not None:
+            wanted = expect_prefix.hex()
+            found = any(p.startswith(wanted) for p in payloads)
+            print(f"     {'OK' if found else 'FAIL'}: expected {wanted}, "
+                  f"received {packets} packet(s)")
+            if not found:
+                ok = False
+        else:
+            print(f"     received {packets} packet(s)")
+        return decoded
+
+    def complete_session(number):
+        state = {"pid": 0, "seq": 1, "acked_server_packets": 0}
+        print(f"\n  session {number}")
+        start_packets = exchange(
+            state, "HandshakeStart", bytes([0x1d, 0x01]), bytes([0x1e]), True)
+        exchange(state, "HandshakeResponse", bytes([0x1f, 0, 0, 0, 0]), bytes([0x20]))
+        exchange(state, "SteamLogin", bytes([0x10, 0, 0, 0]), bytes([0x11]))
+        join_packets = exchange(state, "Join", bytes([0x09]))
+
+        if number == 2:
+            # A new challenge alone could be a false-green if the old outbound
+            # assembler survived. Require the replacement connection's first
+            # response to restart both PacketId and reliable ch0 ChSequence.
+            reset_challenge = any(
+                d.get("pid") == 0 and
+                any(b["chIndex"] == 0 and b["chSeq"] == 1 and
+                    b["payloadHex"].startswith("1e")
+                    for b in d.get("bunches", []))
+                for d in start_packets)
+            opened = {
+                b["chIndex"] for d in join_packets for b in d.get("bunches", [])
+                if b["bOpen"] and b["chIndex"] >= 2
+            }
+            joined_again = 2 in opened
+            print(f"     replacement reset pid/ch0 sequence: "
+                  f"{'yes' if reset_challenge else 'NO'}")
+            print(f"     replacement Join opened owning PC ch2: "
+                  f"{'yes' if joined_again else 'NO'}")
+            if not reset_challenge or not joined_again:
+                ok = False
+        print(f"     acknowledged {state['acked_server_packets']} "
+              "server bunch packet(s)")
+        return state
+
+    print(f"reconnect: two sessions on one UDP endpoint against {host}:{port}")
+    complete_session(1)
+    # Do not close/rebind: keeping this socket is the key regression condition.
+    replacement = complete_session(2)
+    close_pid = replacement["pid"]
+    close_seq = replacement["seq"]
+    replacement["pid"], replacement["seq"] = send_graceful_control_close(
+        sock, (host, port), close_pid, close_seq)
+    print(f"  -> graceful replacement-session close: pid={close_pid} "
+          f"seq={close_seq}")
+    sock.close()
+
+    print("\n=== reconnect: " +
+          ("PASS - fresh same-endpoint session replaced Joined state"
+           if ok else "FAIL - second HandshakeStart was swallowed by stale state") + " ===")
+    return 0 if ok else 1
+
+# ----------------------------------------------------------------------------
 # Spawn mode: drive the FULL menu->spawn path as a UE3 client - handshake, Join,
-# SelectTeam(170), SelectRoleByClass(175) - and verify the server reacts by
-# opening the pawn channel (the role->spawn step). This validates our SEND path
-# for the spawn flow server-side WITHOUT the retail client: it confirms the server
-# emits a well-formed pawn open in response to the role RPC (and that the ack-storm
-# fix didn't regress it). It canNOT prove the real client possesses (no UE3 logic
-# here) - that still needs a real-client test - but it closes the loop on "does the
-# server do the right thing when the menu RPCs arrive". Inbound ch>=2 bunches are
-# dispatched directly to ConnectionManager::DecodeInboundActorBunch (no reassembly),
-# so a single well-formed reliable ch2 bunch carrying SerializeInt(handle, 531) is
-# enough to trigger SelectTeam/SelectRoleByClass. See docs/re/pawn_spawn_replication.md.
+# SelectTeam(170), SelectRoleByClass(175), ServerSetSpawnSelect(261), and
+# ServerSetReadyToSpawn(434) - then verify the server reacts by opening the pawn
+# channel and its loadout contract. This validates our SEND path server-side
+# WITHOUT the retail client, including capture-exact object references, camera,
+# and attachment deltas. It canNOT prove the real client renders the first-person
+# weapon mesh; that still needs a real-client test. Reliable sequence numbers are
+# channel-local in UE3, so control channel 0, actor channel 2, and the inventory
+# manager actor channel each start at sequence 1. Menu RPCs include their complete
+# parameter bodies; a bare SerializeInt(handle, 531) is not a valid role selection.
+# See docs/re/pawn_spawn_replication.md.
 # ----------------------------------------------------------------------------
 ROPC_MAXHANDLE = 531        # kRoPcMaxHandle - PlayerController ClassNetCache max handle
 SELECT_TEAM = 170           # ROPlayerController.SelectTeam(byte TeamID)
 SELECT_ROLE = 175           # ROPlayerController.SelectRoleByClass(...)
+SET_SPAWN = 261             # ROPlayerController.ServerSetSpawnSelect(byte)
+SET_READY = 434             # ROPlayerController.ServerSetReadyToSpawn(enum)
 BOOTSTRAP_CH_MAX = 140      # actor-bootstrap uses ch2..140; the pawn opens ABOVE this
+LOCAL_PAWN_CH = 209         # ConnectionManager::kLocalPawnChannel
+REMOTE_PARTICIPANT_FIRST_CH = 512
+REMOTE_PARTICIPANT_LAST_CH = 767
 
-def spawn(host, port):
+
+@dataclass(frozen=True)
+class SpawnTeamContract:
+    """Capture-pinned wire expectations for one owning faction graph."""
+
+    team_id: int
+    retail_team_id: int
+    label: str
+    role_payload_hex: str
+    pawn_class_ref: int
+    loadout_classes: tuple
+    weapon_chain: tuple
+    weapon_max_handles: tuple
+    attachments: tuple
+    attachment_payload_bits: int
+    attachment_payload_hex: str
+    current_attachment_class_ref: int
+    current_attachment_payload_hex: str
+    final_tail_bits: int
+    final_tail_hex: str
+    minimum_switch_best_weapon_count: int
+    north_graph: bool = False
+
+    @property
+    def loadout_class_map(self):
+        return dict(self.loadout_classes)
+
+    @property
+    def weapon_max_handle_map(self):
+        return dict(self.weapon_max_handles)
+
+    @property
+    def weapon_next_map(self):
+        return {
+            channel: (self.weapon_chain[index + 1]
+                      if index + 1 < len(self.weapon_chain) else 0)
+            for index, channel in enumerate(self.weapon_chain)
+        }
+
+
+SOUTH_SPAWN_TEAM = SpawnTeamContract(
+    team_id=1,
+    retail_team_id=1,
+    label="South/US",
+    role_payload_hex="af465c150080c301",
+    pawn_class_ref=286151,
+    loadout_classes=((210, 286374), (211, 286391), (212, 286464),
+                     (213, 286109), (214, 286389), (219, 82735)),
+    weapon_chain=(210, 211, 212, 213, 214),
+    weapon_max_handles=((210, 99), (211, 99), (212, 101),
+                        (213, 99), (214, 101)),
+    attachments=((0, 286936), (1, 286946), (2, 287063),
+                 (3, 286944), (5, 286126)),
+    attachment_payload_bits=245,
+    attachment_payload_hex=(
+        "a700608311004e03100723009c0a70154600381d001c8c00705a806b170100"),
+    current_attachment_class_ref=286936,
+    current_attachment_payload_hex="93b0c10800",
+    final_tail_bits=119,
+    final_tail_hex="1c7080eaca02040000000800000010",
+    minimum_switch_best_weapon_count=6,
+)
+
+NORTH_SPAWN_TEAM = SpawnTeamContract(
+    team_id=2,
+    retail_team_id=0,
+    label="North/NVA",
+    role_payload_hex="af4456150080c301",
+    pawn_class_ref=286147,
+    loadout_classes=((210, 286271), (212, 286804),
+                     (214, 286758), (219, 82735)),
+    weapon_chain=(210, 212, 214),
+    weapon_max_handles=((210, 99), (212, 101), (214, 101)),
+    attachments=((0, 286845), (2, 287188), (4, 287147)),
+    # Three 49-bit h167 records followed by h148 Encumbrance=9.92.
+    attachment_payload_bits=187,
+    attachment_payload_hex="a700f48111004e05a00e23009c12b01a4600a094c2f50802",
+    current_attachment_class_ref=286845,
+    current_attachment_payload_hex="93fac00800",
+    # Exact f63525 h28(false), h28(false), h390, h226, h101(false,true,false,false).
+    final_tail_bits=51,
+    final_tail_hex="1c7060585c1901",
+    minimum_switch_best_weapon_count=4,
+    north_graph=True,
+)
+
+SPAWN_TEAM_CONTRACTS = (SOUTH_SPAWN_TEAM, NORTH_SPAWN_TEAM)
+
+
+def resolve_spawn_team(team_id=1):
+    """Return the immutable faction contract; direct callers fail closed."""
+    if isinstance(team_id, bool) or not isinstance(team_id, int):
+        raise ValueError("team must be integer 1 (South) or 2 (North)")
+    for contract in SPAWN_TEAM_CONTRACTS:
+        if contract.team_id == team_id:
+            return contract
+    raise ValueError("team must be 1 (South) or 2 (North)")
+
+
+def build_team_selection_bits(team_id=1):
+    """Build SelectTeam(h170), converting server 1/2 to retail US/NVA 1/0."""
+    contract = resolve_spawn_team(team_id)
+    bits = sint_bits(SELECT_TEAM, ROPC_MAXHANDLE)
+    if contract.retail_team_id == 0:
+        return bits + [0]  # default byte is omitted by UE3's presence bit
+    return bits + [1] + [(contract.retail_team_id >> i) & 1 for i in range(8)]
+
+
+def build_role_selection_bits(team_id=1):
+    """Return the exact captured final h175+h451 role request for a faction."""
+    contract = resolve_spawn_team(team_id)
+    return packed_bits(contract.role_payload_hex, 57)
+
+def is_remote_participant_pawn_channel(channel):
+    """True for the odd pawn half of the connection-local PRI/pawn pool."""
+    return (isinstance(channel, int) and
+            REMOTE_PARTICIPANT_FIRST_CH <= channel <= REMOTE_PARTICIPANT_LAST_CH and
+            (channel - REMOTE_PARTICIPANT_FIRST_CH) % 2 == 1)
+
+
+def packet_starts_with_actor_rpc(packet, channel, handle, max_handle):
+    """Return whether any non-open bunch starts with the requested RPC.
+
+    This is intentionally a leading-handle probe, not a general UnrealScript
+    payload decoder.  It is sufficient for detecting the server's reliable
+    ChangedRole spawn-selection reopen without guessing at later parameters.
+    """
+    if not packet.get("ok"):
+        return False
+    for bunch in packet.get("bunches", []):
+        if (bunch.get("chIndex") != channel or bunch.get("bOpen") or
+                not bunch.get("payloadHex") or not bunch.get("bits")):
+            continue
+        reader = BitReader(bytes.fromhex(bunch["payloadHex"]), bunch["bits"])
+        decoded_handle = reader.rint(max_handle)
+        if not reader.error and decoded_handle == handle:
+            return True
+    return False
+
+def parse_channel_set(value):
+    try:
+        channels = {int(piece, 10) for piece in value.split(",") if piece.strip()}
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "channels must be comma-separated integers") from exc
+    if not channels or any(channel < 1 or channel >= 1024 for channel in channels):
+        raise argparse.ArgumentTypeError(
+            "channels must be a non-empty set of values from 1 through 1023")
+    return channels
+
+
+def parse_objective_mapping(value):
+    try:
+        mapping = [int(piece, 10) for piece in value.split(",")
+                   if piece.strip()]
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "objective mapping must be comma-separated integers") from exc
+    if (not mapping or len(mapping) > 16 or
+            any(index < 0 or index > 255 for index in mapping) or
+            len(set(mapping)) != len(mapping)):
+        raise argparse.ArgumentTypeError(
+            "objective mapping must contain 1-16 unique byte values")
+    return mapping
+
+
+SPAWN_PROFILES = {
+    # Resort uses the capture-replayed actor bootstrap; the experimental map
+    # profiles use SendLiveActorBootstrap's grounded PC/GRI/TeamInfo/PRI channels.
+    "resort": ((0, 1, 2, 3, 4), 54, frozenset({2, 21, 26, 54, 56, 76})),
+    # Exact cooked ROObjective replication indices from
+    # data/maps/VNTE-CuChi/objectives.txt, ordered by client slot 0..6.
+    "cu-chi": ((2, 3, 4, 7, 5, 10, 9), 3,
+                frozenset({2, 3, 4, 5, 26})),
+    "hue-city": ((1, 2, 3, 4, 5, 6), 3, frozenset({2, 3, 4, 5, 26})),
+    "compound": ((1, 2, 3), 3, frozenset({2, 3, 4, 5, 26})),
+}
+
+
+OBJECTIVE_GRI_MAX_HANDLE = 184
+OBJECTIVE_GRI_INT_ARRAY_HANDLES = frozenset({37, 38, 46})
+OBJECTIVE_GRI_INT32_HANDLES = frozenset({25, 27, 28, 29, 39, 40, 41, 47, 48, 67})
+OBJECTIVE_GRI_BOOL_HANDLES = frozenset({31, 32, 100, 114, 116, 117})
+OBJECTIVE_GRI_BYTE_HANDLES = frozenset({126, 143})
+OBJECTIVE_GRI_BYTE_ARRAY_HANDLES = frozenset({129, 174, 175, 176, 177, 178, 179})
+
+
+def decode_objective_gri_payload(data, nbits):
+    """Decode the objective-related fields authored on ROGameReplicationInfo.
+
+    Unknown handles stop decoding without guessing their value layout. Callers
+    must require ``complete`` before merging the result so a truncated or newer
+    payload cannot make the spawn validator claim a partial baseline is valid.
+    """
+    empty = {
+        "ok": False,
+        "complete": False,
+        "fields": {},
+        "scalars": {},
+        "unknown_handle": None,
+    }
+    if (not isinstance(data, (bytes, bytearray)) or
+            isinstance(nbits, bool) or not isinstance(nbits, int) or
+            nbits < 0 or nbits > len(data) * 8):
+        return empty
+
+    reader = BitReader(bytes(data), nbits)
+    fields = {}
+    scalars = {}
+    unknown_handle = None
+
+    def read_int32():
+        raw = reader.ru(32)
+        if raw & 0x80000000:
+            return raw - 0x100000000
+        return raw
+
+    while reader.p < reader.n and not reader.error:
+        handle = reader.rint(OBJECTIVE_GRI_MAX_HANDLE)
+        if reader.error:
+            break
+
+        if handle in OBJECTIVE_GRI_INT_ARRAY_HANDLES:
+            slot = reader.ru(8)
+            value = read_int32()
+            if not reader.error:
+                fields[(handle, slot)] = value
+        elif handle in OBJECTIVE_GRI_INT32_HANDLES:
+            value = read_int32()
+            if not reader.error:
+                scalars[handle] = value
+        elif handle in OBJECTIVE_GRI_BOOL_HANDLES:
+            value = bool(reader.bit())
+            if not reader.error:
+                scalars[handle] = value
+        elif handle == 124:
+            slot = reader.ru(8)
+            value = tuple(reader.ru(8) for _ in range(4))
+            if not reader.error:
+                fields[(handle, slot)] = value
+        elif handle in OBJECTIVE_GRI_BYTE_HANDLES:
+            value = reader.ru(8)
+            if not reader.error:
+                scalars[handle] = value
+        elif handle in OBJECTIVE_GRI_BYTE_ARRAY_HANDLES:
+            slot = reader.ru(8)
+            value = reader.ru(8)
+            if not reader.error:
+                fields[(handle, slot)] = value
+        else:
+            unknown_handle = handle
+            break
+
+    ok = not reader.error
+    complete = ok and unknown_handle is None and reader.p == reader.n
+    return {
+        "ok": ok,
+        "complete": complete,
+        "fields": fields,
+        "scalars": scalars,
+        "unknown_handle": unknown_handle,
+    }
+
+
+def resolve_spawn_profile(profile="resort", expected_objectives=None,
+                          objective_mapping=None, gri_channel=None,
+                          menu_channels=None):
+    """Resolve immutable profile defaults plus explicit CLI overrides."""
+    if profile not in SPAWN_PROFILES:
+        raise ValueError(f"unknown spawn profile: {profile}")
+    profile_mapping, profile_gri, profile_menu = SPAWN_PROFILES[profile]
+
+    if objective_mapping is not None:
+        mapping = list(objective_mapping)
+    elif expected_objectives is not None:
+        if expected_objectives < 1 or expected_objectives > 16:
+            raise ValueError("--expected-objectives must be between 1 and 16")
+        mapping = list(range(expected_objectives))
+    else:
+        mapping = list(profile_mapping)
+
+    if (not mapping or len(mapping) > 16 or
+            any(index < 0 or index > 255 for index in mapping) or
+            len(set(mapping)) != len(mapping)):
+        raise ValueError(
+            "objective mapping must contain 1-16 unique byte values")
+
+    resolved_gri = profile_gri if gri_channel is None else gri_channel
+    resolved_menu = set(profile_menu if menu_channels is None else menu_channels)
+    if resolved_gri < 1 or resolved_gri >= 1024:
+        raise ValueError("--gri-channel must be between 1 and 1023")
+    if (not resolved_menu or
+            any(channel < 1 or channel >= 1024 for channel in resolved_menu)):
+        raise ValueError(
+            "--menu-channels must contain values from 1 through 1023")
+    if resolved_gri not in resolved_menu:
+        raise ValueError("--gri-channel must be included in --menu-channels")
+    return mapping, resolved_gri, resolved_menu
+
+
+def spawn(host, port, deployment_wait, expected_objective_values,
+          gri_channel, menu_bootstrap_channels, linger=0.0, team=1):
+    team_contract = resolve_spawn_team(team)
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.settimeout(1.5)
     SERVER_BD = 1500 * 8
-    state = {"seq": 1, "pid": 0}
+    state = {"control_seq": 1, "actor_seq": 1, "pid": 0}
+    seen_empty_keepalives = 0
+    acked_server_packets = 0
+
+    def receive_until(seconds, stop_predicate=None, quiet=False):
+        nonlocal seen_empty_keepalives, acked_server_packets
+        got = []
+        empty_keepalives = 0
+        deadline = time.monotonic() + seconds
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            sock.settimeout(remaining)
+            try:
+                resp, _ = sock.recvfrom(4096)
+                dec = decode_packet(resp, bd_max=SERVER_BD)
+                if not quiet:
+                    got.append(dec)
+                if (dec.get("ok") and not dec.get("acks") and
+                        not dec.get("bunches")):
+                    empty_keepalives += 1
+                # Retire every server packet that delivered bunch data. Pure ACK
+                # and empty keepalive packets are intentionally not ACKed, matching
+                # UE3 and avoiding an ACK-of-ACK ping-pong. Without these ACKs the
+                # mock itself creates a reliable retransmission storm, so the server
+                # never reaches the idle interval this gate is meant to validate.
+                state["pid"], acknowledged = acknowledge_server_bunch_packet(
+                    sock, (host, port), state["pid"], dec)
+                if acknowledged:
+                    acked_server_packets += 1
+                if stop_predicate is not None and stop_predicate(dec):
+                    break
+            except socket.timeout:
+                break
+        sock.settimeout(1.5)
+        seen_empty_keepalives += empty_keepalives
+        if not quiet:
+            for d in got:
+                print(f"     <- {fmt_packet(d)}")
+        return got
 
     def send_recv(name, bunch):
-        dg = encode_packet(state["pid"], [bunch], 2048)
+        dg = encode_packet(state["pid"], [bunch], 1280)
         sock.sendto(dg, (host, port))
         print(f"  -> {name}: pid={state['pid']} seq={bunch.get('chSeq')}")
         state["pid"] += 1
-        got = []
-        try:
-            while True:
-                resp, _ = sock.recvfrom(4096)
-                got.append(decode_packet(resp, bd_max=SERVER_BD))
-        except socket.timeout:
-            pass
-        for d in got:
-            print(f"     <- {fmt_packet(d)}")
-        return got
+        # A healthy server now sends an empty UE3 transport packet every second.
+        # Bound collection by elapsed time instead of waiting for socket silence,
+        # otherwise that keepalive makes this validation harness wait forever.
+        return receive_until(1.75)
 
     def hs(name, payload, want_open=False):
         b = {"bControl": 1 if want_open else 0, "bOpen": 1 if want_open else 0,
              "bClose": 0, "bReliable": 1, "chIndex": 0, "chType": 1,
-             "chSeq": state["seq"], "payload": payload}
+             "chSeq": state["control_seq"], "payload": payload}
         got = send_recv(name, b)
-        state["seq"] += 1
+        state["control_seq"] += 1
         return got
 
     def ch2_rpc(name, bits_payload):
         b = {"bControl": 0, "bOpen": 0, "bClose": 0, "bReliable": 1,
-             "chIndex": 2, "chType": 2, "chSeq": state["seq"], "bits_payload": bits_payload}
+             "chIndex": 2, "chType": 2, "chSeq": state["actor_seq"],
+             "bits_payload": bits_payload}
         got = send_recv(name, b)
-        state["seq"] += 1
+        state["actor_seq"] += 1
         return got
 
-    print(f"spawn: drive menu->spawn against {host}:{port}\n")
+    def actor_rpc(name, channel, sequence, bits_payload):
+        b = {"bControl": 0, "bOpen": 0, "bClose": 0, "bReliable": 1,
+             "chIndex": channel, "chType": 2, "chSeq": sequence,
+             "bits_payload": bits_payload}
+        return send_recv(name, b)
+
+    print(f"spawn: drive {team_contract.label} menu->spawn against {host}:{port}\n")
     # 1-4. Handshake -> Join (same sequence react validates).
     hs("HandshakeStart 0x1d", bytes([0x1d, 0x01]), want_open=True)
     hs("HandshakeResponse 0x1f", bytes([0x1f, 0x00, 0x00, 0x00, 0x00]))
@@ -462,60 +1017,642 @@ def spawn(host, port):
     boot = sorted({b2["chIndex"] for d in join_got for b2 in d.get("bunches", [])
                    if b2["chIndex"] >= 2 and b2["bOpen"]})
     print(f"     bootstrap opened {len(boot)} actor channels (ch{boot[0] if boot else '-'}..{boot[-1] if boot else '-'})\n")
+    stale_world_chans = sorted(set(boot) - menu_bootstrap_channels)
+
+    # The retail objective HUD is populated by ROGameReplicationInfo array
+    # properties (captured Resort ch54; live-profile ch3), not the emulator's
+    # legacy OBJECTIVE_UPDATE packet. Decode the reliable post-open baseline and
+    # require the requested identity slot map.
+    objective_fields = {}
+    objective_overview_enabled = False
+    match_has_begun = None
+    stop_countdown = None
+    objective_payloads_complete = True
+    for d in join_got:
+        for b2 in d.get("bunches", []):
+            if (b2["chIndex"] != gri_channel or b2["bOpen"] or
+                    not b2["payloadHex"]):
+                continue
+            decoded = decode_objective_gri_payload(
+                bytes.fromhex(b2["payloadHex"]), b2["bits"])
+            if not decoded["complete"]:
+                objective_payloads_complete = False
+                continue
+            objective_fields.update(decoded["fields"])
+            scalars = decoded["scalars"]
+            if 31 in scalars:
+                match_has_begun = scalars[31]
+            if 32 in scalars:
+                stop_countdown = scalars[32]
+            if 100 in scalars:
+                objective_overview_enabled = not scalars[100]
+    expected_objective_mapping = {
+        slot: value for slot, value in enumerate(expected_objective_values)
+    }
+    objective_mapping = {
+        slot: objective_fields.get((179, slot))
+        for slot in range(len(expected_objective_values))
+    }
+    has_objective_baseline = (objective_payloads_complete and
+                              objective_overview_enabled and
+                              objective_mapping == expected_objective_mapping and all(
+        (178, slot) in objective_fields
+        for slot in range(len(expected_objective_values))))
+    print(f"     objective GRI baseline ch{gri_channel}: mapping={objective_mapping}, "
+          f"overview={'enabled' if objective_overview_enabled else 'DISABLED'}, "
+          f"status={'yes' if has_objective_baseline else 'NO'}, "
+          f"active-match={'yes' if match_has_begun is True and stop_countdown is False else 'not-published'}\n")
 
     # 5. SelectTeam(byte TeamID): SerializeInt(170,531) + Send presence bit(1) + TeamID byte.
-    team_bits = sint_bits(SELECT_TEAM, ROPC_MAXHANDLE) + [1] + [(1 >> i) & 1 for i in range(8)]
-    team_got = ch2_rpc("SelectTeam(170, TeamID=1)", team_bits)
+    team_bits = build_team_selection_bits(team_contract.team_id)
+    team_got = ch2_rpc(
+        f"SelectTeam(170, retail={team_contract.retail_team_id}, "
+        f"server={team_contract.team_id})", team_bits)
 
-    # 6. SelectRoleByClass: SerializeInt(175,531). No params needed - the server spawns the
-    #    pawn on the first handle-175 after team-select (cs.teamSelected && !cs.spawned).
-    role_got = ch2_rpc("SelectRoleByClass(175)", sint_bits(SELECT_ROLE, ROPC_MAXHANDLE))
+    # 6. Pick a role and request deployment. This is a retail-captured, semantically
+    # complete h175 payload whose final optional bCloseMenu bit is true. A bare handle
+    # is not a valid SelectRoleByClass call and must not authorize an early spawn.
+    # Exact retail final role request: capture frame 2533 ch2 seq31. h175
+    # consumes 48 bits (default WeaponSelection, bCloseMenu=true), followed by
+    # the captured no-parameter h451 ServerAutoSelectSquad tail.
+    final_role_payload = build_role_selection_bits(team_contract.team_id)
+    role_got = ch2_rpc(
+        f"SelectRoleByClass(175,{team_contract.label},bCloseMenu=true)",
+        final_role_payload)
+
+    # 7. Select the first normal spawn-list slot. The UI encodes normal TeamInfo
+    # array slots as 128+slot, and RPC byte parameters carry a presence bit.
+    spawn_bits = (sint_bits(SET_SPAWN, ROPC_MAXHANDLE) + [1] +
+                  [(128 >> i) & 1 for i in range(8)])
+    select_got = ch2_rpc("ServerSetSpawnSelect(261, slot=0)", spawn_bits)
+
+    # 8. Ready is enum value zero, so UE3 emits only the false parameter-presence
+    # bit and the UnrealScript default supplies Ready. Once the round is active
+    # (or the preparation countdown reaches its final deployment window), this
+    # authorizes the selected slot exactly once.
+    ready_bits = sint_bits(SET_READY, ROPC_MAXHANDLE) + [0]
+    ready_got = ch2_rpc("ServerSetReadyToSpawn(434, Ready)", ready_bits)
+
+    # A fresh Territories server intentionally queues Ready until the stock
+    # preparation clock enters its final eight-second window. Keep the mock
+    # connected and ACKing server traffic so that the asynchronous pawn/loadout
+    # transition can be validated instead of reporting a false failure merely
+    # because the test reached h434 before the deployment threshold.
+    def packet_opens_local_pawn(packet):
+        return any(b2.get("chIndex") == LOCAL_PAWN_CH and b2.get("bOpen")
+                   for b2 in packet.get("bunches", []))
+
+    def packet_reopens_spawn_selection(packet):
+        return packet_starts_with_actor_rpc(
+            packet, 2, 210, ROPC_MAXHANDLE)  # ChangedRole(..., showSpawnSelect=true)
+
+    deferred_got = []
+    latest_deployment_got = ready_got
+    deployment_deadline = time.monotonic() + deployment_wait
+    reselection_attempts = 0
+    announced_wait = False
+    while not any(packet_opens_local_pawn(d) for d in latest_deployment_got):
+        # Territory can advance after h261 but before h434.  The server then
+        # reopens the retail selection scene with a fresh, phase-correct list.
+        # Follow that explicit ChangedRole transition instead of timing out on
+        # the stale slot; bound retries so a broken server cannot spin the tool.
+        if any(packet_reopens_spawn_selection(d)
+               for d in latest_deployment_got):
+            if reselection_attempts >= 3:
+                print("  !! spawn selection reopened more than three times; stopping retries")
+                break
+            reselection_attempts += 1
+            print(f"  .. spawn list changed; reselecting slot 0 "
+                  f"(attempt {reselection_attempts}/3)")
+            retry_select = ch2_rpc(
+                "ServerSetSpawnSelect(261, slot=0, refreshed)", spawn_bits)
+            retry_ready = ch2_rpc(
+                "ServerSetReadyToSpawn(434, Ready, refreshed)", ready_bits)
+            deferred_got += retry_select + retry_ready
+            latest_deployment_got = retry_select + retry_ready
+            continue
+
+        remaining = deployment_deadline - time.monotonic()
+        if remaining <= 0.0:
+            break
+        if not announced_wait:
+            print(f"  .. awaiting preparation deployment window "
+                  f"(up to {deployment_wait:.1f}s)")
+            announced_wait = True
+        latest_deployment_got = receive_until(
+            remaining,
+            lambda packet: (packet_opens_local_pawn(packet) or
+                            packet_reopens_spawn_selection(packet)))
+        deferred_got += latest_deployment_got
+        if not latest_deployment_got:
+            break
+
+    if any(packet_opens_local_pawn(d)
+           for d in ready_got + deferred_got):
+        # Drain the rest of the burst; pawn, inventory and camera state can
+        # span several datagrams after the first pawn-channel open.
+        deferred_got += receive_until(1.0)
+
+    # 9. Exercise UE3's recovery request too. A correct server answers AskForPawn with
+    # GivePawn(NewPawn), using the same presence bit + dynamic actor ref as ClientRestart.
+    ask_got = ch2_rpc("AskForPawn(42)", sint_bits(42, ROPC_MAXHANDLE))
+
+    # Confirm the weapon selected by ClientSwitchToBestWeapon. This is the
+    # capture-pinned ROInventoryManager h25 shape from f27397. Then clear it on
+    # the next reliable manager sequence so the mock verifies both h147 forms.
+    # Never target an unopened actor channel after a failed deployment: the
+    # server correctly rejects it, but the resulting warning obscures the actual
+    # role/spawn failure this harness is meant to report.
+    pawn_graph_opened = any(
+        packet_opens_local_pawn(packet)
+        for packet in ready_got + deferred_got + ask_got)
+    weapon_select_got = []
+    weapon_clear_got = []
+    if pawn_graph_opened:
+        select_weapon_bits = (sint_bits(25, 34) + [1, 1] +
+                              sint_bits(210, 1024))
+        weapon_select_got = actor_rpc(
+            "ServerSetCurrentWeapon(219,h25,ch210)", 219, 1,
+            select_weapon_bits)
+        weapon_clear_got = actor_rpc(
+            "ServerSetCurrentWeapon(219,h25,None)", 219, 2,
+            sint_bits(25, 34) + [0])
+    else:
+        print("  .. pawn graph did not open; skipping ch219 weapon RPC probes")
 
     # The pawn-spawn opens a FRESH channel above the bootstrap range (kPawnCh=209).
-    after = team_got + role_got
+    after = (team_got + role_got + select_got + ready_got + deferred_got + ask_got +
+             weapon_select_got + weapon_clear_got)
     pawn_opens = sorted({b2["chIndex"] for d in after for b2 in d.get("bunches", [])
                          if b2["chIndex"] > BOOTSTRAP_CH_MAX and b2["bOpen"]})
+    # Participant actor pairs are allocated as PRI=512+2N, pawn=513+2N. PRI
+    # opens are independently grounded and expected; odd pawn channels must
+    # remain absent until the full role/class templates are capture-backed.
+    remote_pawn_opens = [
+        channel for channel in pawn_opens
+        if is_remote_participant_pawn_channel(channel)
+    ]
+    expected_owning_channels = {LOCAL_PAWN_CH} | set(
+        team_contract.loadout_class_map)
+    owning_graph_opens = {
+        channel for channel in pawn_opens if LOCAL_PAWN_CH <= channel <= 219
+    }
+    unexpected_owning_opens = sorted(
+        owning_graph_opens - expected_owning_channels)
     # Count standalone ack-only datagrams (no bunches) - should be coalesced (few), not a storm.
     ack_only = sum(1 for d in after if d.get("ok") and not d.get("bunches") and d.get("acks"))
     bunch_pkts = sum(1 for d in after if d.get("bunches"))
 
-    # Possession RPCs on ch2 (server->client): ClientRestart (h85) is the RPC that makes the client
-    # accept the pawn + leave the menu; PC.Pawn (h24) points the controller at the pawn channel.
-    # Their first payload byte is SerializeInt(handle, 531)'s low byte, which equals the handle for
-    # handle < 128 (85 -> 0x55, 24 -> 0x18). Requiring ClientRestart makes this gate verify the full
-    # possession SEQUENCE (open + possess), not just that a channel opened.
-    ch2_nmts = {b2["nmt"] for d in after for b2 in d.get("bunches", []) if b2["chIndex"] == 2 and b2["nmt"] is not None}
-    has_client_restart = 0x55 in ch2_nmts   # ClientRestart(h85) - the possession trigger
-    has_pc_pawn        = 0x18 in ch2_nmts    # PlayerController.Pawn(h24) -> pawn channel
+    def fields_on(channel, max_handle):
+        for d in after:
+            for b2 in d.get("bunches", []):
+                if b2["chIndex"] != channel or b2["bOpen"] or not b2["payloadHex"]:
+                    continue
+                br = BitReader(bytes.fromhex(b2["payloadHex"]), b2["bits"])
+                handle = br.rint(max_handle)
+                yield handle, br, b2
+
+    def read_dynamic_ref(br):
+        dynamic = bool(br.bit())
+        index = br.rint(1024 if dynamic else 0x80000000)
+        return dynamic, index
+
+    expected_loadout_classes = team_contract.loadout_class_map
+    loadout_open_classes = {}
+    pawn_open_class = None
+    for d in after:
+        for b2 in d.get("bunches", []):
+            if (not b2["bOpen"] or
+                    b2["chIndex"] not in
+                    (set(expected_loadout_classes) | {LOCAL_PAWN_CH}) or
+                    not b2["payloadHex"]):
+                continue
+            br = BitReader(bytes.fromhex(b2["payloadHex"]), b2["bits"])
+            dynamic, class_ref = read_dynamic_ref(br)
+            if not br.error and not dynamic:
+                if b2["chIndex"] == LOCAL_PAWN_CH:
+                    pawn_open_class = class_ref
+                else:
+                    loadout_open_classes[b2["chIndex"]] = class_ref
+    has_exact_pawn_class = pawn_open_class == team_contract.pawn_class_ref
+    has_exact_loadout_classes = loadout_open_classes == expected_loadout_classes
+
+    # Decode the actual values, not just each payload's first byte. The old gate gave
+    # a false PASS to fixed-width literals whose handle looked right but whose presence/
+    # selector bit decoded NewPawn as None or a bogus static object.
+    has_pc_pawn = False
+    has_client_restart = False
+    has_give_pawn = False
+    has_client_on_possess = False
+    has_changed_role = False
+    has_view_target = False
+    has_controller_view_target = False
+    has_camera_reset = False
+    has_exact_camera_tail = False
+    has_first_person = False
+    has_zero_spawn_penalty = False
+    has_alive_state = False
+    has_switch_best_weapon = False
+    switch_best_weapon_count = 0
+    saw_hud_h392 = False
+    has_north_rotation = False
+    has_north_collide_world_false = False
+    has_north_respawn_sentinel = False
+    has_north_spawned_rpc = False
+    has_north_hide_round_start_rpc = False
+    has_north_cinematic_tail = False
+    has_exact_north_role_transition = any(
+        b2["chIndex"] == 2 and not b2["bOpen"] and
+        b2.get("bReliable") and b2["bits"] == 48 and
+        b2["payloadHex"].lower() == "d2fe735a8103"
+        for d in after for b2 in d.get("bunches", [])
+        if b2.get("payloadHex"))
+    has_exact_north_post_delta = any(
+        b2["chIndex"] == 2 and not b2["bOpen"] and
+        not b2.get("bReliable") and b2["bits"] == 72 and
+        b2["payloadHex"].lower() == "11c0301a9e7f969800"
+        for d in after for b2 in d.get("bunches", [])
+        if b2.get("payloadHex"))
+    # Walk every field in each ch2 bunch. Retail combines h85/h87/h61/h265/h150/h151
+    # into ONE reliable payload, so checking only byte zero/first handle would miss most
+    # of the transition and recreate the old false-green spawn gate.
+    for d in after:
+        for b2 in d.get("bunches", []):
+            if b2["chIndex"] != 2 or b2["bOpen"] or not b2["payloadHex"]:
+                continue
+            has_exact_camera_tail |= (
+                bool(b2.get("bReliable")) and
+                b2["bits"] == team_contract.final_tail_bits and
+                b2["payloadHex"].lower() == team_contract.final_tail_hex)
+            br = BitReader(bytes.fromhex(b2["payloadHex"]), b2["bits"])
+            while br.p < br.n and not br.error:
+                handle = br.rint(ROPC_MAXHANDLE)
+                if handle == 24:
+                    dyn, idx = read_dynamic_ref(br)
+                    has_pc_pawn |= dyn and idx == LOCAL_PAWN_CH and not br.error
+                elif handle == 28:  # ClientSwitchToBestWeapon(optional bool)
+                    valid_switch = br.bit() == 0 and not br.error
+                    has_switch_best_weapon |= valid_switch
+                    switch_best_weapon_count += int(valid_switch)
+                elif handle in (43, 85, 150):
+                    present = bool(br.bit())
+                    dyn, idx = read_dynamic_ref(br) if present else (False, 0)
+                    valid = present and dyn and idx == LOCAL_PAWN_CH and not br.error
+                    has_give_pawn |= handle == 43 and valid
+                    has_client_restart |= handle == 85 and valid
+                    has_client_on_possess |= handle == 150 and valid
+                elif handle == 87:  # ClientSetViewTarget(Pawn, TransitionParams)
+                    present = bool(br.bit())
+                    dyn, idx = read_dynamic_ref(br) if present else (False, 0)
+                    transition_present = bool(br.bit())
+                    if transition_present:
+                        blend_time = br.ru(32)
+                        blend_function = br.rint(6)
+                        blend_exp = br.ru(32)
+                        lock_outgoing = br.bit()
+                        valid_transition = (present and dyn and blend_time == 0 and
+                                            blend_function == 1 and
+                                            blend_exp == 0x40000000 and
+                                            lock_outgoing == 0 and not br.error)
+                        has_view_target |= valid_transition and idx == LOCAL_PAWN_CH
+                        has_controller_view_target |= valid_transition and idx == 2
+                elif handle == 61:  # ClientSetCameraMode(FName)
+                    present = bool(br.bit())
+                    hardcoded = bool(br.bit()) if present else False
+                    name = ""
+                    number = -1
+                    if present and not hardcoded:
+                        length = br.ru(32)
+                        raw = bytes(br.ru(8) for _ in range(length)) if length <= 256 else b""
+                        number = br.ru(32)
+                        name = raw.rstrip(b"\x00").decode("ascii", errors="replace")
+                    has_first_person |= (present and not hardcoded and name == "FirstPerson" and
+                                         number == 0 and not br.error)
+                elif handle == 265:  # SetHUDSpawnPenalty(int); zero is omitted/default
+                    present = bool(br.bit())
+                    penalty = br.ru(32) if present else 0
+                    has_zero_spawn_penalty |= penalty == 0 and not br.error
+                elif handle == 151:  # ClientOnDead(bool), no presence bit for bool params
+                    has_alive_state |= br.bit() == 0 and not br.error
+                elif handle == 17:  # Actor.bCollideWorld property
+                    has_north_collide_world_false |= br.bit() == 0 and not br.error
+                elif handle == 26:  # ClientSetRotation(rotator, bResetCamera)
+                    present = bool(br.bit())
+                    if present:
+                        pitch = br.ru(8) << 8 if br.bit() else 0
+                        yaw = br.ru(8) << 8 if br.bit() else 0
+                        roll = br.ru(8) << 8 if br.bit() else 0
+                    else:
+                        pitch = yaw = roll = 0
+                    reset_camera = bool(br.bit())
+                    has_north_rotation |= (present and pitch == 0 and yaw == 40960 and
+                                           roll == 0 and reset_camera and not br.error)
+                elif handle == 168:  # ClientCameraReset(), no params
+                    has_camera_reset = not br.error
+                elif handle == 226:  # ClientHideRoundStartScreen(), no params
+                    has_north_hide_round_start_rpc = not br.error
+                elif handle == 316:  # NextRespawnTime property
+                    raw = br.ru(32)
+                    respawn_time = raw - 0x100000000 if raw & 0x80000000 else raw
+                    has_north_respawn_sentinel |= respawn_time == 9999999 and not br.error
+                elif handle == 390:  # ClientSpawned(), no params
+                    has_north_spawned_rpc = not br.error
+                elif handle == 392:  # ShowInitialWorldWidget(), no params
+                    saw_hud_h392 = not br.error
+                elif handle == 101:  # ClientSetCinematicMode(bool,bool,bool,bool)
+                    cinematic = bool(br.bit())
+                    movement = bool(br.bit())
+                    turning = bool(br.bit())
+                    hud = bool(br.bit())
+                    has_north_cinematic_tail |= (
+                        not cinematic and movement and not turning and not hud and
+                        not br.error)
+                elif handle == 210:  # ChangedRole(byte, byte, bool, bool)
+                    squad_present = bool(br.bit())
+                    squad = br.ru(8) if squad_present else 0
+                    class_present = bool(br.bit())
+                    class_index = br.ru(8) if class_present else 0
+                    show_lobby = bool(br.bit())
+                    show_spawn = bool(br.bit())
+                    has_changed_role |= (squad == 255 and class_index == 0 and
+                                         not show_lobby and show_spawn and not br.error)
+                else:
+                    # This gate only authors/understands the spawn transition fields.
+                    # Stop this bunch rather than guessing an unknown parameter layout.
+                    break
+
+    has_pawn_controller = False
+    has_pawn_pri = False
+    has_pawn_inv_manager = False
+    has_client_possessed = False
+    for handle, br, _ in fields_on(LOCAL_PAWN_CH, 168):
+        has_client_possessed |= handle == 57 and not br.error
+        if handle in (27, 32, 52):
+            dyn, idx = read_dynamic_ref(br)
+            has_pawn_inv_manager |= handle == 27 and dyn and idx == 219 and not br.error
+            has_pawn_pri |= handle == 32 and dyn and idx == 26 and not br.error
+            has_pawn_controller |= handle == 52 and dyn and idx == 2 and not br.error
+
+    has_attachment_list = any(
+        b2["chIndex"] == LOCAL_PAWN_CH and not b2["bOpen"] and
+        not b2.get("bReliable") and
+        b2["bits"] == team_contract.attachment_payload_bits and
+        b2["payloadHex"].lower() == team_contract.attachment_payload_hex
+        for d in after for b2 in d.get("bunches", [])
+        if b2.get("payloadHex"))
+    current_attachment_refs = set()
+    has_exact_current_attachment = False
+    for handle, br, b2 in fields_on(LOCAL_PAWN_CH, 168):
+        if handle != 147:
+            continue
+        dynamic, attachment_ref = read_dynamic_ref(br)
+        if not br.error:
+            current_attachment_refs.add((dynamic, attachment_ref))
+        has_exact_current_attachment |= (
+            not b2.get("bReliable") and b2["bits"] == 40 and
+            b2["payloadHex"].lower() ==
+            team_contract.current_attachment_payload_hex)
+    has_attachment_clear = (True, 0) in current_attachment_refs
+
+    expected_weapon_next = team_contract.weapon_next_map
+    weapon_max_handle = team_contract.weapon_max_handle_map
+    linked_weapons = set()
+    for weapon_ch, next_ch in expected_weapon_next.items():
+        max_handle = weapon_max_handle[weapon_ch]
+        for handle, br, _ in fields_on(weapon_ch, max_handle):
+            if handle != 23:
+                continue
+            dyn_manager, manager_ch = read_dynamic_ref(br)
+            dyn_next, decoded_next = True, 0
+            next_handle = br.rint(max_handle)
+            if next_ch != 0:
+                if br.error or next_handle != 24:
+                    continue
+                dyn_next, decoded_next = read_dynamic_ref(br)
+                next_handle = br.rint(max_handle)
+            if br.error or next_handle != 25 or not br.bit():
+                continue
+            dyn_owner, owner_ch = read_dynamic_ref(br)
+            do_not_activate = br.bit()
+            if (not br.error and dyn_manager and manager_ch == 219 and dyn_next and
+                    decoded_next == next_ch and dyn_owner and owner_ch == LOCAL_PAWN_CH and
+                    do_not_activate == 0):
+                linked_weapons.add(weapon_ch)
+            break
 
     print()
     print(f"     pawn channel opens (>ch{BOOTSTRAP_CH_MAX}) after role-select: {pawn_opens}")
-    print(f"     possession RPCs on ch2: ClientRestart(h85)={'yes' if has_client_restart else 'NO'}, "
-          f"PC.Pawn(h24)={'yes' if has_pc_pawn else 'NO'}")
+    print(f"     ungrounded remote pawn opens: {remote_pawn_opens or 'none'}")
+    print(f"     owning graph: {team_contract.label} pawn class="
+          f"{pawn_open_class if pawn_open_class is not None else 'missing'} "
+          f"({'exact' if has_exact_pawn_class else 'WRONG'}), "
+          f"unexpected stable channels={unexpected_owning_opens or 'none'}")
+    print(f"     pawn back-refs: Controller(h52)->ch2={'yes' if has_pawn_controller else 'NO'}, "
+          f"PRI(h32)->ch26={'yes' if has_pawn_pri else 'NO'}, "
+          f"InvManager(h27)->ch219={'yes' if has_pawn_inv_manager else 'NO'}, "
+          f"ClientPossessed(h57)={'yes' if has_client_possessed else 'NO'}")
+    print(f"     possession fields: PC.Pawn(h24)->ch{LOCAL_PAWN_CH}={'yes' if has_pc_pawn else 'NO'}, "
+          f"ClientRestart(h85)={'yes' if has_client_restart else 'NO'}, "
+          f"ClientOnPossess(h150)={'yes' if has_client_on_possess else 'NO'}, "
+          f"GivePawn(h43 recovery)={'yes' if has_give_pawn else 'NO'}")
+    print(f"     UI/camera transition: ChangedRole(h210)={'yes' if has_changed_role else 'NO'}, "
+          f"InitialViewTarget(h87)->pawn={'yes' if has_view_target else 'NO'}, "
+          f"FactionTail({team_contract.final_tail_bits}b)={'yes' if has_exact_camera_tail else 'NO'}, "
+          f"FirstPerson(h61)={'yes' if has_first_person else 'NO'}, "
+          f"SpawnPenalty0(h265)={'yes' if has_zero_spawn_penalty else 'NO'}, "
+          f"Alive(h151)={'yes' if has_alive_state else 'NO'}, "
+          f"ForbiddenHUD(h392)={'PRESENT' if saw_hud_h392 else 'absent'}")
+    loadout_channels = set(expected_loadout_classes)
+    loadout_opens = sorted(set(pawn_opens) & loadout_channels)
+    print(f"     loadout actors: {loadout_opens}; "
+          f"classes={'exact' if has_exact_loadout_classes else loadout_open_classes}; "
+          f"linked={sorted(linked_weapons)}; "
+          f"ClientSwitchToBestWeapon(h28)={switch_best_weapon_count}x")
+    print(f"     attachment state: h167-list={'yes' if has_attachment_list else 'NO'}, "
+          f"h147-current({team_contract.current_attachment_class_ref})="
+          f"{'yes' if has_exact_current_attachment else 'NO'}, "
+          f"h147-clear={'yes' if has_attachment_clear else 'NO'}")
+    if team_contract.north_graph:
+        print(f"     North capture state: h210+h211="
+              f"{'exact' if has_exact_north_role_transition else 'NO'}, "
+              f"rotation={'exact' if has_north_rotation else 'NO'}, "
+              f"post-delta={'exact' if has_exact_north_post_delta else 'NO'}, "
+              f"spawn/hide/cinematic="
+              f"{'yes' if (has_north_spawned_rpc and has_north_hide_round_start_rpc and has_north_cinematic_tail) else 'NO'}")
     print(f"     server data packets: {bunch_pkts}; standalone ack-only datagrams: {ack_only}")
-    ok = bool(pawn_opens) and has_client_restart
+    print(f"     server bunch packets acknowledged by mock: {acked_server_packets}")
+    print(f"     empty UE3 transport keepalives: {seen_empty_keepalives}")
+    camera_semantics_ok = (
+        (has_north_spawned_rpc and has_north_hide_round_start_rpc and
+         has_north_cinematic_tail)
+        if team_contract.north_graph
+        else (has_controller_view_target and has_camera_reset))
+    north_capture_ok = (
+        not team_contract.north_graph or
+        (has_exact_north_role_transition and has_north_rotation and
+         has_exact_north_post_delta and has_north_collide_world_false and
+         has_north_respawn_sentinel))
+    ok = (not stale_world_chans and not remote_pawn_opens and
+          not unexpected_owning_opens and
+          has_objective_baseline and
+          LOCAL_PAWN_CH in pawn_opens and
+          has_exact_pawn_class and
+          has_pawn_controller and has_pawn_pri and has_pawn_inv_manager and
+          has_client_possessed and has_pc_pawn and has_client_restart and
+          has_client_on_possess and has_give_pawn and has_changed_role and
+          has_view_target and camera_semantics_ok and north_capture_ok and
+          has_exact_camera_tail and has_first_person and has_zero_spawn_penalty and
+          has_alive_state and not saw_hud_h392 and
+          loadout_channels.issubset(set(pawn_opens)) and
+          has_exact_loadout_classes and
+          set(expected_weapon_next).issubset(linked_weapons) and
+          has_attachment_list and has_exact_current_attachment and
+          has_attachment_clear and has_switch_best_weapon and
+          switch_best_weapon_count >= team_contract.minimum_switch_best_weapon_count and
+          seen_empty_keepalives >= 1)
     if ok:
-        print(f"\n=== spawn: PASS - server opened pawn channel(s) {pawn_opens} + sent ClientRestart possession RPC ===")
+        print(f"\n=== spawn: PASS - {team_contract.label} pawn refs, loadout graph, "
+              f"ClientRestart, and GivePawn recovery decode to ch{LOCAL_PAWN_CH} ===")
     else:
         miss = []
-        if not pawn_opens: miss.append("no pawn channel opened")
-        if not has_client_restart: miss.append("no ClientRestart(h85) possession RPC")
+        if stale_world_chans:
+            miss.append(f"captured-world actors replayed at bootstrap: {stale_world_chans}")
+        if remote_pawn_opens:
+            miss.append(f"ungrounded remote pawn actors opened: {remote_pawn_opens}")
+        if unexpected_owning_opens:
+            miss.append(f"unexpected faction graph channels: {unexpected_owning_opens}")
+        if not has_objective_baseline:
+            miss.append(
+                f"missing ch{gri_channel} objective mapping/status baseline")
+        if LOCAL_PAWN_CH not in pawn_opens: miss.append(f"no pawn open on ch{LOCAL_PAWN_CH}")
+        if not has_exact_pawn_class:
+            miss.append(f"pawn class differs: {pawn_open_class} != {team_contract.pawn_class_ref}")
+        if not has_pawn_controller: miss.append("Pawn.Controller is not dynamic ch2")
+        if not has_pawn_pri: miss.append("Pawn.PRI is not dynamic ch26")
+        if not has_pawn_inv_manager: miss.append("Pawn.InvManager is not dynamic ch219")
+        if not has_client_possessed: miss.append("no pawn ClientPossessed(h57)")
+        if not has_pc_pawn: miss.append(f"PC.Pawn is not dynamic ch{LOCAL_PAWN_CH}")
+        if not has_client_restart: miss.append("ClientRestart NewPawn is absent/wrong")
+        if not has_client_on_possess: miss.append("ClientOnPossess Pawn is absent/wrong")
+        if not has_give_pawn: miss.append("AskForPawn recovery did not send valid GivePawn")
+        if not has_changed_role: miss.append("ChangedRole did not close role/unit select")
+        if not has_view_target: miss.append("initial ClientSetViewTarget is absent/wrong")
+        if not team_contract.north_graph and not has_controller_view_target:
+            miss.append("final ClientSetViewTarget is not dynamic ch2")
+        if not team_contract.north_graph and not has_camera_reset:
+            miss.append("final ClientCameraReset(h168) is absent")
+        if not has_exact_camera_tail:
+            miss.append(f"final {team_contract.final_tail_bits}-bit faction tail differs")
+        if team_contract.north_graph and not has_exact_north_role_transition:
+            miss.append("North h210+h211 role transition differs")
+        if team_contract.north_graph and not has_north_rotation:
+            miss.append("North h26 ClientSetRotation differs")
+        if team_contract.north_graph and not has_exact_north_post_delta:
+            miss.append("North 72-bit h17/h24/h316 post-open delta differs")
+        if team_contract.north_graph and not has_north_collide_world_false:
+            miss.append("North h17 bCollideWorld=false absent")
+        if team_contract.north_graph and not has_north_respawn_sentinel:
+            miss.append("North h316 NextRespawnTime sentinel absent")
+        if team_contract.north_graph and not has_north_spawned_rpc:
+            miss.append("North ClientSpawned(h390) absent")
+        if team_contract.north_graph and not has_north_hide_round_start_rpc:
+            miss.append("North ClientHideRoundStartScreen(h226) absent")
+        if team_contract.north_graph and not has_north_cinematic_tail:
+            miss.append("North ClientSetCinematicMode(h101) differs")
+        if not has_first_person: miss.append("ClientSetCameraMode is not FirstPerson")
+        if not has_zero_spawn_penalty: miss.append("SetHUDSpawnPenalty is not zero")
+        if not has_alive_state: miss.append("ClientOnDead did not set alive=false")
+        if saw_hud_h392: miss.append("forbidden ShowInitialWorldWidget(h392) was authored")
+        missing_loadout = sorted(loadout_channels - set(pawn_opens))
+        if missing_loadout: miss.append(f"missing loadout actor opens: {missing_loadout}")
+        if not has_exact_loadout_classes:
+            miss.append(f"loadout class refs differ: {loadout_open_classes}")
+        missing_graph = sorted(set(expected_weapon_next) - linked_weapons)
+        if missing_graph: miss.append(f"unlinked weapon channels: {missing_graph}")
+        if not has_attachment_list:
+            miss.append(f"missing exact {len(team_contract.attachments)}-record "
+                        "pawn h167 attachment state")
+        if not has_exact_current_attachment:
+            miss.append("missing exact faction-primary pawn h147 current attachment")
+        if not has_attachment_clear: miss.append("missing pawn h147 dynamic-None clear")
+        if switch_best_weapon_count < team_contract.minimum_switch_best_weapon_count:
+            miss.append(f"ClientSwitchToBestWeapon(false) repeated only "
+                        f"{switch_best_weapon_count}x")
+        if seen_empty_keepalives < 1: miss.append("no empty UE3 transport keepalive")
         print(f"\n=== spawn: FAIL - {'; '.join(miss)} (check team->role advance / pawn-spawn) ===")
+    # Keep the fully joined session alive for live-server observation when
+    # requested.  The quiet receive loop still retires every data-bearing server
+    # PacketId, so linger never creates the reliable retry storm this harness is
+    # meant to detect.
+    if boot and linger > 0.0:
+        acked_before_linger = acked_server_packets
+        print(f"\n     lingering for {linger:g}s (quietly ACKing server bunch packets)")
+        receive_until(linger, quiet=True)
+        print(f"     linger complete; acknowledged "
+              f"{acked_server_packets - acked_before_linger} server bunch packets")
+
+    # A joined mock must leave like a UE3 peer, not merely abandon its UDP
+    # socket.  The server intentionally retires this packet without replying;
+    # retransmitted duplicates therefore cannot recreate a phantom session.
+    close_pid = state["pid"]
+    close_seq = state["control_seq"]
+    state["pid"], state["control_seq"] = send_graceful_control_close(
+        sock, (host, port), close_pid, close_seq)
+    print(f"     -> graceful control close: pid={close_pid} seq={close_seq}")
+
     sock.close()
     return 0 if ok else 1
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["replay", "drive", "react", "spawn"])
+    ap.add_argument("mode", choices=["replay", "drive", "react", "spawn", "reconnect"])
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=7777)
+    ap.add_argument(
+        "--profile", choices=tuple(SPAWN_PROFILES), default="resort",
+        help="spawn validation profile (default: resort)")
+    ap.add_argument(
+        "--team", type=int, choices=(1, 2), default=1,
+        help="spawn faction: 1=South/US (default), 2=North/NVA")
+    ap.add_argument("--deployment-wait", type=float, default=35.0,
+                    help="seconds spawn mode waits for the preparation deployment window")
+    ap.add_argument(
+        "--linger", type=float, default=0.0,
+        help="seconds spawn mode stays connected and quietly ACKs before close (0-600)")
+    objective_expectation = ap.add_mutually_exclusive_group()
+    objective_expectation.add_argument(
+        "--expected-objectives", type=int,
+        help="number of identity-mapped objective slots expected in spawn mode")
+    objective_expectation.add_argument(
+        "--objective-mapping", type=parse_objective_mapping,
+        help="comma-separated cooked objective indices expected for slots 0..N")
+    ap.add_argument("--gri-channel", type=int,
+                    help="map profile's GameReplicationInfo actor channel")
+    ap.add_argument("--menu-channels", type=parse_channel_set,
+                    help="comma-separated actor channels expected during menu bootstrap")
     args = ap.parse_args()
+    if (not math.isfinite(args.deployment_wait) or
+            args.deployment_wait < 0.0 or args.deployment_wait > 120.0):
+        ap.error("--deployment-wait must be finite and between 0 and 120 seconds")
+    if (not math.isfinite(args.linger) or
+            args.linger < 0.0 or args.linger > 600.0):
+        ap.error("--linger must be finite and between 0 and 600 seconds")
+    try:
+        expected_objective_values, gri_channel, menu_channels = resolve_spawn_profile(
+            args.profile, args.expected_objectives, args.objective_mapping,
+            args.gri_channel, args.menu_channels)
+    except ValueError as exc:
+        ap.error(str(exc))
     if args.mode == "replay":
         return replay(args.host, args.port)
     if args.mode == "react":
         return react(args.host, args.port)
     if args.mode == "spawn":
-        return spawn(args.host, args.port)
+        return spawn(args.host, args.port, args.deployment_wait,
+                     expected_objective_values, gri_channel, menu_channels,
+                     args.linger, args.team)
+    if args.mode == "reconnect":
+        return reconnect(args.host, args.port)
     return drive(args.host, args.port)
 
 if __name__ == "__main__":

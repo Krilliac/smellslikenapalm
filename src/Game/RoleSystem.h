@@ -4,11 +4,14 @@
 #pragma once
 
 #include <string>
+#include <array>
 #include <vector>
 #include <map>
 #include <unordered_map>
 #include <cstdint>
+#include <cstddef>
 #include <memory>
+#include <optional>
 
 // Factions in RS2V
 enum class Faction : uint8_t {
@@ -78,11 +81,49 @@ struct Squad {
     bool HasLeader() const { return leaderId != 0; }
 };
 
+// Match-scoped retail squad state is deliberately independent from the
+// legacy Squad/CombatRole model above.  UE3 exposes a stable zero-based squad
+// index and a six-slot role index; occupying the leadership slot must not
+// silently replace the infantry class selected by the player.
+struct RetailSquad {
+    static constexpr uint8_t SLOT_COUNT = 6;
+
+    std::array<uint32_t, SLOT_COUNT> slotOwnerIds{};
+    uint32_t leaderId = 0;
+
+    size_t Occupancy() const {
+        size_t count = 0;
+        for (const uint32_t ownerId : slotOwnerIds) {
+            if (ownerId != 0) ++count;
+        }
+        return count;
+    }
+    bool IsFull() const { return Occupancy() == slotOwnerIds.size(); }
+};
+
+struct RetailSquadAssignment {
+    static constexpr uint8_t UNASSIGNED_INDEX = 255;
+
+    uint32_t teamId = 0;
+    uint8_t squadIndex = UNASSIGNED_INDEX;
+    uint8_t roleIndex = UNASSIGNED_INDEX;
+    uint32_t generation = 0;
+
+    bool IsValid() const {
+        return teamId != 0 && squadIndex != UNASSIGNED_INDEX &&
+               roleIndex != UNASSIGNED_INDEX && generation != 0;
+    }
+};
+
 class GameServer;
 class Player;
+class RoleSystemLifecycleTestHarness;
 
 class RoleSystem {
 public:
+    static constexpr uint8_t RETAIL_TEAM_COUNT = 2;
+    static constexpr uint8_t RETAIL_SQUAD_COUNT = 10;
+
     explicit RoleSystem(GameServer* server);
     ~RoleSystem();
 
@@ -97,6 +138,10 @@ public:
 
     // Role management
     bool AssignRole(uint32_t playerId, CombatRole role);
+    // Idempotent gameplay-lifecycle cleanup used for both disconnect and map
+    // travel. Removes every role, commander, and squad reference owned by the
+    // player while preserving valid remaining squad membership.
+    void RemovePlayer(uint32_t playerId);
     CombatRole GetPlayerRole(uint32_t playerId) const;
     std::string GetRoleName(CombatRole role) const;
     bool IsRoleAvailable(uint32_t teamId, CombatRole role) const;
@@ -115,6 +160,40 @@ public:
     std::vector<const Squad*> GetTeamSquads(uint32_t teamId) const;
     void DisbandSquad(uint32_t squadId);
 
+    // Match-scoped UE3 squad allocation. Repeating this call for an already
+    // assigned player is idempotent. New players join the fullest non-full
+    // squad (lowest index breaks ties) and occupy its first free role slot.
+    RetailSquadAssignment AutoAssignRetailSquad(uint32_t playerId,
+                                                uint32_t teamId);
+    // Transactionally joins one explicit retail squad on the authoritative
+    // team. The target's first free role slot is reserved before the source is
+    // released, so an invalid or full target leaves the current assignment
+    // untouched. Rejoining the same squad is idempotent, including when full.
+    RetailSquadAssignment JoinRetailSquad(uint32_t playerId,
+                                          uint32_t authoritativeTeamId,
+                                          uint8_t requestedSquadIndex);
+    // Explicit retail leave used by the native ServerLeaveSquad path. The
+    // return value reports whether any forward or reverse membership existed;
+    // CombatRole and deployment ownership remain unchanged.
+    bool LeaveRetailSquad(uint32_t playerId);
+    // Frees only retail squad ownership, leaving CombatRole unchanged. The
+    // fixed roster is reconciled so stale duplicates/orphans cannot leak slots.
+    bool ReleaseRetailSquadAssignment(uint32_t playerId);
+    std::optional<RetailSquadAssignment> GetRetailSquadAssignment(
+        uint32_t playerId) const;
+    const RetailSquad* GetRetailSquad(uint32_t teamId,
+                                     uint8_t squadIndex) const;
+    uint32_t GetRetailSquadLeader(uint32_t teamId,
+                                  uint8_t squadIndex) const;
+    bool IsRetailSquadLeader(uint32_t playerId) const;
+
+    // Starts a fresh map/match generation and invalidates every previous
+    // retail assignment. Generation zero is reserved for invalid results.
+    uint32_t ResetRetailSquads();
+    uint32_t GetRetailSquadGeneration() const {
+        return m_retailSquadGeneration;
+    }
+
     // Commander management
     bool VolunteerAsCommander(uint32_t playerId);
     bool ResignAsCommander(uint32_t playerId);
@@ -126,6 +205,8 @@ public:
     uint32_t GetNearestRadioman(uint32_t commanderId) const;
 
 private:
+    friend class RoleSystemLifecycleTestHarness;
+
     GameServer* m_server;
 
     // Faction assignments per team
@@ -139,6 +220,15 @@ private:
     std::unordered_map<uint32_t, uint32_t> m_playerSquadMap;  // playerId -> squadId
     uint32_t m_nextSquadId = 1;
 
+    // Fixed team/squad arrays keep the retail indices stable for a 64-player
+    // match. Non-leader holes are retained; only a vacated leader slot zero
+    // promotes the owner from the lowest remaining occupied role slot.
+    using RetailSquadTeam = std::array<RetailSquad, RETAIL_SQUAD_COUNT>;
+    std::array<RetailSquadTeam, RETAIL_TEAM_COUNT> m_retailSquads{};
+    std::unordered_map<uint32_t, RetailSquadAssignment>
+        m_retailSquadAssignments;
+    uint32_t m_retailSquadGeneration = 1;
+
     // Commander assignments per team
     std::map<uint32_t, uint32_t> m_teamCommanders;  // teamId -> playerId
 
@@ -147,4 +237,7 @@ private:
     void InitializeRoleDefinitions();
     const RoleDefinition* FindRoleDef(CombatRole role, Faction faction) const;
     std::string GenerateSquadName(uint32_t teamId) const;
+    RetailSquadAssignment FindRetailSquadSlot(uint32_t teamId) const;
+    void ReconcileRetailSquads(uint32_t removingPlayerId = 0);
+    void RepairRetailSquad(uint32_t teamId, uint8_t squadIndex);
 };

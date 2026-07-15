@@ -52,6 +52,11 @@ void EACServerEmulator::SetAlwaysAccept(bool accept) {
 
 bool EACServerEmulator::Initialize(uint16_t listenPort) {
     Logger::Trace("[EACServerEmulator::Initialize] Entry, listenPort=%u", listenPort);
+    if (listenPort == 0) {
+        Logger::Error("[EACServerEmulator::Initialize] Listen port must be in range 1-65535");
+        Logger::Trace("[EACServerEmulator::Initialize] Exit, returning false (invalid listen port)");
+        return false;
+    }
     m_listenPort = listenPort;
     Logger::Debug("[EACServerEmulator::Initialize] Attempting to bind UDP socket on port %u", listenPort);
     if (!m_socket.Bind(listenPort)) {

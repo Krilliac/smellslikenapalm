@@ -2,6 +2,7 @@
 
 #include "Game/MapVoteManager.h"
 #include "Config/MapConfig.h"
+#include "Network/RetailBootstrap.h"
 #include "Utils/Logger.h"
 #include <algorithm>
 #include <random>
@@ -24,14 +25,24 @@ const std::vector<MapVoteManager::Candidate>& MapVoteManager::StartVote(const st
         return m_candidates;
     }
 
-    // Build the weighted pool of eligible maps (everything except the current map).
+    // Only exact PackageMap/Welcome profiles are eligible. Offering a map that
+    // would later inherit Resort's legacy bootstrap fallback makes the vote
+    // unwinnable and can desynchronize retail clients.
     std::vector<std::string> pool;
     for (const auto& name : m_mapConfig->GetAvailableMaps()) {
         if (name == currentMap) continue;
+        if (!RetailBootstrap::HasExactProfile(name)) {
+            Logger::Debug(
+                "MapVoteManager: excluding '%s' because no exact retail "
+                "bootstrap profile is available",
+                name.c_str());
+            continue;
+        }
         pool.push_back(name);
     }
     if (pool.empty()) {
-        Logger::Warn("MapVoteManager: no maps available to vote on (only the current map exists)");
+        Logger::Warn(
+            "MapVoteManager: no exact-profile maps are available to vote on");
         return m_candidates;
     }
 

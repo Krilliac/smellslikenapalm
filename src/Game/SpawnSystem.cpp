@@ -3,15 +3,28 @@
 
 #include "Game/SpawnSystem.h"
 #include "Game/GameServer.h"
+#include "Game/ObjectiveSystem.h"
 #include "Game/PlayerManager.h"
+#include "Game/SkirmishMode.h"
 #include "Game/TeamManager.h"
+#include "Game/TeamMapping.h"
+#include "Game/TicketSystem.h"
+#include "Game/TerritoryMode.h"
 #include "Game/RoleSystem.h"
 #include "Utils/Logger.h"
 #include <algorithm>
+#include <cmath>
 #include <cstdlib>
+#include <utility>
 
-SpawnSystem::SpawnSystem(GameServer* server)
-    : m_server(server)
+SpawnSystem::SpawnSystem(GameServer* server,
+                         AccessContextResolver accessContextResolver,
+                         SquadLeaderEligibilityResolver
+                             squadLeaderEligibilityResolver)
+    : m_server(server),
+      m_accessContextResolver(std::move(accessContextResolver)),
+      m_squadLeaderEligibilityResolver(
+          std::move(squadLeaderEligibilityResolver))
 {
     Logger::Trace("[SpawnSystem::SpawnSystem] Entry, server=%p", static_cast<void*>(server));
     Logger::Trace("[SpawnSystem::SpawnSystem] Exit");
@@ -48,8 +61,10 @@ uint32_t SpawnSystem::AddSpawnLocation(const SpawnLocation& loc) {
     SpawnLocation l = loc;
     l.id = m_nextSpawnId++;
     m_spawnLocations[l.id] = l;
-    Logger::Info("Spawn location added: '%s' (id=%u, type=%d, team=%u) at (%.1f, %.1f, %.1f)",
+    Logger::Info("Spawn location added: '%s' (id=%u, type=%d, team=%u, territoryPhase=%d..%d) "
+                 "at (%.1f, %.1f, %.1f)",
                  l.name.c_str(), l.id, static_cast<int>(l.type), l.teamId,
+                 l.minTerritoryPhase, l.maxTerritoryPhase,
                  l.position.x, l.position.y, l.position.z);
     Logger::Debug("[SpawnSystem::AddSpawnLocation] Total spawn locations: %zu", m_spawnLocations.size());
     Logger::Trace("[SpawnSystem::AddSpawnLocation] Exit, return id=%u", l.id);
@@ -77,39 +92,150 @@ SpawnLocation* SpawnSystem::GetSpawnLocation(uint32_t id) {
     return result;
 }
 
+std::optional<SpawnAccessContext> SpawnSystem::ResolveAccessContext(
+    uint32_t playerId) const {
+    if (m_accessContextResolver) {
+        try {
+            return m_accessContextResolver(playerId);
+        } catch (...) {
+            Logger::Warn(
+                "[SpawnSystem] access-context resolver threw for player %u",
+                playerId);
+            return std::nullopt;
+        }
+    }
+
+    auto* teams = m_server ? m_server->GetTeamManager() : nullptr;
+    if (!teams) return std::nullopt;
+
+    SpawnAccessContext context;
+    context.playerTeam = teams->GetPlayerTeam(playerId);
+    TerritoryMode* territory = m_server->GetTerritoryMode();
+    if (!territory) return context;
+
+    ObjectiveSystem* objectives = m_server->GetObjectiveSystem();
+    const CaptureZone* current = objectives
+        ? objectives->GetCurrentTerritoryObjective() : nullptr;
+    if (!current) return std::nullopt;
+
+    context.territoryActive = true;
+    context.attackingTeam = territory->GetAttackingTeam();
+    context.defendingTeam = territory->GetDefendingTeam();
+    context.territoryPhase = current->territoryOrder;
+    return context;
+}
+
+bool SpawnSystem::IsSpawnEligibleForContext(
+    const SpawnLocation& location,
+    const SpawnAccessContext& context) noexcept {
+    if (!TeamMapping::IsPlayableServerTeam(context.playerTeam) ||
+        !location.isActive || location.isDestroyed ||
+        !std::isfinite(location.spawnCooldown) ||
+        location.spawnCooldown > 0.0f) {
+        return false;
+    }
+
+    uint32_t effectiveTeam = location.teamId;
+    if (context.territoryActive) {
+        if (context.territoryPhase < 0 ||
+            !TeamMapping::IsPlayableServerTeam(context.attackingTeam) ||
+            !TeamMapping::IsPlayableServerTeam(context.defendingTeam) ||
+            context.attackingTeam == context.defendingTeam) {
+            return false;
+        }
+        if (location.type == SpawnType::BaseSpawn) {
+            effectiveTeam = TeamMapping::ResolveTerritoryRoleTeam(
+                location.teamId, context.attackingTeam,
+                context.defendingTeam);
+            if (effectiveTeam == 0) return false;
+        }
+        if (location.HasTerritoryPhaseBounds() &&
+            !location.IsAvailableInTerritoryPhase(context.territoryPhase)) {
+            return false;
+        }
+    }
+    return effectiveTeam == context.playerTeam;
+}
+
+bool SpawnSystem::IsSpawnAvailableToPlayer(
+    uint32_t playerId, const SpawnLocation& location,
+    const SpawnAccessContext& context) const {
+    if (!IsSpawnEligibleForContext(location, context)) return false;
+    return location.type != SpawnType::SquadLeader ||
+        IsSpecificSquadLeaderAvailable(playerId, location, context);
+}
+
+bool SpawnSystem::IsSpecificSquadLeaderAvailable(
+    uint32_t playerId, const SpawnLocation& location,
+    const SpawnAccessContext& context) const {
+    if (location.type != SpawnType::SquadLeader ||
+        location.squadLeaderId == 0) {
+        return false;
+    }
+
+    if (m_squadLeaderEligibilityResolver) {
+        try {
+            return m_squadLeaderEligibilityResolver(playerId, location);
+        } catch (...) {
+            Logger::Warn(
+                "[SpawnSystem] squad-leader eligibility resolver threw for "
+                "player %u and spawn %u",
+                playerId, location.id);
+            return false;
+        }
+    }
+
+    auto* players = m_server ? m_server->GetPlayerManager() : nullptr;
+    auto* teams = m_server ? m_server->GetTeamManager() : nullptr;
+    if (!players || !teams) return false;
+
+    const auto player = players->GetPlayer(playerId);
+    const auto leader = players->GetPlayer(location.squadLeaderId);
+    if (!player || !leader || !leader->IsAlive()) return false;
+
+    // Squad membership is not currently exposed authoritatively. Enforce the
+    // complete identity information that is available: both participants and
+    // the runtime-owned spawn must still belong to the requesting player's
+    // current team at commit time.
+    const uint32_t currentPlayerTeam = teams->GetPlayerTeam(playerId);
+    const uint32_t currentLeaderTeam =
+        teams->GetPlayerTeam(location.squadLeaderId);
+    return currentPlayerTeam == context.playerTeam &&
+        currentLeaderTeam == context.playerTeam &&
+        location.teamId == context.playerTeam &&
+        !IsSquadLeaderInCombat(location.squadLeaderId);
+}
+
+bool SpawnSystem::CanPlayerSpawnAt(uint32_t playerId,
+                                   uint32_t spawnLocationId) const {
+    const auto location = m_spawnLocations.find(spawnLocationId);
+    if (location == m_spawnLocations.end()) return false;
+    const std::optional<SpawnAccessContext> context =
+        ResolveAccessContext(playerId);
+    return context.has_value() &&
+        IsSpawnAvailableToPlayer(playerId, location->second, *context);
+}
+
 std::vector<const SpawnLocation*> SpawnSystem::GetAvailableSpawns(uint32_t playerId) const {
     Logger::Trace("[SpawnSystem::GetAvailableSpawns] Entry, playerId=%u", playerId);
     std::vector<const SpawnLocation*> result;
-    auto* tm = m_server ? m_server->GetTeamManager() : nullptr;
-    if (!tm) {
-        Logger::Error("[SpawnSystem::GetAvailableSpawns] TeamManager unavailable, returning no spawns for player %u", playerId);
-        Logger::Trace("[SpawnSystem::GetAvailableSpawns] Exit, return 0 spawns (no TeamManager)");
+    const std::optional<SpawnAccessContext> context =
+        ResolveAccessContext(playerId);
+    if (!context.has_value()) {
+        Logger::Error("[SpawnSystem::GetAvailableSpawns] Access context unavailable, returning no spawns for player %u", playerId);
+        Logger::Trace("[SpawnSystem::GetAvailableSpawns] Exit, return 0 spawns (no access context)");
         return result;
     }
-    uint32_t playerTeam = tm->GetPlayerTeam(playerId);
     Logger::Debug("[SpawnSystem::GetAvailableSpawns] Player %u is on team %u, checking %zu spawn locations",
-                  playerId, playerTeam, m_spawnLocations.size());
+                  playerId, context->playerTeam, m_spawnLocations.size());
 
     for (const auto& [id, loc] : m_spawnLocations) {
-        if (loc.teamId != playerTeam) {
-            Logger::Trace("[SpawnSystem::GetAvailableSpawns] Spawn %u: wrong team (%u != %u), skipping", id, loc.teamId, playerTeam);
+        if (!IsSpawnAvailableToPlayer(playerId, loc, *context)) {
+            Logger::Trace(
+                "[SpawnSystem::GetAvailableSpawns] Spawn %u unavailable for "
+                "player %u in current team/role/phase state",
+                id, playerId);
             continue;
-        }
-        if (!loc.isActive || loc.isDestroyed) {
-            Logger::Trace("[SpawnSystem::GetAvailableSpawns] Spawn %u: inactive or destroyed, skipping", id);
-            continue;
-        }
-        if (loc.spawnCooldown > 0.0f) {
-            Logger::Trace("[SpawnSystem::GetAvailableSpawns] Spawn %u: on cooldown (%.1fs), skipping", id, loc.spawnCooldown);
-            continue;
-        }
-
-        // Squad leader spawns require special checks
-        if (loc.type == SpawnType::SquadLeader) {
-            if (!CanSpawnOnSquadLeader(playerId)) {
-                Logger::Debug("[SpawnSystem::GetAvailableSpawns] Spawn %u: squad leader spawn not available for player %u", id, playerId);
-                continue;
-            }
         }
 
         result.push_back(&loc);
@@ -270,6 +396,7 @@ void SpawnSystem::StartSpawnWave(uint32_t teamId) {
     Logger::Trace("[SpawnSystem::StartSpawnWave] Entry, teamId=%u", teamId);
     auto& wave = m_waveStates[teamId];
     wave.active = true;
+    wave.interval = m_waveInterval;
     wave.timer = wave.interval;
     Logger::Info("[SpawnSystem::StartSpawnWave] Spawn wave started for team %u, interval=%.1fs", teamId, wave.interval);
     Logger::Trace("[SpawnSystem::StartSpawnWave] Exit");
@@ -293,12 +420,24 @@ float SpawnSystem::GetWaveTimeRemaining(uint32_t teamId) const {
     return remaining;
 }
 
+void SpawnSystem::SetWaveTimeRemaining(uint32_t teamId, float seconds) {
+    Logger::Trace("[SpawnSystem::SetWaveTimeRemaining] Entry, teamId=%u, seconds=%.1f",
+                  teamId, seconds);
+    auto& wave = m_waveStates[teamId];
+    wave.active = true;
+    wave.interval = m_waveInterval;
+    wave.timer = std::max(0.0f, seconds);
+    Logger::Debug("[SpawnSystem::SetWaveTimeRemaining] Team %u next wave in %.1fs",
+                  teamId, wave.timer);
+    Logger::Trace("[SpawnSystem::SetWaveTimeRemaining] Exit");
+}
+
 bool SpawnSystem::SpawnPlayer(uint32_t playerId, uint32_t spawnLocationId) {
     Logger::Trace("[SpawnSystem::SpawnPlayer] Entry, playerId=%u, spawnLocationId=%u", playerId, spawnLocationId);
     auto* loc = GetSpawnLocation(spawnLocationId);
-    if (!loc || !loc->isActive || loc->isDestroyed) {
-        Logger::Warn("Cannot spawn player %u at location %u (invalid/inactive)", playerId, spawnLocationId);
-        Logger::Trace("[SpawnSystem::SpawnPlayer] Exit, return false (invalid location)");
+    if (!loc || !CanPlayerSpawnAt(playerId, spawnLocationId)) {
+        Logger::Warn("Cannot spawn player %u at location %u (not currently authorized)", playerId, spawnLocationId);
+        Logger::Trace("[SpawnSystem::SpawnPlayer] Exit, return false (unauthorized location)");
         return false;
     }
 
@@ -393,6 +532,18 @@ void SpawnSystem::Update(float deltaSeconds) {
         }
         wave.timer -= deltaSeconds;
         if (wave.timer <= 0.0f) {
+            // Skirmish owns the authoritative respawn window. The deployment
+            // clock may still expire after the fifth window, during preparation,
+            // or in sudden death; none of those states may revive a player.
+            auto* skirmish = m_server ? m_server->GetSkirmishMode() : nullptr;
+            if (skirmish && !skirmish->CanReleaseSpawnWave(teamId, deltaSeconds)) {
+                Logger::Debug("[SpawnSystem::Update] Team %u wave reached while the "
+                              "Skirmish spawn window is closed; no players spawned",
+                              teamId);
+                wave.timer = wave.interval;
+                continue;
+            }
+
             Logger::Info("[SpawnSystem::Update] Spawn wave triggered for team %u", teamId);
             // Spawn all pending players
             auto* pm = m_server ? m_server->GetPlayerManager() : nullptr;
@@ -414,15 +565,35 @@ void SpawnSystem::Update(float deltaSeconds) {
                     continue;
                 }
                 uint32_t pid = conn->GetClientId();
-                if (tm->GetPlayerTeam(pid) == teamId) {
-                    Logger::Debug("[SpawnSystem::Update] Spawning dead player %u in wave for team %u", pid, teamId);
-                    SpawnPlayerAtDefault(pid);
-                    spawnedCount++;
+                if (tm->GetPlayerTeam(pid) != teamId) continue;
+                if (player->GetState() != PlayerState::Dead ||
+                    !player->IsReadyToSpawn()) {
+                    Logger::Trace("[SpawnSystem::Update] Player %u is not an eligible "
+                                  "deployed casualty; skipping wave spawn", pid);
+                    continue;
                 }
+
+                auto* tickets = m_server ? m_server->GetTicketSystem() : nullptr;
+                const bool outOfReinforcements =
+                    tickets && tickets->GetInitialTickets(teamId) > 0 &&
+                    !tickets->HasTickets(teamId);
+                if (outOfReinforcements) {
+                    Logger::Debug("[SpawnSystem::Update] Player %u cannot spawn in team %u "
+                                  "wave: no reinforcements remain", pid, teamId);
+                    continue;
+                }
+
+                Logger::Debug("[SpawnSystem::Update] Spawning dead player %u in wave for team %u",
+                              pid, teamId);
+                if (SpawnPlayerAtDefault(pid)) ++spawnedCount;
             }
-            wave.timer = wave.interval;
+            // Preserve fractional/loaded-tick overshoot so four 25-second
+            // Skirmish waves stay anchored to the round clock instead of
+            // drifting past the final close boundary.
+            wave.timer += wave.interval;
             Logger::Debug("Spawn wave for team %u", teamId);
-            Logger::Debug("[SpawnSystem::Update] Wave complete: spawned %d players, next wave in %.1fs", spawnedCount, wave.interval);
+            Logger::Debug("[SpawnSystem::Update] Wave complete: spawned %d players, next wave in %.1fs",
+                          spawnedCount, wave.timer);
         }
     }
     Logger::Trace("[SpawnSystem::Update] Exit");

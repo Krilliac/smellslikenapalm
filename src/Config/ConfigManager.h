@@ -9,6 +9,8 @@
 #include <thread>
 #include <atomic>
 #include <mutex>
+#include <condition_variable>
+#include <shared_mutex>
 
 // Interface for receiving config change notifications
 class IConfigurationListener {
@@ -22,8 +24,12 @@ public:
     ConfigManager();
     ~ConfigManager();
 
-    // Initialize configuration system, loads config/server.ini
+    // Initialize configuration system using the default config/server.ini.
     bool Initialize();
+
+    // Initialize configuration system using an explicit primary file. This is
+    // the startup path used by the server's --config command-line option.
+    bool Initialize(const std::string& configFile);
 
     // Load a specific configuration file
     bool LoadConfiguration(const std::string& configFile);
@@ -40,7 +46,8 @@ public:
     // Reset to default built-in configuration values
     void ResetToDefaults();
 
-    // Save all configurations back to disk
+    // Explicitly persist the current in-memory values to the primary file.
+    // Merely loading/destroying a ConfigManager never rewrites that file.
     bool SaveAllConfigurations();
 
     // Explicitly save to a given file
@@ -83,14 +90,20 @@ public:
     std::vector<std::string> GetAvailableBackups() const;
 
 private:
+    using ConfigValues = std::map<std::string, std::string>;
 
     // Validation and application steps
-    bool ValidateConfiguration();
-    bool ValidateServerConfig();
-    bool ValidateNetworkConfig();
-    bool ValidateSecurityConfig();
-    bool ValidateEACConfig();
-    bool ValidateGameConfig();
+    bool ParseConfigurationFile(const std::string& configFile,
+                                ConfigValues& parsedValues) const;
+    bool LoadConfigurationTransaction(const std::string& configFile,
+                                      const std::string* expectedPrimaryFile);
+
+    bool ValidateConfiguration(const ConfigValues& values) const;
+    bool ValidateServerConfig(const ConfigValues& values) const;
+    bool ValidateNetworkConfig(const ConfigValues& values) const;
+    bool ValidateSecurityConfig(const ConfigValues& values) const;
+    bool ValidateEACConfig(const ConfigValues& values) const;
+    bool ValidateGameConfig(const ConfigValues& values) const;
 
     void ApplySecurityConfiguration();
     void ApplyEACConfiguration();
@@ -104,18 +117,30 @@ private:
     std::string GetCurrentTimestamp();
 
     // File watcher thread function
-    void FileWatcherThread();
+    void FileWatcherThread(std::string watchedFile);
 
     // Member variables
     std::string m_primaryConfigFile;
-    std::map<std::string, std::string> m_configValues;
+    ConfigValues m_configValues;
     bool m_autoSave = false;
     std::vector<std::weak_ptr<IConfigurationListener>> m_listeners;
+
+    // Configuration values, primary-file identity, and auto-save form one
+    // coherent state. Readers take a shared lock; mutations publish a complete
+    // replacement under an exclusive lock.
+    mutable std::shared_mutex m_stateMutex;
+    mutable std::mutex m_listenerMutex;
+    mutable std::mutex m_fileIoMutex;
 
     // File watcher state
     std::thread m_fileWatcherThread;
     std::atomic<bool> m_fileWatcherRunning{false};
-    std::mutex m_configMutex;
+    std::mutex m_watcherLifecycleMutex;
+    std::condition_variable m_watcherLifecycleCv;
+    bool m_watcherJoinInProgress = false;
+    std::thread::id m_watcherThreadId{};
+    std::mutex m_watcherWaitMutex;
+    std::condition_variable m_watcherWake;
 
     // Backup tracking
     std::string m_backupDirectory;

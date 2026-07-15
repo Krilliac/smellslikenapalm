@@ -88,7 +88,11 @@ rs2v_add_test(ControlReassemblerTests) # UE3 inbound control-channel reassembler
 rs2v_add_test(ControlReassemblerFuzzTests) # fuzz/hostile-input: out-of-order/dup/huge-seq/oversized bunches -> bounded buffering, no crash/over-read/hang
 rs2v_add_test(HandshakeStateFuzzTests)     # fuzz/hostile-input: malformed/truncated/oversized NMT + bad type bytes -> never throws/crashes, phase stays valid
 rs2v_add_test(HandshakeIntegrationTests) # end-to-end client<->server handshake over the real wire codec
+rs2v_add_test(ConnectionLoginBridgeTests) # NMT_Join lifecycle: menu player remains undeployed until final role RPC
 rs2v_add_test(ActorReplicationTests)     # actor-channel NetGUID/SerializeNewActor codec (per-session replication)
+rs2v_add_test(RetailBootstrapTests)      # structured PackageMap/Welcome rebuild + map/mode profile invariants
+rs2v_add_test(ClientTravelReplicationTests) # exact PlayerController.ClientTravel parameter bit layout + bounds
+rs2v_add_test(ConnectionTravelLifecycleTests) # atomic retail travel cohorts, identity replacement, deployment isolation
 rs2v_add_test(BitReaderFuzzTests)        # fuzz + malformed-input hardening for BitReader/BitWriter (overflow safety, no OOB/hang, round-trip)
 rs2v_add_test(PacketCodecFuzzTests)      # fuzz/hostile-input: random+mutated+boundary bytes into Decode/Encode (no crash/OOB/hang), valid round-trip
 rs2v_add_test(NetworkPacketSafetyTests)  # malformed-input bounds checks for legacy Packet readers (ReadString/DecodeString/ReadUInt/ReadFloat/ReadBytes)
@@ -104,10 +108,41 @@ rs2v_add_test(CryptoUtilsTests)        # Utils/CryptoUtils: SHA-256/HMAC/Base64 
 rs2v_add_test(ProtocolUtilsTests)      # Protocol/ProtocolUtils: hex/base64/checksum/tag<->type
 rs2v_add_test(NetworkUtilsTests)       # Network/NetworkUtils: IPv4 validate/normalize, ports
 rs2v_add_test(BoundsTests)             # Game/Bounds: AABB contains/center/size
+rs2v_add_test(MapRuntimeTests)         # Config/MapConfig + Game/MapManager: absolute assets with local spawn fallback
+rs2v_add_test(DeploymentCoordinatorTests) # Game/DeploymentCoordinator: role/spawn validation, ready state, countdown deployment
+rs2v_add_test(DeploymentReplicationTests) # Network/DeploymentReplication: exact retail h261/h434 parameter decoding
+rs2v_add_test(RoleSelectionReplicationTests) # Network/RoleSelectionReplication: capture-exact h175 role commit + owner PRI ordering
+rs2v_add_test(RoleSystemLifecycleTests) # Game/RoleSystem: disconnect commander/squad cleanup, promotion, reuse
+rs2v_add_test(WeaponCombatReplicationTests) # Network/WeaponCombatReplication: transactional retail h56 decoder
+rs2v_add_test(CombatAuthorityTests)    # Game/CombatAuthority: ammo/cadence, hitscan damage, projectiles/grenades
+rs2v_add_test(MantleAuthorityTests)    # Game/MantleAuthority: bounded h280 geometry, world checks, cooldown/lifecycle
+rs2v_add_test(MovementValidationTests) # Physics/MovementValidator: explicit resets, immutable rejection, bounded lifecycle
+rs2v_add_test(ActorReliableSequencerTests) # Network: bounded per-channel actor reliable ordering/dedup
+rs2v_add_test(TicketSystemTests)       # Game/TicketSystem: unlimited zero pools and one-shot depletion transitions
+rs2v_add_test(PlayerManagerLifecycleTests) # Game/PlayerManager: idempotent death/respawn transitions and fail-closed lifecycle inputs
+rs2v_add_test(ParticipantRosterTests) # tagged human/bot remote actor channel allocation, retirement, generation safety
+rs2v_add_test(BotNavigationTests)      # Game/BotNavigation: deterministic objective routing and movement
+rs2v_add_test(BotManagerTests)         # Game/BotManager: fill/rebalance, capture, combat, death/respawn
+rs2v_add_test(GameServerBotCombatTests) # GameServer: authoritative bot-to-human damage/replication/lifecycle boundaries
+rs2v_add_test(GameServerNativeRotationTests) # GameServer: one-shot deferred native-mode Finished rotation
+rs2v_add_test(ObjectiveSystemBotCaptureTests) # Game/ObjectiveSystem: headless bot capture/contest weighting
+rs2v_add_test(ObjectiveSystemSafetyTests) # Game/ObjectiveSystem: malformed inputs, provider/callback reentrancy, ID/team/order safety
+rs2v_add_test(SpawnSystemTests)        # Game/SpawnSystem: Territory role ownership and commit-time spawn authorization
+rs2v_add_test(SpawnReplicationTests)   # Network/SpawnReplication: ROTeamInfo h59 static spawn-volume refs
+rs2v_add_test(TerritoryModeTests)      # grouped-phase overtime, capture gates, unsigned ticket tiebreak
+rs2v_add_test(SupremacyModeTests)      # signed score flow + Hue City objective topology/connectivity
+rs2v_add_test(SkirmishModeTests)       # five-wave windows + lockdown/sudden-death retail state
 rs2v_add_test(RandomGeneratorTests)    # Utils/RandomGenerator: seed determinism, range bounds
 rs2v_add_test(CompressionHandlerTests) # Protocol/CompressionHandler: NONE + zlib round-trips
+rs2v_add_test(ReplicationManagerTests) # legacy replication outbound sink: retry/commit/exception semantics
+rs2v_add_test(SubsystemNullSafetyTests) # detached subsystem construction and no-network lifecycle safety
 rs2v_add_test(CommandManagerTests)     # Game/CommandManager + Network/RemoteAdminServer: tokenise/alias/permission-gate/help-visibility + defensive SOAP XML parse
 rs2v_add_test(CrashHandlerTests)       # Utils/CrashHandler: non-fatal Guard swallows+counts exceptions, returns completion status
+rs2v_add_test(FrameTimingTests)        # Time/FrameTiming: wall delta under load, pause cap, deterministic fallback
+rs2v_add_test(StartupOptionsTests)     # Config/StartupOptions: no-throw command-line parsing and bounded port validation
+rs2v_add_test(StartupConfigTests)      # ConfigManager: explicit --config primary-file selection
+rs2v_add_test(SecurityManagerTests)    # disabled/off anti-cheat must not bind the fixed EAC emulator port
+rs2v_add_test(TelemetryManagerTests)   # sampling wakeup, bounded ring, null reporters
 
 # Scripting is OFF by default (deprecated .NET COM hosting). The scripting test
 # is gated on ENABLE_SCRIPTING, but it ALSO references Scripting/ScriptEngine.h
@@ -154,8 +189,6 @@ endif()
 #   BandwidthTests        -> same: mocks over non-virtual NetworkConfig
 #                            (GetMTU/GetTickRate/...).
 #   MapTests              -> mocks override non-virtual ConfigManager methods.
-#   MovementValidationTests -> mocks override non-virtual PlayerManager methods
-#                            (GetPlayerPosition/IsValidPlayerPosition/...).
 #   InputValidationTests  -> mocks over non-virtual ConfigManager/ChatManager.
 #   PlayerTests           -> PlayerManager has no AddNewPlayer/IsValidPlayer.
 #   TeamTests             -> TeamManager has no CreateTeam; no TeamID enum.
@@ -200,6 +233,8 @@ if(RS2V_TESTS_INDIVIDUAL)
         add_executable(${_t} ${_t}.cpp)
         rs2v_apply_test_settings(${_t})
         add_test(NAME ${_t} COMMAND ${_t})
+        set_tests_properties(${_t} PROPERTIES
+            WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}")
     endforeach()
 else()
     # Consolidated single-binary runner: every test source + one shared main().
@@ -215,4 +250,6 @@ else()
     # them in CI. Use `ctest -R rs2v_tests` or run the exe directly with
     # --filter=<substr> to scope to a subset.
     add_test(NAME rs2v_tests COMMAND rs2v_tests)
+    set_tests_properties(rs2v_tests PROPERTIES
+        WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}")
 endif()

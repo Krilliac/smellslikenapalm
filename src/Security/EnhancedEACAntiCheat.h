@@ -37,7 +37,8 @@ public:
     ~EnhancedEACAntiCheat();
 
     // Initialize all sub‐systems
-    bool Initialize();
+    bool Initialize(uint16_t listenPort =
+        static_cast<uint16_t>(SecurityConfig::kDefaultEACListenPort));
 
     // Shutdown and cleanup
     void Shutdown();

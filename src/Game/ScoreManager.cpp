@@ -11,7 +11,7 @@ ScoreManager::ScoreManager(GameServer* server)
     : m_server(server)
 {
     Logger::Trace("[ScoreManager::ScoreManager] Entry, server=%p", static_cast<void*>(server));
-    m_teamManager = m_server->GetTeamManager();
+    m_teamManager = m_server ? m_server->GetTeamManager() : nullptr;
     Logger::Debug("[ScoreManager::ScoreManager] TeamManager obtained: %p", static_cast<void*>(m_teamManager));
     Logger::Trace("[ScoreManager::ScoreManager] Exit");
 }
@@ -158,7 +158,13 @@ void ScoreManager::BroadcastScores() const {
         data.insert(data.end(), reinterpret_cast<const uint8_t*>(&teamId), reinterpret_cast<const uint8_t*>(&teamId) + sizeof(teamId));
         data.insert(data.end(), reinterpret_cast<const uint8_t*>(&ts.score), reinterpret_cast<const uint8_t*>(&ts.score) + sizeof(ts.score));
     }
-    m_server->GetNetworkManager()->BroadcastPacket("SCORE_UPDATE", data);
+    NetworkManager* network = m_server ? m_server->GetNetworkManager() : nullptr;
+    if (!network) {
+        Logger::Debug("[ScoreManager::BroadcastScores] No network manager; "
+                      "score state retained without broadcast");
+        return;
+    }
+    network->BroadcastPacket("SCORE_UPDATE", data);
     Logger::Debug("Broadcasted scores for %u teams", count);
     Logger::Trace("[ScoreManager::BroadcastScores] Exit");
 }

@@ -368,8 +368,11 @@ void MemoryMetricsReporter::CleanupExpiredSnapshots() {
             } else {
                 m_writeIndex = 0;
             }
-            Logger::Info("[MemoryMetricsReporter::CleanupExpiredSnapshots] Removed %zu expired snapshots, "
-                         "%zu remaining", removeCount, m_snapshots.size());
+            // At the normal one-second sampling cadence this is steady-state
+            // maintenance after the retention window, not an operator event.
+            // INFO here floods the managed server log once per sample.
+            Logger::Debug("[MemoryMetricsReporter::CleanupExpiredSnapshots] Removed %zu expired snapshots, "
+                          "%zu remaining", removeCount, m_snapshots.size());
         }
     }
 

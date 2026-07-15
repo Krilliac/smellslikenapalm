@@ -24,8 +24,8 @@ team/role selection).
   ch2 traffic switches from tiny menu/team-select RPCs (~52 bits) to steady ~31/s ServerMove
   movement bunches (~205 bits). Team/role selection therefore completed between Join (t103) and t146.
 - **Pawn class** = `ROPawn` (chain `Object→Actor→Pawn→GamePawn→ROPawn`), **net handle space
-  maxHandle = 170**. **Weapon class** = `ROWeapon` (`Object→Actor→Inventory→Weapon→ROWeapon`),
-  **maxHandle = 99**.
+  maxHandle = 168**. The M16/M1911/binocular actors use the `ROWeapon` **maxHandle = 99** table;
+  the M61 and M18 grenade actors use **maxHandle = 101**.
 - **CORRECTION to MEMORY note**: on `ROPlayerController` (ch2) the Pawn property is **handle 24**,
   not 23. **Handle 23 = `PlayerReplicationInfo`, handle 24 = `Pawn`** (`Controller.Pawn`, ni=1861).
 
@@ -58,22 +58,23 @@ Decoding the open headers (`classref` + `SerializeCompressedInitial` Location) f
 shows the pawn and its inventory share one Location. Two real clusters at **f27394 (t553)**:
 
 ```
- ch209  cls=286151  loc=(-8981, 7936,-517)   <- PAWN (ROPawn-family, 763 bits)
- ch210  cls=286374  loc=(-8981, 7936,-517)   <- inventory/ammo item
- ch211  cls=286391  loc=(-8981, 7936,-517)   <- inventory item
- ch212  cls=286464  loc=(-8981, 7936,-517)   <- inventory item
- ch213  cls=286109  loc=(-8981, 7936,-517)   <- inventory item
- ch214  cls=286389  loc=(-8981, 7936,-517)   <- inventory item
- ch219  cls=82735   loc=(-8981, 7936,-517)   <- weapon (ROWeapon-family)
- --- a SECOND pawn in the same packet, different spawn point ---
- ch218  cls=286038  loc=(-92793,6804,-416)   <- PAWN (1383 bits)
+ ch209  cls=286151  loc=(-8981, 7936,-517)   <- ROSouthPawn (maxHandle 168, 763 bits)
+ ch210  cls=286374  loc=(-8981, 7936,-517)   <- M16 (maxHandle 99)
+ ch211  cls=286391  loc=(-8981, 7936,-517)   <- M1911 (maxHandle 99)
+ ch212  cls=286464  loc=(-8981, 7936,-517)   <- M61 (maxHandle 101)
+ ch213  cls=286109  loc=(-8981, 7936,-517)   <- US binoculars (maxHandle 99)
+ ch214  cls=286389  loc=(-8981, 7936,-517)   <- M18 purple smoke (maxHandle 101)
+ ch219  cls=82735   loc=(-8981, 7936,-517)   <- ROInventoryManager (maxHandle 34)
+ --- a UH-1H vehicle graph in the same packet, at its cooked factory ---
+ ch218  cls=286038  loc=(-92793,6804,-416)   <- ROHeli_UH1H_Content (1383 bits)
  ch215  cls=286095  loc=(-92793,6804,-416)
  ch216  cls=75939   loc=(-92793,6804,-416)
- ch217  cls=82735   loc=(-92793,6804,-408)   <- weapon
+ ch217  cls=82735   loc=(-92793,6804,-408)   <- ROInventoryManager
 ```
 
-`f19885 (t439)` and `f18972 (t427)` show the same shape: a ~1000-bit ROPawn channel plus 5–7
-~100–400-bit Inventory/Weapon channels at one Location. **Reproduce with**
+`f19885 (t439)` and `f18972 (t427)` include similar co-located actor graphs. A location cluster
+alone is not proof of a player pawn: vehicles also inherit `Pawn` and own inventory/weapon actors.
+**Reproduce with**
 `scratchpad/decode_cluster.py` (loads a frame window, prints `classidx`, compressed Location).
 
 So to **emulate a player spawn** the server must, in one tick, open:
@@ -89,8 +90,8 @@ So to **emulate a player spawn** the server must, in one tick, open:
 Static index = `package.ObjectBase + Object->NetIndex` (deterministic; see
 `docs/UE3_NetGUID_PackageMap.md §0`). Resolving an index → exact class **name** needs the cooked
 package linker export tables (not in `data/packagemap_export_7258.bin`, which only exports *package*
-names via NMT_Uses). Classes are therefore identified by the **known four** plus **empirical family
-classification** (open size + co-location + decode against a class's maxHandle):
+names via NMT_Uses). Later source/net-index correlation pinned the owning f27394 graph; remaining
+rows retain their empirical family classification (open size + co-location):
 
 | idx | opens | avg bits | class (confidence) |
 |-----|------:|---------:|--------------------|
@@ -101,23 +102,26 @@ classification** (open size + co-location + decode against a class's maxHandle):
 | **286147** | **841** | **1186** | **ROPawn family — dominant soldier pawn** (most common respawn) |
 | **286151** | 516 | 1086 | **ROPawn family** (pawn) |
 | **286186** | 52 | 964 | **ROPawn family** (pawn) |
-| **286038** | 36 | 1409 | **ROPawn family** (heavier pawn) |
-| **285996 / 285994 / 286184** | 13/11/13 | ~1100–1260 | **ROPawn family** (pawns) |
-| 82735 | 26 | 209 | **ROWeapon/Inventory family** (co-located weapon) |
+| **286038** | 36 | 1409 | **`ROHeli_UH1H_Content`** (compiled export + factory-location grounded) |
+| **285996** | 13 | ~1000 | **`ROHeli_OH6_Content`** (compiled export + factory-location grounded) |
+| **285994** | 11 | ~1000 | **`ROHeli_AH1G_Content`** (compiled export + factory-location grounded) |
+| **286184** | 13 | ~1100–1260 | ROPawn family (pawn) |
+| 82735 | 26 | 209 | **ROInventoryManager** (f27394 ch219) |
 | 75939 | 22 | 198 | Inventory/Weapon family |
-| 286374 / 286391 / 286464 / 286109 / 286389 / 286097 / 286095 | 4–15 each | ~100–280 | **Inventory/ammo items** (co-located with pawns) |
+| 286374 / 286391 / 286464 / 286109 / 286389 | 4–15 each | ~100–280 | **M16 / M1911 / M61 / US binoculars / M18 purple smoke** |
+| 286097 / 286095 | 4–15 each | ~100–280 | Inventory/ammo items (other pawn graphs) |
 | 60168 | 1383 | 179 | high-rate transient (projectile/tracer/FX), first seen f20874 |
 | 68586 | 274 | 378 | transient (grenade/projectile) |
 | 60852 / 60303 / 60059 / 59648 / 60264 … | many | 150–230 | transients / effects / minor actors |
 
-The pawn-class indices all live in the tight band **285994..286464** (cooked ROGame export
-neighborhood) — consistent with ROPawn subclasses (per-faction / per-role soldier classes) and their
-inventory living next to each other in the cooked package. Pinning each exact name is a separate
-linker-export task; not required to generate the spawn.
+Pawn, helicopter, and nearby inventory exports share the tight **285994..286464** cooked package
+neighborhood; the numeric band alone does not distinguish actor families. The three helicopter
+identities above are resolved in `vehicle_replication_evidence.md`; exact names outside those and
+the pinned f27394 player graph remain a separate linker-export task.
 
 ---
 
-## 4. ROPawn replicated-field handle layout (maxHandle = 170)
+## 4. ROPawn replicated-field handle layout (maxHandle = 168)
 
 From `tools/netfields_from_u.ps1 -Class ROPawn` (UELib over the compiled `.u`; chain
 `Object→Actor(23)→Pawn(33)→GamePawn(3)→ROPawn(111)`, FieldsBase Actor=0/Pawn=23/GamePawn=56/ROPawn=59).
@@ -139,15 +143,16 @@ ROPawn-specific replicated state (handles 97–167) covers stance/cover/lean/hea
 attachment (e.g. 147 `CurrentWeaponAttachmentClass`, 137 `HitZoneHealths`, 33 `Health`,
 40 `FiringMode`, 41 `FlashCount`). These are why a pawn open is ~1000+ bits.
 
-**Identifying the LOCAL player's pawn** (next step, not yet pinned to a channel): it is the ROPawn
-channel whose **handle 52 (`Controller`) = a dynamic ref to ch2** and **handle 32
+**Identifying the LOCAL player's pawn:** it is the ROPawn channel whose **handle 52
+(`Controller`) = a dynamic ref to ch2** and **handle 32
 (`PlayerReplicationInfo`) = the local PRI**, replicated with `RemoteRole=AutonomousProxy` +
 `bNetOwner=1`. Equivalently it is the channel ch2's **handle 24 (`Pawn`)** points at.
 
-## 4b. ROWeapon handle layout (maxHandle = 99)
+## 4b. Weapon handle layouts (maxHandle = 99 or 101)
 
 From `tools/netfields_from_u.ps1 -Class ROWeapon` (`Object→Actor(23)→Inventory(2)→Weapon→ROWeapon`;
-`tools/netfields_u_ROWeapon.txt`). Key: **23 `InvManager`** (obj ref → pawn's inv manager),
+`tools/netfields_u_ROWeapon.txt`). The M16/M1911/binocular classes use maxHandle 99; M61/M18 use
+the grenade maxHandle 101 table. Key: **23 `InvManager`** (obj ref → pawn's inv manager),
 **24 `Inventory`** (obj ref → next item in the pawn's inventory linked list), and ammo state
 89 `TotalStoredAmmoCount` / 91 `CurrentMagCount` / 92 `AmmoCount`.
 
@@ -232,34 +237,107 @@ index — confirm via ch2 handle 24).
 3. **Decode one full pawn open** property-by-property (typed) to get the exact initial-property set +
    role-flag bytes the client expects, for the generator.
 
+### Remote visual safety gate
+
+The class-family refs `286147` and `286151` prove that the capture contains
+ROPawn actors, but they do not identify a complete non-owning visual template
+for every map/team/role. In particular, the typed initial property tail,
+`Role`/`RemoteRole`, role class, inventory/attachment graph, and their dynamic
+references still need to be correlated from the same spawn incarnation.
+
+Accordingly, live remote pawn opens remain fail-closed behind
+`kRemotePawnVisualTemplatesGrounded == false`. Viewer-local remote PRIs may be
+opened because their capture contract is independently grounded; pawn channels
+remain `Unopened`, cannot resolve as weapon-hit participants, and cannot produce
+the old default-pawn ghost visuals. Flip this gate only when a role-keyed,
+capture-backed template registry and a retail render test exist.
+
 ---
 
-## 10. Implementation status (server-side built + autonomously validated)
+## 10. Current capture-pinned implementation contract
 
-`ConnectionManager::SendPawnSpawn` implements the §6 flow. On the first inbound
-`SelectRoleByClass` (ch2 handle 175) after a `SelectTeam` (handle 170), the server, in two
-decoupled reliable packets:
+`ConnectionManager::SendPawnSpawn` chooses a capture-pinned owning graph from the authoritative
+server team after deployment authorizes the selected spawn.
 
-1. **opens the pawn channel `kPawnCh = 209`** with the verbatim ROPawn open (`bControl=1,bOpen=1`,
-   class 286147, 1137 bits) + the back-refs **h52 `Controller` → ch2** and **h32
-   `PlayerReplicationInfo` → ch26**;
-2. sends the possession RPCs on ch2: **h24 `Pawn` → ch209** and **h85 `ClientRestart`**.
+### South / US graph (f27394)
 
-**The S2C ack-storm** (a standalone ack-only datagram per received packet) was congesting Windows
-loopback and dropping these reliable bunches; `FlushPendingAcks()` now **coalesces acks** to ≤1
-datagram per client per pump (acks also piggyback on data), which fixed the drop.
+1. **ch209** is the local `ROSouthPawn` class 286151, with h52 `Controller` → dynamic ch2,
+   h32 `PlayerReplicationInfo` → dynamic ch26, h27 `InvManager` → dynamic ch219, and h57
+   `ClientPossessed`;
+2. **ch210..214** are classes 286374, 286391, 286464, 286109, and 286389. Their exact field-table
+   maxima are 99, 99, 101, 99, and 101. The last actor omits h24 `Inventory` instead of writing an
+   explicit None;
+3. **ch219** is class 82735 `ROInventoryManager` (maxHandle 34). Its successful inbound h25
+   `ServerSetCurrentWeapon` selection publishes pawn h147 `CurrentWeaponAttachmentClass`; clearing
+   the selection publishes dynamic None;
+4. the pawn publishes five unreliable h167 attachment-list records: slot/class 0/286936,
+   1/286946, 2/287063, 3/286944, and 5/286126;
+5. the final camera bunch is the exact reliable 119-bit f27394 tail: h28(false), h28(false), h168,
+   then h87 targeting dynamic ch2 with transition `{0, Cubic, 2.0, false}`.
 
-**Autonomous validation — `python tools/mock_client.py spawn`** drives the full path as a UE3
-client (handshake → Join → `SelectTeam(170)` → `SelectRoleByClass(175)`) and asserts the server
-opens a channel above the bootstrap range. **RESULT: PASS** — server opens **ch209** (1137-bit open)
-+ h52/h32 back-refs + ch2 h24/h85, with **0 standalone ack-only datagrams** (ack-storm fix holds;
-e.g. `ack5` piggybacks on the pawn open). The reliable open/possession retransmit because the mock
-doesn't ACK — expected, and proves reliable retransmission works.
+### North / NVA graph (f63525)
 
-`react` (handshake/bootstrap) and `spawn` (menu→pawn) are the **two netcode regression gates** — run
-both (`python tools/mock_client.py react` and `... spawn`) after any netcode/GameServer change.
+Frame 63525 is the first local North pawn graph immediately before frame 63526 acknowledges
+possession and starts `ServerMove`. Its actor opens are independently delimited and consume exactly:
 
-**Remaining unknown (pending a real-client test):** whether the retail client *accepts* the pawn
-open and switches to the §7 ServerMove stream (true possession). The send path is proven correct to
-the bit and the ack-storm is gone, so the next real-client connect is the test. Client verbose
-logging (ROEngine.ini `Suppress=-DevNet`) + `-FORCELOGFLUSH` are enabled to capture it.
+| capture channel | stable channel | class | bits | compiled identity / maxHandle |
+|---:|---:|---:|---:|---|
+| 94 | 209 | 286147 | 782 | `RONorthPawn` / 168 |
+| 95 | 210 | 286271 | 301 | `ROWeap_AK47_AssaultRifle_Type56` / 99 |
+| 96 | 212 | 286804 | 301 | `ROWeap_Type67_Grenade_Content` / 101 |
+| 97 | 214 | 286758 | 262 | `ROWeap_PunjiTrap_Content` / 101 |
+| 104 | 219 | 82735 | 315 | `ROInventoryManager` / 34 |
+
+These are not opaque search-and-replace guesses. The normalizer validates and retargets only the
+following typed 11-bit dynamic references before the variable-length Location is relocated:
+
+| payload | selector bit(s) | captured field/value | stable value |
+|---|---|---|---|
+| pawn | 146 | h32 `PlayerReplicationInfo` -> ch4 | ch26 |
+| AK | 88, 106, 250 | h6 Owner, h4 Instigator, h25 NewOwner -> ch94 | ch209 |
+| Type67 | 88, 106, 250 | h6 Owner, h4 Instigator, h25 NewOwner -> ch94 | ch209 |
+| Punji | 88, 106, 211 | h6 Owner, h4 Instigator, h25 NewOwner -> ch94 | ch209 |
+| manager | 86, 102, 124 | h6/h4 -> ch94; h23 InventoryChain -> ch95 | ch209; ch210 |
+
+RS2 uses `SerializeInt(channel,1024)`, so each dynamic reference is fixed at selector + 10 value
+bits. Wrong old values, overlaps, out-of-bounds offsets, invalid replacement channels, or template
+truncation abort the still-unsent spawn packet atomically. Tests pin the complete normalized hex for
+all five payloads, not merely the resulting channel values.
+
+The exact following deltas establish h27 `InvManager` -> ch219 and the linked list
+ch210 -> ch212 -> ch214, then publish h167 attachment records slot/class 0/286845 (AK),
+2/287188 (Type67), and 4/287147 (Punji) plus h148 `Encumbrance=9.92`. The North possession burst
+adds captured h26 `ClientSetRotation((0,40960,0), true)`. Its final 51-bit ch2 tail is
+h28(false), h28(false), h390 `ClientSpawned`, h226 `ClientHideRoundStartScreen`, and h101
+`ClientSetCinematicMode(false,true,false,false)`. The following exact 72-bit PC delta is h17=false,
+h24 Pawn->ch209, h316 `NextRespawnTime=9999999`.
+
+North Type67 h29/h30 input is admitted as the faction grenade on stable ch212 with the same exact
+`ROExplosiveWeapon` 101-handle contract as M61. Authority preserves the grounded Type67 identity,
+4.5-second source fuse, throw-speed envelope, five-contact bounce model, 200 damage, and 625-UU
+radius. Its retail projectile visual remains deliberately suppressed: the installed `ROGame.u` does
+not prove the capture-era Type67 projectile CDO NetIndex/schema, so neither the M61 visual nor a
+current-package-derived class reference is substituted. Punji intent remains explicitly
+unidentified/fail-closed.
+
+An already-open ch209..219 graph cannot change actor classes in place. Switching faction while that
+graph remains open therefore fails deployment until an explicit actor-channel close/reopen generation
+is implemented; it never silently reuses the other faction's pawn.
+
+Do **not** author ch2 h392 `ShowInitialWorldWidget` as a HUD bootstrap. The retail source resets the
+HUD flag and hides the tactical display on that path, and the official capture has no spawn h392.
+
+`python tools/mock_client.py spawn` drives the South graph by default; add `--team 2` for the
+server-team-2 North graph. The latter correctly sends retail h170 team index 0 (the omitted-default
+10-bit form), then the exact North h175 payload. Both paths drive handshake, team/role, spawn
+selection/readiness, pawn recovery, and ch219 weapon selection/clear. The gate decodes exact object
+references and rejects h392, wrong weapon maxHandle tables, a non-retail camera tail, missing
+h167/h147 state, and an explicit final h24 None. `ActorReplicationTests.cpp` independently pins the
+119-bit camera tail,
+the 245-bit five-record h167 list, both h147 forms, and the active GRI h32(false) then h31(true)
+18-bit payload. Run those gates after building; syntax-only Python validation is not a retail-client
+acceptance test.
+
+**Remaining live-client uncertainty:** h167/h147 restore attachment/paper-doll state, but whether
+they also make the first-person weapon mesh appear is not proven. Validate the client view, weapon
+fire, selection/clear, HUD lifetime, and late-join active GRI state on the next retail connection.
