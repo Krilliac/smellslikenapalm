@@ -624,7 +624,6 @@ SELECT_TEAM = 170           # ROPlayerController.SelectTeam(byte TeamID)
 SELECT_ROLE = 175           # ROPlayerController.SelectRoleByClass(...)
 SET_SPAWN = 261             # ROPlayerController.ServerSetSpawnSelect(byte)
 SET_READY = 434             # ROPlayerController.ServerSetReadyToSpawn(enum)
-BOOTSTRAP_CH_MAX = 140      # actor-bootstrap uses ch2..140; the pawn opens ABOVE this
 LOCAL_PAWN_CH = 209         # ConnectionManager::kLocalPawnChannel
 REMOTE_PARTICIPANT_FIRST_CH = 512
 REMOTE_PARTICIPANT_LAST_CH = 767
@@ -910,9 +909,10 @@ def parse_objective_mapping(value):
 
 
 SPAWN_PROFILES = {
-    # Resort uses the capture-replayed actor bootstrap; the experimental map
-    # profiles use SendLiveActorBootstrap's grounded PC/GRI/TeamInfo/PRI channels.
-    "resort": ((0, 1, 2, 3, 4), 54, frozenset({2, 21, 26, 54, 56, 76})),
+    # Every supported profile uses the per-session PC/GRI/TeamInfo/PRI cohort.
+    # The populated Resort capture is available only through the explicit
+    # RS2V_REPLAY_CAPTURE_WORLD=1 reverse-engineering diagnostic.
+    "resort": ((0, 1, 2, 3, 4), 3, frozenset({2, 3, 4, 5, 26})),
     # Exact cooked ROObjective replication indices from
     # data/maps/VNTE-CuChi/objectives.txt, ordered by client slot 0..6.
     "cu-chi": ((2, 3, 4, 7, 5, 10, 9), 3,
@@ -1139,10 +1139,14 @@ def spawn(host, port, deployment_wait, expected_objective_values,
     boot = sorted({b2["chIndex"] for d in join_got for b2 in d.get("bunches", [])
                    if b2["chIndex"] >= 2 and b2["bOpen"]})
     print(f"     bootstrap opened {len(boot)} actor channels (ch{boot[0] if boot else '-'}..{boot[-1] if boot else '-'})\n")
-    stale_world_chans = sorted(set(boot) - menu_bootstrap_channels)
+    opened_bootstrap_channels = set(boot)
+    missing_menu_chans = sorted(
+        menu_bootstrap_channels - opened_bootstrap_channels)
+    unexpected_bootstrap_chans = sorted(
+        opened_bootstrap_channels - menu_bootstrap_channels)
 
     # The retail objective HUD is populated by ROGameReplicationInfo array
-    # properties (captured Resort ch54; live-profile ch3), not the emulator's
+    # properties (live GRI ch3), not the emulator's
     # legacy OBJECTIVE_UPDATE packet. Decode the reliable post-open baseline and
     # require the requested identity slot map.
     objective_fields = {}
@@ -1302,11 +1306,11 @@ def spawn(host, port, deployment_wait, expected_objective_values,
     else:
         print("  .. pawn graph did not open; skipping ch219 weapon RPC probes")
 
-    # The pawn-spawn opens a FRESH channel above the bootstrap range (kPawnCh=209).
+    # The owning pawn graph starts at the fixed local pawn channel (kPawnCh=209).
     after = (team_got + role_got + select_got + ready_got + deferred_got + ask_got +
              weapon_select_got + weapon_clear_got)
     pawn_opens = sorted({b2["chIndex"] for d in after for b2 in d.get("bunches", [])
-                         if b2["chIndex"] > BOOTSTRAP_CH_MAX and b2["bOpen"]})
+                         if b2["chIndex"] >= LOCAL_PAWN_CH and b2["bOpen"]})
     # Participant actor pairs are allocated as PRI=512+2N, pawn=513+2N. PRI
     # opens are independently grounded and expected; odd pawn channels must
     # remain absent until the full role/class templates are capture-backed.
@@ -1565,7 +1569,7 @@ def spawn(host, port, deployment_wait, expected_objective_values,
             break
 
     print()
-    print(f"     pawn channel opens (>ch{BOOTSTRAP_CH_MAX}) after role-select: {pawn_opens}")
+    print(f"     pawn channel opens (ch{LOCAL_PAWN_CH}+) after role-select: {pawn_opens}")
     print(f"     ungrounded remote pawn opens: {remote_pawn_opens or 'none'}")
     print(f"     owning graph: {team_contract.label} pawn class="
           f"{pawn_open_class if pawn_open_class is not None else 'missing'} "
@@ -1616,7 +1620,8 @@ def spawn(host, port, deployment_wait, expected_objective_values,
         (has_exact_north_role_transition and has_north_rotation and
          has_exact_north_post_delta and has_north_collide_world_false and
          has_north_respawn_sentinel))
-    ok = (not stale_world_chans and not remote_pawn_opens and
+    ok = (not missing_menu_chans and not unexpected_bootstrap_chans and
+          not remote_pawn_opens and
           not unexpected_owning_opens and
           has_objective_baseline and
           LOCAL_PAWN_CH in pawn_opens and
@@ -1639,8 +1644,13 @@ def spawn(host, port, deployment_wait, expected_objective_values,
               f"ClientRestart, and GivePawn recovery decode to ch{LOCAL_PAWN_CH} ===")
     else:
         miss = []
-        if stale_world_chans:
-            miss.append(f"captured-world actors replayed at bootstrap: {stale_world_chans}")
+        if missing_menu_chans:
+            miss.append(
+                f"missing live menu bootstrap channels: {missing_menu_chans}")
+        if unexpected_bootstrap_chans:
+            miss.append(
+                "unexpected actors opened at live bootstrap: "
+                f"{unexpected_bootstrap_chans}")
         if remote_pawn_opens:
             miss.append(f"ungrounded remote pawn actors opened: {remote_pawn_opens}")
         if unexpected_owning_opens:

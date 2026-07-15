@@ -81,6 +81,10 @@ struct RetailParticipantCombatState {
 
 struct RetailParticipantInitialState {
     RetailParticipantCombatState combat;
+    // Authoritative UE3 PRI.PlayerID allocated by LoginBridge. Detached tests
+    // and bots may omit it and use ParticipantActorChannelMap's stable tagged
+    // fallback instead.
+    std::optional<int32_t> wirePlayerId;
     uint8_t serverTeamId = 0;
     std::string playerName;
     Vector3 positionUu{};

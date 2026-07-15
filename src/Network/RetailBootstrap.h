@@ -75,10 +75,11 @@ struct OwningPawnPackageMapLayout {
     uint32_t inventoryManagerArchetypeRef = 0;
 };
 
-// Process-start artifact policy for the captured replication cohort. The
-// canonical PackageMap and actor captures remain the default; the installed
-// PackageMap plus source-grounded actor-reference rebase are reachable only
-// through one exact opt-in value. String views always refer to static literals.
+// Process-start artifact policy for the live replication cohort. The canonical
+// PackageMap and static references remain the default; the installed PackageMap
+// plus source-grounded actor-reference rebase are reachable only through one
+// exact opt-in value. Captured full-world replay is a separate, canonical-only
+// diagnostic switch. String views always refer to static literals.
 struct ArtifactSelection {
     std::string_view variant;
     std::string_view path;

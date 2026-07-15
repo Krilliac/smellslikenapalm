@@ -146,6 +146,7 @@ void ConnectionLoginBridge::OnClientLoggedIn(const ClientLoggedInEvent& ev)
     pri.bIsSpectator = spectator;
     pri.score        = 0;
     pri.deaths       = 0;
+    conn->SetRetailPlayerId(pri.playerId);
 
     // ChangeName: default name if the client supplied none
     // (GameInfo::Login step 18: InName = DefaultPlayerName $ PlayerID).

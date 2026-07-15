@@ -6,6 +6,7 @@
 #include "Network/BitWriter.h"
 #include "Network/ConnectionManager.h"
 #include "Network/ControlChannel.h"
+#include "Network/ObjectiveReplication.h"
 #include "Network/PacketCodec.h"
 #include "Network/SpawnReplication.h"
 #include "Network/RoleSelectionReplication.h"
@@ -948,6 +949,25 @@ public:
         ASSERT_TRUE(built.has_value());
     }
 
+    static bool ConsumeOutboundPacketCapacityLeavingOneSlot(
+        ConnectionManager& manager, uint32_t clientId) {
+        auto& outbound = manager.m_controlState.at(clientId).outbound;
+        constexpr int64_t halfRange =
+            static_cast<int64_t>(kMaxPacketId) / 2;
+        PacketCodec::Bunch untracked;
+        untracked.chIndex = 2u;
+
+        while (outbound.NextPacketSerial() -
+                   outbound.AckUnwrapReferenceSerial() <
+               halfRange - 1) {
+            if (!outbound.BuildRawBunchPacket(untracked)) return false;
+        }
+        return outbound.HasPacketIdCapacity() &&
+               outbound.NextPacketSerial() -
+                       outbound.AckUnwrapReferenceSerial() ==
+                   halfRange - 1;
+    }
+
     static bool EnsureBunchlessAckReferenceSafe(
         ConnectionManager& manager, uint32_t clientId) {
         return manager.EnsureBunchlessAckReferenceSafe(
@@ -1199,24 +1219,60 @@ public:
         return classRef.index;
     }
 
+    static std::optional<PacketCodec::Bunch> QueueAuthoritativeRemotePri(
+        ConnectionManager& manager, uint32_t viewerClientId,
+        const ParticipantId& participant) {
+        DeploymentRepl::RetailParticipantInitialState initial;
+        if (!manager.BuildRemoteParticipantInitialState(
+                participant, nullptr, initial)) {
+            return std::nullopt;
+        }
+        std::vector<PacketCodec::Bunch> output;
+        if (manager.QueueRemoteParticipantPriOpen(
+                viewerClientId, initial, output) !=
+            ConnectionManager::RemotePriOpenResult::OpenQueued) {
+            return std::nullopt;
+        }
+        const auto open = std::find_if(
+            output.begin(), output.end(),
+            [](const PacketCodec::Bunch& bunch) {
+                return bunch.bOpen && !bunch.bClose;
+            });
+        return open == output.end()
+            ? std::nullopt
+            : std::optional<PacketCodec::Bunch>(*open);
+    }
+
     static bool FreezeRetailBootstrap(
         ConnectionManager& manager, uint32_t clientId,
-        std::string_view variant) {
+        std::string_view variant,
+        std::string_view mapUrl = "VNTE-Resort",
+        std::string_view mode = "Territories") {
         std::string error;
         const auto selection = RetailBootstrap::ResolveArtifactSelection(
             variant, error);
-        if (!selection) return false;
+        const auto profile = RetailBootstrap::ResolveExactProfile(mapUrl, mode);
+        if (!selection || !profile) return false;
 
         auto& state = manager.m_controlState.at(clientId);
         state.retailArtifactSelectionResolved = true;
         state.retailArtifactSelection = selection;
-        state.retailBootstrapProfile = RetailBootstrap::CanonicalProfile();
+        state.retailBootstrapProfile = profile;
         return true;
     }
 
-    static void SendLiveActorBootstrap(ConnectionManager& manager,
-                                       uint32_t clientId) {
-        manager.SendLiveActorBootstrap(clientId);
+    static bool ClearLiveTeamInfoClassRef(ConnectionManager& manager,
+                                          uint32_t clientId) {
+        auto& selection =
+            manager.m_controlState.at(clientId).retailArtifactSelection;
+        if (!selection) return false;
+        selection->roGame.teamInfoClassRef = 0u;
+        return true;
+    }
+
+    static uint32_t GriChannel(const ConnectionManager& manager,
+                               uint32_t clientId) {
+        return manager.m_controlState.at(clientId).griChannel;
     }
 
     static void SendActorBootstrap(ConnectionManager& manager,
@@ -3923,6 +3979,45 @@ TEST(ConnectionTravelLifecycle,
 }
 
 TEST_F(ConnectionTravelCuChiRoleIntegrationTest,
+       RemoteHumanPriUsesLoginBridgePlayerIdInsteadOfTransportId) {
+    using Harness = ConnectionTravelLifecycleTestHarness;
+    const std::shared_ptr<ClientConnection> target =
+        Connect(0u, 41u, TeamMapping::kServerUs);
+    const std::shared_ptr<ClientConnection> viewer =
+        Connect(1u, 42u, TeamMapping::kServerNva);
+    ASSERT_TRUE(target != nullptr);
+    ASSERT_TRUE(viewer != nullptr);
+    target->SetRetailPlayerId(73);
+
+    const std::optional<PacketCodec::Bunch> remotePri =
+        Harness::QueueAuthoritativeRemotePri(
+            manager_, viewer->GetClientId(),
+            ParticipantId::Human(target->GetClientId()));
+    ASSERT_TRUE(remotePri.has_value());
+
+    BitReader reader(remotePri->payload.data(), remotePri->payload.size(),
+                     remotePri->payloadBits);
+    (void)ActorRepl::ReadNetGUID(reader);
+    float x = 0.0f, y = 0.0f, z = 0.0f;
+    ActorRepl::ReadCompressedVector(reader, x, y, z);
+    constexpr uint32_t maxHandle =
+        DeploymentRepl::kRoPlayerReplicationInfoMaxHandle;
+    EXPECT_EQ(reader.SerializeInt(maxHandle), 24u);
+    (void)reader.ReadInt32();
+    EXPECT_EQ(reader.SerializeInt(maxHandle), 28u);
+    (void)reader.ReadBit();
+    EXPECT_EQ(reader.SerializeInt(maxHandle), 31u);
+    (void)reader.ReadBit();
+    EXPECT_EQ(reader.SerializeInt(maxHandle), 32u);
+    (void)reader.ReadBit();
+    EXPECT_EQ(reader.SerializeInt(maxHandle), 33u);
+    (void)reader.ReadBit();
+    EXPECT_EQ(reader.SerializeInt(maxHandle), 36u);
+    EXPECT_EQ(reader.ReadInt32(), 73);
+    EXPECT_FALSE(reader.IsOverflowed());
+}
+
+TEST_F(ConnectionTravelCuChiRoleIntegrationTest,
        CanonicalSouthAndNorthFinalRequestsCommitRuntimeSquadAndRoleLedger) {
     using Harness = ConnectionTravelLifecycleTestHarness;
     struct RoleCase {
@@ -5970,145 +6065,417 @@ TEST(ConnectionTravelLifecycle,
 }
 
 TEST(ConnectionTravelLifecycle,
-     LiveActorBootstrapQueuesClassesAndGameClassFromFrozenArtifact) {
+     DefaultActorBootstrapUsesLiveLayoutForEverySupportedProfile) {
     struct LayoutCase {
         std::string_view variant;
         uint32_t playerController;
         uint32_t gameReplicationInfo;
         uint32_t teamInfo;
         uint32_t playerReplicationInfo;
-        uint32_t territoriesGameClass;
     };
     const std::vector<LayoutCase> layouts{
-        {{}, 57520u, 70887u, 90245u, 86701u, 69601u},
-        {"installed", 57522u, 70889u, 90248u, 86704u, 69603u},
+        {{}, 57520u, 70887u, 90245u, 86701u},
+        {"installed", 57522u, 70889u, 90248u, 86704u},
     };
+    struct ProfileCase {
+        std::string_view mapUrl;
+        std::string_view mode;
+        uint32_t canonicalGameClass;
+        uint32_t installedGameClass;
+    };
+    const std::vector<ProfileCase> profiles{
+        {"VNTE-Resort", "Territories", 69601u, 69603u},
+        {"VNTE-CuChi", "Territories", 69601u, 69603u},
+        {"VNSU-HueCity", "Supremacy", 70442u, 70444u},
+        {"VNSK-Compound", "Skirmish", 70363u, 70365u},
+    };
+    ScopedEnvironmentVariable replayWorld(
+        "RS2V_REPLAY_CAPTURE_WORLD", "0");
 
-    for (const LayoutCase& expected : layouts) {
-        ConnectionManager manager(nullptr);
-        ConnectionTravelLifecycleTestHarness::AddClient(
-            manager, 1, "127.0.0.1", 30134, true, 0, false);
-        ASSERT_TRUE(ConnectionTravelLifecycleTestHarness::FreezeRetailBootstrap(
-            manager, 1, expected.variant));
+    for (const ProfileCase& profile : profiles) {
+        for (const LayoutCase& expected : layouts) {
+            ConnectionManager manager(nullptr);
+            const std::shared_ptr<ClientConnection> connection =
+                ConnectionTravelLifecycleTestHarness::AddClient(
+                    manager, 1, "127.0.0.1", 30134, true, 0, false);
+            ASSERT_TRUE(
+                ConnectionTravelLifecycleTestHarness::FreezeRetailBootstrap(
+                    manager, 1, expected.variant, profile.mapUrl,
+                    profile.mode));
 
-        ConnectionTravelLifecycleTestHarness::SendLiveActorBootstrap(manager, 1);
-        const std::vector<PacketCodec::Bunch> queued =
-            ConnectionTravelLifecycleTestHarness::QueuedReliableBunches(
+            ConnectionTravelLifecycleTestHarness::SendActorBootstrap(
                 manager, 1);
+            const std::vector<PacketCodec::Bunch> queued =
+                ConnectionTravelLifecycleTestHarness::QueuedReliableBunches(
+                    manager, 1);
 
-        ASSERT_GE(queued.size(), 2u);
-        EXPECT_EQ(queued[0].chIndex, 2u);
-        EXPECT_TRUE(queued[0].bOpen);
-        EXPECT_EQ(queued[1].chIndex, 0u);
-        EXPECT_EQ(queued[1].payload,
-                  (std::vector<uint8_t>{0x24u, 0x01u, 0x00u, 0x00u, 0x00u}));
-        EXPECT_EQ(queued[1].payloadBits, 40u);
-        EXPECT_EQ(ConnectionTravelLifecycleTestHarness::FirstPendingBunchCount(
-                      manager, 1),
-                  2u);
+            ASSERT_FALSE(connection->IsDisconnected());
+            ASSERT_GE(queued.size(), 2u);
+            EXPECT_EQ(queued[0].chIndex, 2u);
+            EXPECT_TRUE(queued[0].bOpen);
+            EXPECT_EQ(queued[1].chIndex, 0u);
+            EXPECT_EQ(
+                queued[1].payload,
+                (std::vector<uint8_t>{0x24u, 0x01u, 0x00u, 0x00u, 0x00u}));
+            EXPECT_EQ(queued[1].payloadBits, 40u);
+            EXPECT_EQ(
+                ConnectionTravelLifecycleTestHarness::FirstPendingBunchCount(
+                    manager, 1),
+                2u);
 
-        const PacketCodec::Bunch* pc = FindQueuedOpen(queued, 2);
-        const PacketCodec::Bunch* gri = FindQueuedOpen(queued, 3);
-        const PacketCodec::Bunch* team0 = FindQueuedOpen(queued, 4);
-        const PacketCodec::Bunch* team1 = FindQueuedOpen(queued, 5);
-        const PacketCodec::Bunch* pri = FindQueuedOpen(queued, 26);
-        ASSERT_TRUE(pc != nullptr);
-        ASSERT_TRUE(gri != nullptr);
-        ASSERT_TRUE(team0 != nullptr);
-        ASSERT_TRUE(team1 != nullptr);
-        ASSERT_TRUE(pri != nullptr);
+            std::vector<uint32_t> openedChannels;
+            for (const PacketCodec::Bunch& bunch : queued) {
+                if (bunch.bOpen && !bunch.bClose) {
+                    openedChannels.push_back(bunch.chIndex);
+                }
+            }
+            std::sort(openedChannels.begin(), openedChannels.end());
+            openedChannels.erase(
+                std::unique(openedChannels.begin(), openedChannels.end()),
+                openedChannels.end());
+            EXPECT_EQ(openedChannels,
+                      (std::vector<uint32_t>{2u, 3u, 4u, 5u, 26u}));
+            EXPECT_EQ(ConnectionTravelLifecycleTestHarness::GriChannel(
+                          manager, 1),
+                      3u);
 
-        struct OpenExpectation {
-            const PacketCodec::Bunch* bunch;
-            uint32_t classRef;
-            bool playerController;
-        };
-        const std::vector<OpenExpectation> opens{
-            {pc, expected.playerController, true},
-            {gri, expected.gameReplicationInfo, false},
-            {team0, expected.teamInfo, false},
-            {team1, expected.teamInfo, false},
-            {pri, expected.playerReplicationInfo, false},
-        };
-        for (const OpenExpectation& open : opens) {
-            bool overflowed = false;
-            const ActorRepl::NetGUIDRef classRef = DecodeLiveOpenClass(
-                *open.bunch, open.playerController, overflowed);
-            EXPECT_FALSE(overflowed);
-            EXPECT_FALSE(classRef.isDynamic);
-            EXPECT_EQ(classRef.index, open.classRef);
+            const auto priLink = std::find_if(
+                queued.begin(), queued.end(),
+                [](const PacketCodec::Bunch& bunch) {
+                    return bunch.bReliable && !bunch.bOpen &&
+                           !bunch.bClose && bunch.chIndex == 2u &&
+                           bunch.payloadBits == 20u;
+                });
+            ASSERT_TRUE(priLink != queued.end());
+            EXPECT_EQ(priLink->chSequence, 2u);
+            EXPECT_EQ(priLink->payload,
+                      (std::vector<uint8_t>{0x17u, 0x6au, 0x00u}));
+
+            std::vector<uint32_t> ch2ReliableSequences;
+            for (const PacketCodec::Bunch& bunch : queued) {
+                if (bunch.bReliable && bunch.chIndex == 2u) {
+                    ch2ReliableSequences.push_back(bunch.chSequence);
+                }
+            }
+            EXPECT_EQ(ch2ReliableSequences,
+                      (std::vector<uint32_t>{1u, 2u, 3u, 4u}));
+
+            const PacketCodec::Bunch* pc = FindQueuedOpen(queued, 2);
+            const PacketCodec::Bunch* gri = FindQueuedOpen(queued, 3);
+            const PacketCodec::Bunch* team0 = FindQueuedOpen(queued, 4);
+            const PacketCodec::Bunch* team1 = FindQueuedOpen(queued, 5);
+            const PacketCodec::Bunch* pri = FindQueuedOpen(queued, 26);
+            ASSERT_TRUE(pc != nullptr);
+            ASSERT_TRUE(gri != nullptr);
+            ASSERT_TRUE(team0 != nullptr);
+            ASSERT_TRUE(team1 != nullptr);
+            ASSERT_TRUE(pri != nullptr);
+
+            struct OpenExpectation {
+                const PacketCodec::Bunch* bunch;
+                uint32_t classRef;
+                bool playerController;
+            };
+            const std::vector<OpenExpectation> opens{
+                {pc, expected.playerController, true},
+                {gri, expected.gameReplicationInfo, false},
+                {team0, expected.teamInfo, false},
+                {team1, expected.teamInfo, false},
+                {pri, expected.playerReplicationInfo, false},
+            };
+            for (const OpenExpectation& open : opens) {
+                bool overflowed = false;
+                const ActorRepl::NetGUIDRef classRef = DecodeLiveOpenClass(
+                    *open.bunch, open.playerController, overflowed);
+                EXPECT_FALSE(overflowed);
+                EXPECT_FALSE(classRef.isDynamic);
+                EXPECT_EQ(classRef.index, open.classRef);
+            }
+
+            BitReader pcReader(pc->payload.data(), pc->payload.size(),
+                               pc->payloadBits);
+            (void)ActorRepl::ReadNetGUID(pcReader);
+            float pcX = 0.0f, pcY = 0.0f, pcZ = 0.0f;
+            ActorRepl::ReadCompressedVector(
+                pcReader, pcX, pcY, pcZ);
+            EXPECT_EQ(pcReader.ReadByte(), 0u);
+            EXPECT_FALSE(pcReader.IsOverflowed());
+            EXPECT_EQ(pcReader.BitPos(), pc->payloadBits);
+
+            // Both playable TeamInfo opens must seed h62 before spawn selection.
+            // With no GameServer/TicketSystem in this harness, initial==0 means an
+            // unlimited pool and therefore the positive retail display sentinel.
+            const std::array<
+                std::pair<const PacketCodec::Bunch*, int32_t>, 2>
+                teamOpens{{{team0, 0}, {team1, 1}}};
+            for (const auto& [teamBunch, expectedTeam] : teamOpens) {
+                BitReader teamReader(teamBunch->payload.data(),
+                                     teamBunch->payload.size(),
+                                     teamBunch->payloadBits);
+                const ActorRepl::NetGUIDRef teamClass =
+                    ActorRepl::ReadNetGUID(teamReader);
+                EXPECT_FALSE(teamClass.isDynamic);
+                EXPECT_EQ(teamClass.index, expected.teamInfo);
+                float teamX = 0.0f, teamY = 0.0f, teamZ = 0.0f;
+                ActorRepl::ReadCompressedVector(
+                    teamReader, teamX, teamY, teamZ);
+                EXPECT_EQ(teamReader.SerializeInt(
+                              SpawnRepl::kTeamInfoMaxHandle),
+                          23u);
+                EXPECT_EQ(teamReader.ReadInt32(), expectedTeam);
+                EXPECT_EQ(teamReader.SerializeInt(
+                              SpawnRepl::kTeamInfoMaxHandle),
+                          SpawnRepl::kReinforcementsRemaining);
+                EXPECT_EQ(teamReader.ReadInt32(),
+                          SpawnRepl::kUnlimitedReinforcementsDisplay);
+                EXPECT_FALSE(teamReader.IsOverflowed());
+                EXPECT_EQ(teamReader.BitPos(), teamBunch->payloadBits);
+            }
+
+            // The GRI's first bNetInitial property is h33 GameClass. Decode it from
+            // the actual queued opening bunch rather than re-testing the resolver.
+            BitReader griReader(gri->payload.data(), gri->payload.size(),
+                                gri->payloadBits);
+            (void)ActorRepl::ReadNetGUID(griReader);
+            float x = 0.0f, y = 0.0f, z = 0.0f;
+            ActorRepl::ReadCompressedVector(griReader, x, y, z);
+            EXPECT_EQ(griReader.SerializeInt(184u), 33u);
+            const ActorRepl::NetGUIDRef gameClass =
+                ActorRepl::ReadNetGUID(griReader);
+            EXPECT_EQ(griReader.SerializeInt(184u),
+                      ObjectiveRepl::kBalanceTeams);
+            EXPECT_TRUE(griReader.ReadBit());
+            EXPECT_EQ(griReader.SerializeInt(184u),
+                      ObjectiveRepl::kMaxTeamDifference);
+            EXPECT_EQ(griReader.ReadByte(), 2u);
+            EXPECT_EQ(griReader.SerializeInt(184u),
+                      ObjectiveRepl::kMaxPlayers);
+            EXPECT_EQ(griReader.ReadByte(), 64u);
+            EXPECT_FALSE(griReader.IsOverflowed());
+            EXPECT_EQ(griReader.BitPos(), gri->payloadBits);
+            EXPECT_FALSE(gameClass.isDynamic);
+            EXPECT_EQ(gameClass.index,
+                      expected.variant.empty()
+                          ? profile.canonicalGameClass
+                          : profile.installedGameClass);
         }
-
-        // Both playable TeamInfo opens must seed h62 before spawn selection.
-        // With no GameServer/TicketSystem in this harness, initial==0 means an
-        // unlimited pool and therefore the positive retail display sentinel.
-        const std::array<std::pair<const PacketCodec::Bunch*, int32_t>, 2>
-            teamOpens{{{team0, 0}, {team1, 1}}};
-        for (const auto& [teamBunch, expectedTeam] : teamOpens) {
-            BitReader teamReader(teamBunch->payload.data(),
-                                 teamBunch->payload.size(),
-                                 teamBunch->payloadBits);
-            const ActorRepl::NetGUIDRef teamClass =
-                ActorRepl::ReadNetGUID(teamReader);
-            EXPECT_FALSE(teamClass.isDynamic);
-            EXPECT_EQ(teamClass.index, expected.teamInfo);
-            float teamX = 0.0f, teamY = 0.0f, teamZ = 0.0f;
-            ActorRepl::ReadCompressedVector(teamReader, teamX, teamY, teamZ);
-            EXPECT_EQ(teamReader.SerializeInt(
-                          SpawnRepl::kTeamInfoMaxHandle),
-                      23u);
-            EXPECT_EQ(teamReader.ReadInt32(), expectedTeam);
-            EXPECT_EQ(teamReader.SerializeInt(
-                          SpawnRepl::kTeamInfoMaxHandle),
-                      SpawnRepl::kReinforcementsRemaining);
-            EXPECT_EQ(teamReader.ReadInt32(),
-                      SpawnRepl::kUnlimitedReinforcementsDisplay);
-            EXPECT_FALSE(teamReader.IsOverflowed());
-            EXPECT_EQ(teamReader.BitPos(), teamBunch->payloadBits);
-        }
-
-        // The GRI's first bNetInitial property is h33 GameClass. Decode it from
-        // the actual queued opening bunch rather than re-testing the resolver.
-        BitReader griReader(gri->payload.data(), gri->payload.size(),
-                            gri->payloadBits);
-        (void)ActorRepl::ReadNetGUID(griReader);
-        float x = 0.0f, y = 0.0f, z = 0.0f;
-        ActorRepl::ReadCompressedVector(griReader, x, y, z);
-        EXPECT_EQ(griReader.SerializeInt(184u), 33u);
-        const ActorRepl::NetGUIDRef gameClass =
-            ActorRepl::ReadNetGUID(griReader);
-        EXPECT_FALSE(griReader.IsOverflowed());
-        EXPECT_FALSE(gameClass.isDynamic);
-        EXPECT_EQ(gameClass.index, expected.territoriesGameClass);
     }
 }
 
 TEST(ConnectionTravelLifecycle,
-     InstalledFullWorldReplayGateQueuesNoActorBunches) {
+     LiveBootstrapKeepsFrozenLayoutAndLoginIdentityPerConnection) {
     ConnectionManager manager(nullptr);
-    ConnectionTravelLifecycleTestHarness::AddClient(
-        manager, 1, "127.0.0.1", 30135, true, 0, false);
+    const std::shared_ptr<ClientConnection> canonical =
+        ConnectionTravelLifecycleTestHarness::AddClient(
+            manager, 41, "127.0.0.1", 30135, true, 0, false);
+    const std::shared_ptr<ClientConnection> installed =
+        ConnectionTravelLifecycleTestHarness::AddClient(
+            manager, 42, "127.0.0.1", 30136, true, 0, false);
+    canonical->SetPlayerName("CanonicalLogin");
+    canonical->SetRetailPlayerId(7);
+    installed->SetPlayerName("InstalledReconnect");
+    installed->SetRetailPlayerId(19);
+    ASSERT_TRUE(ConnectionTravelLifecycleTestHarness::FreezeRetailBootstrap(
+        manager, 41, {}));
+    ASSERT_TRUE(ConnectionTravelLifecycleTestHarness::FreezeRetailBootstrap(
+        manager, 42, "installed"));
+
+    ScopedEnvironmentVariable replayWorld(
+        "RS2V_REPLAY_CAPTURE_WORLD", "0");
+    ConnectionTravelLifecycleTestHarness::SendActorBootstrap(manager, 41);
+    ConnectionTravelLifecycleTestHarness::SendActorBootstrap(manager, 42);
+
+    struct ExpectedPri {
+        uint32_t clientId;
+        uint32_t classRef;
+        int32_t playerId;
+        std::string name;
+    };
+    const std::array<ExpectedPri, 2> expectations{{
+        {41u, 86701u, 7, "CanonicalLogin"},
+        {42u, 86704u, 19, "InstalledReconnect"},
+    }};
+    for (const ExpectedPri& expected : expectations) {
+        const std::vector<PacketCodec::Bunch> queued =
+            ConnectionTravelLifecycleTestHarness::QueuedReliableBunches(
+                manager, expected.clientId);
+        const PacketCodec::Bunch* pri = FindQueuedOpen(queued, 26u);
+        ASSERT_TRUE(pri != nullptr);
+
+        BitReader reader(pri->payload.data(), pri->payload.size(),
+                         pri->payloadBits);
+        const ActorRepl::NetGUIDRef priClass =
+            ActorRepl::ReadNetGUID(reader);
+        EXPECT_FALSE(priClass.isDynamic);
+        EXPECT_EQ(priClass.index, expected.classRef);
+        float x = 0.0f, y = 0.0f, z = 0.0f;
+        ActorRepl::ReadCompressedVector(reader, x, y, z);
+        EXPECT_EQ(reader.SerializeInt(98u), 36u);
+        EXPECT_EQ(reader.ReadInt32(), expected.playerId);
+        EXPECT_EQ(reader.SerializeInt(98u), 37u);
+        EXPECT_EQ(reader.ReadString(), expected.name);
+        EXPECT_FALSE(reader.IsOverflowed());
+        EXPECT_EQ(reader.BitPos(), pri->payloadBits);
+    }
+}
+
+TEST(ConnectionTravelLifecycle,
+     CanonicalResortFullWorldReplayRequiresExplicitSwitch) {
+    ConnectionManager manager(nullptr);
+    const std::shared_ptr<ClientConnection> connection =
+        ConnectionTravelLifecycleTestHarness::AddClient(
+            manager, 1, "127.0.0.1", 30135, true, 0, false);
+    ASSERT_TRUE(ConnectionTravelLifecycleTestHarness::FreezeRetailBootstrap(
+        manager, 1, {}));
+
+    {
+        ScopedEnvironmentVariable replayWorld(
+            "RS2V_REPLAY_CAPTURE_WORLD", "1");
+        ConnectionTravelLifecycleTestHarness::SendActorBootstrap(manager, 1);
+    }
+
+    const std::vector<PacketCodec::Bunch> queued =
+        ConnectionTravelLifecycleTestHarness::QueuedReliableBunches(
+            manager, 1);
+    EXPECT_FALSE(connection->IsDisconnected());
+    EXPECT_EQ(ConnectionTravelLifecycleTestHarness::GriChannel(manager, 1),
+              54u);
+    EXPECT_GT(queued.size(), static_cast<size_t>(5));
+    const PacketCodec::Bunch* capturedGri = FindQueuedOpen(queued, 54u);
+    ASSERT_TRUE(capturedGri != nullptr);
+    EXPECT_TRUE(capturedGri->bReliable);
+    EXPECT_EQ(capturedGri->chSequence, 1u);
+    EXPECT_EQ(capturedGri->payloadBits, 4662u);
+
+    // ch140 is the last actor in the populated Resort capture. Its presence
+    // proves the explicit switch replayed the full world, not merely the live
+    // menu-critical ch2/ch3/ch4/ch5/ch26 cohort with a different GRI ledger.
+    const PacketCodec::Bunch* capturedWorldTail =
+        FindQueuedOpen(queued, 140u);
+    ASSERT_TRUE(capturedWorldTail != nullptr);
+    EXPECT_TRUE(capturedWorldTail->bReliable);
+    EXPECT_EQ(capturedWorldTail->chSequence, 1u);
+    EXPECT_EQ(capturedWorldTail->payloadBits, 999u);
+}
+
+TEST(ConnectionTravelLifecycle,
+     InstalledFullWorldReplayGateFailsClosedWithoutActorBunches) {
+    ConnectionManager manager(nullptr);
+    const std::shared_ptr<ClientConnection> connection =
+        ConnectionTravelLifecycleTestHarness::AddClient(
+            manager, 1, "127.0.0.1", 30136, true, 0, false);
     ASSERT_TRUE(ConnectionTravelLifecycleTestHarness::FreezeRetailBootstrap(
         manager, 1, "installed"));
 
     {
         ScopedEnvironmentVariable replayWorld(
             "RS2V_REPLAY_CAPTURE_WORLD", "1");
-        // If the installed full-world gate regresses, force the deterministic
-        // live path so this test cannot false-pass on a missing capture file.
-        ScopedEnvironmentVariable liveReplication("RS2V_LIVE_REPL", "1");
-        const char* active = std::getenv("RS2V_REPLAY_CAPTURE_WORLD");
-        ASSERT_TRUE(active != nullptr);
-        EXPECT_EQ(std::string(active), std::string("1"));
         ConnectionTravelLifecycleTestHarness::SendActorBootstrap(manager, 1);
     }
 
+    EXPECT_TRUE(connection->IsDisconnected());
     EXPECT_EQ(ConnectionTravelLifecycleTestHarness::PendingReliableCount(
                   manager, 1),
               static_cast<size_t>(0));
     EXPECT_TRUE(
         ConnectionTravelLifecycleTestHarness::QueuedReliableBunches(manager, 1)
             .empty());
+}
+
+TEST(ConnectionTravelLifecycle,
+     NonResortFullWorldReplayGateFailsClosedWithoutActorBunches) {
+    ConnectionManager manager(nullptr);
+    const std::shared_ptr<ClientConnection> connection =
+        ConnectionTravelLifecycleTestHarness::AddClient(
+            manager, 1, "127.0.0.1", 30137, true, 0, false);
+    ASSERT_TRUE(ConnectionTravelLifecycleTestHarness::FreezeRetailBootstrap(
+        manager, 1, {}, "VNTE-CuChi", "Territories"));
+
+    {
+        ScopedEnvironmentVariable replayWorld(
+            "RS2V_REPLAY_CAPTURE_WORLD", "1");
+        ConnectionTravelLifecycleTestHarness::SendActorBootstrap(manager, 1);
+    }
+
+    EXPECT_TRUE(connection->IsDisconnected());
+    EXPECT_EQ(ConnectionTravelLifecycleTestHarness::PendingReliableCount(
+                  manager, 1),
+              static_cast<size_t>(0));
+    EXPECT_FALSE(ConnectionTravelLifecycleTestHarness::OutboundActorChannelOpen(
+        manager, 1, 2u));
+}
+
+TEST(ConnectionTravelLifecycle,
+     InvalidDefaultLiveLayoutFailsClosedBeforeJoinedCallback) {
+    ConnectionManager manager(nullptr);
+    const std::shared_ptr<ClientConnection> connection =
+        ConnectionTravelLifecycleTestHarness::AddClient(
+            manager, 1, "127.0.0.1", 30138, false, 0, false);
+    ASSERT_TRUE(ConnectionTravelLifecycleTestHarness::FreezeRetailBootstrap(
+        manager, 1, {}));
+    ASSERT_TRUE(
+        ConnectionTravelLifecycleTestHarness::ClearLiveTeamInfoClassRef(
+            manager, 1));
+
+    int joinedCallbacks = 0;
+    manager.SetClientJoinedCallback(
+        [&](const ClientJoinedEvent&) { ++joinedCallbacks; });
+    {
+        ScopedEnvironmentVariable replayWorld(
+            "RS2V_REPLAY_CAPTURE_WORLD", "0");
+        manager.FireClientJoined(ClientJoinedEvent{1u});
+    }
+
+    EXPECT_TRUE(connection->IsDisconnected());
+    EXPECT_EQ(joinedCallbacks, 0);
+    EXPECT_EQ(ConnectionTravelLifecycleTestHarness::PendingReliableCount(
+                  manager, 1),
+              static_cast<size_t>(0));
+    EXPECT_FALSE(ConnectionTravelLifecycleTestHarness::OutboundActorChannelOpen(
+        manager, 1, 2u));
+}
+
+TEST(ConnectionTravelLifecycle,
+     LiveBootstrapCohortAllocatorFailureSuppressesJoinAndStateCommit) {
+    using Harness = ConnectionTravelLifecycleTestHarness;
+    ConnectionManager manager(nullptr);
+    const std::shared_ptr<ClientConnection> connection = Harness::AddClient(
+        manager, 1u, "127.0.0.1", 30139u, false, 0u, false);
+    ASSERT_TRUE(Harness::FreezeRetailBootstrap(manager, 1u, {}));
+
+    // Leave room for exactly the atomic PC OPEN/NMT 0x24 entry packet. The
+    // following GRI/TeamInfo/PRI + reserved ch2 PRI-link cohort must then take
+    // SendReservedCh2Bunches' rejected-publication rollback path.
+    ASSERT_TRUE(Harness::ConsumeOutboundPacketCapacityLeavingOneSlot(
+        manager, 1u));
+
+    int joinedCallbacks = 0;
+    manager.SetClientJoinedCallback(
+        [&](const ClientJoinedEvent&) { ++joinedCallbacks; });
+    {
+        ScopedEnvironmentVariable replayWorld(
+            "RS2V_REPLAY_CAPTURE_WORLD", "0");
+        manager.FireClientJoined(ClientJoinedEvent{1u});
+    }
+
+    EXPECT_TRUE(connection->IsDisconnected());
+    EXPECT_EQ(joinedCallbacks, 0);
+    ASSERT_EQ(Harness::PendingReliableCount(manager, 1u), 1u);
+    EXPECT_EQ(Harness::FirstPendingBunchCount(manager, 1u), 2u);
+    const std::vector<PacketCodec::Bunch> queued =
+        Harness::QueuedReliableBunches(manager, 1u);
+    EXPECT_TRUE(FindQueuedOpen(queued, 2u) != nullptr);
+    EXPECT_TRUE(FindQueuedOpen(queued, 3u) == nullptr);
+    EXPECT_TRUE(FindQueuedOpen(queued, 4u) == nullptr);
+    EXPECT_TRUE(FindQueuedOpen(queued, 5u) == nullptr);
+    EXPECT_TRUE(FindQueuedOpen(queued, 26u) == nullptr);
+    EXPECT_EQ(Harness::GriChannel(manager, 1u), 0u);
+
+    const std::array<std::optional<int32_t>, 2> noReinforcements{};
+    EXPECT_EQ(Harness::PublishedTeamReinforcements(manager, 1u),
+              noReinforcements);
+    EXPECT_EQ(Harness::PendingTeamReinforcements(manager, 1u),
+              noReinforcements);
 }
 
 TEST(ConnectionTravelLifecycle,

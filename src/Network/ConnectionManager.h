@@ -263,7 +263,7 @@ private:
         // actorChType is ch2's ChType (CHTYPE_Actor) reused for later bunches.
         // teamSelected guards the SelectTeam->role-select advance.
         uint32_t actorChType = 2;
-        uint32_t griChannel = 0;       // captured bootstrap ch54; live bootstrap ch3
+        uint32_t griChannel = 0;       // live bootstrap ch3; captured RE diagnostic ch54
         uint32_t griOutReliable = 0;   // reliable sequence seeded by the GRI open
         // Retail TeamInfo actor channels indexed by retail team (0=NVA, 1=US).
         // Captured Resort bootstrap uses {76,56}; the live builder uses {4,5}.
@@ -860,18 +860,16 @@ private:
     // send UE3's canonical empty PacketId+terminator transport keepalive.
     void TransportKeepAliveTick();
 
-    // Open the bootstrap ACTOR channels after the client confirms Join. Reads the
-    // official captured actor burst from
-    // data/actor_bootstrap.bin - a stream of full bunch descriptors
-    // [u16 chIndex][u8 chType][u8 flags][u16 chSequence][u32 len][payload]. ch0
-    // records ride the normal control path; ChIndex>=2 records open their own
-    // channel via PacketAssembler::BuildRawBunchPacket. No-op (logged) if absent.
-    // Actor payloads are session-specific, so normal gameplay filters the file to
-    // the adoption/menu-critical channels {2,21,26,54,56,76}. Replaying captured
-    // pawns/vehicles is opt-in via RS2V_REPLAY_CAPTURE_WORLD=1 for RE only.
+    // Open the per-session bootstrap ACTOR channels after Join: owning PC ch2,
+    // GRI ch3, TeamInfo ch4/ch5, and owning PRI ch26. Class references come from
+    // the connection's frozen canonical/installed PackageMap layout and the GRI
+    // GameClass comes from its exact map/mode profile. The populated canonical
+    // Resort capture is available only for reverse engineering through the exact
+    // RS2V_REPLAY_CAPTURE_WORLD=1 switch; every mismatched profile/artifact fails
+    // closed before actor publication.
     void SendActorBootstrap(uint32_t clientId);
-    // Live per-session actor bootstrap (GRI + TeamInfo + local PC/PRI) — replaces the
-    // canned capture replay so the client keeps real actors and the team menu works.
+    // Author the live GRI + TeamInfo + local PC/PRI cohort and its retry-owned
+    // PC->PRI link, then queue the ordered team-select transition.
     void SendLiveActorBootstrap(uint32_t clientId);
 
     // Encode the ObjectiveSystem authority into ROGameReplicationInfo static

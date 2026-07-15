@@ -73,8 +73,8 @@ cites the function that does the work.
 │ WORLD BOOTSTRAP + MENU (back in ConnectionManager, post-Join)             │
 │                                                                            │
 │  SendReplicationBootstrap()  PackageMap export (NetGUID/package list)      │
-│  SendActorBootstrap()        open actor channels: ROGameReplicationInfo,   │
-│                              ROTeamInfo, local ROPlayerController, PRIs     │
+│  SendActorBootstrap()        live PC ch2, GRI ch3, TeamInfo ch4/ch5,       │
+│                              local PRI ch26 + retry-owned PC→PRI link       │
 │  SendCh2Rpc(ClientShowTeamSelect)   → client renders team-select menu      │
 │                                                                            │
 │  inbound: DecodeInboundActorBunch() → SelectTeam RPC                       │
@@ -180,7 +180,7 @@ allocates a `clientId`). Its progression, with the owning state:
 | **Hello → Challenge** | `HandshakePhase::ChallengeSent` | Client `NMT_Hello` (version, SteamId, rate, URL); server emits Challenge nonce. Steam auth is **stubbed** (accepted blindly). |
 | **Login → Welcome** | `HandshakePhase::WelcomeSent` | `NMT_Login` parsed → `ClientLoggedIn` fires → `ConnectionLoginBridge` runs PreLogin + Login, creates the PRI and (lazily) the single GRI. |
 | **Join** | `HandshakePhase::Joined` | `NMT_Join` → `ClientJoined` fires → bridge runs PostLogin (team pick + spawn). |
-| **World bootstrap** | `ConnectionManager::ControlState` (per-client) | `SendReplicationBootstrap` (PackageMap) then `SendActorBootstrap` open the bootstrap actor channels; ch2 carries `ClientShowTeamSelect`. |
+| **World bootstrap** | `ConnectionManager::ControlState` (per-client) | `SendReplicationBootstrap` publishes PackageMap, then `SendActorBootstrap` authors PC ch2, GRI ch3, TeamInfo ch4/ch5, PRI ch26, and the retry-owned PC→PRI link from the frozen profile/artifact; later ch2 sequences carry `ClientShowTeamSelect`. |
 | **Team / role / spawn** | `ControlState` (`teamSelected`, `ch2Reliable`, owning-pawn generation fields) | Inbound `SelectTeam` (`DecodeInboundActorBunch`) persists the team and advances to `ClientShowRoleSelect`; role selection leads to a spawn request. Possession recovery is eligible only for the exact live generation represented by the open owning-pawn graph. |
 | **Teardown** | — | `RemoveStaleConnections` (heartbeat timeout) or explicit disconnect drops the `ClientConnection`, handshake, and control state. |
 

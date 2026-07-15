@@ -48,7 +48,7 @@ ACK window. `PacketCodec::Encode` then feeds the already-bounded wire image to
 Three things never mix:
 1. **Framing** (`PacketCodec`) — PacketId, acks, bunch headers, BunchDataBits. Knows nothing about NMT or actors.
 2. **Control messages** (`ControlChannel` / `HandshakeState`) — the NMT byte-stream carried on ch0.
-3. **Replication** (`ActorReplication`, the bootstrap replays, the ch2 RPC path) — actor channels (ch≥2).
+3. **Replication** (`ActorReplication`, the live actor bootstrap, the explicit capture diagnostic, the ch2 RPC path) — actor channels (ch≥2).
 
 All bit IO is **LSB-first within each byte**; bounded ints use `SerializeInt`/`ReadInt`
 (UE3 `FBitReader::SerializeInt`). Multi-byte fixed values are little-endian.
@@ -378,9 +378,9 @@ that the client may proceed past `NMT_Uses`; downstream `ObjectBase`/static refe
 still be validated from the retail packet trace before this artifact can be promoted.
 
 The 2026-07-14 retail dogfood runs prove this candidate clears PackageMap reconciliation,
-loads `VNTE-Resort`, reaches `NMT_Join`, creates all six menu-critical actors, and adopts
-ch2 as the local `ROPlayerController`. Source-grounded installed-package indices provide
-the actor-side candidate under the same `installed` selector. Actor opens reference their
+loads `VNTE-Resort`, reaches `NMT_Join`, and adopts ch2 as the local
+`ROPlayerController`. Source-grounded installed-package indices now feed the live actor
+builder under the same frozen `installed` selector. Actor opens reference their
 `Default__` archetypes, while HUD/GameInfo values are UClass refs:
 `Default__ROPlayerController=57522`, `Default__ROTeamInfo=90248`,
 `Default__ROPlayerReplicationInfo=86704`, `Default__ROGameReplicationInfo=70889`,
@@ -389,13 +389,10 @@ embedded Territory `GameClass=69603`, and
 objects later than the capture (`288295 -> 288300`), so six `MapBoundaries` plus the Axis
 and Allies spawn-protection references also move by exactly +5. Three of those eight stale
 map refs resolved to a wrong object of the expected class and produced no client warning;
-all eight are therefore patched as one decoded cohort. The server derives the candidate in
-memory from canonical `data/actor_bootstrap.bin` using 19 pinned byte changes representing
-16 semantic static-reference corrections. Derivation requires the 14,537-byte source
-capture SHA-256 `AF0CA556...0522B3E0` and verifies candidate SHA-256
-`6DF1E41B...851418`; a wrong source, unsupported selector, or unavailable SHA-256 support
-disables actor replication instead of falling back. Installed full-world replay remains
-disabled because only the menu-critical Resort records have been completely grounded.
+all eight are therefore patched as one decoded cohort. The older 19-patch derivation from
+canonical `data/actor_bootstrap.bin` remains validation evidence for that investigation,
+but normal installed sessions do not replay it. Installed full-world replay is rejected;
+the captured world is grounded only against the canonical Resort/Territories artifact.
 
 Authored `spawns.txt` h59 references follow that same canonical map layout. The
 connection's frozen artifact selection now carries a map-object offset (`0` for canonical,
@@ -433,39 +430,47 @@ client from loading Resort while the server is authoritative for a different wor
 
 ### 4.2 Actor channel burst — on ClientJoined
 
-`SendActorBootstrap` (`ConnectionManager.cpp:656`) is called from `FireClientJoined`
-(`:461`). It replays the official server's post-Join open burst from `data/actor_bootstrap.bin`,
-a stream of full bunch descriptors
-`[u16 chIndex][u8 chType][u8 flags][u16 chSeq][u32 bunchDataBits][payload]`
-(`GetActorBootstrapRecords`, `:613`; flags: b0 bOpen, b1 bClose, b2 bReliable, b3 bControl).
-Join completion first waits for every earlier reliable ch0 message and deferred ch0 FIFO
-entry to drain. Until that barrier clears, `HandshakeComplete`, actor/game traffic, and the
-Game callback remain gated. The bootstrap then preserves these capture-grounded ordering
-decisions:
+`SendActorBootstrap` is called from `FireClientJoined` after the earlier reliable ch0
+stream and deferred ch0 FIFO have drained. Until that barrier clears,
+`HandshakeComplete`, actor/game traffic, and the Game callback remain gated. Normal
+sessions then author a connection-local cohort from the exact map/mode profile and the
+frozen canonical or installed PackageMap layout:
 
-1. **ch2 (the PlayerController) opened first.** The client adopts
-   ch2 (NetPlayerIndex==0) as its LOCAL PlayerController via `HandleClientPlayer`, and the
-   team menu only opens once that adoption succeeds (ShowTeamSelect's
-   `LocalPlayer(Player)!=none` gate). Burying ch2 in the middle of 138 other opens made
-   adoption intermittent.
-2. **NMT 0x24 immediately after ch2 in the same packet.** Official f1484 places the
-   control message `24 01 00 00 00` (int32 LE = 1) as the second bunch after ch2 OPEN.
-   Both reliable bunches share one PacketId and retry ledger, so UDP loss or a failed
-   first handoff cannot expose the ch0 transition without the adoption bunch.
-3. **Batched opens.** The rest of the opens are packed into
-   `kBatchBitBudget = 8192`-bit (~1024-byte) packets instead of one
-   datagram per bunch. 139 back-to-back single-bunch datagrams overflow the client's UDP
-   receive buffer (even on loopback) and intermittently drop the ch2 open. Batching matches
-   how the real server frames its burst (multiple bunches per packet). A ch0 record in the
-   stream flushes the pending batch first (ordering) and rides the normal control path.
+| Channel | Live actor | Required initial state |
+|---|---|---|
+| 2 | owning `ROPlayerController` | artifact-specific class ref, `NetPlayerIndex=0` |
+| 3 | `ROGameReplicationInfo` | profile-specific Territories/Supremacy/Skirmish `GameClass`, menu scalars |
+| 4 / 5 | playable `ROTeamInfo` pair | retail TeamIndex 0/1 and authoritative reinforcements |
+| 26 | owning `ROPlayerReplicationInfo` | LoginBridge `PlayerID` and connection-local player name |
 
-Every actor bunch goes out through `SendReliableBunches`, so the whole burst is covered by
-the retransmission machinery in §3.
+The ordering is load-bearing:
 
-> The actor payloads in `actor_bootstrap.bin` are a **best-effort verbatim replay** — they
-> contain session-specific NetGUIDs and the recorded player's state. Correct per-session
-> actor replication (building these from live game state via `ActorReplication.h`) is a later
-> step. The *framing* (this doc) is correct and session-independent.
+1. **ch2 OPEN and NMT `0x24` share the entry packet.** Official f1484 places
+   `24 01 00 00 00` immediately after the owning-PC open. Both reliable bunches share
+   one PacketId and retry ledger, so loss cannot expose the ch0 transition without
+   `HandleClientPlayer` adoption.
+2. **GRI, TeamInfo x2, PRI, and the PC->PRI link form one retry-owned cohort.** The
+   h23 dynamic reference from ch2 to ch26 is published as ch2 reliable sequence 2.
+   `ClientShowTeamSelect` and `ClientGotoState` use the following ch2 sequences, so the
+   UI cannot overtake the PRI identity it dereferences.
+3. **Every prerequisite failure is terminal for that connection.** Unsupported map
+   profiles, invalid artifact selectors, incomplete class layouts, unresolved GameClass
+   values, or a failed cohort publication disconnect before the Game callback can expose
+   an actor-less joined session.
+
+`data/actor_bootstrap.bin` is no longer a gameplay default. It contains a populated
+retail Resort match with stale session actors and is reachable only when the process is
+started with the exact direct switch `RS2V_REPLAY_CAPTURE_WORLD=1`. That diagnostic is
+accepted only for the canonical artifact and exact Resort/Territories profile; installed
+or non-Resort combinations fail closed before queuing a bunch. The file format remains
+`[u16 ChIndex][u8 ChType][u8 flags][u16 ChSequence][u32 BunchDataBits][payload]`
+for reverse-engineering comparisons. This process switch is not an INI override and is
+not hot-reloaded.
+
+The live actor cohort has grounded class/GameClass refs for all four exact profiles
+across both artifact layouts. That is bootstrap compatibility, not a claim that every
+downstream role resolver is complete: current h175 role selection remains intentionally
+fail-closed outside its narrower grounded profile/artifact combinations.
 
 ### 4.3 Open-bunch (SerializeNewActor) payload layout
 
@@ -512,9 +517,9 @@ Pinned `maxHandle` values (capture-verified, `MASTER` §0):
 | Class | maxHandle | Channel(s) |
 |---|---|---|
 | ROPlayerController | **531** | ch2 |
-| ROGameReplicationInfo | 184 | ch54 |
-| ROTeamInfo | 78 | ch21/56/76 |
-| ROPlayerReplicationInfo | 98 | PRI channels |
+| ROGameReplicationInfo | 184 | ch3 live; ch54 captured RE |
+| ROTeamInfo | 78 | ch4/ch5 live; ch21/ch56/ch76 captured RE |
+| ROPlayerReplicationInfo | 98 | ch26 owning PRI; remote PRI channels |
 | ROPawn / ROWeapon | 170 / 99 | spawn clusters |
 
 Triple-confirmed for ClientShowTeamSelect: NetIndex sort → handle 206; decoding the
@@ -729,7 +734,7 @@ role, squad, PRI, or deployment mutation.
 | Reliable retransmission | `SendReliableBunches`/`OnClientAck`/`RetransmitTick` (ConnectionManager.cpp:792/814/825), called from PumpNetwork:138 | (this doc §3) |
 | Ack policy | `ParseIncomingControl:1055-1068`, `:1096-1098` | — |
 | PackageMap export | `SendReplicationBootstrap` (:1004) ← FireClientLoggedIn:438 | `RS2V_PostJoin_Replication_7258.md` |
-| Actor burst (ch2-first, batched, NMT 0x24) | `SendActorBootstrap` (:656) ← FireClientJoined:461 | `RS2V_PostJoin_Replication_7258.md`, `re/postjoin_packet_timeline.md` |
+| Live actor cohort (ch2-first, NMT 0x24, retry-owned PRI link) | `SendActorBootstrap` / `SendLiveActorBootstrap` ← `FireClientJoined` | `RS2V_PostJoin_Replication_7258.md`, `re/postjoin_packet_timeline.md` |
 | Open-bunch layout | `ActorReplication.h` (`WriteActorOpenHeader`/`WriteProp*`) | `re/open_bunch_structure.md`, `MASTER` §2 |
 | Handle / maxHandle derivation | `tools/netfields_from_u.ps1` → `tools/netfields_u_<Class>.txt` | `UE3_ClassNetCache_HandleOrder.md`, `MASTER` §5 |
 | Object-ref / compressed-vector codecs | `BitReader`/`BitWriter`, `ActorReplication.h` | `MASTER` §2–4, `re/ue3_property_value_codec.md` |

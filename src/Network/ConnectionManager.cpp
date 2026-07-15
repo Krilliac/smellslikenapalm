@@ -1336,9 +1336,9 @@ void ConnectionManager::FireClientJoined(const ClientJoinedEvent& ev) try {
     UpdateTelemetryPlayerCounts();
     // The PackageMap export went out earlier (on ClientLoggedIn / right after
     // Welcome). Now that the client has Joined, open the bootstrap ACTOR channels
-    // (ROGameReplicationInfo, TeamInfo, the local PlayerController, PRIs) so it can
-    // build the world and spawn. Best-effort verbatim replay of the official f231
-    // burst - see SendActorBootstrap.
+    // (ROGameReplicationInfo, TeamInfo, the local PlayerController, PRI) so it can
+    // build the world and spawn. The normal path authors this cohort from the
+    // connection's frozen profile and PackageMap layout; see SendActorBootstrap.
     SendActorBootstrap(ev.clientId);
 
     if (const auto connection = GetConnection(ev.clientId);
@@ -1962,75 +1962,71 @@ const std::vector<ActorBunchRecord>& GetActorBootstrapRecords(
 } // namespace
 
 void ConnectionManager::SendActorBootstrap(uint32_t clientId) {
-    // LIVE per-session replication (milestone 1). The canned actor_bootstrap.bin
-    // replay carries another session's actor state (stale GUIDs / PRI / position),
-    // which the retail client tears down (ch3..ch140 closed with empty bClose) - so
-    // it never has a real GRI/PRI and the team menu can't function. Build the
-    // menu-critical actors live instead. Resort retains the captured replay by
-    // default for A/B continuity; reconstructed non-Resort profiles are forced
-    // through the map/mode-aware live builder below.
+    const auto conn = GetConnection(clientId);
+    if (!conn || conn->IsDisconnected()) return;
+
+    // Normal sessions author the menu-critical actor cohort from their frozen
+    // map/profile and PackageMap layout. actor_bootstrap.bin is a populated
+    // Resort match from another session and is retained only as an explicit,
+    // exact reverse-engineering diagnostic below.
     const RetailBootstrap::Profile& profile =
         GetRetailBootstrapProfile(clientId);
     if (profile.usedFallback) {
         Logger::Error(
             "[ActorBootstrap] client %u rejected unsupported map profile; "
-            "refusing to replay the Resort actor cohort into another world",
+            "refusing to publish an actor cohort without exact map metadata",
             clientId);
+        conn->MarkDisconnected();
         return;
     }
 
     const std::optional<RetailBootstrap::ArtifactSelection>& selectedArtifact =
         GetRetailArtifactSelection(clientId);
-    if (!selectedArtifact) return;
+    if (!selectedArtifact) {
+        conn->MarkDisconnected();
+        return;
+    }
     const RetailBootstrap::ArtifactSelection& artifact = *selectedArtifact;
 
     const char* replayWorldEnv = std::getenv("RS2V_REPLAY_CAPTURE_WORLD");
-    const bool replayCapturedWorld = replayWorldEnv &&
-        (replayWorldEnv[0] == '1' || replayWorldEnv[0] == 'y' ||
-         replayWorldEnv[0] == 'Y');
-    if (replayCapturedWorld &&
-        !artifact.roGame.capturedWorldReplayGrounded) {
-        Logger::Error(
-            "[ActorBootstrap] client %u rejected variant='%.*s' with "
-            "RS2V_REPLAY_CAPTURE_WORLD=1: only the menu-critical Resort actor "
-            "cohort is migrated; full 139-record replay disabled",
-            clientId, static_cast<int>(artifact.variant.size()),
-            artifact.variant.data());
+    const bool replayCapturedWorld = replayWorldEnv != nullptr &&
+        std::string_view(replayWorldEnv) == "1";
+    if (!replayCapturedWorld) {
+        SendLiveActorBootstrap(clientId);
         return;
     }
 
-    {
-        // Default = canned replay. UE3-source + client-log evidence: the canned
-        // bootstrap triggers local-PC adoption on Resort. The minimal live open now
-        // does too when its class ref comes from the selected PackageMap layout
-        // (Compound dogfood: SetPlayer plus normal inbound ch2 RPCs). Keep the opt-in
-        // for comparing the two Resort paths while non-Resort profiles require live.
-        const char* lr = std::getenv("RS2V_LIVE_REPL");
-        const bool liveRequested = lr &&
-            (lr[0] == '1' || lr[0] == 'y' || lr[0] == 'Y');
-        // The canned actor file is a Resort/Territories capture whose embedded
-        // GRI h33 cannot represent Supremacy or Skirmish. Experimental map
-        // profiles therefore require the live actor builder, which consumes the
-        // same frozen profile as PackageMap/Welcome and ChangedTeams.
-        const bool useLive = liveRequested || profile.experimental;
-        if (useLive) {
-            if (profile.experimental && !liveRequested) {
-                Logger::Info("[ActorBootstrap] forcing live actor bootstrap for experimental "
-                             "profile %s / %s; canned actors are Resort-specific",
-                             profile.mapUrl.c_str(), profile.gameClassPath.c_str());
-            }
-            SendLiveActorBootstrap(clientId);
-            return;
-        }
+    const RetailBootstrap::Profile capturedProfile =
+        RetailBootstrap::CanonicalProfile();
+    const bool exactCapturedProfile =
+        !profile.experimental &&
+        profile.mapUrl == capturedProfile.mapUrl &&
+        profile.modeName == capturedProfile.modeName &&
+        profile.gameClassPath == capturedProfile.gameClassPath &&
+        profile.gameClassIndex == capturedProfile.gameClassIndex &&
+        profile.mapPackageGuid == capturedProfile.mapPackageGuid;
+    if (artifact.variant != "canonical" ||
+        !artifact.roGame.capturedWorldReplayGrounded ||
+        !exactCapturedProfile) {
+        Logger::Error(
+            "[ActorBootstrap] client %u rejected profile='%s/%s' "
+            "variant='%.*s' with RS2V_REPLAY_CAPTURE_WORLD=1: the captured "
+            "world is grounded only for canonical Resort/Territories",
+            clientId, profile.mapUrl.c_str(), profile.modeName.c_str(),
+            static_cast<int>(artifact.variant.size()),
+            artifact.variant.data());
+        conn->MarkDisconnected();
+        return;
     }
 
     const std::vector<ActorBunchRecord>& records =
         GetActorBootstrapRecords(artifact);
     if (records.empty()) {
-        return;
-    }
-    auto conn = GetConnection(clientId);
-    if (!conn) {
+        Logger::Error(
+            "[ActorBootstrap] client %u could not load the requested canonical "
+            "Resort captured world; failing closed",
+            clientId);
+        conn->MarkDisconnected();
         return;
     }
     ControlState& cs = GetControlState(clientId);
@@ -2046,43 +2042,21 @@ void ConnectionManager::SendActorBootstrap(uint32_t clientId) {
     // the owning PC reverses the official transition.
     static const std::vector<uint8_t> kPreActorNmt24 = {0x24, 0x01, 0x00, 0x00, 0x00};
 
-    // actor_bootstrap.bin was extracted from a populated retail match. Replaying every
-    // captured open makes the client instantiate that match's pawns and helicopters, but
-    // this server never owns or updates them. The result is exactly what it looks like:
-    // stale players drifting through the air and vehicles falling under client physics.
-    //
-    // The captured PC open is still required for HandleClientPlayer/local-PC adoption,
-    // so keep only the menu-critical singleton/team/local-player actors by default. The
-    // full captured world remains available as an explicit RE diagnostic, never as the
-    // gameplay default.
-    auto shouldReplay = [replayCapturedWorld](uint16_t chIndex) {
-        if (replayCapturedWorld || chIndex == 0) return true;
-        switch (chIndex) {
-            case 2:   // owning ROPlayerController
-            case 21:  // ROTeamInfo
-            case 26:  // owning ROPlayerReplicationInfo
-            case 54:  // ROGameReplicationInfo
-            case 56:  // ROTeamInfo
-            case 76:  // ROTeamInfo
-                return true;
-            default:
-                return false;
-        }
-    };
-    const size_t replayCount = static_cast<size_t>(std::count_if(
-        records.begin(), records.end(),
-        [&](const ActorBunchRecord& r) { return shouldReplay(r.chIndex); }));
+    // actor_bootstrap.bin was extracted from a populated retail Resort match.
+    // Replaying it instantiates stale pawns and vehicles that this emulator does
+    // not own or update. Reaching this block therefore means the operator asked
+    // for the complete capture explicitly; normal gameplay returned through the
+    // live builder above.
     for (const ActorBunchRecord& r : records) {
-        if (r.chIndex == 54 && shouldReplay(r.chIndex)) {
+        if (r.chIndex == 54) {
             cs.griChannel = r.chIndex;
             cs.griOutReliable = r.chSequence;
             break;
         }
     }
 
-    Logger::Info("[ConnectionManager::SendActorBootstrap] client %u: opening local PC, NMT 0x24, then %zu/%zu bootstrap records (%s)",
-                 clientId, replayCount, records.size(),
-                 replayCapturedWorld ? "full captured-world RE replay" : "menu/local-player only");
+    Logger::Info("[ConnectionManager::SendActorBootstrap] client %u: opening local PC, NMT 0x24, then %zu captured Resort records (full-world RE replay)",
+                 clientId, records.size());
     // BATCH the actor opens into MaxPacket-sized packets instead of one datagram each.
     // Sending 139 back-to-back single-bunch datagrams overflows the client's UDP receive
     // buffer (even on loopback) and intermittently drops the ch2 open, so the client's
@@ -2100,11 +2074,19 @@ void ConnectionManager::SendActorBootstrap(uint32_t clientId) {
     // client's buffer is ~1280; budget to 8192 bits (~1024 B) for safe margin. Reliable
     // retransmit resends the same batch, so an oversized packet fails forever - keep it small.
     constexpr size_t kBatchBitBudget = 8192;
-    auto flushBatch = [&]() {
-        if (batch.empty()) return;
-        SendReliableBunches(clientId, batch);  // sent + recorded for retransmission
+    auto flushBatch = [&]() -> bool {
+        if (batch.empty()) return true;
+        const bool published = SendReliableBunches(clientId, batch);
         batch.clear();
         batchBits = 0;
+        if (!published) {
+            Logger::Error(
+                "[ConnectionManager::SendActorBootstrap] client %u could "
+                "not publish a captured actor batch; failing closed",
+                clientId);
+            conn->MarkDisconnected();
+        }
+        return published;
     };
     // Capture f1484 places the PlayerController OPEN immediately before NMT 0x24
     // in the same packet. Keep that pair under one PacketId/retry ledger: merely
@@ -2112,7 +2094,7 @@ void ConnectionManager::SendActorBootstrap(uint32_t clientId) {
     // transition before HandleClientPlayer adopts the owning controller.
     std::optional<PacketCodec::Bunch> playerControllerOpen;
     for (const ActorBunchRecord& r : records) {
-        if (r.chIndex == 2 && shouldReplay(r.chIndex)) {
+        if (r.chIndex == 2) {
             if (!r.bOpen || !r.bReliable || r.bClose) {
                 Logger::Error(
                     "[ConnectionManager::SendActorBootstrap] client %u "
@@ -2156,11 +2138,10 @@ void ConnectionManager::SendActorBootstrap(uint32_t clientId) {
 
     for (const ActorBunchRecord& r : records) {
         if (r.chIndex == 2) continue;   // already sent in the entry packet
-        if (!shouldReplay(r.chIndex)) continue;
         if (r.chIndex == 0) {
             // A ch0 control bunch in the burst rides the normal control path; flush the
             // pending actor batch first so ordering is preserved.
-            flushBatch();
+            if (!flushBatch()) return;
             if (!PublishControlMessageImmediately(
                     clientId, r.payload,
                     "captured actor-bootstrap ch0 record")) {
@@ -2180,12 +2161,12 @@ void ConnectionManager::SendActorBootstrap(uint32_t clientId) {
         b.payloadBits = r.bunchDataBits;  // exact bit count (not byte-padded)
         const size_t est = r.bunchDataBits + 64;  // payload + bunch-header allowance
         if (batchBits + est > kBatchBitBudget) {
-            flushBatch();
+            if (!flushBatch()) return;
         }
         batch.push_back(std::move(b));
         batchBits += est;
     }
-    flushBatch();
+    if (!flushBatch()) return;
 
     // The captured ch54 open contains a mid-match objective snapshot. Replace it
     // immediately with this map/session's authoritative slot mapping and state.
@@ -2248,7 +2229,7 @@ void ConnectionManager::SendActorBootstrap(uint32_t clientId) {
 
 }
 
-// Live per-session actor bootstrap (milestone 1): open the menu-critical actors -
+// Live per-session actor bootstrap: open the menu-critical actors -
 // GameReplicationInfo, two TeamInfos, the owning client's PlayerController (ch2,
 // NetPlayerIndex 0) and its PlayerReplicationInfo (ch26) - with THIS session's
 // values, then pop the team-select menu. Every static class ref is selected from
@@ -2260,12 +2241,27 @@ void ConnectionManager::SendLiveActorBootstrap(uint32_t clientId) {
     using ActorRepl::MakeOpeningActorBunch;
 
     auto conn = GetConnection(clientId);
-    if (!conn) return;
+    if (!conn || conn->IsDisconnected()) return;
     ControlState& cs = GetControlState(clientId);
+    if (cs.mapTravelPending) {
+        Logger::Error(
+            "[ConnectionManager::SendLiveActorBootstrap] client %u is "
+            "already drain-only for ClientTravel; actor bootstrap rejected",
+            clientId);
+        conn->MarkDisconnected();
+        return;
+    }
 
     const std::optional<RetailBootstrap::ArtifactSelection>& selectedArtifact =
         GetRetailArtifactSelection(clientId);
-    if (!selectedArtifact) return;
+    if (!selectedArtifact) {
+        Logger::Error(
+            "[ConnectionManager::SendLiveActorBootstrap] client %u has no "
+            "valid frozen PackageMap artifact; failing closed",
+            clientId);
+        conn->MarkDisconnected();
+        return;
+    }
     const RetailBootstrap::RoGameLayout& layout = selectedArtifact->roGame;
     if (layout.playerControllerClassRef == 0 ||
         layout.playerReplicationInfoClassRef == 0 ||
@@ -2273,23 +2269,33 @@ void ConnectionManager::SendLiveActorBootstrap(uint32_t clientId) {
         layout.teamInfoClassRef == 0) {
         Logger::Error(
             "[ConnectionManager::SendLiveActorBootstrap] client %u has an "
-            "incomplete ROGame actor layout; live bootstrap disabled",
+            "incomplete ROGame actor layout; failing closed",
             clientId);
+        conn->MarkDisconnected();
         return;
     }
 
     const RetailBootstrap::Profile& bootstrapProfile =
         GetRetailBootstrapProfile(clientId);
+    if (bootstrapProfile.usedFallback) {
+        Logger::Error(
+            "[ConnectionManager::SendLiveActorBootstrap] client %u has no "
+            "exact retail map profile; failing closed",
+            clientId);
+        conn->MarkDisconnected();
+        return;
+    }
     const std::optional<uint32_t> gameClassRef =
         RetailBootstrap::ResolveGameClassRef(
             *selectedArtifact, bootstrapProfile.gameClassPath);
     if (!gameClassRef) {
         Logger::Error(
             "[ConnectionManager::SendLiveActorBootstrap] client %u cannot "
-            "resolve GameClass '%s' through variant='%.*s'; live bootstrap disabled",
+            "resolve GameClass '%s' through variant='%.*s'; failing closed",
             clientId, bootstrapProfile.gameClassPath.c_str(),
             static_cast<int>(selectedArtifact->variant.size()),
             selectedArtifact->variant.data());
+        conn->MarkDisconnected();
         return;
     }
 
@@ -2353,7 +2359,12 @@ void ConnectionManager::SendLiveActorBootstrap(uint32_t clientId) {
     // the datagram stays well under the client's receive buffer.)
     std::string name = conn->GetPlayerName();
     if (name.empty()) name = "Player" + std::to_string(clientId);
-    const int32_t playerId = static_cast<int32_t>(clientId);
+    // LoginBridge owns the UE3 PlayerID allocator. It intentionally differs
+    // from the transport clientId once sessions reconnect or earlier ids are
+    // retired. Detached network tests have no bridge and retain the stable
+    // clientId fallback.
+    const int32_t playerId = conn->GetRetailPlayerId().value_or(
+        static_cast<int32_t>(clientId));
 
     const int32_t team0Reinforcements =
         ResolveRetailWireReinforcements(TeamMapping::kRetailNva);
@@ -2383,10 +2394,46 @@ void ConnectionManager::SendLiveActorBootstrap(uint32_t clientId) {
         ActorRepl::WritePropInt   (w, 36, kMaxPRI, playerId);   // PlayerID
         ActorRepl::WritePropString(w, 37, kMaxPRI, name);       // PlayerName
     }));
-    if (SendReliableBunches(clientId, batch)) {
-        cs.publishedTeamReinforcements = {
-            team0Reinforcements, team1Reinforcements};
+
+    // PC.PlayerReplicationInfo (h23 -> dynamic ch26) is load-bearing for the
+    // role/unit-select UI. The retail capture streams this property
+    // unreliably, but five fire-and-forget copies could all miss while the
+    // reliable menu RPCs still arrived. Publish it as ch2 sequence 2 in the
+    // same retry-owned cohort as the PRI open. Later ch2 RPCs cannot overtake
+    // it, and packet loss retransmits both the actor open and its owner link.
+    auto priLinkReservation = ReserveCh2Reliable(
+        cs, clientId, 1u, "initial PC.PlayerReplicationInfo link");
+    if (!priLinkReservation) {
+        FailCloseCh2Publication(
+            clientId, "initial PC.PlayerReplicationInfo reservation");
+        return;
     }
+    BitWriter priLinkWriter;
+    priLinkWriter.SerializeInt(23u, kMaxPC);
+    priLinkWriter.WriteBit(true);
+    priLinkWriter.SerializeInt(26u, ActorRepl::kDynamicChannelMax);
+    PacketCodec::Bunch priLink;
+    priLink.bReliable = true;
+    priLink.chIndex = kChPC;
+    priLink.chType = cs.actorChType;
+    priLink.chSequence = priLinkReservation->front();
+    priLink.payload = priLinkWriter.GetBytes();
+    priLink.payloadBits = static_cast<uint32_t>(priLinkWriter.NumBits());
+    batch.push_back(std::move(priLink));
+
+    if (!SendReservedCh2Bunches(
+            clientId, batch, *priLinkReservation,
+            "initial live actor/PRI-link cohort")) {
+        Logger::Error(
+            "[ConnectionManager::SendLiveActorBootstrap] client %u could "
+            "not publish the GRI/TeamInfo/PRI cohort; failing closed",
+            clientId);
+        FailCloseCh2Publication(
+            clientId, "initial live actor/PRI-link cohort");
+        return;
+    }
+    cs.publishedTeamReinforcements = {
+        team0Reinforcements, team1Reinforcements};
     cs.griChannel = kChGRI;
     cs.griOutReliable = 1;
     SendRetailObjectiveState(clientId, /*baseline=*/true);
@@ -2395,11 +2442,10 @@ void ConnectionManager::SendLiveActorBootstrap(uint32_t clientId) {
                  "TeamInfo(ch%u,ch%u) PC(ch2) PRI(ch26); popping team-select",
                  clientId, kChGRI, kChTeam0, kChTeam1);
 
-    // Pop the team-select menu on the now-owned ch2 (ClientShowTeamSelect, handle 206),
-    // then assert the PC->PRI link so the role/unit-select UI has a non-none LocalPRI.
+    // Pop the team-select menu on the now-owned ch2 (ClientShowTeamSelect,
+    // handle 206). Its reliable sequences follow the retry-owned PRI link
+    // above, so the UI cannot overtake the identity it dereferences.
     {
-        SendLocalPriLink(clientId, 5);
-
         BitWriter fw;
         fw.SerializeInt(206, kMaxPC);
         const bool teamSelectQueued = SendCh2Rpc(
@@ -5627,6 +5673,7 @@ bool ConnectionManager::BuildRemoteParticipantInitialState(
             players ? players->GetPlayer(participant.value) : nullptr;
         if (!connection || connection->IsDisconnected() || !player) return false;
 
+        state.wirePlayerId = connection->GetRetailPlayerId();
         const uint32_t playerTeam = player->GetTeam();
         if (playerTeam != 1u && playerTeam != 2u) return false;
         state.serverTeamId = static_cast<uint8_t>(playerTeam);
@@ -5728,6 +5775,9 @@ ConnectionManager::QueueRemoteParticipantPriOpen(
             participant.combat.participant.IsBot() ? "bot" : "human",
             participant.combat.participant.value);
         return RemotePriOpenResult::Failed;
+    }
+    if (participant.wirePlayerId) {
+        binding->wirePlayerId = *participant.wirePlayerId;
     }
     const uint8_t retailTeam =
         TeamMapping::ServerToRetail(participant.serverTeamId);
@@ -9114,7 +9164,8 @@ void ConnectionManager::DecodeInboundActorBunch(uint32_t clientId,
         // The retail client's ChangedTeams() does the team->role transition itself:
         //   * line 3618: PlayerReplicationInfo.Team = WorldInfo.GRI.Teams[TeamIndex]
         //                -> it BINDS PRI.Team from GRI.Teams[] (already populated by our
-        //                   TeamInfo opens on ch21/56/76), so NO PRI.Team delta is needed.
+        //                   TeamInfo opens on live ch4/ch5, or the explicit canonical
+        //                   capture diagnostic's ch76/ch56), so NO PRI.Team delta is needed.
         //   * line 3627: ShowRoleSelectScene(GameTypeClass, TeamIndex, ...)
         //                -> uses the GameTypeClass PARAM directly. If it is none, the
         //                   client SKIPS InitSquadsForGametype (ROPlayerController.uc:5941),

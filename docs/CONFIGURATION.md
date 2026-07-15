@@ -69,6 +69,13 @@ Priority (highest → lowest):
 
 **Environment variables** use the prefix `RS2V_` followed by the uppercase key name with underscores. For example, the `port` key in `[Network]` can be overridden by setting `RS2V_PORT=8777`.
 
+Two replication variables are direct process policy switches rather than INI-key
+overrides. `RS2V_REPLICATION_BOOTSTRAP_VARIANT=installed` selects the installed
+PackageMap/object layout; leaving it unset selects canonical. The exact
+`RS2V_REPLAY_CAPTURE_WORLD=1` diagnostic requests the populated canonical Resort
+capture and is rejected for installed or non-Resort sessions. Set either before
+launch; neither participates in `ConfigWatcher` hot reload.
+
 **Config files** can be layered. The production override file (`config/server_production.ini`) is loaded on top of the base `config/server.ini` when specified. Values in the override file replace values from the base file; keys not present in the override fall through to the base.
 
 ### 1.2 Hot Reload

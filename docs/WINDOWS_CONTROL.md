@@ -33,6 +33,12 @@ no-override path; in that mode the variable is omitted from the child rather
 than set to the nonempty value `canonical`. The controller restores its own
 process environment immediately after creating the child.
 
+All normal canonical and installed launches use the live per-session actor
+cohort. `RS2V_REPLAY_CAPTURE_WORLD=1` is a direct, startup-only reverse-engineering
+diagnostic for the canonical Resort/Territories capture; it fails closed with the
+controller's default installed artifact or any other map/profile. It is not a
+hot-reloadable server setting.
+
 `Stop` is deliberately a hard process termination. The retail client can remain stuck
 in pretransition after a graceful network disconnect, so the controller kills the
 exact process whose PID, executable path, and creation time are recorded in

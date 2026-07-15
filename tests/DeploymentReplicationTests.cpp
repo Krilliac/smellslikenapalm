@@ -605,10 +605,11 @@ TEST(DeploymentReplication, OwnerNextRespawnTimeTruncationOverflowsSafely) {
     }
 }
 
-TEST(DeploymentReplication, EncodesCaptureBackedRemoteHumanPriFields) {
+TEST(DeploymentReplication, EncodesAuthoritativeRemoteHumanPlayerId) {
     DeploymentRepl::RetailParticipantInitialState state;
     state.combat = {
         ParticipantId::Human(7), 83, 4, 2, 11, false};
+    state.wirePlayerId = 73;
     state.serverTeamId = 1;
     state.playerName = "RemoteHuman";
 
@@ -630,7 +631,7 @@ TEST(DeploymentReplication, EncodesCaptureBackedRemoteHumanPriFields) {
     EXPECT_EQ(reader.SerializeInt(maxHandle), 33u);
     EXPECT_FALSE(reader.ReadBit());
     EXPECT_EQ(reader.SerializeInt(maxHandle), 36u);
-    EXPECT_EQ(static_cast<int32_t>(reader.ReadUInt32()), 7);
+    EXPECT_EQ(static_cast<int32_t>(reader.ReadUInt32()), 73);
     EXPECT_EQ(reader.SerializeInt(maxHandle), 37u);
     EXPECT_EQ(reader.ReadString(), std::string("RemoteHuman"));
     EXPECT_EQ(reader.SerializeInt(maxHandle), 39u);

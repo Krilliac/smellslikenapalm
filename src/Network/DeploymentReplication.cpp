@@ -593,6 +593,7 @@ bool IsValidRetailParticipantCombatState(
 bool IsValidRetailParticipantInitialState(
     const RetailParticipantInitialState& state) noexcept {
     return IsValidRetailParticipantCombatState(state.combat) &&
+           (!state.wirePlayerId || *state.wirePlayerId >= 0) &&
            ParticipantRoster::IsPlayableTeam(state.serverTeamId) &&
            HasValidPlayerName(state.playerName) &&
            IsCompressibleVector(state.positionUu);
@@ -617,9 +618,11 @@ std::optional<uint32_t> RemotePawnArchetypeForServerTeam(
 bool WriteRemotePriInitial(
     BitWriter& writer, const RetailParticipantInitialState& state) {
     if (!IsValidRetailParticipantInitialState(state)) return false;
-    const std::optional<std::int32_t> wirePlayerId =
-        ParticipantActorChannelMap::EncodeWirePlayerId(
+    std::optional<std::int32_t> wirePlayerId = state.wirePlayerId;
+    if (!wirePlayerId) {
+        wirePlayerId = ParticipantActorChannelMap::EncodeWirePlayerId(
             state.combat.participant);
+    }
     if (!wirePlayerId) return false;
 
     // Ascending net-field handles keep this bounded block deterministic.

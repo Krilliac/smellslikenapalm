@@ -61,11 +61,11 @@ class SpawnProfileTests(unittest.TestCase):
         writer.wu(slot, 8)
         writer.wu(value, 8)
 
-    def test_resort_profile_preserves_legacy_defaults(self):
+    def test_resort_profile_uses_live_bootstrap_defaults(self):
         mapping, gri, channels = mock_client.resolve_spawn_profile()
         self.assertEqual(mapping, [0, 1, 2, 3, 4])
-        self.assertEqual(gri, 54)
-        self.assertEqual(channels, {2, 21, 26, 54, 56, 76})
+        self.assertEqual(gri, 3)
+        self.assertEqual(channels, {2, 3, 4, 5, 26})
 
     def test_spawn_team_contracts_pin_south_and_north_graphs(self):
         south = mock_client.resolve_spawn_team()
@@ -454,11 +454,11 @@ class SpawnProfileTests(unittest.TestCase):
 
     def test_spawn_closes_even_when_validation_fails_before_bootstrap(self):
         sock = RecordingSocket()
+        mapping, gri, channels = mock_client.resolve_spawn_profile()
         with mock.patch.object(mock_client.socket, "socket", return_value=sock), \
                 mock.patch("builtins.print"):
             result = mock_client.spawn(
-                "127.0.0.1", 7777, 0.0, [0, 1, 2, 3, 4], 54,
-                {2, 21, 26, 54, 56, 76}, 0.0)
+                "127.0.0.1", 7777, 0.0, mapping, gri, channels, 0.0)
 
         self.assertEqual(result, 1)
         self.assertTrue(sock.closed)
@@ -475,6 +475,48 @@ class SpawnProfileTests(unittest.TestCase):
                 wire, bd_max=1280 * 8).get("bunches", [])
         }
         self.assertNotIn(219, sent_channels)
+
+    def test_spawn_reports_a_missing_expected_live_bootstrap_channel(self):
+        expected_channels = {2, 3, 4, 5, 26}
+        partial_bootstrap = mock_client.encode_packet(
+            77,
+            [{
+                "bControl": 1,
+                "bOpen": 1,
+                "bClose": 0,
+                "bReliable": 1,
+                "chIndex": channel,
+                "chType": 2,
+                "chSeq": 1,
+                "payload": b"\x00",
+            } for channel in sorted(expected_channels - {26})],
+            1500)
+
+        class PartialBootstrapSocket(RecordingSocket):
+            def __init__(self):
+                super().__init__()
+                self.delivered_bootstrap = False
+
+            def recvfrom(self, _size):
+                if len(self.sent) >= 4 and not self.delivered_bootstrap:
+                    self.delivered_bootstrap = True
+                    return partial_bootstrap, ("127.0.0.1", 7777)
+                raise mock_client.socket.timeout()
+
+        sock = PartialBootstrapSocket()
+        mapping, gri, _ = mock_client.resolve_spawn_profile()
+        with mock.patch.object(mock_client.socket, "socket", return_value=sock), \
+                mock.patch("builtins.print") as output:
+            result = mock_client.spawn(
+                "127.0.0.1", 7777, 0.0, mapping, gri,
+                expected_channels, 0.0)
+
+        report = "\n".join(
+            " ".join(str(arg) for arg in call.args)
+            for call in output.call_args_list)
+        self.assertEqual(result, 1)
+        self.assertIn("missing live menu bootstrap channels: [26]", report)
+        self.assertNotIn("unexpected actors opened at live bootstrap", report)
 
     def test_spawn_forwards_profile_to_role_request_builder(self):
         sock = RecordingSocket()

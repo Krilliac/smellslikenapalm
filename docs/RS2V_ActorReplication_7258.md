@@ -15,6 +15,12 @@ and the control-channel handshake are documented in
 PackageMap export** and covers the part that turns a frozen, camera-locked client
 into a controllable player.
 
+> **Capture/runtime boundary (2026-07-15):** capture channel tables and payloads
+> below remain reverse-engineering evidence. The current runtime authors a smaller
+> per-connection cohort: owning PC ch2, GRI ch3, TeamInfo ch4/ch5, and owning PRI
+> ch26. `docs/NETCODE.md` is authoritative for current emission policy; the
+> populated capture is never a normal gameplay bootstrap.
+
 Confidence tags: **[H]** bit-exact from capture and/or reproduced across both
 sessions; **[M]** strong inference from capture + source; **[L]** plausible, not yet
 bit-pinned (flagged for disassembly follow-up).
@@ -600,12 +606,13 @@ milestone after the menu (needs the Pawn open + `ClientRestart`), and is separab
 
 ### 6.6 Emitter checklist for `MakeOpeningActorBunch`
 
-1. On C->S `NMT 0x09`: open **ch2** with the §6.1 PC template (verbatim). 
-2. Open the **GRI** (§6.2) with our ServerName/GameClass spliced into the FStrings.
-3. Open **2-3 TeamInfos** (§6.3) — the tiny 81-bit form is enough; set TeamIndex 0/1.
-4. Open the **local PRI** (§6.4) with our PlayerName + a `Team` ref into a TeamInfo above.
-5. Each open: `bControl=1,bOpen=1,bReliable=1,ChType=2`, ascending `ChIndex` from 2,
-   `ChSeq=1`. After this set the client should present the team-select menu.
-6. (Later, for control) spawn+possess a Pawn, open its channel, send `ClientRestart` on
-   ch2 (§5 Phase 3).
-```
+1. After the Join drain barrier, open owning **PC ch2** with the selected
+   PackageMap's class ref and `NetPlayerIndex=0`.
+2. Put NMT `0x24` immediately after that open in the same reliable packet.
+3. Open **GRI ch3**, **TeamInfo ch4/ch5**, and **PRI ch26** from live profile,
+   ticket, LoginBridge identity, and player-name state.
+4. Publish PC h23 -> dynamic ch26 as retry-owned ch2 sequence 2; queue menu RPCs
+   only on later ch2 sequences.
+5. Fail the connection closed if any exact profile, artifact class ref, GameClass,
+   or load-bearing publication is unavailable.
+6. Spawn and possess the pawn later, then send `ClientRestart` on ch2 (§5 Phase 3).
