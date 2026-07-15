@@ -7223,15 +7223,29 @@ void ConnectionManager::DecodeInboundActorBunch(uint32_t clientId,
         // NVA/Axis and retail 1 is US/Allies, while TeamManager deliberately
         // uses 1=US and 2=NVA. Never convert with +1: that swaps the factions.
         if (m_server) {
+            TeamManager* teamManager = m_server->GetTeamManager();
             if (auto* roleSystem = m_server->GetRoleSystem()) {
                 roleSystem->ReleaseRetailSquadAssignment(clientId);
             }
-            if (auto* tm = m_server->GetTeamManager()) {
-                tm->AddPlayerToTeam(
+            if (teamManager) {
+                teamManager->AddPlayerToTeam(
                     clientId, TeamMapping::RetailToServer(teamId));
             }
+            // The emulator's fixed per-team fill policy must reconcile at the
+            // team-admission boundary, not on the later world tick, because h170
+            // and h175 can arrive in one packet/poll. BotManager's synchronous
+            // callbacks update the tagged RoleSystem occupancy without
+            // Human(n)/Bot(n) aliasing. Retail source establishes that bots
+            // consume normal squad slots, but does not establish this emulator-
+            // specific fill-eviction timing.
+            if (BotManager* bots = m_server->GetBotManager();
+                bots && teamManager) {
+                bots->SetHumanTeamCounts(
+                    teamManager->GetTeamPlayers(BotManager::kTeamOne).size(),
+                    teamManager->GetTeamPlayers(BotManager::kTeamTwo).size());
+            }
             // Releasing an old-team slot can promote another member. Publish
-            // each repaired assignment before advancing its local cache.
+            // each repaired human assignment before advancing its local cache.
             SynchronizeRetailSquadAssignments();
         }
 

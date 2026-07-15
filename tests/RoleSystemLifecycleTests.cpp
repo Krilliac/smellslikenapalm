@@ -42,20 +42,21 @@ public:
                                 uint8_t squadIndex, uint8_t roleIndex,
                                 uint32_t playerId) {
         roles.m_retailSquads[teamId - 1][squadIndex]
-            .slotOwnerIds[roleIndex] = playerId;
+            .slotOwnerIds[roleIndex] = ParticipantId::Human(playerId);
     }
 
     static void SeedRetailAssignment(RoleSystem& roles, uint32_t playerId,
                                      uint32_t teamId, uint8_t squadIndex,
                                      uint8_t roleIndex,
                                      uint32_t generation) {
-        roles.m_retailSquadAssignments[playerId] = RetailSquadAssignment{
-            teamId, squadIndex, roleIndex, generation};
+        roles.m_retailSquadAssignments[ParticipantId::Human(playerId)] =
+            RetailSquadAssignment{teamId, squadIndex, roleIndex, generation};
     }
 
     static bool HasRawRetailAssignment(const RoleSystem& roles,
                                        uint32_t playerId) {
-        return roles.m_retailSquadAssignments.find(playerId) !=
+        return roles.m_retailSquadAssignments.find(
+                   ParticipantId::Human(playerId)) !=
                roles.m_retailSquadAssignments.end();
     }
 
@@ -265,8 +266,8 @@ TEST(RoleSystemLifecycle, RetailReconciliationPurgesInactiveRawState) {
     ASSERT_TRUE(roles.AutoAssignRetailSquad(1, 1).IsValid());
     EXPECT_FALSE(RoleSystemLifecycleTestHarness::HasRawRetailAssignment(
         roles, 700));
-    EXPECT_EQ(roles.GetRetailSquad(1, 8)->slotOwnerIds[3], 0u);
-    EXPECT_EQ(roles.GetRetailSquad(1, 8)->leaderId, 0u);
+    EXPECT_EQ(roles.GetRetailSquad(1, 8)->slotOwnerIds[3], ParticipantId{});
+    EXPECT_EQ(roles.GetRetailSquad(1, 8)->leaderId, ParticipantId{});
     EXPECT_FALSE(roles.GetRetailSquad(1, 8)->locked);
 }
 
@@ -316,6 +317,43 @@ TEST(RoleSystemLifecycle, RetailAllocatorPacksFullestSquadWithStableIndices) {
     EXPECT_EQ(repeated.roleIndex, 0u);
 }
 
+TEST(RoleSystemLifecycle,
+     RetailBotOwnersCountAndNeverAliasSameNumericHumanId) {
+    RoleSystem roles(nullptr);
+
+    // Production fills eight AI Controllers per side. Retail ChooseSquad counts
+    // their six-slot Owner fields exactly like human Controllers.
+    for (uint32_t botId = 1; botId <= 8; ++botId) {
+        const RetailSquadAssignment assignment =
+            roles.AutoAssignRetailSquad(ParticipantId::Bot(botId), 1);
+        ASSERT_TRUE(assignment.IsValid());
+    }
+    ASSERT_EQ(roles.GetRetailSquad(1, 0)->Occupancy(), 6u);
+    ASSERT_EQ(roles.GetRetailSquad(1, 1)->Occupancy(), 2u);
+
+    // A joining human replaces the highest-id fill bot before role selection.
+    ASSERT_TRUE(roles.ReleaseRetailSquadAssignment(ParticipantId::Bot(8)));
+    const RetailSquadAssignment human =
+        roles.AutoAssignRetailSquad(ParticipantId::Human(1), 1);
+    ASSERT_TRUE(human.IsValid());
+    EXPECT_EQ(human.squadIndex, 1u);
+    EXPECT_EQ(human.roleIndex, 1u);
+
+    const auto botWithSameValue =
+        roles.GetRetailSquadAssignment(ParticipantId::Bot(1));
+    const auto humanWithSameValue =
+        roles.GetRetailSquadAssignment(ParticipantId::Human(1));
+    ASSERT_TRUE(botWithSameValue.has_value());
+    ASSERT_TRUE(humanWithSameValue.has_value());
+    EXPECT_EQ(botWithSameValue->squadIndex, 0u);
+    EXPECT_EQ(botWithSameValue->roleIndex, 0u);
+    EXPECT_EQ(humanWithSameValue->squadIndex, 1u);
+    EXPECT_EQ(humanWithSameValue->roleIndex, 1u);
+    EXPECT_EQ(roles.GetRetailSquadLeaderParticipant(1, 0),
+              ParticipantId::Bot(1));
+    EXPECT_FALSE(roles.IsRetailSquadLeader(ParticipantId::Human(1)));
+}
+
 TEST(RoleSystemLifecycle, RetailReleaseReusesExactHoleAndKeepsRoleSeparate) {
     RoleSystem roles(nullptr);
     RoleSystemLifecycleTestHarness::SeedRole(
@@ -331,7 +369,7 @@ TEST(RoleSystemLifecycle, RetailReleaseReusesExactHoleAndKeepsRoleSeparate) {
 
     ASSERT_TRUE(roles.ReleaseRetailSquadAssignment(3));
     EXPECT_FALSE(roles.GetRetailSquadAssignment(3).has_value());
-    EXPECT_EQ(roles.GetRetailSquad(1, 0)->slotOwnerIds[2], 0u);
+    EXPECT_EQ(roles.GetRetailSquad(1, 0)->slotOwnerIds[2], ParticipantId{});
 
     // Squad zero has five owners versus squad one's two, so it is still the
     // fullest eligible squad. Its first retained hole is role index two.
@@ -344,8 +382,9 @@ TEST(RoleSystemLifecycle, RetailReleaseReusesExactHoleAndKeepsRoleSeparate) {
     ASSERT_TRUE(roles.ReleaseRetailSquadAssignment(1));
     EXPECT_FALSE(roles.ReleaseRetailSquadAssignment(1));
     EXPECT_EQ(roles.GetRetailSquadLeader(1, 0), 2u);
-    EXPECT_EQ(roles.GetRetailSquad(1, 0)->slotOwnerIds[0], 2u);
-    EXPECT_EQ(roles.GetRetailSquad(1, 0)->slotOwnerIds[1], 0u);
+    EXPECT_EQ(roles.GetRetailSquad(1, 0)->slotOwnerIds[0],
+              ParticipantId::Human(2));
+    EXPECT_EQ(roles.GetRetailSquad(1, 0)->slotOwnerIds[1], ParticipantId{});
     ASSERT_TRUE(roles.GetRetailSquadAssignment(2).has_value());
     EXPECT_EQ(roles.GetRetailSquadAssignment(2)->roleIndex, 0u);
     EXPECT_EQ(roles.GetPlayerRole(1), CombatRole::Pointman);
@@ -360,7 +399,7 @@ TEST(RoleSystemLifecycle, RetailReleaseReusesExactHoleAndKeepsRoleSeparate) {
     EXPECT_EQ(moved.teamId, 2u);
     EXPECT_EQ(moved.squadIndex, 0u);
     EXPECT_EQ(moved.roleIndex, 0u);
-    EXPECT_EQ(roles.GetRetailSquad(1, 0)->slotOwnerIds[1], 0u);
+    EXPECT_EQ(roles.GetRetailSquad(1, 0)->slotOwnerIds[1], ParticipantId{});
     EXPECT_EQ(roles.GetPlayerRole(2), CombatRole::CombatEngineer);
     ASSERT_TRUE(roles.GetRetailSquadAssignment(9).has_value());
     EXPECT_EQ(roles.GetRetailSquadAssignment(9)->roleIndex, 0u);
@@ -393,7 +432,7 @@ TEST(RoleSystemLifecycle, RetailCrossTeamMoveKeepsSourceWhenTargetIsFull) {
     EXPECT_EQ(retained->roleIndex, source.roleIndex);
     EXPECT_EQ(roles.GetRetailSquad(1, source.squadIndex)
                   ->slotOwnerIds[source.roleIndex],
-              42u);
+              ParticipantId::Human(42));
     EXPECT_TRUE(roles.IsRetailSquadLeader(42));
 }
 
@@ -449,7 +488,7 @@ TEST(RoleSystemLifecycle, RetailExplicitJoinRejectsInvalidAndFullTargets) {
     EXPECT_EQ(retained->roleIndex, source.roleIndex);
     EXPECT_EQ(roles.GetRetailSquad(1, source.squadIndex)
                   ->slotOwnerIds[source.roleIndex],
-              42u);
+              ParticipantId::Human(42));
 }
 
 TEST(RoleSystemLifecycle, RetailExplicitMovePromotesSourceLeaderAndKeepsRole) {
@@ -470,10 +509,10 @@ TEST(RoleSystemLifecycle, RetailExplicitMovePromotesSourceLeaderAndKeepsRole) {
 
     const RetailSquad* source = roles.GetRetailSquad(1, 4);
     ASSERT_NE(source, nullptr);
-    EXPECT_EQ(source->leaderId, 20u);
-    EXPECT_EQ(source->slotOwnerIds[0], 20u);
-    EXPECT_EQ(source->slotOwnerIds[1], 0u);
-    EXPECT_EQ(source->slotOwnerIds[2], 30u);
+    EXPECT_EQ(source->leaderId, ParticipantId::Human(20));
+    EXPECT_EQ(source->slotOwnerIds[0], ParticipantId::Human(20));
+    EXPECT_EQ(source->slotOwnerIds[1], ParticipantId{});
+    EXPECT_EQ(source->slotOwnerIds[2], ParticipantId::Human(30));
     ASSERT_TRUE(roles.GetRetailSquadAssignment(20).has_value());
     EXPECT_EQ(roles.GetRetailSquadAssignment(20)->roleIndex, 0u);
 
@@ -504,10 +543,10 @@ TEST(RoleSystemLifecycle, RetailLeaderPromotionUsesLowestOccupiedRoleSlot) {
     ASSERT_TRUE(roles.ReleaseRetailSquadAssignment(50));
     const RetailSquad* squad = roles.GetRetailSquad(1, 0);
     ASSERT_NE(squad, nullptr);
-    EXPECT_EQ(squad->slotOwnerIds[0], 900u);
-    EXPECT_EQ(squad->slotOwnerIds[1], 0u);
-    EXPECT_EQ(squad->slotOwnerIds[2], 10u);
-    EXPECT_EQ(squad->leaderId, 900u);
+    EXPECT_EQ(squad->slotOwnerIds[0], ParticipantId::Human(900));
+    EXPECT_EQ(squad->slotOwnerIds[1], ParticipantId{});
+    EXPECT_EQ(squad->slotOwnerIds[2], ParticipantId::Human(10));
+    EXPECT_EQ(squad->leaderId, ParticipantId::Human(900));
 
     const auto promoted = roles.GetRetailSquadAssignment(900);
     ASSERT_TRUE(promoted.has_value());
@@ -547,10 +586,10 @@ TEST(RoleSystemLifecycle, RetailReleaseReconcilesOrphansAndDuplicates) {
 
     const RetailSquad* squad = roles.GetRetailSquad(1, 0);
     ASSERT_NE(squad, nullptr);
-    EXPECT_EQ(squad->slotOwnerIds[0], 2u);
-    EXPECT_EQ(squad->slotOwnerIds[1], 0u);
-    EXPECT_EQ(squad->slotOwnerIds[2], 3u);
-    EXPECT_EQ(squad->leaderId, 2u);
+    EXPECT_EQ(squad->slotOwnerIds[0], ParticipantId::Human(2));
+    EXPECT_EQ(squad->slotOwnerIds[1], ParticipantId{});
+    EXPECT_EQ(squad->slotOwnerIds[2], ParticipantId::Human(3));
+    EXPECT_EQ(squad->leaderId, ParticipantId::Human(2));
 
     const auto promoted = roles.GetRetailSquadAssignment(2);
     ASSERT_TRUE(promoted.has_value());
@@ -561,9 +600,9 @@ TEST(RoleSystemLifecycle, RetailReleaseReconcilesOrphansAndDuplicates) {
     ASSERT_TRUE(repaired.has_value());
     EXPECT_EQ(repaired->roleIndex, 2u);
 
-    EXPECT_EQ(roles.GetRetailSquad(2, 9)->slotOwnerIds[5], 0u);
-    EXPECT_EQ(roles.GetRetailSquad(2, 8)->slotOwnerIds[4], 0u);
-    EXPECT_EQ(roles.GetRetailSquad(2, 7)->slotOwnerIds[3], 0u);
+    EXPECT_EQ(roles.GetRetailSquad(2, 9)->slotOwnerIds[5], ParticipantId{});
+    EXPECT_EQ(roles.GetRetailSquad(2, 8)->slotOwnerIds[4], ParticipantId{});
+    EXPECT_EQ(roles.GetRetailSquad(2, 7)->slotOwnerIds[3], ParticipantId{});
     EXPECT_FALSE(RoleSystemLifecycleTestHarness::HasRawRetailAssignment(
         roles, 777));
     EXPECT_FALSE(RoleSystemLifecycleTestHarness::HasRawRetailAssignment(

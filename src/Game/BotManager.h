@@ -181,6 +181,8 @@ public:
     using DeathBatchCallback =
         std::function<void(const std::vector<BotDeathEvent>&)>;
     using RespawnCallback = std::function<void(const BotRespawnEvent&)>;
+    using CreationCallback = std::function<void(const BotSnapshot&)>;
+    using RemovalCallback = std::function<void(const BotRemovalEvent&)>;
 
     explicit BotManager(const BotManagerConfig& config = BotManagerConfig{});
 
@@ -265,6 +267,14 @@ public:
     void SetRespawnCallback(RespawnCallback callback) {
         respawnCallback_ = std::move(callback);
     }
+    // Roster callbacks run synchronously after creation/removal commits. GameServer
+    // uses them to keep retail squad occupancy exact before a same-poll role RPC.
+    void SetCreationCallback(CreationCallback callback) {
+        creationCallback_ = std::move(callback);
+    }
+    void SetRemovalCallback(RemovalCallback callback) {
+        removalCallback_ = std::move(callback);
+    }
 
     std::vector<BotCombatEvent> ConsumeCombatEvents();
     std::vector<BotHumanCombatEvent> ConsumeHumanCombatEvents();
@@ -334,6 +344,8 @@ private:
     DeathCallback deathCallback_;
     DeathBatchCallback deathBatchCallback_;
     RespawnCallback respawnCallback_;
+    CreationCallback creationCallback_;
+    RemovalCallback removalCallback_;
     std::vector<BotCombatEvent> combatEvents_;
     std::vector<BotExternalHumanSnapshot> externalHumans_;
     bool externalHumansFresh_ = false;

@@ -14,6 +14,8 @@
 #include <optional>
 #include <string_view>
 
+#include "Game/ParticipantRoster.h"
+
 // Factions in RS2V
 enum class Faction : uint8_t {
     None = 0,
@@ -89,14 +91,17 @@ struct Squad {
 struct RetailSquad {
     static constexpr uint8_t SLOT_COUNT = 6;
 
-    std::array<uint32_t, SLOT_COUNT> slotOwnerIds{};
-    uint32_t leaderId = 0;
+    // Retail counts both human Controllers and AI Controllers as squad owners.
+    // Keep the identity tagged so Human(1) and Bot(1) cannot alias while the
+    // fixed six-slot wire indices remain unchanged.
+    std::array<ParticipantId, SLOT_COUNT> slotOwnerIds{};
+    ParticipantId leaderId{};
     bool locked = false;
 
     size_t Occupancy() const {
         size_t count = 0;
-        for (const uint32_t ownerId : slotOwnerIds) {
-            if (ownerId != 0) ++count;
+        for (const ParticipantId& ownerId : slotOwnerIds) {
+            if (ownerId.IsValid()) ++count;
         }
         return count;
     }
@@ -166,7 +171,9 @@ public:
     // assigned player is idempotent. New players join the fullest non-full
     // squad (lowest index breaks ties) and occupy its first free role slot.
     RetailSquadAssignment AutoAssignRetailSquad(uint32_t playerId,
-                                                uint32_t teamId);
+                                                 uint32_t teamId);
+    RetailSquadAssignment AutoAssignRetailSquad(
+        const ParticipantId& participant, uint32_t teamId);
     // Transactionally joins one explicit retail squad on the authoritative
     // team. The target's first free role slot is reserved before the source is
     // released, so an invalid or full target leaves the current assignment
@@ -181,13 +188,19 @@ public:
     // Frees only retail squad ownership, leaving CombatRole unchanged. The
     // fixed roster is reconciled so stale duplicates/orphans cannot leak slots.
     bool ReleaseRetailSquadAssignment(uint32_t playerId);
+    bool ReleaseRetailSquadAssignment(const ParticipantId& participant);
     std::optional<RetailSquadAssignment> GetRetailSquadAssignment(
         uint32_t playerId) const;
+    std::optional<RetailSquadAssignment> GetRetailSquadAssignment(
+        const ParticipantId& participant) const;
     const RetailSquad* GetRetailSquad(uint32_t teamId,
                                      uint8_t squadIndex) const;
     uint32_t GetRetailSquadLeader(uint32_t teamId,
                                   uint8_t squadIndex) const;
+    ParticipantId GetRetailSquadLeaderParticipant(
+        uint32_t teamId, uint8_t squadIndex) const;
     bool IsRetailSquadLeader(uint32_t playerId) const;
+    bool IsRetailSquadLeader(const ParticipantId& participant) const;
 
     // Retail ROMapInfo.GetNumSquads behavior. Invalid/non-positive capacities
     // use the shipped 64-player default instead of accidentally constraining a
@@ -246,7 +259,7 @@ private:
     // promotes the owner from the lowest remaining occupied role slot.
     using RetailSquadTeam = std::array<RetailSquad, RETAIL_SQUAD_COUNT>;
     std::array<RetailSquadTeam, RETAIL_TEAM_COUNT> m_retailSquads{};
-    std::unordered_map<uint32_t, RetailSquadAssignment>
+    std::map<ParticipantId, RetailSquadAssignment>
         m_retailSquadAssignments;
     uint32_t m_retailSquadGeneration = 1;
     uint8_t m_activeRetailSquadCount = RETAIL_SQUAD_COUNT;
@@ -260,6 +273,7 @@ private:
     const RoleDefinition* FindRoleDef(CombatRole role, Faction faction) const;
     std::string GenerateSquadName(uint32_t teamId) const;
     RetailSquadAssignment FindRetailSquadSlot(uint32_t teamId) const;
-    void ReconcileRetailSquads(uint32_t removingPlayerId = 0);
+    void ReconcileRetailSquads(
+        const ParticipantId& removingParticipant = ParticipantId{});
     void RepairRetailSquad(uint32_t teamId, uint8_t squadIndex);
 };

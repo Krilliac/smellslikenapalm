@@ -2726,7 +2726,11 @@ void GameServer::InitializeBotsForCurrentMap() {
         }
     }
     BotManagerConfig config;
-    config.fillTargetPerTeam = 8;
+    constexpr std::size_t kDefaultFillTargetPerTeam = 8u;
+    // Install lifecycle callbacks before the first bot exists. The target is
+    // applied below only after RoleSystem can account for each AI Controller in
+    // the same retail squad grid used by human role selection.
+    config.fillTargetPerTeam = 0;
     config.maxBotsPerTeam = 32;
     config.fixedStepSeconds = 0.1f;
     // 600 UU/s is an infantry sprint at the server's 50 UU/m scale. Resort's
@@ -2796,6 +2800,29 @@ void GameServer::InitializeBotsForCurrentMap() {
         [this](const std::vector<BotDeathEvent>& deaths) {
             ProcessBotDeathBatch(deaths);
         });
+    m_botManager->SetCreationCallback(
+        [this](const BotSnapshot& bot) {
+            if (!m_roleSystem) return;
+            const RetailSquadAssignment assignment =
+                m_roleSystem->AutoAssignRetailSquad(bot.id, bot.teamId);
+            if (!assignment.IsValid()) {
+                Logger::Warn(
+                    "[GameServer] could not assign %s to retail squad authority "
+                    "for team %u",
+                    bot.name.c_str(), static_cast<unsigned>(bot.teamId));
+            }
+        });
+    m_botManager->SetRemovalCallback(
+        [this](const BotRemovalEvent& removal) {
+            if (m_roleSystem) {
+                m_roleSystem->ReleaseRetailSquadAssignment(removal.botId);
+            }
+        });
+    if (!m_botManager->SetFillTargetPerTeam(kDefaultFillTargetPerTeam)) {
+        Logger::Error(
+            "[GameServer] rejected built-in bot fill target %zu",
+            kDefaultFillTargetPerTeam);
+    }
     if (m_objectiveSystem) {
         m_objectiveSystem->SetBotCaptureWeightProvider(
             [this](uint32_t objectiveId, uint32_t teamId) {

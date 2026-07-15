@@ -402,14 +402,20 @@ bool RoleSystem::IsRetailSquadLocked(uint32_t teamId,
 
 RetailSquadAssignment RoleSystem::AutoAssignRetailSquad(uint32_t playerId,
                                                         uint32_t teamId) {
+    return AutoAssignRetailSquad(ParticipantId::Human(playerId), teamId);
+}
+
+RetailSquadAssignment RoleSystem::AutoAssignRetailSquad(
+    const ParticipantId& participant, uint32_t teamId) {
     RetailSquadAssignment invalid;
     invalid.generation = m_retailSquadGeneration;
-    if (playerId == 0 || teamId == 0 || teamId > RETAIL_TEAM_COUNT) {
+    if (!participant.IsValid() || teamId == 0 ||
+        teamId > RETAIL_TEAM_COUNT) {
         return invalid;
     }
 
     ReconcileRetailSquads();
-    if (const auto current = GetRetailSquadAssignment(playerId)) {
+    if (const auto current = GetRetailSquadAssignment(participant)) {
         if (current->teamId == teamId) {
             return *current;
         }
@@ -427,21 +433,21 @@ RetailSquadAssignment RoleSystem::AutoAssignRetailSquad(uint32_t playerId,
     // a different team.
     const auto squadsBeforeMove = m_retailSquads;
     const auto assignmentsBeforeMove = m_retailSquadAssignments;
-    ReleaseRetailSquadAssignment(playerId);
+    ReleaseRetailSquadAssignment(participant);
 
     RetailSquad& squad =
         m_retailSquads[selected.teamId - 1][selected.squadIndex];
-    if (squad.slotOwnerIds[selected.roleIndex] != 0) {
+    if (squad.slotOwnerIds[selected.roleIndex].IsValid()) {
         // Restore the complete clean snapshot if an invariant violation ever
         // invalidates the preselected target during source release.
         m_retailSquads = squadsBeforeMove;
         m_retailSquadAssignments = assignmentsBeforeMove;
         return invalid;
     }
-    squad.slotOwnerIds[selected.roleIndex] = playerId;
+    squad.slotOwnerIds[selected.roleIndex] = participant;
 
     RetailSquadAssignment assignment = selected;
-    m_retailSquadAssignments[playerId] = assignment;
+    m_retailSquadAssignments[participant] = assignment;
     RepairRetailSquad(assignment.teamId, assignment.squadIndex);
     return assignment;
 }
@@ -449,16 +455,17 @@ RetailSquadAssignment RoleSystem::AutoAssignRetailSquad(uint32_t playerId,
 RetailSquadAssignment RoleSystem::JoinRetailSquad(
     uint32_t playerId, uint32_t authoritativeTeamId,
     uint8_t requestedSquadIndex) {
+    const ParticipantId participant = ParticipantId::Human(playerId);
     RetailSquadAssignment invalid;
     invalid.generation = m_retailSquadGeneration;
-    if (playerId == 0 || authoritativeTeamId == 0 ||
+    if (!participant.IsValid() || authoritativeTeamId == 0 ||
         authoritativeTeamId > RETAIL_TEAM_COUNT ||
         requestedSquadIndex >= RETAIL_SQUAD_COUNT) {
         return invalid;
     }
 
     ReconcileRetailSquads();
-    const auto current = GetRetailSquadAssignment(playerId);
+    const auto current = GetRetailSquadAssignment(participant);
     if (current && current->teamId == authoritativeTeamId &&
         current->squadIndex == requestedSquadIndex) {
         return *current;
@@ -480,7 +487,7 @@ RetailSquadAssignment RoleSystem::JoinRetailSquad(
         m_retailSquads[authoritativeTeamId - 1][requestedSquadIndex];
     for (uint8_t roleIndex = 0; roleIndex < RetailSquad::SLOT_COUNT;
          ++roleIndex) {
-        if (target.slotOwnerIds[roleIndex] == 0) {
+        if (!target.slotOwnerIds[roleIndex].IsValid()) {
             selected.roleIndex = roleIndex;
             break;
         }
@@ -493,18 +500,18 @@ RetailSquadAssignment RoleSystem::JoinRetailSquad(
     // an otherwise transactional move into a partial release.
     const auto squadsBeforeMove = m_retailSquads;
     const auto assignmentsBeforeMove = m_retailSquadAssignments;
-    ReleaseRetailSquadAssignment(playerId);
+    ReleaseRetailSquadAssignment(participant);
 
     RetailSquad& destination =
         m_retailSquads[selected.teamId - 1][selected.squadIndex];
-    if (destination.slotOwnerIds[selected.roleIndex] != 0) {
+    if (destination.slotOwnerIds[selected.roleIndex].IsValid()) {
         m_retailSquads = squadsBeforeMove;
         m_retailSquadAssignments = assignmentsBeforeMove;
         return invalid;
     }
 
-    destination.slotOwnerIds[selected.roleIndex] = playerId;
-    m_retailSquadAssignments[playerId] = selected;
+    destination.slotOwnerIds[selected.roleIndex] = participant;
+    m_retailSquadAssignments[participant] = selected;
     RepairRetailSquad(selected.teamId, selected.squadIndex);
     return selected;
 }
@@ -535,7 +542,7 @@ RetailSquadAssignment RoleSystem::FindRetailSquadSlot(uint32_t teamId) const {
         uint8_t firstHole = RetailSquadAssignment::UNASSIGNED_INDEX;
         for (uint8_t roleIndex = 0; roleIndex < RetailSquad::SLOT_COUNT;
              ++roleIndex) {
-            if (squad.slotOwnerIds[roleIndex] == 0) {
+            if (!squad.slotOwnerIds[roleIndex].IsValid()) {
                 firstHole = roleIndex;
                 break;
             }
@@ -552,7 +559,14 @@ RetailSquadAssignment RoleSystem::FindRetailSquadSlot(uint32_t teamId) const {
 
 std::optional<RetailSquadAssignment>
 RoleSystem::GetRetailSquadAssignment(uint32_t playerId) const {
-    const auto it = m_retailSquadAssignments.find(playerId);
+    return GetRetailSquadAssignment(ParticipantId::Human(playerId));
+}
+
+std::optional<RetailSquadAssignment>
+RoleSystem::GetRetailSquadAssignment(
+    const ParticipantId& participant) const {
+    if (!participant.IsValid()) return std::nullopt;
+    const auto it = m_retailSquadAssignments.find(participant);
     if (it == m_retailSquadAssignments.end()) return std::nullopt;
 
     const RetailSquadAssignment& assignment = it->second;
@@ -566,7 +580,7 @@ RoleSystem::GetRetailSquadAssignment(uint32_t playerId) const {
 
     const RetailSquad& squad =
         m_retailSquads[assignment.teamId - 1][assignment.squadIndex];
-    if (squad.slotOwnerIds[assignment.roleIndex] != playerId) {
+    if (squad.slotOwnerIds[assignment.roleIndex] != participant) {
         return std::nullopt;
     }
     return assignment;
@@ -583,15 +597,27 @@ const RetailSquad* RoleSystem::GetRetailSquad(uint32_t teamId,
 
 uint32_t RoleSystem::GetRetailSquadLeader(uint32_t teamId,
                                           uint8_t squadIndex) const {
+    const ParticipantId leader =
+        GetRetailSquadLeaderParticipant(teamId, squadIndex);
+    return leader.IsHuman() ? leader.value : 0u;
+}
+
+ParticipantId RoleSystem::GetRetailSquadLeaderParticipant(
+    uint32_t teamId, uint8_t squadIndex) const {
     const RetailSquad* squad = GetRetailSquad(teamId, squadIndex);
-    return squad ? squad->leaderId : 0;
+    return squad ? squad->leaderId : ParticipantId{};
 }
 
 bool RoleSystem::IsRetailSquadLeader(uint32_t playerId) const {
-    const auto assignment = GetRetailSquadAssignment(playerId);
+    return IsRetailSquadLeader(ParticipantId::Human(playerId));
+}
+
+bool RoleSystem::IsRetailSquadLeader(
+    const ParticipantId& participant) const {
+    const auto assignment = GetRetailSquadAssignment(participant);
     return assignment &&
-           GetRetailSquadLeader(assignment->teamId,
-                                assignment->squadIndex) == playerId;
+           GetRetailSquadLeaderParticipant(
+               assignment->teamId, assignment->squadIndex) == participant;
 }
 
 uint32_t RoleSystem::ResetRetailSquads() {
@@ -606,24 +632,31 @@ uint32_t RoleSystem::ResetRetailSquads() {
 }
 
 bool RoleSystem::ReleaseRetailSquadAssignment(uint32_t playerId) {
-    bool found = m_retailSquadAssignments.find(playerId) !=
+    return ReleaseRetailSquadAssignment(ParticipantId::Human(playerId));
+}
+
+bool RoleSystem::ReleaseRetailSquadAssignment(
+    const ParticipantId& participant) {
+    if (!participant.IsValid()) return false;
+    bool found = m_retailSquadAssignments.find(participant) !=
                  m_retailSquadAssignments.end();
     for (const RetailSquadTeam& team : m_retailSquads) {
         for (const RetailSquad& squad : team) {
             if (std::find(squad.slotOwnerIds.begin(),
-                          squad.slotOwnerIds.end(), playerId) !=
+                          squad.slotOwnerIds.end(), participant) !=
                 squad.slotOwnerIds.end()) {
                 found = true;
             }
         }
     }
-    ReconcileRetailSquads(playerId);
+    ReconcileRetailSquads(participant);
     return found;
 }
 
-void RoleSystem::ReconcileRetailSquads(uint32_t removingPlayerId) {
-    if (removingPlayerId != 0) {
-        m_retailSquadAssignments.erase(removingPlayerId);
+void RoleSystem::ReconcileRetailSquads(
+    const ParticipantId& removingParticipant) {
+    if (removingParticipant.IsValid()) {
+        m_retailSquadAssignments.erase(removingParticipant);
     }
 
     // Inactive stable indices must never retain owners or locks. This also
@@ -641,7 +674,7 @@ void RoleSystem::ReconcileRetailSquads(uint32_t removingPlayerId) {
     for (auto it = m_retailSquadAssignments.begin();
          it != m_retailSquadAssignments.end();) {
         const RetailSquadAssignment& assignment = it->second;
-        if (it->first == 0 || !assignment.IsValid() ||
+        if (!it->first.IsValid() || !assignment.IsValid() ||
             assignment.generation != m_retailSquadGeneration ||
             assignment.teamId > RETAIL_TEAM_COUNT ||
             assignment.squadIndex >= m_activeRetailSquadCount ||
@@ -658,12 +691,12 @@ void RoleSystem::ReconcileRetailSquads(uint32_t removingPlayerId) {
         for (uint8_t squadIndex = 0; squadIndex < m_activeRetailSquadCount;
              ++squadIndex) {
             RetailSquad& squad = team[squadIndex];
-            for (uint32_t& ownerId : squad.slotOwnerIds) {
-                if (ownerId == 0) continue;
-                if (ownerId == removingPlayerId ||
+            for (ParticipantId& ownerId : squad.slotOwnerIds) {
+                if (!ownerId.IsValid()) continue;
+                if (ownerId == removingParticipant ||
                     m_retailSquadAssignments.find(ownerId) ==
                         m_retailSquadAssignments.end()) {
-                    ownerId = 0;
+                    ownerId = {};
                 }
             }
         }
@@ -674,7 +707,7 @@ void RoleSystem::ReconcileRetailSquads(uint32_t removingPlayerId) {
     // recorded exact slot when possible; otherwise keep the lowest coordinate.
     for (auto it = m_retailSquadAssignments.begin();
          it != m_retailSquadAssignments.end();) {
-        const uint32_t playerId = it->first;
+        const ParticipantId participant = it->first;
         RetailSquadAssignment& assignment = it->second;
         uint32_t occurrenceCount = 0;
         uint32_t chosenTeam = 0;
@@ -690,7 +723,7 @@ void RoleSystem::ReconcileRetailSquads(uint32_t removingPlayerId) {
                 RetailSquad& squad = team[squadIndex];
                 for (uint8_t roleIndex = 0;
                      roleIndex < RetailSquad::SLOT_COUNT; ++roleIndex) {
-                    if (squad.slotOwnerIds[roleIndex] != playerId) continue;
+                    if (squad.slotOwnerIds[roleIndex] != participant) continue;
                     ++occurrenceCount;
                     const bool recorded =
                         assignment.teamId == teamId &&
@@ -719,10 +752,10 @@ void RoleSystem::ReconcileRetailSquads(uint32_t removingPlayerId) {
                 RetailSquad& squad = team[squadIndex];
                 for (uint8_t roleIndex = 0;
                      roleIndex < RetailSquad::SLOT_COUNT; ++roleIndex) {
-                    if (squad.slotOwnerIds[roleIndex] == playerId &&
+                    if (squad.slotOwnerIds[roleIndex] == participant &&
                         (teamId != chosenTeam || squadIndex != chosenSquad ||
                          roleIndex != chosenRole)) {
-                        squad.slotOwnerIds[roleIndex] = 0;
+                        squad.slotOwnerIds[roleIndex] = {};
                     }
                 }
             }
@@ -746,15 +779,15 @@ void RoleSystem::ReconcileRetailSquads(uint32_t removingPlayerId) {
 
 void RoleSystem::RepairRetailSquad(uint32_t teamId, uint8_t squadIndex) {
     RetailSquad& squad = m_retailSquads[teamId - 1][squadIndex];
-    if (squad.slotOwnerIds[0] == 0) {
+    if (!squad.slotOwnerIds[0].IsValid()) {
         for (uint8_t roleIndex = 1; roleIndex < RetailSquad::SLOT_COUNT;
              ++roleIndex) {
-            const uint32_t promotedId = squad.slotOwnerIds[roleIndex];
-            if (promotedId == 0) continue;
+            const ParticipantId promoted = squad.slotOwnerIds[roleIndex];
+            if (!promoted.IsValid()) continue;
 
-            squad.slotOwnerIds[0] = promotedId;
-            squad.slotOwnerIds[roleIndex] = 0;
-            auto assignment = m_retailSquadAssignments.find(promotedId);
+            squad.slotOwnerIds[0] = promoted;
+            squad.slotOwnerIds[roleIndex] = {};
+            auto assignment = m_retailSquadAssignments.find(promoted);
             if (assignment != m_retailSquadAssignments.end()) {
                 assignment->second.teamId = teamId;
                 assignment->second.squadIndex = squadIndex;

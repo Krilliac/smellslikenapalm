@@ -695,6 +695,9 @@ bool BotManager::CreateBot(std::uint8_t teamId) {
     auto inserted = bots_.emplace(rawBotId, std::move(bot));
     SyncRoster(inserted.first->second);
     AttemptRespawn(inserted.first->second);
+    if (creationCallback_) {
+        creationCallback_(inserted.first->second.snapshot);
+    }
     return true;
 }
 
@@ -702,12 +705,16 @@ void BotManager::RemoveBot(std::uint32_t rawBotId) {
     const auto found = bots_.find(rawBotId);
     if (found == bots_.end()) return;
 
-    const BotSnapshot& snapshot = found->second.snapshot;
-    removalEvents_.push_back(BotRemovalEvent{
+    const BotSnapshot snapshot = found->second.snapshot;
+    const BotRemovalEvent removal{
         snapshot.id, snapshot.teamId,
-        snapshot.lifecycle == BotLifecycle::Alive});
+        snapshot.lifecycle == BotLifecycle::Alive};
+    removalEvents_.push_back(removal);
     roster_.Remove(snapshot.id);
     bots_.erase(found);
+    if (removalCallback_) {
+        removalCallback_(removal);
+    }
 }
 
 void BotManager::StepFixed() {

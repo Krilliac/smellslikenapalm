@@ -6,6 +6,7 @@
 #include "Game/ObjectiveSystem.h"
 #include "Game/Player.h"
 #include "Game/PlayerManager.h"
+#include "Game/RoleSystem.h"
 #include "Game/SkirmishMode.h"
 #include "Game/SpawnSystem.h"
 #include "Game/SupremacyMode.h"
@@ -17,6 +18,7 @@
 #include "Network/SocketFactory.h"
 #include "Network/UDPSocket.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -32,6 +34,13 @@
 // listeners or constructing unrelated map/mode services.
 class GameServerBotCombatTestHarness {
 public:
+    static void InstallRetailBotSquadAuthority(GameServer& server) {
+        server.m_roleSystem = std::make_unique<RoleSystem>(&server);
+        server.m_roleSystem->Initialize();
+        server.m_roleSystem->ConfigureRetailSquads("Territories", 64);
+        server.InitializeBotsForCurrentMap();
+    }
+
     static void Install(GameServer& server, const BotManagerConfig& config) {
         server.m_combatAuthority =
             std::make_unique<CombatAuthority::Authority>();
@@ -215,6 +224,7 @@ public:
         server.m_objectiveSystem.reset();
         server.m_spawnSystem.reset();
         server.m_botManager.reset();
+        server.m_roleSystem.reset();
         server.m_ticketSystem.reset();
         server.m_combatAuthority.reset();
     }
@@ -241,6 +251,62 @@ BotManagerConfig CombatConfig(std::uint64_t generation) {
     config.combatRoundsPerMinute = 600.0f;
     config.humanCombatGeneration = generation;
     return config;
+}
+
+TEST(GameServerBotCombat,
+     ProductionFillCallbacksTrackRetailBotSquadOccupancy) {
+    GameServer server;
+    GameServerBotCombatTestHarness::InstallRetailBotSquadAuthority(server);
+
+    BotManager* bots = server.GetBotManager();
+    RoleSystem* roles = server.GetRoleSystem();
+    ASSERT_NE(bots, nullptr);
+    ASSERT_NE(roles, nullptr);
+    ASSERT_EQ(bots->CountBots(BotManager::kTeamOne), 8u);
+    ASSERT_EQ(bots->CountBots(BotManager::kTeamTwo), 8u);
+    EXPECT_EQ(roles->GetRetailSquad(1, 0)->Occupancy(), 6u);
+    EXPECT_EQ(roles->GetRetailSquad(1, 1)->Occupancy(), 2u);
+    EXPECT_EQ(roles->GetRetailSquad(2, 0)->Occupancy(), 6u);
+    EXPECT_EQ(roles->GetRetailSquad(2, 1)->Occupancy(), 2u);
+
+    uint32_t removedBotId = 0u;
+    for (const BotSnapshot& bot : bots->GetBots()) {
+        if (bot.teamId == BotManager::kTeamOne) {
+            removedBotId = std::max(removedBotId, bot.id.value);
+        }
+    }
+    ASSERT_NE(removedBotId, 0u);
+    ASSERT_TRUE(roles->GetRetailSquadAssignment(
+        ParticipantId::Bot(removedBotId)).has_value());
+
+    // Human admission synchronously removes the highest-id fill bot. Its
+    // callback must free the retail slot before the immediately following role
+    // request allocates the human with the same raw numeric id as Bot(1).
+    ASSERT_TRUE(bots->SetHumanTeamCount(BotManager::kTeamOne, 1u));
+    EXPECT_FALSE(roles->GetRetailSquadAssignment(
+        ParticipantId::Bot(removedBotId)).has_value());
+    const RetailSquadAssignment human = roles->AutoAssignRetailSquad(
+        ParticipantId::Human(1), BotManager::kTeamOne);
+    ASSERT_TRUE(human.IsValid());
+    EXPECT_EQ(human.squadIndex, 1u);
+    EXPECT_EQ(human.roleIndex, 1u);
+    EXPECT_TRUE(roles->GetRetailSquadAssignment(
+        ParticipantId::Bot(1)).has_value());
+
+    ASSERT_TRUE(roles->ReleaseRetailSquadAssignment(
+        ParticipantId::Human(1)));
+    ASSERT_TRUE(bots->SetHumanTeamCount(BotManager::kTeamOne, 0u));
+    EXPECT_EQ(bots->CountBots(BotManager::kTeamOne), 8u);
+    EXPECT_EQ(bots->FindBot(ParticipantId::Bot(removedBotId)), nullptr);
+    const ParticipantId replacementBot = ParticipantId::Bot(17u);
+    ASSERT_NE(bots->FindBot(replacementBot), nullptr);
+    const auto replacement =
+        roles->GetRetailSquadAssignment(replacementBot);
+    ASSERT_TRUE(replacement.has_value());
+    EXPECT_EQ(replacement->squadIndex, 1u);
+    EXPECT_EQ(replacement->roleIndex, 1u);
+
+    GameServerBotCombatTestHarness::Reset(server);
 }
 
 void PrepareBots(BotManager& bots) {

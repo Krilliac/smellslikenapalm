@@ -12,6 +12,7 @@
 #include "Network/SocketFactory.h"
 #include "Network/UDPSocket.h"
 #include "Game/GameServer.h"
+#include "Game/BotManager.h"
 #include "Game/PlayerManager.h"
 #include "Game/RoleSystem.h"
 #include "Game/SpawnSystem.h"
@@ -91,11 +92,16 @@ public:
     }
 
     static void ResetRoleSelectionRuntime(GameServer& server) {
+        server.m_botManager.reset();
         server.m_spawnSystem.reset();
         server.m_roleSystem.reset();
         // PlayerManager shutdown consults TeamManager, so preserve that order.
         server.m_playerManager.reset();
         server.m_teamManager.reset();
+    }
+
+    static void InstallProductionBotFill(GameServer& server) {
+        server.InitializeBotsForCurrentMap();
     }
 
     static bool AttachRoleSelectionPlayer(
@@ -116,6 +122,24 @@ public:
         std::string error;
         const auto artifact =
             RetailBootstrap::ResolveArtifactSelection({}, error);
+        const auto profile = RetailBootstrap::ResolveExactProfile(
+            "VNTE-CuChi", "Territories");
+        if (!artifact || !profile) return false;
+
+        auto& state = manager.m_controlState.at(clientId);
+        state.retailArtifactSelectionResolved = true;
+        state.retailArtifactSelection = artifact;
+        state.retailBootstrapProfile = profile;
+        state.teamSelected = true;
+        state.teamInfoChannels = {4u, 5u};
+        return true;
+    }
+
+    static bool FreezeInstalledCuChiSession(ConnectionManager& manager,
+                                            uint32_t clientId) {
+        std::string error;
+        const auto artifact =
+            RetailBootstrap::ResolveArtifactSelection("installed", error);
         const auto profile = RetailBootstrap::ResolveExactProfile(
             "VNTE-CuChi", "Territories");
         if (!artifact || !profile) return false;
@@ -2285,6 +2309,118 @@ TEST_F(ConnectionTravelCuChiRoleIntegrationTest,
               DeploymentCoordinator::ReadyStatus::Ready);
     EXPECT_TRUE(deployment->deploymentAuthorized);
     EXPECT_TRUE(Harness::DeploymentPrepared(manager_, kClientId));
+}
+
+TEST_F(ConnectionTravelCuChiRoleIntegrationTest,
+       SamePacketTeamThenRoleReconcilesProductionFillBots) {
+    using Harness = ConnectionTravelLifecycleTestHarness;
+    Harness::InstallProductionBotFill(server_);
+    RoleSystem* roles = server_.GetRoleSystem();
+    BotManager* bots = server_.GetBotManager();
+    ASSERT_TRUE(roles != nullptr);
+    ASSERT_TRUE(bots != nullptr);
+    ASSERT_EQ(bots->CountBots(BotManager::kTeamOne), 8u);
+    ASSERT_EQ(bots->CountBots(BotManager::kTeamTwo), 8u);
+
+    // Start on the other side and first reconcile its human count so h170 must
+    // exercise both directions of the fixed-fill transaction: remove a team-one
+    // bot and refill the vacated team-two bot. Human(1) intentionally collides
+    // numerically with Bot(1).
+    const std::shared_ptr<ClientConnection> connection =
+        Connect(0u, 1u, BotManager::kTeamTwo);
+    ASSERT_TRUE(connection != nullptr);
+    bots->SetHumanTeamCounts(0u, 1u);
+    EXPECT_EQ(bots->CountBots(BotManager::kTeamOne), 8u);
+    EXPECT_EQ(bots->CountBots(BotManager::kTeamTwo), 7u);
+    EXPECT_FALSE(roles->GetRetailSquadAssignment(
+        ParticipantId::Bot(16u)).has_value());
+
+    PacketCodec::Bunch selectTeam = MakeSelectTeamBunch(1u);
+    PacketCodec::Bunch selectRole = CuChiFinalRoleBunch(true);
+    selectTeam.chSequence = 1u;
+    selectRole.chSequence = 2u;
+    PacketCodec::Packet inbound;
+    inbound.packetId = 1u;
+    inbound.bunches.push_back(std::move(selectTeam));
+    inbound.bunches.push_back(std::move(selectRole));
+    Harness::Deliver(manager_, EncodeClientPacket(inbound),
+                     connection->GetIP(), connection->GetPort());
+
+    // BotManager applies the emulator's deterministic highest-id eviction and
+    // refills the old team synchronously before the following h175 in this same
+    // packet chooses a squad.
+    EXPECT_EQ(bots->CountBots(BotManager::kTeamOne), 7u);
+    EXPECT_EQ(bots->CountBots(BotManager::kTeamTwo), 8u);
+    EXPECT_FALSE(roles->GetRetailSquadAssignment(
+        ParticipantId::Bot(8u)).has_value());
+    EXPECT_TRUE(roles->GetRetailSquadAssignment(
+        ParticipantId::Bot(17u)).has_value());
+    EXPECT_TRUE(roles->GetRetailSquadAssignment(
+        ParticipantId::Bot(1u)).has_value());
+
+    const std::vector<PacketCodec::Bunch> wireBunches =
+        FlattenBunches(DrainDecodedPackets(0u));
+    const PacketCodec::Bunch expectedTransition = ExpectedChangedRole(
+        RoleSelectionRepl::ChangedRoleEvidence{
+            255u, RoleSelectionRepl::kCuChiInfantryClassIndex,
+            false, true,
+            RoleSelectionRepl::ChangedSquadEvidence{1u, 1u}});
+    const PacketCodec::Bunch expectedAssignment =
+        ExpectedOwnerPriAssignment(1u, 1u);
+    EXPECT_LT(FindWireBunch(wireBunches, expectedTransition),
+              wireBunches.size());
+    EXPECT_LT(FindWireBunch(wireBunches, expectedAssignment),
+              wireBunches.size());
+
+    const auto human = roles->GetRetailSquadAssignment(1u);
+    const auto sameValueBot = roles->GetRetailSquadAssignment(
+        ParticipantId::Bot(1u));
+    ASSERT_TRUE(human.has_value());
+    ASSERT_TRUE(sameValueBot.has_value());
+    EXPECT_EQ(human->teamId, BotManager::kTeamOne);
+    EXPECT_EQ(human->squadIndex, 1u);
+    EXPECT_EQ(human->roleIndex, 1u);
+    EXPECT_EQ(sameValueBot->squadIndex, 0u);
+    EXPECT_EQ(sameValueBot->roleIndex, 0u);
+}
+
+TEST_F(ConnectionTravelCuChiRoleIntegrationTest,
+       InstalledArtifactRejectsFinalRoleBeforeAnyAuthorityMutation) {
+    using Harness = ConnectionTravelLifecycleTestHarness;
+    constexpr uint32_t kClientId = 7u;
+    constexpr uint32_t kTeamId = RoleSelectionRepl::kCuChiUsServerTeam;
+    ASSERT_TRUE(Connect(0u, kClientId, kTeamId) != nullptr);
+    ASSERT_TRUE(Harness::FreezeInstalledCuChiSession(manager_, kClientId));
+
+    RoleSystem* roles = server_.GetRoleSystem();
+    ASSERT_TRUE(roles != nullptr);
+    const Harness::RoleLedgerSnapshot before =
+        Harness::RoleLedger(manager_, kClientId);
+    const uint32_t nextReliableBefore =
+        Harness::NextCh2Reliable(manager_, kClientId);
+    const size_t pendingBefore =
+        Harness::PendingReliableCount(manager_, kClientId);
+
+    Harness::DeliverActorBunch(
+        manager_, kClientId, CuChiFinalRoleBunch(true));
+
+    EXPECT_TRUE(DrainDecodedPackets(0u).empty());
+    EXPECT_FALSE(roles->GetRetailSquadAssignment(kClientId).has_value());
+    EXPECT_EQ(roles->GetRoleCount(kTeamId, CombatRole::Rifleman), 0);
+    const Harness::RoleLedgerSnapshot after =
+        Harness::RoleLedger(manager_, kClientId);
+    EXPECT_EQ(after.accepted, before.accepted);
+    EXPECT_EQ(after.finalized, before.finalized);
+    EXPECT_EQ(after.priClassReplicated, before.priClassReplicated);
+    EXPECT_EQ(after.roleInfoObjectRef, before.roleInfoObjectRef);
+    EXPECT_EQ(after.classIndex, before.classIndex);
+    EXPECT_EQ(after.squadIndex, before.squadIndex);
+    EXPECT_EQ(after.roleIndex, before.roleIndex);
+    EXPECT_EQ(after.changedRole.has_value(), before.changedRole.has_value());
+    EXPECT_EQ(Harness::NextCh2Reliable(manager_, kClientId),
+              nextReliableBefore);
+    EXPECT_EQ(Harness::PendingReliableCount(manager_, kClientId),
+              pendingBefore);
 }
 
 TEST_F(ConnectionTravelCuChiRoleIntegrationTest,
