@@ -7,6 +7,7 @@
 #include <utility>
 #include <vector>
 
+#include "Game/RoleSystem.h"
 #include "Network/ActorReplication.h"
 #include "Network/BitReader.h"
 #include "Network/BitWriter.h"
@@ -898,7 +899,8 @@ TEST(RoleSelectionReplication, EmitsCapturedOwnerPriAndChangedRoleOrder) {
   EXPECT_EQ(changedReader.BitsLeft(), 0u);
 }
 
-TEST(RoleSelectionReplication, EmitsCapturedNorthCompoundTransitionAndPriState) {
+TEST(RoleSelectionReplication,
+     EmitsCapturedResortNorthCombinedTransitionAndPriState) {
   // North f61973 publishes h79 ClassIndex=0. The property encoding is the same
   // capture-grounded owner-PRI primitive used above.
   BitWriter classWriter;
@@ -956,6 +958,27 @@ TEST(RoleSelectionReplication, EmitsCapturedNorthCompoundTransitionAndPriState) 
       RoleSelectionRepl::kPriRoleIndexHandle);
   EXPECT_EQ(reader.ReadByte(), 3u);
   EXPECT_EQ(reader.BitsLeft(), 0u);
+}
+
+TEST(RoleSelectionReplication,
+     EmitsCompoundNorthFirstRuntimeSquadTransition) {
+  RoleSystem roles(nullptr);
+  const RetailSquadAssignment assignment = roles.AutoAssignRetailSquad(
+      1u, RoleSelectionRepl::kCompoundNlfServerTeam);
+  ASSERT_TRUE(assignment.IsValid());
+  EXPECT_EQ(assignment.squadIndex, 0u);
+  EXPECT_EQ(assignment.roleIndex, 0u);
+
+  RoleSelectionRepl::ChangedRoleEvidence transitionEvidence{
+      255, 0, false, true,
+      RoleSelectionRepl::ChangedSquadEvidence{assignment.squadIndex,
+                                               assignment.roleIndex}};
+  uint32_t transitionBits = 0;
+  const std::vector<uint8_t> transition =
+      RoleSelectionRepl::EncodeChangedRoleTransition(transitionEvidence,
+                                                     transitionBits);
+  EXPECT_EQ(transitionBits, 32u);
+  EXPECT_EQ(transition, Hex("d2fe731a"));
 }
 
 TEST(RoleSelectionReplication, EmitsStandaloneChangedSquadWithRetailDefaults) {

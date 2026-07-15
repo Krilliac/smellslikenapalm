@@ -131,4 +131,33 @@ exception — the only fatal paths left are signals and throws that escape *all*
 guards. The recovered-exception count (`NonFatalExceptionCount`) now also covers
 these threads.
 
+## 2026-07-15 — Bound ch2 reliability and possession recovery to explicit lifecycles
+**Context:** Reliable ch2 actor RPCs used a scalar increment with no representation
+of modulo wrap or unacknowledged values. The fixed owning-pawn channel graph could
+also outlive one pawn life, so a delayed `AskForPawn` needed a stronger identity
+than “the graph is open.”
+**Decision:** Use a channel-agnostic `OutboundReliableSequencer` instance for the
+explicit ch2 actor sequence space. It reserves contiguous batches atomically in
+modulo 1024 (where sequence 0 is valid), permits at most 511 issued values from
+the oldest unresolved sequence through the cursor (including out-of-order ACKed
+tombstones), commits a batch only after `pendingReliable` owns its retry, and releases values
+only when an associated packet attempt is acknowledged. Retransmission keeps the
+original ChSequence. Separately, bind owning-pawn graph publication, recovery,
+and possession acknowledgement to the same nonzero pawn generation. Charge the
+recovery count and interval only after the response is successfully queued.
+**Rules out:** A monotonic scalar ch2 counter; treating wrapped sequence 0 as an
+invalid sentinel; releasing a sequence after the first send attempt; consuming
+recovery budget before queueing; or using only `pawnGraphOpen` to authorize a
+response for a possibly stale pawn life.
+**Consequences:** A full issuance window or rejected queue is transient
+backpressure and cannot manufacture a sequence gap. Bootstrap must adopt its
+externally assigned ch2-open sequence, ACK processing must release tracked ch2
+values, and every pawn death/reset/travel/publication-failure path must invalidate
+the recovery generation. This is an emulator-side safety decision, not a claim
+about the retail server's internal allocator or pawn-lifecycle representation.
+Because h42 is parameterless and h44 identifies only the reused ch209 channel,
+generation binding cannot distinguish a prior-life message that arrives after a
+new generation is already live; it deliberately guarantees lifecycle gating,
+not per-message life correlation absent from the observed wire format.
+
 <!-- Append new decisions above this line, newest first. -->

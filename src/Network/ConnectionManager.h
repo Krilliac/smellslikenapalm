@@ -2,6 +2,7 @@
 
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <vector>
@@ -20,6 +21,7 @@
 #include "Network/PacketAssembler.h"
 #include "Network/ControlReassembler.h"
 #include "Network/ActorReliableSequencer.h"
+#include "Network/OutboundReliableSequencer.h"
 #include "Network/ClientTravelReplication.h"
 #include "Network/RetailBootstrap.h"
 #include "Network/RoleSelectionReplication.h"
@@ -199,11 +201,12 @@ private:
         // messages. Unreliable actor traffic deliberately bypasses this object.
         PacketCodec::ActorReliableSequencer actorReliableInbound;
         // Per-channel state for the owning client's PlayerController (ch2). The actor
-        // bootstrap opens ch2 (seq 1) then sends ClientShowTeamSelect (seq 2); each
-        // further server->client reliable RPC on ch2 (ClientShowRoleSelect, ...)
-        // increments ch2OutReliable. actorChType is ch2's ChType (CHTYPE_Actor) reused
-        // for those bunches. teamSelected guards the SelectTeam->role-select advance.
-        uint32_t ch2OutReliable = 0;
+        // bootstrap opens ch2 (seq 1) then sends ClientShowTeamSelect (seq 2).
+        // Sequence zero is valid after modulo wrap, so channel openness is kept
+        // separately and this allocator owns cursor/in-flight state only.
+        PacketCodec::OutboundReliableSequencer ch2Reliable;
+        // actorChType is ch2's ChType (CHTYPE_Actor) reused for later bunches.
+        // teamSelected guards the SelectTeam->role-select advance.
         uint32_t actorChType = 2;
         uint32_t griChannel = 0;       // captured bootstrap ch54; live bootstrap ch3
         uint32_t griOutReliable = 0;   // reliable sequence seeded by the GRI open
@@ -224,7 +227,14 @@ private:
         bool     spawned = false;      // sent the pawn-spawn + possession once (SelectRoleByClass)
         bool     pawnGraphOpen = false; // owning pawn/loadout channels may be reused next round
         uint32_t pawnGraphTeamId = 0;  // immutable faction of the open ch209..219 graph
-        bool     possessionAcked = false; // received ServerAcknowledgePossession for our pawn
+        // The fixed owning actor channels can survive multiple pawn lives. Keep
+        // the authoritative life and the graph/recovery binding explicit so a
+        // delayed possession request cannot revive stale per-life state.
+        uint64_t owningPawnGeneration = 0; // increments on each accepted Dead->Alive transition
+        uint64_t pawnGraphGeneration = 0;  // generation currently represented by ch209..219
+        bool     owningPawnAlive = false;
+        uint64_t possessionAckedGeneration = 0;
+        uint64_t possessionRecoveryGeneration = 0;
         // AskForPawn is only a recovery hint; reliable retransmission already
         // carries the original possession graph. Bound fresh GivePawn bursts so
         // a client which cannot resolve its pawn cannot exhaust ch2 sequence
@@ -403,7 +413,8 @@ private:
         Respond,
         Malformed,
         Ineligible,
-        SequenceExhausted,
+        StaleGeneration,
+        Backpressured,
         RateLimited,
         LimitReached,
         Suppressed,
@@ -412,7 +423,17 @@ private:
     static constexpr uint64_t kPossessionRecoveryIntervalMs = 1000;
     static constexpr uint32_t kAskForPawnPayloadBits = 9;
     static PossessionRecoveryDecision EvaluatePossessionRecovery(
-        ControlState& state, bool exactStandaloneRequest, uint64_t nowMs);
+        ControlState& state, bool exactStandaloneRequest,
+        uint64_t expectedPawnGeneration, uint64_t nowMs);
+    static bool CommitPossessionRecoveryResponse(
+        ControlState& state, uint64_t expectedPawnGeneration,
+        uint64_t nowMs);
+    static uint64_t AdvanceOwningPawnGeneration(ControlState& state);
+    static bool HasLiveOwningPawnGeneration(
+        const ControlState& state, uint64_t expectedPawnGeneration);
+    static void BindPossessionRecovery(
+        ControlState& state, uint64_t pawnGeneration);
+    static void InvalidatePossessionRecovery(ControlState& state);
     static void ResetPossessionRecovery(ControlState& state);
 
     std::unordered_map<uint32_t, ControlState> m_controlState;
@@ -496,7 +517,7 @@ private:
     // channel (ch2): payload = SerializeInt(handle, maxHandle) + any params, already
     // packed into `payload`/`payloadBits` by the caller. Assigns the next ch2 reliable
     // ChSequence. Used for ClientShowTeamSelect / ClientShowRoleSelect / ChangedTeams.
-    void SendCh2Rpc(uint32_t clientId, const std::vector<uint8_t>& payload,
+    bool SendCh2Rpc(uint32_t clientId, const std::vector<uint8_t>& payload,
                     uint32_t payloadBits, const char* name);
 
     struct DeploymentPhaseState {
@@ -513,15 +534,15 @@ private:
     void SendOwnerPriClassIndex(uint32_t clientId, uint8_t classIndex);
     void SendOwnerPriRoleAssignment(uint32_t clientId, uint8_t squadIndex,
                                     uint8_t roleIndex);
-    void SendChangedSquadAssignment(
+    bool SendChangedSquadAssignment(
         uint32_t clientId,
         const RoleSelectionRepl::ChangedSquadEvidence& evidence);
     void SynchronizeRetailSquadAssignments();
-    void SendChangedRoleSpawnSelect(uint32_t clientId,
+    bool SendChangedRoleSpawnSelect(uint32_t clientId,
                                     bool includeOwnerPriAssignment = false);
     void SendPriSpawnSelection(uint32_t clientId, uint8_t encodedSelection);
-    void SendShowRoundStartScreen(uint32_t clientId, uint32_t displaySeconds);
-    void SendHideRoundStartScreen(uint32_t clientId);
+    bool SendShowRoundStartScreen(uint32_t clientId, uint32_t displaySeconds);
+    bool SendHideRoundStartScreen(uint32_t clientId);
     bool ExecutePreparedDeployment(uint32_t clientId, uint32_t spawnId);
     void BeginDeploymentGeneration();
     bool IsRetailGameplayActive(uint32_t clientId) const;
@@ -573,7 +594,7 @@ private:
     // sends the retail possession/camera transition and ClientSwitchToBestWeapon(h28).
     // PC.Pawn(h24) follows on the next packet. Expected result: closed spawn UI,
     // an equipped weapon, and ServerMove(h65).
-    bool SendPawnSpawn(uint32_t clientId);
+    bool SendPawnSpawn(uint32_t clientId, uint64_t expectedPawnGeneration);
 
     // Replicate the owning pawn's capture-pinned current attachment class after
     // ROInventoryManager h25 confirms a client weapon selection. Channel zero
@@ -583,7 +604,7 @@ private:
 
     // UE3's AskForPawn(h42) recovery path: re-assert PC.Pawn and answer with
     // GivePawn(h43, Pawn), whose client implementation calls ClientRestart itself.
-    void SendGivePawn(uint32_t clientId);
+    bool SendGivePawn(uint32_t clientId, uint64_t expectedPawnGeneration);
 
     static constexpr uint32_t kLocalPawnChannel = 209;
 
@@ -603,6 +624,14 @@ private:
     // retransmission until acked. The single choke-point for sending actor bunches.
     bool SendReliableBunches(uint32_t clientId,
                              const std::vector<PacketCodec::Bunch>& bunches);
+    std::optional<PacketCodec::OutboundReliableSequencer::Reservation>
+    ReserveCh2Reliable(ControlState& state, uint32_t clientId, size_t count,
+                       const char* context);
+    bool SendReservedCh2Bunches(
+        uint32_t clientId, const std::vector<PacketCodec::Bunch>& bunches,
+        const PacketCodec::OutboundReliableSequencer::Reservation& reservation,
+        const char* context);
+    void FailCloseCh2Publication(uint32_t clientId, const char* context);
 
     // Coalesce + throttle pending acks into at most one standalone ack-only datagram per
     // client per pump cycle (~20ms). Acks also piggyback on any data packet we send. Replaces

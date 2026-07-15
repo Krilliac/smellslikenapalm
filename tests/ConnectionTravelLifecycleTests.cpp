@@ -41,7 +41,9 @@ public:
         }
         manager.m_clients.emplace(ClientAddress{ip, port}, connection);
         auto& state = manager.m_controlState[clientId];
-        state.ch2OutReliable = ch2Reliable;
+        if (ch2Reliable != 0u) {
+            (void)state.ch2Reliable.Seed(ch2Reliable);
+        }
         state.mapTravelPending = travelPending;
         state.outboundActorChannels.set(2u, ch2Reliable != 0u);
         manager.m_nextClientId = std::max(manager.m_nextClientId, clientId + 1u);
@@ -117,7 +119,8 @@ public:
         Respond,
         Malformed,
         Ineligible,
-        SequenceExhausted,
+        StaleGeneration,
+        Backpressured,
         RateLimited,
         LimitReached,
         Suppressed,
@@ -125,19 +128,76 @@ public:
 
     static void SetPossessionRecoveryEligibility(
         ConnectionManager& manager, uint32_t clientId, bool spawned,
-        bool pawnGraphOpen, bool possessionAcked) {
+        bool pawnGraphOpen, bool possessionAcked,
+        uint64_t pawnGeneration = 1u) {
         auto& state = manager.m_controlState.at(clientId);
         state.spawned = spawned;
         state.pawnGraphOpen = pawnGraphOpen;
-        state.possessionAcked = possessionAcked;
+        state.owningPawnAlive = spawned;
+        state.owningPawnGeneration = pawnGeneration;
+        state.pawnGraphGeneration = pawnGraphOpen ? pawnGeneration : 0u;
+        state.possessionRecoveryGeneration =
+            spawned && pawnGraphOpen ? pawnGeneration : 0u;
+        state.possessionAckedGeneration =
+            possessionAcked ? pawnGeneration : 0u;
     }
 
     static RecoveryDecision EvaluatePossessionRecovery(
         ConnectionManager& manager, uint32_t clientId,
         bool exactStandaloneRequest, uint64_t nowMs) {
+        auto& state = manager.m_controlState.at(clientId);
+        const uint64_t pawnGeneration = state.owningPawnGeneration;
         const auto decision = ConnectionManager::EvaluatePossessionRecovery(
-            manager.m_controlState.at(clientId), exactStandaloneRequest, nowMs);
+            state, exactStandaloneRequest, pawnGeneration, nowMs);
+        if (decision ==
+            ConnectionManager::PossessionRecoveryDecision::Respond) {
+            (void)ConnectionManager::CommitPossessionRecoveryResponse(
+                state, pawnGeneration, nowMs);
+        }
         return static_cast<RecoveryDecision>(static_cast<uint8_t>(decision));
+    }
+
+    static std::vector<uint32_t> ReservePublishedCh2Reliables(
+        ConnectionManager& manager, uint32_t clientId, size_t count) {
+        auto& sequencer = manager.m_controlState.at(clientId).ch2Reliable;
+        auto reservation = sequencer.ReserveBatch(count);
+        if (!reservation) return {};
+        if (!sequencer.CommitBatch(*reservation)) return {};
+        return reservation->SequenceValues();
+    }
+
+    static bool ReleaseCh2Reliable(ConnectionManager& manager,
+                                   uint32_t clientId,
+                                   uint32_t sequence) {
+        return manager.m_controlState.at(clientId)
+            .ch2Reliable.Release(sequence).has_value();
+    }
+
+    static void SetPawnGenerationBindings(
+        ConnectionManager& manager, uint32_t clientId,
+        uint64_t owningGeneration, uint64_t graphGeneration,
+        uint64_t recoveryGeneration, bool alive) {
+        auto& state = manager.m_controlState.at(clientId);
+        state.spawned = true;
+        state.pawnGraphOpen = true;
+        state.owningPawnAlive = alive;
+        state.owningPawnGeneration = owningGeneration;
+        state.pawnGraphGeneration = graphGeneration;
+        state.possessionRecoveryGeneration = recoveryGeneration;
+        state.possessionAckedGeneration = 0u;
+        ConnectionManager::ResetPossessionRecovery(state);
+    }
+
+    static uint64_t AdvanceAndBindLivePawnGeneration(
+        ConnectionManager& manager, uint32_t clientId) {
+        auto& state = manager.m_controlState.at(clientId);
+        state.spawned = true;
+        state.pawnGraphOpen = true;
+        state.owningPawnAlive = true;
+        const uint64_t generation =
+            ConnectionManager::AdvanceOwningPawnGeneration(state);
+        ConnectionManager::BindPossessionRecovery(state, generation);
+        return generation;
     }
 
     static void ResetPossessionRecovery(ConnectionManager& manager,
@@ -166,12 +226,41 @@ public:
 
     static bool PossessionAcked(const ConnectionManager& manager,
                                 uint32_t clientId) {
-        return manager.m_controlState.at(clientId).possessionAcked;
+        const auto& state = manager.m_controlState.at(clientId);
+        return state.owningPawnGeneration != 0u &&
+               state.possessionAckedGeneration ==
+                   state.owningPawnGeneration;
     }
 
-    static uint32_t Ch2OutboundReliable(
+    static bool TeamSelected(const ConnectionManager& manager,
+                             uint32_t clientId) {
+        return manager.m_controlState.at(clientId).teamSelected;
+    }
+
+    static uint64_t OwningPawnGeneration(
         const ConnectionManager& manager, uint32_t clientId) {
-        return manager.m_controlState.at(clientId).ch2OutReliable;
+        return manager.m_controlState.at(clientId).owningPawnGeneration;
+    }
+
+    static uint32_t NextCh2Reliable(
+        const ConnectionManager& manager, uint32_t clientId) {
+        return manager.m_controlState.at(clientId)
+            .ch2Reliable.NextSequence()
+            .value_or(PacketCodec::kMaxChSequence);
+    }
+
+    static std::vector<uint32_t> QueuedCh2ReliableSequences(
+        const ConnectionManager& manager, uint32_t clientId) {
+        std::vector<uint32_t> sequences;
+        for (const auto& pending :
+             manager.m_controlState.at(clientId).pendingReliable) {
+            for (const PacketCodec::Bunch& bunch : pending.bunches) {
+                if (bunch.bReliable && bunch.chIndex == 2u) {
+                    sequences.push_back(bunch.chSequence);
+                }
+            }
+        }
+        return sequences;
     }
 
     static uint32_t LocalPawnChannel() {
@@ -268,9 +357,10 @@ public:
         return manager.m_controlState.at(clientId).pendingReliable.size();
     }
 
-    static void SendPriorCh2Reliable(ConnectionManager& manager,
+    static bool SendPriorCh2Reliable(ConnectionManager& manager,
                                      uint32_t clientId) {
-        manager.SendCh2Rpc(clientId, {0x01u}, 1u, "PriorReliableForTest");
+        return manager.SendCh2Rpc(
+            clientId, {0x01u}, 1u, "PriorReliableForTest");
     }
 
     static void SendControlReliable(ConnectionManager& manager,
@@ -586,7 +676,8 @@ PacketCodec::Bunch MakeParameterlessPcBunch(uint32_t handle,
     return bunch;
 }
 
-PacketCodec::Bunch MakePossessionAckBunch(uint32_t pawnChannel) {
+PacketCodec::Bunch MakePossessionAckBunch(uint32_t pawnChannel,
+                                          bool reliable = true) {
     BitWriter writer;
     writer.SerializeInt(
         DeploymentRepl::kServerAcknowledgePossessionHandle,
@@ -595,6 +686,27 @@ PacketCodec::Bunch MakePossessionAckBunch(uint32_t pawnChannel) {
     ActorRepl::WriteNetGUID(
         writer,
         ActorRepl::NetGUIDRef{/*isDynamic=*/true, pawnChannel});
+
+    PacketCodec::Bunch bunch;
+    bunch.bReliable = reliable;
+    bunch.chIndex = 2u;
+    bunch.chType = 2u;
+    bunch.chSequence = 1u;
+    bunch.payload = writer.GetBytes();
+    bunch.payloadBits = static_cast<uint32_t>(writer.NumBits());
+    return bunch;
+}
+
+PacketCodec::Bunch MakeSelectTeamBunch(uint8_t retailTeam) {
+    BitWriter writer;
+    writer.SerializeInt(170u,
+                        DeploymentRepl::kRoPlayerControllerMaxHandle);
+    if (retailTeam == 0u) {
+        writer.WriteBit(false);
+    } else {
+        writer.WriteBit(true);
+        writer.WriteByte(retailTeam);
+    }
 
     PacketCodec::Bunch bunch;
     bunch.bReliable = true;
@@ -856,6 +968,22 @@ TEST(ConnectionTravelLifecycle, ClosedPlayerControllerChannelFailsPreflight) {
     size_t eligible = 0;
     EXPECT_FALSE(manager.CanBroadcastRetailClientTravel(
         rpc, "VNSK-Compound", &eligible));
+}
+
+TEST(ConnectionTravelLifecycle,
+     ClosedPlayerControllerChannelRejectsNewReliableAllocation) {
+    using Harness = ConnectionTravelLifecycleTestHarness;
+
+    ConnectionManager manager(nullptr);
+    Harness::AddClient(
+        manager, 1, "127.0.0.1", 30112, true, 7, false);
+    const uint32_t nextBeforeClose = Harness::NextCh2Reliable(manager, 1);
+
+    Harness::PeerClosePlayerController(manager, 1);
+
+    EXPECT_FALSE(Harness::SendPriorCh2Reliable(manager, 1));
+    EXPECT_EQ(Harness::NextCh2Reliable(manager, 1), nextBeforeClose);
+    EXPECT_EQ(Harness::PendingReliableCount(manager, 1), 0u);
 }
 
 TEST(ConnectionTravelLifecycle,
@@ -1264,10 +1392,10 @@ TEST(ConnectionTravelLifecycle,
     PacketCodec::Bunch exact = MakeParameterlessPcBunch(42u);
     ASSERT_EQ(exact.payloadBits, 9u);
     const uint32_t initialReliable =
-        Harness::Ch2OutboundReliable(manager, 1);
+        Harness::NextCh2Reliable(manager, 1);
     Harness::DeliverActorBunch(manager, 1, exact);
     EXPECT_EQ(Harness::PossessionRecoveryResponses(manager, 1), 1u);
-    EXPECT_EQ(Harness::Ch2OutboundReliable(manager, 1),
+    EXPECT_EQ(Harness::NextCh2Reliable(manager, 1),
               initialReliable + 3u);
 
     PacketCodec::Bunch trailing = MakeParameterlessPcBunch(42u, true);
@@ -1281,7 +1409,7 @@ TEST(ConnectionTravelLifecycle,
     Harness::DeliverActorBunch(manager, 1, unreliable);
 
     EXPECT_EQ(Harness::PossessionRecoveryResponses(manager, 1), 1u);
-    EXPECT_EQ(Harness::Ch2OutboundReliable(manager, 1),
+    EXPECT_EQ(Harness::NextCh2Reliable(manager, 1),
               initialReliable + 3u);
 
     Harness::ResetPossessionRecovery(manager, 1);
@@ -1292,39 +1420,249 @@ TEST(ConnectionTravelLifecycle,
         manager, 1, true, true, true);
     Harness::DeliverActorBunch(manager, 1, exact);
     EXPECT_EQ(Harness::PossessionRecoveryResponses(manager, 1), 0u);
-    EXPECT_EQ(Harness::Ch2OutboundReliable(manager, 1),
+    EXPECT_EQ(Harness::NextCh2Reliable(manager, 1),
               initialReliable + 3u);
 }
 
 TEST(ConnectionTravelLifecycle,
-     AskForPawnRecoveryNeverOverflowsWireChSequence) {
+     AskForPawnRecoveryWrapsModuloSequenceSpace) {
     using Harness = ConnectionTravelLifecycleTestHarness;
 
     PacketCodec::Bunch exact = MakeParameterlessPcBunch(42u);
     ASSERT_EQ(exact.payloadBits, 9u);
 
-    ConnectionManager boundaryAllowed(nullptr);
+    ConnectionManager manager(nullptr);
     Harness::AddClient(
-        boundaryAllowed, 1, "127.0.0.1", 30145, true,
-        PacketCodec::kMaxChSequence - 4u, false);
+        manager, 1, "127.0.0.1", 30145, true,
+        PacketCodec::kMaxChSequence - 2u, false);
     Harness::SetPossessionRecoveryEligibility(
-        boundaryAllowed, 1, true, true, false);
-    Harness::DeliverActorBunch(boundaryAllowed, 1, exact);
-    EXPECT_EQ(Harness::Ch2OutboundReliable(boundaryAllowed, 1),
-              PacketCodec::kMaxChSequence - 1u);
-    EXPECT_EQ(Harness::PossessionRecoveryResponses(boundaryAllowed, 1), 1u);
+        manager, 1, true, true, false);
+    Harness::DeliverActorBunch(manager, 1, exact);
 
-    ConnectionManager boundaryRejected(nullptr);
+    const std::vector<uint32_t> expected{
+        PacketCodec::kMaxChSequence - 1u, 0u, 1u};
+    EXPECT_EQ(Harness::QueuedCh2ReliableSequences(manager, 1), expected);
+    EXPECT_EQ(Harness::NextCh2Reliable(manager, 1), 2u);
+    EXPECT_EQ(Harness::PossessionRecoveryResponses(manager, 1), 1u);
+}
+
+TEST(ConnectionTravelLifecycle,
+     PossessionRecoveryBackpressureDoesNotConsumeBudget) {
+    using Harness = ConnectionTravelLifecycleTestHarness;
+    using Decision = Harness::RecoveryDecision;
+
+    ConnectionManager manager(nullptr);
     Harness::AddClient(
-        boundaryRejected, 2, "127.0.0.1", 30146, true,
-        PacketCodec::kMaxChSequence - 3u, false);
+        manager, 1, "127.0.0.1", 30146, true, 7, false);
     Harness::SetPossessionRecoveryEligibility(
-        boundaryRejected, 2, true, true, false);
-    Harness::DeliverActorBunch(boundaryRejected, 2, exact);
-    EXPECT_EQ(Harness::Ch2OutboundReliable(boundaryRejected, 2),
-              PacketCodec::kMaxChSequence - 3u);
-    EXPECT_EQ(Harness::PossessionRecoveryResponses(boundaryRejected, 2), 0u);
-    EXPECT_TRUE(Harness::PossessionRecoveryLimitLogged(boundaryRejected, 2));
+        manager, 1, true, true, false, 17u);
+
+    const std::vector<uint32_t> occupied =
+        Harness::ReservePublishedCh2Reliables(
+            manager, 1,
+            PacketCodec::OutboundReliableSequencer::kMaximumOutstanding -
+                2u);
+    ASSERT_EQ(
+        occupied.size(),
+        PacketCodec::OutboundReliableSequencer::kMaximumOutstanding - 2u);
+
+    EXPECT_EQ(Harness::EvaluatePossessionRecovery(
+                  manager, 1, true, 1000u),
+              Decision::Backpressured);
+    EXPECT_EQ(Harness::PossessionRecoveryResponses(manager, 1), 0u);
+    EXPECT_EQ(Harness::LastPossessionRecoveryResponseMs(manager, 1), 0u);
+    EXPECT_FALSE(Harness::PossessionRecoveryLimitLogged(manager, 1));
+
+    ASSERT_TRUE(Harness::ReleaseCh2Reliable(
+        manager, 1, occupied.front()));
+    EXPECT_EQ(Harness::EvaluatePossessionRecovery(
+                  manager, 1, true, 1000u),
+              Decision::Respond);
+    EXPECT_EQ(Harness::PossessionRecoveryResponses(manager, 1), 1u);
+    EXPECT_EQ(Harness::LastPossessionRecoveryResponseMs(manager, 1), 1000u);
+}
+
+TEST(ConnectionTravelLifecycle,
+     PossessionRecoveryRejectsStaleAndDeadPawnGenerations) {
+    using Harness = ConnectionTravelLifecycleTestHarness;
+    using Decision = Harness::RecoveryDecision;
+
+    ConnectionManager manager(nullptr);
+    Harness::AddClient(
+        manager, 1, "127.0.0.1", 30147, true, 7, false);
+
+    Harness::SetPawnGenerationBindings(
+        manager, 1, 9u, 8u, 9u, true);
+    EXPECT_EQ(Harness::EvaluatePossessionRecovery(
+                  manager, 1, true, 1000u),
+              Decision::StaleGeneration);
+    EXPECT_EQ(Harness::PossessionRecoveryResponses(manager, 1), 0u);
+
+    Harness::SetPawnGenerationBindings(
+        manager, 1, 10u, 10u, 10u, false);
+    EXPECT_EQ(Harness::EvaluatePossessionRecovery(
+                  manager, 1, true, 2000u),
+              Decision::Ineligible);
+    EXPECT_EQ(Harness::PossessionRecoveryResponses(manager, 1), 0u);
+}
+
+TEST(ConnectionTravelLifecycle,
+     NewPawnGenerationClearsPriorAckAndRecoveryBudget) {
+    using Harness = ConnectionTravelLifecycleTestHarness;
+    using Decision = Harness::RecoveryDecision;
+
+    ConnectionManager manager(nullptr);
+    Harness::AddClient(
+        manager, 1, "127.0.0.1", 30148, true, 7, false);
+    Harness::SetPossessionRecoveryEligibility(
+        manager, 1, true, true, false, 20u);
+
+    EXPECT_EQ(Harness::EvaluatePossessionRecovery(
+                  manager, 1, true, 1000u),
+              Decision::Respond);
+    EXPECT_EQ(Harness::EvaluatePossessionRecovery(
+                  manager, 1, true, 2000u),
+              Decision::Respond);
+    EXPECT_EQ(Harness::EvaluatePossessionRecovery(
+                  manager, 1, true, 3000u),
+              Decision::Respond);
+    ASSERT_EQ(Harness::PossessionRecoveryResponses(manager, 1), 3u);
+
+    EXPECT_EQ(Harness::AdvanceAndBindLivePawnGeneration(manager, 1), 21u);
+    EXPECT_EQ(Harness::PossessionRecoveryResponses(manager, 1), 0u);
+    EXPECT_EQ(Harness::LastPossessionRecoveryResponseMs(manager, 1), 0u);
+    EXPECT_FALSE(Harness::PossessionAcked(manager, 1));
+
+    Harness::DeliverActorBunch(
+        manager, 1,
+        MakePossessionAckBunch(Harness::LocalPawnChannel()));
+    ASSERT_TRUE(Harness::PossessionAcked(manager, 1));
+
+    EXPECT_EQ(Harness::AdvanceAndBindLivePawnGeneration(manager, 1), 22u);
+    EXPECT_FALSE(Harness::PossessionAcked(manager, 1));
+    EXPECT_EQ(Harness::PossessionRecoveryResponses(manager, 1), 0u);
+    EXPECT_EQ(Harness::EvaluatePossessionRecovery(
+                  manager, 1, true, 4000u),
+              Decision::Respond);
+}
+
+TEST(ConnectionTravelLifecycle,
+     DuplicateAliveCallbackPreservesPawnGenerationAndAck) {
+    using Harness = ConnectionTravelLifecycleTestHarness;
+
+    ConnectionManager manager(nullptr);
+    Harness::AddClient(
+        manager, 1, "127.0.0.1", 30149, true, 7, false);
+    Harness::SetPossessionRecoveryEligibility(
+        manager, 1, true, true, false, 33u);
+    Harness::DeliverActorBunch(
+        manager, 1,
+        MakePossessionAckBunch(Harness::LocalPawnChannel()));
+    ASSERT_TRUE(Harness::PossessionAcked(manager, 1));
+
+    manager.ReplicateRetailParticipantCombatState(
+        ParticipantId::Human(1u), 100, 0, 0, 0,
+        /*isDead=*/false, /*sendHealth=*/false,
+        /*sendDeathRpc=*/true);
+
+    EXPECT_EQ(Harness::OwningPawnGeneration(manager, 1), 33u);
+    EXPECT_TRUE(Harness::PossessionAcked(manager, 1));
+}
+
+TEST(ConnectionTravelLifecycle,
+     UnreliableStandalonePossessionAckCannotAcknowledgeLivePawn) {
+    using Harness = ConnectionTravelLifecycleTestHarness;
+
+    ConnectionManager manager(nullptr);
+    Harness::AddClient(
+        manager, 1, "127.0.0.1", 30152, true, 7, false);
+    Harness::SetPossessionRecoveryEligibility(
+        manager, 1, true, true, false, 40u);
+
+    Harness::DeliverActorBunch(
+        manager, 1,
+        MakePossessionAckBunch(Harness::LocalPawnChannel(),
+                               /*reliable=*/false));
+
+    EXPECT_FALSE(Harness::PossessionAcked(manager, 1));
+}
+
+TEST(ConnectionTravelLifecycle,
+     UnreliableCompoundReadyAckCannotAcknowledgeLivePawn) {
+    using Harness = ConnectionTravelLifecycleTestHarness;
+
+    ConnectionManager manager(nullptr);
+    Harness::AddClient(
+        manager, 1, "127.0.0.1", 30153, true, 7, false);
+    Harness::SetPossessionRecoveryEligibility(
+        manager, 1, true, true, false, 41u);
+
+    PacketCodec::Bunch readyAck = MakeCapturedPcBunch(
+        {0xb2, 0xd1, 0x92, 0x3d, 0x16, 0x47, 0xc3, 0x11}, 62u);
+    readyAck.bReliable = false;
+    Harness::DeliverActorBunch(manager, 1, readyAck);
+
+    EXPECT_FALSE(Harness::PossessionAcked(manager, 1));
+}
+
+TEST(ConnectionTravelLifecycle,
+     ReliableCompoundReadyAckAcknowledgesLivePawn) {
+    using Harness = ConnectionTravelLifecycleTestHarness;
+
+    ConnectionManager manager(nullptr);
+    Harness::AddClient(
+        manager, 1, "127.0.0.1", 30156, true, 7, false);
+    Harness::SetPossessionRecoveryEligibility(
+        manager, 1, true, true, false, 41u);
+
+    const PacketCodec::Bunch readyAck = MakeCapturedPcBunch(
+        {0xb2, 0xd1, 0x92, 0x3d, 0x16, 0x47, 0xc3, 0x11}, 62u);
+    Harness::DeliverActorBunch(manager, 1, readyAck);
+
+    EXPECT_TRUE(Harness::PossessionAcked(manager, 1));
+}
+
+TEST(ConnectionTravelLifecycle,
+     ClientOnDeadBackpressureFailClosesOwningConnection) {
+    using Harness = ConnectionTravelLifecycleTestHarness;
+
+    ConnectionManager manager(nullptr);
+    const std::shared_ptr<ClientConnection> connection = Harness::AddClient(
+        manager, 1, "127.0.0.1", 30154, true, 7, false);
+    Harness::SetPossessionRecoveryEligibility(
+        manager, 1, true, true, false, 42u);
+    ASSERT_EQ(Harness::ReservePublishedCh2Reliables(
+                  manager, 1,
+                  PacketCodec::OutboundReliableSequencer::kMaximumOutstanding)
+                  .size(),
+              PacketCodec::OutboundReliableSequencer::kMaximumOutstanding);
+
+    manager.ReplicateRetailParticipantCombatState(
+        ParticipantId::Human(1u), 0, 0, 1, 0,
+        /*isDead=*/true, /*sendHealth=*/false,
+        /*sendDeathRpc=*/true);
+
+    EXPECT_TRUE(connection->IsDisconnected());
+}
+
+TEST(ConnectionTravelLifecycle,
+     ChangedTeamsBackpressureDoesNotCommitSelectionAuthority) {
+    using Harness = ConnectionTravelLifecycleTestHarness;
+
+    ConnectionManager manager(nullptr);
+    const std::shared_ptr<ClientConnection> connection = Harness::AddClient(
+        manager, 1, "127.0.0.1", 30155, true, 7, false);
+    ASSERT_TRUE(Harness::FreezeRetailBootstrap(manager, 1, {}));
+    ASSERT_EQ(Harness::ReservePublishedCh2Reliables(
+                  manager, 1,
+                  PacketCodec::OutboundReliableSequencer::kMaximumOutstanding)
+                  .size(),
+              PacketCodec::OutboundReliableSequencer::kMaximumOutstanding);
+
+    Harness::DeliverActorBunch(manager, 1, MakeSelectTeamBunch(1u));
+
+    EXPECT_TRUE(connection->IsDisconnected());
+    EXPECT_FALSE(Harness::TeamSelected(manager, 1));
 }
 
 TEST(ConnectionTravelLifecycle,
@@ -1861,7 +2199,7 @@ TEST(ConnectionTravelLifecycle,
     ConnectionManager manager(nullptr);
     const std::shared_ptr<ClientConnection> oldConnection =
         ConnectionTravelLifecycleTestHarness::AddClient(
-            manager, 1, "192.0.2.44", 31005, true, 0, false);
+            manager, 1, "192.0.2.44", 31005, true, 7, false);
     ConnectionTravelLifecycleTestHarness::SetTravelPending(
         manager, 1, 5000);
     ConnectionTravelLifecycleTestHarness::SetPossessionRecoveryEligibility(

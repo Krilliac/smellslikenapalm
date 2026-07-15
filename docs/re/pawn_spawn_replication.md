@@ -259,6 +259,28 @@ capture-backed template registry and a retail render test exist.
 `ConnectionManager::SendPawnSpawn` chooses a capture-pinned owning graph from the authoritative
 server team after deployment authorizes the selected spawn.
 
+### Owning-pawn generation binding
+
+The fixed ch209..ch219 channel numbers do not make two pawn lives interchangeable. The emulator
+assigns a nonzero `owningPawnGeneration` to each accepted owning-pawn life and binds the published
+graph and possession-recovery state to that exact value. Recovery is live only while the pawn is
+alive and spawned and
+`owningPawnGeneration == pawnGraphGeneration == possessionRecoveryGeneration`. Death, failed graph
+publication, team/deployment reset, and map travel invalidate the binding. Consequently, a delayed
+`AskForPawn` cannot trigger recovery while the graph is stale or unbound.
+
+Only the canonical standalone reliable 9-bit ch2 h42 request is considered. The matching
+`GivePawn` response reserves its three reliable ch2 sequences as one atomic batch. If the
+modulo-1024 allocator is temporarily backpressured, or the response cannot enter the
+`pendingReliable` retransmission ledger, the request consumes neither the per-generation response
+count nor the one-second rate-limit interval. The count/timestamp commit occurs only after queueing,
+and h44 `ServerAcknowledgePossession` suppresses subsequent recovery only when it names ch209 for
+the current live generation. This is an emulator-side lifecycle guard derived from the observed RPC
+shape and fixed-channel implementation; it is not a claim about the retail server's internal data
+structures. There is a residual wire ambiguity: h42 carries no pawn identity and h44 carries only
+the reused ch209 identity. If an old message arrives after a later generation has already been
+published, the wire alone cannot prove which life originated it.
+
 ### South / US graph (f27394)
 
 1. **ch209** is the local `ROSouthPawn` class 286151, with h52 `Controller` → dynamic ch2,
@@ -337,6 +359,11 @@ h167/h147 state, and an explicit final h24 None. `ActorReplicationTests.cpp` ind
 the 245-bit five-record h167 list, both h147 forms, and the active GRI h32(false) then h31(true)
 18-bit payload. Run those gates after building; syntax-only Python validation is not a retail-client
 acceptance test.
+
+For the live installed Compound profile, run `python tools/mock_client.py spawn --profile compound`.
+That profile emits the source-grounded installed Compound h175 role request and validates the
+artifact-rebased pawn, loadout, inventory-manager, h167, and h147 static references instead of the
+canonical Resort-era values.
 
 **Remaining live-client uncertainty:** h167/h147 restore attachment/paper-doll state, but whether
 they also make the first-person weapon mesh appear is not proven. Validate the client view, weapon

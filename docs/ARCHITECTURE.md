@@ -87,11 +87,17 @@ cites the function that does the work.
 `BitReader`/`BitWriter` (FBitReader/FBitWriter-compatible). `MaxPacket` is
 phase-dependent: 8 bytes during StatelessConnect, then 2048 for inbound NMT
 decode and 1500 for our outbound encode — the exact bounds matter bit-for-bit
-(`src/Network/PacketCodec.h` documents why). Outbound framing (PacketId /
-ChSequence assignment, fragmentation, acks) is `PacketAssembler`; inbound
+(`src/Network/PacketCodec.h` documents why). Outbound framing (PacketId
+assignment, bunch serialization/fragmentation, acks) is `PacketAssembler`; inbound
 ordering/dedup of reliable control bunches is `ControlReassembler`. Reliable
 bunches are retransmitted until acked — `ConnectionManager::SendReliableBunches`
 records them, `OnClientAck` clears them, `RetransmitTick` (run every pump) resends.
+Explicit reliable ch2 actor sequences are owned by one
+`OutboundReliableSequencer` per connection: it reserves modulo-1024 batches
+(including sequence 0), caps the forward issuance window at 511, and commits a
+tokenized reservation only after `pendingReliable` owns the retry. Out-of-order
+ACKed successors remain window tombstones until the oldest gap closes. ACK
+processing releases the values; retransmission reuses them with a new PacketId.
 
 **Decoupling.** The Network layer never `#include`s anything from Game. The
 handshake notifies Game purely through `std::function` observers
@@ -163,13 +169,16 @@ allocates a `clientId`). Its progression, with the owning state:
 | **Login → Welcome** | `HandshakePhase::WelcomeSent` | `NMT_Login` parsed → `ClientLoggedIn` fires → `ConnectionLoginBridge` runs PreLogin + Login, creates the PRI and (lazily) the single GRI. |
 | **Join** | `HandshakePhase::Joined` | `NMT_Join` → `ClientJoined` fires → bridge runs PostLogin (team pick + spawn). |
 | **World bootstrap** | `ConnectionManager::ControlState` (per-client) | `SendReplicationBootstrap` (PackageMap) then `SendActorBootstrap` open the bootstrap actor channels; ch2 carries `ClientShowTeamSelect`. |
-| **Team / role / spawn** | `ControlState` (`teamSelected`, `ch2OutReliable`) | Inbound `SelectTeam` (`DecodeInboundActorBunch`) persists the team and advances to `ClientShowRoleSelect`; role selection leads to a spawn request. |
+| **Team / role / spawn** | `ControlState` (`teamSelected`, `ch2Reliable`, owning-pawn generation fields) | Inbound `SelectTeam` (`DecodeInboundActorBunch`) persists the team and advances to `ClientShowRoleSelect`; role selection leads to a spawn request. Possession recovery is eligible only for the exact live generation represented by the open owning-pawn graph. |
 | **Teardown** | — | `RemoveStaleConnections` (heartbeat timeout) or explicit disconnect drops the `ClientConnection`, handshake, and control state. |
 
 Reliability spans the whole post-Join phase: every reliable server→client bunch
 is retransmitted (same per-channel `ChSequence`, new `PacketId`) until the client
 acks the packet it rode in — without this, a single dropped bootstrap bunch
-soft-locks the client. See `ConnectionManager::ControlState::SentReliable`.
+soft-locks the client. A full ch2 reliable window is transient backpressure: a
+new atomic reservation is deferred without consuming a sequence or a
+possession-recovery response. See `ConnectionManager::ControlState::SentReliable`
+and `PacketCodec::OutboundReliableSequencer`.
 
 ---
 

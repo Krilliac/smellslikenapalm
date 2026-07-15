@@ -111,6 +111,126 @@ class SpawnProfileTests(unittest.TestCase):
             "af4456150080c301")
         self.assertEqual(len(mock_client.build_role_selection_bits(2)), 57)
 
+        compound_south = mock_client.build_role_selection_bits(
+            1, profile="compound")
+        self.assertEqual(self._bits_hex(compound_south), "af565c150080c301")
+        self.assertEqual(len(compound_south), 57)
+
+        compound_north = mock_client.build_role_selection_bits(
+            2, profile="compound")
+        self.assertEqual(
+            self._bits_hex(compound_north),
+            "af94561500180000000080c3b300")
+        self.assertEqual(len(compound_north), 107)
+
+        # Resort's h211(2,3) values are a captured occupancy snapshot. A clean
+        # Compound server allocates its first North player to runtime slot 0/0.
+        self.assertEqual(
+            mock_client.resolve_north_role_transition_contract("resort"),
+            (48, "d2fe735a8103"))
+        self.assertEqual(
+            mock_client.resolve_north_role_transition_contract("compound"),
+            (32, "d2fe731a"))
+        with self.assertRaises(ValueError):
+            mock_client.resolve_north_role_transition_contract("unknown")
+
+        self.assertEqual(
+            self._bits_hex(mock_client.build_role_selection_bits(
+                1, profile="hue-city")),
+            "af465c150080c301")
+
+    def test_compound_wire_contracts_pin_installed_package_map_graph(self):
+        south = mock_client.resolve_spawn_wire_contract(1, "compound")
+        self.assertEqual(south.pawn_class_ref, 286156)
+        self.assertEqual(
+            south.loadout_class_map,
+            {210: 286379, 211: 286396, 212: 286469,
+             213: 286114, 214: 286394, 219: 82737})
+        self.assertEqual(
+            south.attachments,
+            ((0, 286941), (1, 286951), (2, 287068),
+             (3, 286949), (5, 286131)))
+        self.assertEqual(south.attachment_payload_bits, 245)
+        self.assertEqual(
+            south.attachment_payload_hex,
+            "a700748311004e03380723009c0ac0154600381da01c8c00705ac06c170100")
+        self.assertEqual(south.current_attachment_class_ref, 286941)
+        self.assertEqual(south.current_attachment_payload_bits, 40)
+        self.assertEqual(south.current_attachment_payload_hex, "93bac10800")
+
+        north = mock_client.resolve_spawn_wire_contract(2, "compound")
+        self.assertEqual(north.pawn_class_ref, 286152)
+        self.assertEqual(
+            north.loadout_class_map,
+            {210: 286276, 212: 286809, 214: 286763, 219: 82737})
+        self.assertEqual(
+            north.attachments,
+            ((0, 286850), (2, 287193), (4, 287152)))
+        self.assertEqual(north.attachment_payload_bits, 187)
+        self.assertEqual(
+            north.attachment_payload_hex,
+            "a700088211004e05c80e23009c12001b4600a094c2f50802")
+        self.assertEqual(north.current_attachment_class_ref, 286850)
+        self.assertEqual(north.current_attachment_payload_bits, 40)
+        self.assertEqual(north.current_attachment_payload_hex, "9304c10800")
+
+        for wire, has_encumbrance in ((south, False), (north, True)):
+            with self.subTest(team="North" if has_encumbrance else "South"):
+                attachment_reader = mock_client.BitReader(
+                    bytes.fromhex(wire.attachment_payload_hex),
+                    wire.attachment_payload_bits)
+                decoded_attachments = []
+                for _ in wire.attachments:
+                    self.assertEqual(attachment_reader.rint(168), 167)
+                    slot = attachment_reader.ru(8)
+                    self.assertEqual(attachment_reader.bit(), 0)
+                    self.assertEqual(attachment_reader.bit(), 0)
+                    decoded_attachments.append(
+                        (slot, attachment_reader.rint(0x80000000)))
+                self.assertEqual(tuple(decoded_attachments), wire.attachments)
+                if has_encumbrance:
+                    self.assertEqual(attachment_reader.rint(168), 148)
+                    raw = attachment_reader.ru(32).to_bytes(4, "little")
+                    self.assertAlmostEqual(
+                        struct.unpack("<f", raw)[0], 9.92, places=5)
+                self.assertFalse(attachment_reader.error)
+                self.assertEqual(attachment_reader.p, attachment_reader.n)
+
+                current_reader = mock_client.BitReader(
+                    bytes.fromhex(wire.current_attachment_payload_hex),
+                    wire.current_attachment_payload_bits)
+                self.assertEqual(current_reader.rint(168), 147)
+                self.assertEqual(current_reader.bit(), 0)
+                self.assertEqual(
+                    current_reader.rint(0x80000000),
+                    wire.current_attachment_class_ref)
+                self.assertFalse(current_reader.error)
+                self.assertEqual(current_reader.p, current_reader.n)
+
+        resort = mock_client.resolve_spawn_wire_contract()
+        self.assertEqual(
+            resort.pawn_class_ref,
+            mock_client.SOUTH_SPAWN_TEAM.pawn_class_ref)
+        self.assertEqual(
+            resort.loadout_class_map,
+            mock_client.SOUTH_SPAWN_TEAM.loadout_class_map)
+        self.assertEqual(
+            resort.attachments,
+            mock_client.SOUTH_SPAWN_TEAM.attachments)
+        self.assertEqual(
+            resort.attachment_payload_bits,
+            mock_client.SOUTH_SPAWN_TEAM.attachment_payload_bits)
+        self.assertEqual(
+            resort.attachment_payload_hex,
+            mock_client.SOUTH_SPAWN_TEAM.attachment_payload_hex)
+        self.assertEqual(
+            resort.current_attachment_class_ref,
+            mock_client.SOUTH_SPAWN_TEAM.current_attachment_class_ref)
+        self.assertEqual(resort.current_attachment_payload_bits, 40)
+        self.assertEqual(
+            resort.current_attachment_payload_hex,
+            mock_client.SOUTH_SPAWN_TEAM.current_attachment_payload_hex)
+
     def test_north_attachment_and_tail_literals_decode_semantically(self):
         north = mock_client.NORTH_SPAWN_TEAM
         reader = mock_client.BitReader(
@@ -216,7 +336,7 @@ class SpawnProfileTests(unittest.TestCase):
             self.assertEqual(mock_client.main(), 0)
         spawn.assert_called_once_with(
             "127.0.0.1", 7777, 35.0, [1, 2, 3, 4, 5, 6], 3,
-            {2, 3, 4, 5, 26}, 0.0, 1)
+            {2, 3, 4, 5, 26}, 0.0, 1, "hue-city")
 
         invalid_cases = (
             {"expected_objectives": 0},
@@ -341,18 +461,32 @@ class SpawnProfileTests(unittest.TestCase):
         }
         self.assertNotIn(219, sent_channels)
 
+    def test_spawn_forwards_profile_to_role_request_builder(self):
+        sock = RecordingSocket()
+        with mock.patch.object(mock_client.socket, "socket", return_value=sock), \
+                mock.patch.object(
+                    mock_client, "build_role_selection_bits",
+                    wraps=mock_client.build_role_selection_bits) as builder, \
+                mock.patch("builtins.print"):
+            result = mock_client.spawn(
+                "127.0.0.1", 7777, 0.0, [1, 2, 3], 3,
+                {2, 3, 4, 5, 26}, 0.0, 1, "compound")
+
+        self.assertEqual(result, 1)
+        builder.assert_called_once_with(1, "compound")
+
     def test_cli_linger_is_bounded_and_forwarded_to_spawn(self):
         with mock.patch.object(
                 sys, "argv", ["mock_client.py", "spawn", "--linger", "12.5"]), \
                 mock.patch.object(mock_client, "spawn", return_value=0) as spawn:
             self.assertEqual(mock_client.main(), 0)
-        self.assertEqual(spawn.call_args.args[-2:], (12.5, 1))
+        self.assertEqual(spawn.call_args.args[-3:], (12.5, 1, "resort"))
 
         with mock.patch.object(
                 sys, "argv", ["mock_client.py", "spawn", "--team", "2"]), \
                 mock.patch.object(mock_client, "spawn", return_value=0) as spawn:
             self.assertEqual(mock_client.main(), 0)
-        self.assertEqual(spawn.call_args.args[-1], 2)
+        self.assertEqual(spawn.call_args.args[-2:], (2, "resort"))
 
         for invalid in ("-0.1", "600.1", "nan", "inf"):
             with self.subTest(invalid=invalid), \

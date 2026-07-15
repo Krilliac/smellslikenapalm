@@ -209,13 +209,15 @@ see §4.
 
 UE3 reliability rule: a reliable bunch must be re-sent until the client acks the *packet*
 that carried it. Without this, one dropped reliable bunch in the bootstrap burst stalls that
-channel forever and the client soft-locks (can't even disconnect). State and the three
-operations live in `ConnectionManager`:
+channel forever and the client soft-locks (can't even disconnect). The send and retry state
+lives in `ConnectionManager`:
 
-**Per-channel send state** (`ControlState`, `ConnectionManager.h:91-118`): `outbound`
-(`PacketAssembler` — assigns PacketId/ChSequence, drains queued acks), the inbound
-`reassembler`, ch2 RPC bookkeeping (`ch2OutReliable`, `actorChType`, `teamSelected`), and
-`pendingReliable` — the list of un-acked reliable bunch-sets:
+**Per-channel send state** (`ControlState`): `outbound` (`PacketAssembler` — assigns
+PacketIds and drains queued acks), the inbound `reassembler`, ch2 RPC bookkeeping
+(`ch2Reliable`, `actorChType`, `teamSelected`), and `pendingReliable` — the list of
+un-acked reliable bunch-sets. `ch2Reliable` is an `OutboundReliableSequencer` instance
+owned by that connection's PlayerController channel; it allocates the explicit
+ChSequence values used by ch2 actor bunches:
 
 ```cpp
 struct SentReliable {
@@ -226,17 +228,32 @@ struct SentReliable {
 };
 ```
 
-**Record — `SendReliableBunches`** (`ConnectionManager.cpp:792`): the single choke-point for
-sending actor bunches. Builds ONE packet from the bunches (`outbound.BuildRawBunchesPacket`),
-encodes at `kServerSendMaxPacketBytes`, sends it, then records the **reliable** bunches
-(filters `b.bReliable`) as a `SentReliable` tagged with this packet's PacketId.
+**Reserve and record.** `OutboundReliableSequencer::ReserveBatch` reserves a contiguous
+batch atomically in the modulo-1024 ch2 sequence space. Sequence **0 is valid after wrap**;
+there is no zero sentinel once the allocator has been initialized. At most **511** values
+may span the forward issuance window from the oldest unresolved value through the cursor,
+keeping modular ordering strictly inside half a cycle. An out-of-order packet ACK stops
+retransmission but leaves a window tombstone until every older gap is ACKed; raw in-flight
+count therefore cannot reopen capacity prematurely. A failed reservation changes neither
+the cursor nor the in-flight/window state, so sequence pressure is transient backpressure
+rather than a manufactured gap. Only one unpublished reservation may exist, and its opaque
+monotonic token prevents an ancient same-shaped batch from cancelling a later modulo-lap
+reservation.
 
-**Ack-clear — `OnClientAck`** (`:814`): when a client ack names a PacketId, drop any pending
-`SentReliable` whose `packetIds` contains it (`erase`/`remove_if`). Called from
-`ParseIncomingControl` for every `pkt.acks` entry (`:1066-1068`).
+`SendReservedCh2Bunches` verifies that the reliable ch2 bunches consume the reservation
+in order, then passes them to `SendReliableBunches`. The latter builds one packet, attempts
+the initial datagram send, and records its reliable bunches in `pendingReliable`. Once that
+retry ledger owns the batch, `CommitBatch` removes rollback eligibility. This commit is
+based on successful queueing in `pendingReliable`, not on the first UDP send succeeding;
+`RetransmitTick` can recover a failed first send. If a batch is rejected before queueing,
+the latest unpublished reservation is cancelled and the cursor is rewound without a gap.
 
-**RTO resend — `RetransmitTick`** (`:825`): called every pump cycle from
-`PumpNetwork` (`:138`). For each pending set older than `kRtoMs = 250` and under
+**Ack-clear — `OnClientAck`:** when a client ack names any PacketId associated with a
+`SentReliable`, release each tracked reliable ch2 ChSequence from `ch2Reliable`, then drop
+the pending set. Non-ch2 reliable state continues to use its owning subsystem's lifecycle.
+
+**RTO resend — `RetransmitTick`:** called every pump cycle from `PumpNetwork`. For each
+pending set older than `kRtoMs = 250` and under
 `kMaxResends = 12`, it rebuilds a packet from the **same bunches verbatim** — same
 per-channel ChSequence — in a **NEW PacketId**, sends it, and appends the new PacketId to the
 set. The client fills the gap or ignores the duplicate.
@@ -489,18 +506,37 @@ SaveNum`+chars, UniqueNetId=64-bit LE SteamID64, etc.): `MASTER` §4 /
 
 ### 6.1 Server → client RPC (`SendCh2Rpc`)
 
-`SendCh2Rpc` (`ConnectionManager.cpp:851`) sends a reliable server→client function call on
-the PlayerController channel (ch2). The bunch is `bReliable=1, bOpen=0, bClose=0, chIndex=2,
-chType=actorChType`, ChSequence = `++ch2OutReliable` (seeded at the ch2 open's ChSequence in
-`SendActorBootstrap`, `:773-775`). The payload the caller packs is:
+`SendCh2Rpc` sends a reliable server→client function call on the PlayerController channel
+(ch2). The bunch is `bReliable=1, bOpen=0, bClose=0, chIndex=2,
+chType=actorChType`. Its ChSequence comes from a one-value atomic reservation in
+`ch2Reliable`, which adopts the externally assigned ch2-open sequence during actor
+bootstrap. Allocation advances modulo 1024, including sequence 0, and returns transient
+backpressure when the 511-value issuance window cannot accept the reservation. The payload
+the caller packs is:
 
 ```
 SerializeInt(handle, maxHandle)   +   [serialized params…]
 ```
 
-It goes out via `SendReliableBunches`, so it is retransmitted until acked. ClientShowTeamSelect
-is the simplest case: a `reliable client` function with **no params**, so the payload is just
-`SerializeInt(206, 531)` = `CE 00` (9 bits) and nothing else (`:776-780`).
+It goes out through the reserved-ch2 wrapper and `SendReliableBunches`, so the reservation
+is committed only after it enters `pendingReliable`, retransmissions reuse that same
+ChSequence, and the value is released only by an ACK for one of the packet attempts.
+ClientShowTeamSelect is the simplest case: a `reliable client` function with **no params**,
+so the payload is just `SerializeInt(206, 531)` = `CE 00` (9 bits) and nothing else.
+
+**Possession recovery is generation-bound.** A canonical standalone reliable 9-bit
+`AskForPawn` (handle 42) is only eligible while the owning pawn is alive and spawned and
+the open pawn graph, recovery binding, and authoritative owning-pawn life all name the
+same nonzero generation. Death, failed graph publication, team/deployment reset, and map
+travel invalidate that binding, so no response is emitted while lifecycle state is stale or
+unbound. The h42 request is parameterless and h44 names the stable ch209, however, so the wire
+does not identify which life originated a message that arrives only after a later generation is
+already bound. A matching `ServerAcknowledgePossession` is therefore applied only while the
+current generation is live; this is a lifecycle gate, not cryptographic correlation to a life.
+The recovery count and rate-limit timestamp are committed only after the three-reliable-bunch
+`GivePawn` response is successfully queued in `pendingReliable`. Allocator backpressure or
+a rejected queue therefore consumes neither the per-generation response budget nor its
+rate-limit interval.
 
 ### 6.2 Client → server RPC (`DecodeInboundActorBunch`)
 

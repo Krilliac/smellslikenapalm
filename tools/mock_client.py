@@ -668,6 +668,24 @@ class SpawnTeamContract:
         }
 
 
+@dataclass(frozen=True)
+class SpawnWireContract:
+    """PackageMap-specific static refs and their exact pawn deltas."""
+
+    pawn_class_ref: int
+    loadout_classes: tuple
+    attachments: tuple
+    attachment_payload_bits: int
+    attachment_payload_hex: str
+    current_attachment_class_ref: int
+    current_attachment_payload_bits: int
+    current_attachment_payload_hex: str
+
+    @property
+    def loadout_class_map(self):
+        return dict(self.loadout_classes)
+
+
 SOUTH_SPAWN_TEAM = SpawnTeamContract(
     team_id=1,
     retail_team_id=1,
@@ -716,6 +734,51 @@ NORTH_SPAWN_TEAM = SpawnTeamContract(
 
 SPAWN_TEAM_CONTRACTS = (SOUTH_SPAWN_TEAM, NORTH_SPAWN_TEAM)
 
+# Installed VNSK-Compound live requests pinned by
+# tests/RoleSelectionReplicationTests.cpp. South's final request is followed by
+# h451 only; North's captured final request also carries the exact h89 default
+# spectator-location tail.
+COMPOUND_ROLE_REQUESTS = {
+    1: ("af565c150080c301", 57),
+    2: ("af94561500180000000080c3b300", 107),
+}
+
+# Source-grounded installed PackageMap layout. RetailBootstrapTests pins the
+# ROGameContent +5 export shift for every actor/attachment below and pins the
+# inventory-manager CDO separately at 82737. The payloads are those exact refs
+# serialized into the capture-matched h167 list and h147 current-attachment
+# property shapes.
+COMPOUND_SOUTH_WIRE = SpawnWireContract(
+    pawn_class_ref=286156,
+    loadout_classes=((210, 286379), (211, 286396), (212, 286469),
+                     (213, 286114), (214, 286394), (219, 82737)),
+    attachments=((0, 286941), (1, 286951), (2, 287068),
+                 (3, 286949), (5, 286131)),
+    attachment_payload_bits=245,
+    attachment_payload_hex=(
+        "a700748311004e03380723009c0ac0154600381da01c8c00705ac06c170100"),
+    current_attachment_class_ref=286941,
+    current_attachment_payload_bits=40,
+    current_attachment_payload_hex="93bac10800",
+)
+
+COMPOUND_NORTH_WIRE = SpawnWireContract(
+    pawn_class_ref=286152,
+    loadout_classes=((210, 286276), (212, 286809),
+                     (214, 286763), (219, 82737)),
+    attachments=((0, 286850), (2, 287193), (4, 287152)),
+    attachment_payload_bits=187,
+    attachment_payload_hex="a700088211004e05c80e23009c12001b4600a094c2f50802",
+    current_attachment_class_ref=286850,
+    current_attachment_payload_bits=40,
+    current_attachment_payload_hex="9304c10800",
+)
+
+COMPOUND_WIRE_CONTRACTS = {
+    1: COMPOUND_SOUTH_WIRE,
+    2: COMPOUND_NORTH_WIRE,
+}
+
 
 def resolve_spawn_team(team_id=1):
     """Return the immutable faction contract; direct callers fail closed."""
@@ -727,6 +790,38 @@ def resolve_spawn_team(team_id=1):
     raise ValueError("team must be 1 (South) or 2 (North)")
 
 
+def resolve_spawn_wire_contract(team_id=1, profile="resort"):
+    """Resolve PackageMap-specific owning-pawn validation expectations."""
+    contract = resolve_spawn_team(team_id)
+    if profile not in SPAWN_PROFILES:
+        raise ValueError(f"unknown spawn profile: {profile}")
+    if profile == "compound":
+        return COMPOUND_WIRE_CONTRACTS[contract.team_id]
+    return SpawnWireContract(
+        pawn_class_ref=contract.pawn_class_ref,
+        loadout_classes=contract.loadout_classes,
+        attachments=contract.attachments,
+        attachment_payload_bits=contract.attachment_payload_bits,
+        attachment_payload_hex=contract.attachment_payload_hex,
+        current_attachment_class_ref=contract.current_attachment_class_ref,
+        current_attachment_payload_bits=40,
+        current_attachment_payload_hex=contract.current_attachment_payload_hex,
+    )
+
+
+def resolve_north_role_transition_contract(profile="resort"):
+    """Return the exact h210+h211 transition for a clean North spawn."""
+    if profile not in SPAWN_PROFILES:
+        raise ValueError(f"unknown spawn profile: {profile}")
+    if profile == "compound":
+        # Compound allocates the first free runtime squad/role slot. On a clean
+        # server that is 0/0, so both h211 byte parameters use their defaults.
+        # Do not import Resort capture occupancy (2/3) into this map profile.
+        return 32, "d2fe731a"
+    # Resort frame 61989 captured h210(255,0,false,true)+h211(2,3).
+    return 48, "d2fe735a8103"
+
+
 def build_team_selection_bits(team_id=1):
     """Build SelectTeam(h170), converting server 1/2 to retail US/NVA 1/0."""
     contract = resolve_spawn_team(team_id)
@@ -736,10 +831,17 @@ def build_team_selection_bits(team_id=1):
     return bits + [1] + [(contract.retail_team_id >> i) & 1 for i in range(8)]
 
 
-def build_role_selection_bits(team_id=1):
-    """Return the exact captured final h175+h451 role request for a faction."""
+def build_role_selection_bits(team_id=1, profile="resort"):
+    """Return the profile- and faction-exact captured final role request."""
     contract = resolve_spawn_team(team_id)
-    return packed_bits(contract.role_payload_hex, 57)
+    if profile not in SPAWN_PROFILES:
+        raise ValueError(f"unknown spawn profile: {profile}")
+    payload_hex, payload_bits = (
+        COMPOUND_ROLE_REQUESTS[contract.team_id]
+        if profile == "compound"
+        else (contract.role_payload_hex, 57)
+    )
+    return packed_bits(payload_hex, payload_bits)
 
 def is_remote_participant_pawn_channel(channel):
     """True for the odd pawn half of the connection-local PRI/pawn pool."""
@@ -929,8 +1031,12 @@ def resolve_spawn_profile(profile="resort", expected_objectives=None,
 
 
 def spawn(host, port, deployment_wait, expected_objective_values,
-          gri_channel, menu_bootstrap_channels, linger=0.0, team=1):
+          gri_channel, menu_bootstrap_channels, linger=0.0, team=1,
+          profile="resort"):
     team_contract = resolve_spawn_team(team)
+    wire_contract = resolve_spawn_wire_contract(team, profile)
+    north_role_transition_bits, north_role_transition_hex = (
+        resolve_north_role_transition_contract(profile))
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.settimeout(1.5)
     SERVER_BD = 1500 * 8
@@ -1069,13 +1175,13 @@ def spawn(host, port, deployment_wait, expected_objective_values,
         f"SelectTeam(170, retail={team_contract.retail_team_id}, "
         f"server={team_contract.team_id})", team_bits)
 
-    # 6. Pick a role and request deployment. This is a retail-captured, semantically
-    # complete h175 payload whose final optional bCloseMenu bit is true. A bare handle
-    # is not a valid SelectRoleByClass call and must not authorize an early spawn.
-    # Exact retail final role request: capture frame 2533 ch2 seq31. h175
-    # consumes 48 bits (default WeaponSelection, bCloseMenu=true), followed by
-    # the captured no-parameter h451 ServerAutoSelectSquad tail.
-    final_role_payload = build_role_selection_bits(team_contract.team_id)
+    # 6. Pick a role and request deployment. This is a retail-captured,
+    # semantically complete h175 payload whose final optional bCloseMenu bit is
+    # true. A bare handle is not a valid SelectRoleByClass call and must not
+    # authorize an early spawn. Resort preserves the frame-2533 h175+h451
+    # request; Compound uses its installed live profile's exact role object.
+    final_role_payload = build_role_selection_bits(
+        team_contract.team_id, profile)
     role_got = ch2_rpc(
         f"SelectRoleByClass(175,{team_contract.label},bCloseMenu=true)",
         final_role_payload)
@@ -1193,7 +1299,7 @@ def spawn(host, port, deployment_wait, expected_objective_values,
         if is_remote_participant_pawn_channel(channel)
     ]
     expected_owning_channels = {LOCAL_PAWN_CH} | set(
-        team_contract.loadout_class_map)
+        wire_contract.loadout_class_map)
     owning_graph_opens = {
         channel for channel in pawn_opens if LOCAL_PAWN_CH <= channel <= 219
     }
@@ -1217,7 +1323,7 @@ def spawn(host, port, deployment_wait, expected_objective_values,
         index = br.rint(1024 if dynamic else 0x80000000)
         return dynamic, index
 
-    expected_loadout_classes = team_contract.loadout_class_map
+    expected_loadout_classes = wire_contract.loadout_class_map
     loadout_open_classes = {}
     pawn_open_class = None
     for d in after:
@@ -1234,7 +1340,7 @@ def spawn(host, port, deployment_wait, expected_objective_values,
                     pawn_open_class = class_ref
                 else:
                     loadout_open_classes[b2["chIndex"]] = class_ref
-    has_exact_pawn_class = pawn_open_class == team_contract.pawn_class_ref
+    has_exact_pawn_class = pawn_open_class == wire_contract.pawn_class_ref
     has_exact_loadout_classes = loadout_open_classes == expected_loadout_classes
 
     # Decode the actual values, not just each payload's first byte. The old gate gave
@@ -1263,8 +1369,9 @@ def spawn(host, port, deployment_wait, expected_objective_values,
     has_north_cinematic_tail = False
     has_exact_north_role_transition = any(
         b2["chIndex"] == 2 and not b2["bOpen"] and
-        b2.get("bReliable") and b2["bits"] == 48 and
-        b2["payloadHex"].lower() == "d2fe735a8103"
+        b2.get("bReliable") and
+        b2["bits"] == north_role_transition_bits and
+        b2["payloadHex"].lower() == north_role_transition_hex
         for d in after for b2 in d.get("bunches", [])
         if b2.get("payloadHex"))
     has_exact_north_post_delta = any(
@@ -1396,8 +1503,8 @@ def spawn(host, port, deployment_wait, expected_objective_values,
     has_attachment_list = any(
         b2["chIndex"] == LOCAL_PAWN_CH and not b2["bOpen"] and
         not b2.get("bReliable") and
-        b2["bits"] == team_contract.attachment_payload_bits and
-        b2["payloadHex"].lower() == team_contract.attachment_payload_hex
+        b2["bits"] == wire_contract.attachment_payload_bits and
+        b2["payloadHex"].lower() == wire_contract.attachment_payload_hex
         for d in after for b2 in d.get("bunches", [])
         if b2.get("payloadHex"))
     current_attachment_refs = set()
@@ -1409,9 +1516,10 @@ def spawn(host, port, deployment_wait, expected_objective_values,
         if not br.error:
             current_attachment_refs.add((dynamic, attachment_ref))
         has_exact_current_attachment |= (
-            not b2.get("bReliable") and b2["bits"] == 40 and
+            not b2.get("bReliable") and
+            b2["bits"] == wire_contract.current_attachment_payload_bits and
             b2["payloadHex"].lower() ==
-            team_contract.current_attachment_payload_hex)
+            wire_contract.current_attachment_payload_hex)
     has_attachment_clear = (True, 0) in current_attachment_refs
 
     expected_weapon_next = team_contract.weapon_next_map
@@ -1469,7 +1577,7 @@ def spawn(host, port, deployment_wait, expected_objective_values,
           f"linked={sorted(linked_weapons)}; "
           f"ClientSwitchToBestWeapon(h28)={switch_best_weapon_count}x")
     print(f"     attachment state: h167-list={'yes' if has_attachment_list else 'NO'}, "
-          f"h147-current({team_contract.current_attachment_class_ref})="
+          f"h147-current({wire_contract.current_attachment_class_ref})="
           f"{'yes' if has_exact_current_attachment else 'NO'}, "
           f"h147-clear={'yes' if has_attachment_clear else 'NO'}")
     if team_contract.north_graph:
@@ -1526,7 +1634,7 @@ def spawn(host, port, deployment_wait, expected_objective_values,
                 f"missing ch{gri_channel} objective mapping/status baseline")
         if LOCAL_PAWN_CH not in pawn_opens: miss.append(f"no pawn open on ch{LOCAL_PAWN_CH}")
         if not has_exact_pawn_class:
-            miss.append(f"pawn class differs: {pawn_open_class} != {team_contract.pawn_class_ref}")
+            miss.append(f"pawn class differs: {pawn_open_class} != {wire_contract.pawn_class_ref}")
         if not has_pawn_controller: miss.append("Pawn.Controller is not dynamic ch2")
         if not has_pawn_pri: miss.append("Pawn.PRI is not dynamic ch26")
         if not has_pawn_inv_manager: miss.append("Pawn.InvManager is not dynamic ch219")
@@ -1570,7 +1678,7 @@ def spawn(host, port, deployment_wait, expected_objective_values,
         missing_graph = sorted(set(expected_weapon_next) - linked_weapons)
         if missing_graph: miss.append(f"unlinked weapon channels: {missing_graph}")
         if not has_attachment_list:
-            miss.append(f"missing exact {len(team_contract.attachments)}-record "
+            miss.append(f"missing exact {len(wire_contract.attachments)}-record "
                         "pawn h167 attachment state")
         if not has_exact_current_attachment:
             miss.append("missing exact faction-primary pawn h147 current attachment")
@@ -1650,7 +1758,7 @@ def main():
     if args.mode == "spawn":
         return spawn(args.host, args.port, args.deployment_wait,
                      expected_objective_values, gri_channel, menu_channels,
-                     args.linger, args.team)
+                     args.linger, args.team, args.profile)
     if args.mode == "reconnect":
         return reconnect(args.host, args.port)
     return drive(args.host, args.port)
