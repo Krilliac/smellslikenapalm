@@ -35,6 +35,7 @@ in-repo `docs/` tree and the GitHub wiki mirror.
 - [Scripting Assessment](SCRIPTING_ASSESSMENT.md)
 
 ### Protocol & Reverse Engineering
+- [Cooked Map Metadata Extraction](COOKED_MAP_METADATA.md)
 - [Control-Channel Wire Spec (7258)](RS2V_ControlChannel_WireSpec_7258.md)
 - [Actor Replication (7258)](RS2V_ActorReplication_7258.md)
 - [Post-Join Replication (7258)](RS2V_PostJoin_Replication_7258.md)

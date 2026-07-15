@@ -45,7 +45,10 @@ wire LE as `idx<<1`):
 | ROGameReplicationInfo | 70887 | `ce 29 02 00` | ch54 |
 | ROPlayerReplicationInfo | 86701 | `5a a5 02 00` | ch13,14,16,17,…(~65) |
 | ROTeamInfo | 90245 | `0a c1 02 00` | ch21, ch56, ch76 |
-| ROPawn subclasses | 285994–286464 | — | respawn clusters |
+| `ROHeli_AH1G_Content` | 285994 | `54 ba 08 00` | helicopter opens |
+| `ROHeli_OH6_Content` | 285996 | `58 ba 08 00` | helicopter opens |
+| `ROHeli_UH1H_Content` | 286038 | `ac ba 08 00` | helicopter opens |
+| ROPawn subclasses | 286147, 286151, 286186, … | — | respawn clusters |
 | ROWeapon/Inventory | 82735, 75939, 286097… | — | co-located w/ pawn |
 
 ---

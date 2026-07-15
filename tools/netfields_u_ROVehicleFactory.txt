@@ -1,0 +1,27 @@
+﻿# ROVehicleFactory  maxHandle=25
+   h  class                  kind name                               type                   netindex
+   0  Actor                  func DemoRecordSound                    (rpc)                  ni=495
+   1  Actor                  prop RelativeRotation                   struct Rotator         ni=2481
+   2  Actor                  prop RelativeLocation                   struct Vector          ni=2482
+   3  Actor                  prop Velocity                           struct Vector          ni=2488
+   4  Actor                  prop Instigator                         obj<Pawn>              ni=2502
+   5  Actor                  prop Base                               obj<Actor>             ni=2515
+   6  Actor                  prop Owner                              obj<Actor>             ni=2516
+   7  Actor                  prop ReplicatedCollisionType            byte(enum ECollisionType) ni=2518
+   8  Actor                  prop Role                               byte(enum ENetRole)    ni=2520
+   9  Actor                  prop RemoteRole                         byte(enum ENetRole)    ni=2521
+  10  Actor                  prop Physics                            byte(enum EPhysics)    ni=2522
+  11  Actor                  prop DrawScale                          float                  ni=2528
+  12  Actor                  prop Rotation                           struct Rotator         ni=2529
+  13  Actor                  prop Location                           struct Vector          ni=2530
+  14  Actor                  prop bNetOwner                          bool                   ni=2546
+  15  Actor                  prop bProjTarget                        bool                   ni=2560
+  16  Actor                  prop bBlockActors                       bool                   ni=2561
+  17  Actor                  prop bCollideWorld                      bool                   ni=2563
+  18  Actor                  prop bCollideActors                     bool                   ni=2564
+  19  Actor                  prop bHardAttach                        bool                   ni=2583
+  20  Actor                  prop bTearOff                           bool                   ni=2598
+  21  Actor                  prop bHidden                            bool                   ni=2626
+  22  Actor                  prop bLoadedFromSavegame                bool                   ni=2628
+  23  ROVehicleFactory       prop bHasLockedVehicle                  bool                   ni=51245
+  24  ROVehicleFactory       prop ChildVehicle                       obj<ROVehicle>         ni=51249
