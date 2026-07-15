@@ -52,6 +52,8 @@ Logs and runtime files
 *.pid.lock
 .remember/logs/
 server_iter*
+.server-control/
+.client-control/
 protocol_analysis/
 telemetry/output/
 
@@ -95,6 +97,8 @@ Security: do not ignore config files if needed, but ignore secrets
 *.crt
 # CMake test/out build dirs
 build-tests/
+build-gcc/
+build-merge/
 out/
 build-authtests/
 Testing/
@@ -106,3 +110,6 @@ __pycache__/
 
 # PacketRecorder sniff output (runtime-generated)
 packetlog/
+
+# Retail-client visual acceptance artifacts
+retail_*.png
