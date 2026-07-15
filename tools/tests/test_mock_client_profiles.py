@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Focused unit tests for mock_client spawn-profile and GRI validation."""
 
+import io
 import sys
 import struct
 import unittest
@@ -112,12 +113,12 @@ class SpawnProfileTests(unittest.TestCase):
         self.assertEqual(len(mock_client.build_role_selection_bits(2)), 57)
 
         compound_south = mock_client.build_role_selection_bits(
-            1, profile="compound")
+            1, profile="compound", artifact_variant="installed")
         self.assertEqual(self._bits_hex(compound_south), "af565c150080c301")
         self.assertEqual(len(compound_south), 57)
 
         compound_north = mock_client.build_role_selection_bits(
-            2, profile="compound")
+            2, profile="compound", artifact_variant="installed")
         self.assertEqual(
             self._bits_hex(compound_north),
             "af94561500180000000080c3b300")
@@ -141,7 +142,8 @@ class SpawnProfileTests(unittest.TestCase):
             mock_client.resolve_north_role_transition_contract("resort"),
             (48, "d2fe735a8103"))
         self.assertEqual(
-            mock_client.resolve_north_role_transition_contract("compound"),
+            mock_client.resolve_north_role_transition_contract(
+                "compound", "installed"),
             (32, "d2fe731a"))
         self.assertEqual(
             mock_client.resolve_north_role_transition_contract("cu-chi"),
@@ -149,13 +151,16 @@ class SpawnProfileTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             mock_client.resolve_north_role_transition_contract("unknown")
 
-        self.assertEqual(
-            self._bits_hex(mock_client.build_role_selection_bits(
-                1, profile="hue-city")),
-            "af465c150080c301")
+        for artifact in mock_client.REPLICATION_ARTIFACT_VARIANTS:
+            with self.subTest(artifact=artifact), self.assertRaisesRegex(
+                    ValueError,
+                    f"hue-city/{artifact}"):
+                mock_client.build_role_selection_bits(
+                    1, profile="hue-city", artifact_variant=artifact)
 
     def test_compound_wire_contracts_pin_installed_package_map_graph(self):
-        south = mock_client.resolve_spawn_wire_contract(1, "compound")
+        south = mock_client.resolve_spawn_wire_contract(
+            1, "compound", "installed")
         self.assertEqual(south.pawn_class_ref, 286156)
         self.assertEqual(
             south.loadout_class_map,
@@ -173,7 +178,8 @@ class SpawnProfileTests(unittest.TestCase):
         self.assertEqual(south.current_attachment_payload_bits, 40)
         self.assertEqual(south.current_attachment_payload_hex, "93bac10800")
 
-        north = mock_client.resolve_spawn_wire_contract(2, "compound")
+        north = mock_client.resolve_spawn_wire_contract(
+            2, "compound", "installed")
         self.assertEqual(north.pawn_class_ref, 286152)
         self.assertEqual(
             north.loadout_class_map,
@@ -296,6 +302,40 @@ class SpawnProfileTests(unittest.TestCase):
         self.assertEqual(gri, 3)
         self.assertEqual(channels, {2, 3, 4, 5, 26})
 
+    def test_actor_bootstrap_support_is_the_full_four_by_two_matrix(self):
+        expected = frozenset(
+            (profile, artifact)
+            for profile in ("resort", "cu-chi", "hue-city", "compound")
+            for artifact in ("canonical", "installed"))
+        self.assertEqual(mock_client.ACTOR_BOOTSTRAP_SUPPORT, expected)
+
+        for profile, artifact in sorted(expected):
+            with self.subTest(profile=profile, artifact=artifact):
+                mapping, gri, channels = mock_client.resolve_spawn_profile(
+                    profile, artifact_variant=artifact)
+                self.assertTrue(mapping)
+                self.assertEqual(gri, 3)
+                self.assertEqual(channels, {2, 3, 4, 5, 26})
+
+    def test_role_spawn_support_is_narrower_and_fail_closed(self):
+        expected = frozenset({
+            ("resort", "canonical"),
+            ("cu-chi", "canonical"),
+            ("compound", "installed"),
+        })
+        self.assertEqual(mock_client.ROLE_SPAWN_SUPPORT, expected)
+
+        for profile, artifact in sorted(expected):
+            with self.subTest(profile=profile, artifact=artifact):
+                mock_client.validate_role_spawn_support(profile, artifact)
+
+        for profile, artifact in sorted(
+                mock_client.ACTOR_BOOTSTRAP_SUPPORT - expected):
+            with self.subTest(profile=profile, artifact=artifact), \
+                    self.assertRaisesRegex(
+                        ValueError, f"{profile}/{artifact}"):
+                mock_client.validate_role_spawn_support(profile, artifact)
+
     def test_remote_participant_pool_classifies_only_odd_pawn_channels(self):
         for channel in (512, 514, 766):
             self.assertFalse(
@@ -346,12 +386,43 @@ class SpawnProfileTests(unittest.TestCase):
 
     def test_cli_profile_resolution_and_validation_are_wired(self):
         with mock.patch.object(
-                sys, "argv", ["mock_client.py", "spawn", "--profile", "hue-city"]), \
+                sys, "argv", ["mock_client.py", "spawn", "--profile", "cu-chi"]), \
                 mock.patch.object(mock_client, "spawn", return_value=0) as spawn:
             self.assertEqual(mock_client.main(), 0)
         spawn.assert_called_once_with(
-            "127.0.0.1", 7777, 35.0, [1, 2, 3, 4, 5, 6], 3,
-            {2, 3, 4, 5, 26}, 0.0, 1, "hue-city")
+            "127.0.0.1", 7777, 35.0, [2, 3, 4, 7, 5, 10, 9], 3,
+            {2, 3, 4, 5, 26}, 0.0, 1, "cu-chi", "canonical")
+
+        with mock.patch.object(
+                sys, "argv", ["mock_client.py", "spawn", "--profile",
+                              "compound", "--artifact", "installed"]), \
+                mock.patch.object(mock_client, "spawn", return_value=0) as spawn:
+            self.assertEqual(mock_client.main(), 0)
+        spawn.assert_called_once_with(
+            "127.0.0.1", 7777, 35.0, [1, 2, 3], 3,
+            {2, 3, 4, 5, 26}, 0.0, 1, "compound", "installed")
+
+        unsupported = (
+            ("resort", "installed"),
+            ("cu-chi", "installed"),
+            ("hue-city", "canonical"),
+            ("hue-city", "installed"),
+            ("compound", "canonical"),
+        )
+        for profile, artifact in unsupported:
+            stderr = io.StringIO()
+            with self.subTest(profile=profile, artifact=artifact), \
+                    mock.patch.object(
+                        sys, "argv", ["mock_client.py", "spawn", "--profile",
+                                     profile, "--artifact", artifact]), \
+                    mock.patch.object(sys, "stderr", stderr), \
+                    mock.patch.object(mock_client, "spawn") as spawn, \
+                    self.assertRaises(SystemExit):
+                mock_client.main()
+            spawn.assert_not_called()
+            self.assertIn(
+                f"role/spawn validation is not grounded for {profile}/{artifact}",
+                stderr.getvalue())
 
         invalid_cases = (
             {"expected_objectives": 0},
@@ -476,6 +547,19 @@ class SpawnProfileTests(unittest.TestCase):
         }
         self.assertNotIn(219, sent_channels)
 
+    def test_spawn_rejects_unsupported_role_pair_before_opening_socket(self):
+        mapping, gri, channels = mock_client.resolve_spawn_profile(
+            "hue-city", artifact_variant="canonical")
+        with mock.patch.object(mock_client.socket, "socket") as socket_factory, \
+                self.assertRaisesRegex(
+                    ValueError,
+                    "role/spawn validation is not grounded for "
+                    "hue-city/canonical"):
+            mock_client.spawn(
+                "127.0.0.1", 7777, 0.0, mapping, gri, channels,
+                0.0, 1, "hue-city", "canonical")
+        socket_factory.assert_not_called()
+
     def test_spawn_reports_a_missing_expected_live_bootstrap_channel(self):
         expected_channels = {2, 3, 4, 5, 26}
         partial_bootstrap = mock_client.encode_packet(
@@ -527,23 +611,27 @@ class SpawnProfileTests(unittest.TestCase):
                 mock.patch("builtins.print"):
             result = mock_client.spawn(
                 "127.0.0.1", 7777, 0.0, [1, 2, 3], 3,
-                {2, 3, 4, 5, 26}, 0.0, 1, "compound")
+                {2, 3, 4, 5, 26}, 0.0, 1, "compound", "installed")
 
         self.assertEqual(result, 1)
-        builder.assert_called_once_with(1, "compound")
+        builder.assert_called_once_with(1, "compound", "installed")
 
     def test_cli_linger_is_bounded_and_forwarded_to_spawn(self):
         with mock.patch.object(
                 sys, "argv", ["mock_client.py", "spawn", "--linger", "12.5"]), \
                 mock.patch.object(mock_client, "spawn", return_value=0) as spawn:
             self.assertEqual(mock_client.main(), 0)
-        self.assertEqual(spawn.call_args.args[-3:], (12.5, 1, "resort"))
+        self.assertEqual(
+            spawn.call_args.args[-4:],
+            (12.5, 1, "resort", "canonical"))
 
         with mock.patch.object(
                 sys, "argv", ["mock_client.py", "spawn", "--team", "2"]), \
                 mock.patch.object(mock_client, "spawn", return_value=0) as spawn:
             self.assertEqual(mock_client.main(), 0)
-        self.assertEqual(spawn.call_args.args[-2:], (2, "resort"))
+        self.assertEqual(
+            spawn.call_args.args[-3:],
+            (2, "resort", "canonical"))
 
         for invalid in ("-0.1", "600.1", "nan", "inf"):
             with self.subTest(invalid=invalid), \

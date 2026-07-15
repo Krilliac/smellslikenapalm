@@ -9411,39 +9411,6 @@ void ConnectionManager::DecodeInboundActorBunch(uint32_t clientId,
             return;
         }
 
-        // Evaluate the live-player guard without lazily freezing any session
-        // metadata. Runtime-squad h175 paths currently apply the role
-        // immediately; accepting one from a pawn already in play would mutate
-        // authority while deliberately skipping the pre-spawn h210 publication.
-        // Keep both exact profiles read-only until next-life role transitions
-        // are independently grounded.
-        const RetailBootstrap::Profile liveGuardProfile =
-            cs.retailBootstrapProfile.has_value()
-                ? *cs.retailBootstrapProfile
-                : ResolveRetailBootstrapProfile(m_server);
-        const bool compoundSession =
-            liveGuardProfile.mapUrl == "VNSK-Compound" &&
-            liveGuardProfile.modeName == "Skirmish";
-        const bool cuChiSession =
-            liveGuardProfile.mapUrl == "VNTE-CuChi" &&
-            liveGuardProfile.modeName == "Territories";
-        if (compoundSession || cuChiSession) {
-            bool alreadyLive = cs.spawned;
-            if (PlayerManager* players = m_server->GetPlayerManager()) {
-                if (const std::shared_ptr<Player> player =
-                        players->GetPlayer(clientId)) {
-                    alreadyLive = alreadyLive || player->IsAlive();
-                }
-            }
-            if (alreadyLive) {
-                Logger::Warn(
-                    "[RoleSelection] client %u rejected %s h175 while already "
-                    "spawned/live; role, squad and PRI state unchanged",
-                    clientId, compoundSession ? "Compound" : "Cu Chi");
-                return;
-            }
-        }
-
         const RetailBootstrap::Profile& profile =
             GetRetailBootstrapProfile(clientId);
         if (profile.usedFallback) {
@@ -9463,40 +9430,79 @@ void ConnectionManager::DecodeInboundActorBunch(uint32_t clientId,
             return;
         }
 
-        const bool isCompoundRoleProfile =
-            profile.mapUrl == "VNSK-Compound" && profile.modeName == "Skirmish";
-        const bool isCuChiRoleProfile =
-            profile.mapUrl == "VNTE-CuChi" &&
-            profile.modeName == "Territories";
-        // The installed artifact's legacy Resort/Cu Chi registry remains
-        // intentionally fail-closed. Compound is a narrower exception: all ten
-        // h175 UClass refs were re-extracted from the currently installed
-        // ROGame.u and are gated below by exact variant, ObjectBase, map, mode,
-        // team, class and weapon-selection evidence.
-        if (!isCompoundRoleProfile &&
-            !selectedArtifact->roGame.roleRegistryGrounded) {
+        const RoleSelectionRepl::GroundedRoleProfile roleProfile =
+            RoleSelectionRepl::ClassifyGroundedRoleProfile(
+                profile.mapUrl, profile.modeName, profile.roGameObjectBase,
+                selectedArtifact->variant,
+                selectedArtifact->roGame.actualObjectBase,
+                selectedArtifact->roGame.roleRegistryGrounded);
+        if (roleProfile ==
+            RoleSelectionRepl::GroundedRoleProfile::Unsupported) {
             Logger::Warn(
-                "[RoleSelection] client %u rejected h175 for variant='%.*s': "
-                "the installed ROGame role CDO registry is not fully migrated; "
-                "legacy role grounding remains fail-closed",
+                "[RoleSelection] client %u rejected h175 for unsupported "
+                "profile map='%s' mode='%s' profileBase=%u variant='%.*s' "
+                "artifactBase=%u registryGrounded=%u",
                 clientId,
+                profile.mapUrl.c_str(), profile.modeName.c_str(),
+                profile.roGameObjectBase,
                 static_cast<int>(selectedArtifact->variant.size()),
-                selectedArtifact->variant.data());
+                selectedArtifact->variant.data(),
+                selectedArtifact->roGame.actualObjectBase,
+                selectedArtifact->roGame.roleRegistryGrounded ? 1u : 0u);
             return;
         }
+
+        const bool isCompoundRoleProfile =
+            roleProfile ==
+            RoleSelectionRepl::GroundedRoleProfile::InstalledCompound;
+        const bool isCuChiRoleProfile =
+            roleProfile ==
+            RoleSelectionRepl::GroundedRoleProfile::CanonicalCuChi;
+
+        // Runtime-squad h175 paths apply the role immediately. Accepting one
+        // from a pawn already in play would mutate authority while deliberately
+        // skipping the pre-spawn h210 publication. Derive this guard from the
+        // same exact, case-normalized classifier as dispatch so identity drift
+        // cannot bypass it. Resort retains its separately captured behavior.
+        if (isCompoundRoleProfile || isCuChiRoleProfile) {
+            bool alreadyLive = cs.spawned;
+            if (PlayerManager* players = m_server->GetPlayerManager()) {
+                if (const std::shared_ptr<Player> player =
+                        players->GetPlayer(clientId)) {
+                    alreadyLive = alreadyLive || player->IsAlive();
+                }
+            }
+            if (alreadyLive) {
+                Logger::Warn(
+                    "[RoleSelection] client %u rejected %s h175 while already "
+                    "spawned/live; role, squad and PRI state unchanged",
+                    clientId,
+                    isCompoundRoleProfile ? "Compound" : "Cu Chi");
+                return;
+            }
+        }
+
         const uint32_t serverTeam = teams->GetPlayerTeam(clientId);
-        const RoleSelectionRepl::GroundingResult grounded =
-            isCompoundRoleProfile
-                ? RoleSelectionRepl::ResolveGroundedCompoundRole(
-                      decoded.rpc, profile.mapUrl, profile.modeName,
-                      selectedArtifact->variant,
-                      selectedArtifact->roGame.actualObjectBase, serverTeam)
-                : isCuChiRoleProfile
-                      ? RoleSelectionRepl::ResolveGroundedCuChiInfantry(
-                            decoded.rpc, profile.mapUrl, profile.modeName,
-                            profile.roGameObjectBase, serverTeam)
-                      : RoleSelectionRepl::ResolveGroundedResortInfantry(
-                            decoded.rpc, profile.mapUrl, serverTeam);
+        RoleSelectionRepl::GroundingResult grounded;
+        switch (roleProfile) {
+        case RoleSelectionRepl::GroundedRoleProfile::CanonicalResort:
+            grounded = RoleSelectionRepl::ResolveGroundedResortInfantry(
+                decoded.rpc, profile.mapUrl, serverTeam);
+            break;
+        case RoleSelectionRepl::GroundedRoleProfile::CanonicalCuChi:
+            grounded = RoleSelectionRepl::ResolveGroundedCuChiInfantry(
+                decoded.rpc, profile.mapUrl, profile.modeName,
+                profile.roGameObjectBase, serverTeam);
+            break;
+        case RoleSelectionRepl::GroundedRoleProfile::InstalledCompound:
+            grounded = RoleSelectionRepl::ResolveGroundedCompoundRole(
+                decoded.rpc, profile.mapUrl, profile.modeName,
+                selectedArtifact->variant,
+                selectedArtifact->roGame.actualObjectBase, serverTeam);
+            break;
+        case RoleSelectionRepl::GroundedRoleProfile::Unsupported:
+            return;
+        }
         if (!grounded.valid()) {
             Logger::Warn(
                 "[RoleSelection] client %u rejected unsupported map/team/loadout "
@@ -9716,6 +9722,15 @@ void ConnectionManager::DecodeInboundActorBunch(uint32_t clientId,
                 static_cast<unsigned>(grounded.role.classIndex),
                 static_cast<unsigned>(assignment.squadIndex),
                 static_cast<unsigned>(assignment.roleIndex));
+            return;
+        }
+
+        if (roleProfile !=
+            RoleSelectionRepl::GroundedRoleProfile::CanonicalResort) {
+            Logger::Error(
+                "[RoleSelection] client %u reached captured Resort handling "
+                "without the exact canonical Resort profile",
+                clientId);
             return;
         }
 

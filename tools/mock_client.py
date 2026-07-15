@@ -26,8 +26,7 @@ Usage:
   python tools/mock_client.py spawn [--host 127.0.0.1] [--port 7777] [--linger 30]
   python tools/mock_client.py spawn --team 2
   python tools/mock_client.py spawn --profile cu-chi  # canonical artifact only
-  python tools/mock_client.py spawn --profile hue-city
-  python tools/mock_client.py spawn --profile compound
+  python tools/mock_client.py spawn --profile compound --artifact installed
 """
 import argparse
 import math
@@ -800,11 +799,11 @@ def resolve_spawn_team(team_id=1):
     raise ValueError("team must be 1 (South) or 2 (North)")
 
 
-def resolve_spawn_wire_contract(team_id=1, profile="resort"):
+def resolve_spawn_wire_contract(team_id=1, profile="resort",
+                                artifact_variant="canonical"):
     """Resolve PackageMap-specific owning-pawn validation expectations."""
     contract = resolve_spawn_team(team_id)
-    if profile not in SPAWN_PROFILES:
-        raise ValueError(f"unknown spawn profile: {profile}")
+    validate_role_spawn_support(profile, artifact_variant)
     if profile == "compound":
         return COMPOUND_WIRE_CONTRACTS[contract.team_id]
     return SpawnWireContract(
@@ -819,10 +818,10 @@ def resolve_spawn_wire_contract(team_id=1, profile="resort"):
     )
 
 
-def resolve_north_role_transition_contract(profile="resort"):
+def resolve_north_role_transition_contract(profile="resort",
+                                           artifact_variant="canonical"):
     """Return the exact h210+h211 transition for a clean North spawn."""
-    if profile not in SPAWN_PROFILES:
-        raise ValueError(f"unknown spawn profile: {profile}")
+    validate_role_spawn_support(profile, artifact_variant)
     if profile in ("compound", "cu-chi"):
         # Compound and Cu Chi allocate the first free runtime squad/role slot.
         # On a clean server that is 0/0, so both h211 byte parameters use their
@@ -842,11 +841,11 @@ def build_team_selection_bits(team_id=1):
     return bits + [1] + [(contract.retail_team_id >> i) & 1 for i in range(8)]
 
 
-def build_role_selection_bits(team_id=1, profile="resort"):
+def build_role_selection_bits(team_id=1, profile="resort",
+                              artifact_variant="canonical"):
     """Return the profile- and faction-exact captured final role request."""
     contract = resolve_spawn_team(team_id)
-    if profile not in SPAWN_PROFILES:
-        raise ValueError(f"unknown spawn profile: {profile}")
+    validate_role_spawn_support(profile, artifact_variant)
     if profile == "compound":
         payload_hex, payload_bits = COMPOUND_ROLE_REQUESTS[contract.team_id]
     elif profile == "cu-chi":
@@ -920,6 +919,47 @@ SPAWN_PROFILES = {
     "hue-city": ((1, 2, 3, 4, 5, 6), 3, frozenset({2, 3, 4, 5, 26})),
     "compound": ((1, 2, 3), 3, frozenset({2, 3, 4, 5, 26})),
 }
+
+REPLICATION_ARTIFACT_VARIANTS = ("canonical", "installed")
+
+# Live PC/GRI/TeamInfo/PRI actor opens are grounded for the full 4x2 matrix.
+# h175 and the downstream pawn graph are intentionally narrower: every pair
+# not listed in ROLE_SPAWN_SUPPORT must fail before a socket is opened.
+ACTOR_BOOTSTRAP_SUPPORT = frozenset(
+    (profile, artifact)
+    for profile in SPAWN_PROFILES
+    for artifact in REPLICATION_ARTIFACT_VARIANTS
+)
+ROLE_SPAWN_SUPPORT = frozenset({
+    ("resort", "canonical"),
+    ("cu-chi", "canonical"),
+    ("compound", "installed"),
+})
+
+
+def validate_actor_bootstrap_support(profile, artifact_variant):
+    """Require one of the eight grounded live actor-bootstrap combinations."""
+    if profile not in SPAWN_PROFILES:
+        raise ValueError(f"unknown spawn profile: {profile}")
+    if artifact_variant not in REPLICATION_ARTIFACT_VARIANTS:
+        raise ValueError(f"unknown replication artifact: {artifact_variant}")
+    if (profile, artifact_variant) not in ACTOR_BOOTSTRAP_SUPPORT:
+        raise ValueError(
+            f"actor bootstrap is not grounded for {profile}/{artifact_variant}")
+
+
+def validate_role_spawn_support(profile, artifact_variant):
+    """Fail closed unless h175 and its pawn graph are grounded for this pair."""
+    validate_actor_bootstrap_support(profile, artifact_variant)
+    if (profile, artifact_variant) in ROLE_SPAWN_SUPPORT:
+        return
+    supported = ", ".join(
+        f"{supported_profile}/{supported_artifact}"
+        for supported_profile, supported_artifact in sorted(ROLE_SPAWN_SUPPORT)
+    )
+    raise ValueError(
+        "role/spawn validation is not grounded for "
+        f"{profile}/{artifact_variant}; supported pairs: {supported}")
 
 
 OBJECTIVE_GRI_MAX_HANDLE = 184
@@ -1009,10 +1049,13 @@ def decode_objective_gri_payload(data, nbits):
 
 def resolve_spawn_profile(profile="resort", expected_objectives=None,
                           objective_mapping=None, gri_channel=None,
-                          menu_channels=None):
+                          menu_channels=None, artifact_variant=None):
     """Resolve immutable profile defaults plus explicit CLI overrides."""
-    if profile not in SPAWN_PROFILES:
-        raise ValueError(f"unknown spawn profile: {profile}")
+    if artifact_variant is None:
+        if profile not in SPAWN_PROFILES:
+            raise ValueError(f"unknown spawn profile: {profile}")
+    else:
+        validate_actor_bootstrap_support(profile, artifact_variant)
     profile_mapping, profile_gri, profile_menu = SPAWN_PROFILES[profile]
 
     if objective_mapping is not None:
@@ -1045,14 +1088,15 @@ def resolve_spawn_profile(profile="resort", expected_objectives=None,
 
 def spawn(host, port, deployment_wait, expected_objective_values,
           gri_channel, menu_bootstrap_channels, linger=0.0, team=1,
-          profile="resort"):
-    if profile == "cu-chi":
-        print("Cu Chi role/spawn validation requires the canonical replication "
-              "artifact (RS2V_REPLICATION_BOOTSTRAP_VARIANT unset).")
+          profile="resort", artifact_variant="canonical"):
+    validate_role_spawn_support(profile, artifact_variant)
+    print(f"Role/spawn validation uses grounded pair "
+          f"{profile}/{artifact_variant}.")
     team_contract = resolve_spawn_team(team)
-    wire_contract = resolve_spawn_wire_contract(team, profile)
+    wire_contract = resolve_spawn_wire_contract(
+        team, profile, artifact_variant)
     north_role_transition_bits, north_role_transition_hex = (
-        resolve_north_role_transition_contract(profile))
+        resolve_north_role_transition_contract(profile, artifact_variant))
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.settimeout(1.5)
     SERVER_BD = 1500 * 8
@@ -1201,7 +1245,7 @@ def spawn(host, port, deployment_wait, expected_objective_values,
     # authorize an early spawn. Resort preserves the frame-2533 h175+h451
     # request; Compound uses its installed live profile's exact role object.
     final_role_payload = build_role_selection_bits(
-        team_contract.team_id, profile)
+        team_contract.team_id, profile, artifact_variant)
     role_got = ch2_rpc(
         f"SelectRoleByClass(175,{team_contract.label},bCloseMenu=true)",
         final_role_payload)
@@ -1744,8 +1788,12 @@ def main():
     ap.add_argument("--port", type=int, default=7777)
     ap.add_argument(
         "--profile", choices=tuple(SPAWN_PROFILES), default="resort",
-        help=("spawn validation profile (default: resort; cu-chi requires "
-              "the canonical replication artifact)"))
+        help="map profile used by actor and role/spawn validation")
+    ap.add_argument(
+        "--artifact", choices=REPLICATION_ARTIFACT_VARIANTS,
+        default="canonical",
+        help=("replication artifact selected by the server (default: canonical; "
+              "must match RS2V_REPLICATION_BOOTSTRAP_VARIANT)"))
     ap.add_argument(
         "--team", type=int, choices=(1, 2), default=1,
         help="spawn faction: 1=South/US (default), 2=North/NVA")
@@ -1775,7 +1823,7 @@ def main():
     try:
         expected_objective_values, gri_channel, menu_channels = resolve_spawn_profile(
             args.profile, args.expected_objectives, args.objective_mapping,
-            args.gri_channel, args.menu_channels)
+            args.gri_channel, args.menu_channels, args.artifact)
     except ValueError as exc:
         ap.error(str(exc))
     if args.mode == "replay":
@@ -1783,9 +1831,13 @@ def main():
     if args.mode == "react":
         return react(args.host, args.port)
     if args.mode == "spawn":
+        try:
+            validate_role_spawn_support(args.profile, args.artifact)
+        except ValueError as exc:
+            ap.error(str(exc))
         return spawn(args.host, args.port, args.deployment_wait,
                      expected_objective_values, gri_channel, menu_channels,
-                     args.linger, args.team, args.profile)
+                     args.linger, args.team, args.profile, args.artifact)
     if args.mode == "reconnect":
         return reconnect(args.host, args.port)
     return drive(args.host, args.port)

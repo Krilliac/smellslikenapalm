@@ -70,6 +70,15 @@ public:
         return connection;
     }
 
+    static void RemoveClientSession(
+        ConnectionManager& manager,
+        const std::shared_ptr<ClientConnection>& connection) {
+        if (!connection) return;
+        manager.RemoveClientSession(
+            ClientAddress{connection->GetIP(), connection->GetPort()},
+            "role-profile matrix fixture cleanup");
+    }
+
     static void InstallRoleSelectionRuntime(GameServer& server) {
         server.m_playerManager = std::make_unique<PlayerManager>(&server);
         server.m_playerManager->Initialize();
@@ -1640,6 +1649,19 @@ protected:
                 : std::vector<uint8_t>{
                       0xaf, 0x64, 0x56, 0x15, 0x00, 0x80, 0xc3, 0x01},
             57u);
+    }
+
+    static PacketCodec::Bunch ResortSouthFinalRoleBunch() {
+        // rs2_realserver_capture.pcapng frame 2533, reliable ch2 seq31.
+        return MakeCapturedPcBunch(
+            {0xaf, 0x46, 0x5c, 0x15, 0x00, 0x80, 0xc3, 0x01}, 57u);
+    }
+
+    static PacketCodec::Bunch InstalledCompoundSouthFinalRoleBunch() {
+        // Installed VNSK-Compound live capture: final h175 + h451 + h89(false).
+        return MakeCapturedPcBunch(
+            {0xaf, 0x56, 0x5c, 0x15, 0x00, 0x80, 0xc3, 0xb3, 0x00},
+            67u);
     }
 
     static PacketCodec::Bunch SpawnSelectBunch(uint8_t slot = 0u) {
@@ -4015,6 +4037,281 @@ TEST_F(ConnectionTravelCuChiRoleIntegrationTest,
     EXPECT_EQ(reader.SerializeInt(maxHandle), 36u);
     EXPECT_EQ(reader.ReadInt32(), 73);
     EXPECT_FALSE(reader.IsOverflowed());
+}
+
+TEST_F(ConnectionTravelCuChiRoleIntegrationTest,
+       ExactProfileArtifactMatrixKeepsUnsupportedH175FailureAtomic) {
+    using Harness = ConnectionTravelLifecycleTestHarness;
+    enum class CapturedRoleRequest : uint8_t {
+        ResortSouth,
+        CuChiSouth,
+        InstalledCompoundSouth,
+    };
+    struct ProfileCase {
+        std::string_view mapUrl;
+        std::string_view mode;
+        CapturedRoleRequest request;
+        Faction southFaction;
+        bool canonicalAccepted;
+        bool installedAccepted;
+        uint32_t expectedRoleInfoRef;
+        uint8_t expectedClassIndex;
+        uint8_t expectedSquadIndex;
+        uint8_t expectedRoleIndex;
+        bool runtimeSquad;
+    };
+    const std::array<ProfileCase, 4> profiles{{
+        {"VNTE-Resort", "Territories",
+         CapturedRoleRequest::ResortSouth, Faction::USArmy,
+         true, false,
+         RoleSelectionRepl::kResortSouthGruntRoleInfoObjectRef,
+         RoleSelectionRepl::kResortSouthGruntClassIndex,
+         RoleSelectionRepl::kResortSouthGruntSquadIndex,
+         RoleSelectionRepl::kResortSouthGruntRoleIndex, false},
+        {"VNTE-CuChi", "Territories",
+         CapturedRoleRequest::CuChiSouth, Faction::USArmy,
+         true, false,
+         RoleSelectionRepl::kCuChiSouthGruntRoleInfoObjectRef,
+         RoleSelectionRepl::kCuChiInfantryClassIndex, 0u, 0u, true},
+        // No Hue City h175 role capture or grounded role registry exists yet.
+        // A source-exact, syntactically valid Resort final request is used only
+        // to prove that both exact Hue profile/layout cells fail closed before
+        // any Resort authority can leak through the generic decoder.
+        {"VNSU-HueCity", "Supremacy",
+         CapturedRoleRequest::ResortSouth, Faction::USArmy,
+         false, false, 0u, 0u, 0u, 0u, false},
+        {"VNSK-Compound", "Skirmish",
+         CapturedRoleRequest::InstalledCompoundSouth, Faction::USMC,
+         false, true,
+         RoleSelectionRepl::kCompoundSouthGruntRoleClassRef,
+         RoleSelectionRepl::kCompoundRiflemanClassIndex, 0u, 0u, true},
+    }};
+    struct ArtifactCase {
+        std::string_view selection;
+        std::string_view label;
+        bool canonical;
+    };
+    const std::array<ArtifactCase, 2> artifacts{{
+        {{}, "canonical", true},
+        {"installed", "installed", false},
+    }};
+
+    RoleSystem* roles = server_.GetRoleSystem();
+    TeamManager* teams = server_.GetTeamManager();
+    PlayerManager* players = server_.GetPlayerManager();
+    ASSERT_TRUE(roles != nullptr);
+    ASSERT_TRUE(teams != nullptr);
+    ASSERT_TRUE(players != nullptr);
+
+    for (size_t profileIndex = 0u; profileIndex < profiles.size();
+         ++profileIndex) {
+        const ProfileCase& profile = profiles[profileIndex];
+        EXPECT_NE(roles->ConfigureRetailSquads(profile.mode, 64), 0u)
+            << profile.mapUrl;
+        roles->SetTeamFaction(RoleSelectionRepl::kCompoundUsServerTeam,
+                              profile.southFaction);
+        roles->SetTeamFaction(RoleSelectionRepl::kCompoundNlfServerTeam,
+                              Faction::NLFSV);
+
+        for (size_t artifactIndex = 0u; artifactIndex < artifacts.size();
+             ++artifactIndex) {
+            const ArtifactCase& artifact = artifacts[artifactIndex];
+            const std::string caseLabel =
+                std::string(profile.mapUrl) + "/" +
+                std::string(profile.mode) + "/" +
+                std::string(artifact.label);
+            const uint32_t clientId = static_cast<uint32_t>(
+                100u + profileIndex * artifacts.size() + artifactIndex);
+            const std::shared_ptr<ClientConnection> connection = Connect(
+                artifactIndex, clientId,
+                RoleSelectionRepl::kCompoundUsServerTeam);
+            ASSERT_TRUE(connection != nullptr) << caseLabel;
+            const std::shared_ptr<Player> player =
+                players->GetPlayer(clientId);
+            ASSERT_TRUE(player != nullptr) << caseLabel;
+            ASSERT_TRUE(Harness::FreezeRetailBootstrap(
+                manager_, clientId, artifact.selection, profile.mapUrl,
+                profile.mode)) << caseLabel;
+            (void)DrainDecodedPackets(artifactIndex);
+
+            const Harness::RoleLedgerSnapshot ledgerBefore =
+                Harness::RoleLedger(manager_, clientId);
+            const std::optional<RetailSquadAssignment> assignmentBefore =
+                roles->GetRetailSquadAssignment(clientId);
+            const int roleCountBefore = roles->GetRoleCount(
+                RoleSelectionRepl::kCompoundUsServerTeam,
+                CombatRole::Rifleman);
+            const uint32_t teamBefore = teams->GetPlayerTeam(clientId);
+            const uint32_t nextReliableBefore =
+                Harness::NextCh2Reliable(manager_, clientId);
+            const size_t pendingBefore =
+                Harness::PendingReliableCount(manager_, clientId);
+            const uint32_t packetIdBefore =
+                Harness::NextOutboundPacketId(manager_, clientId);
+            const std::optional<DeploymentCoordinator::ClientStateSnapshot>
+                deploymentBefore = Harness::DeploymentState(
+                    manager_, clientId);
+            const bool playerAliveBefore = player->IsAlive();
+            const bool playerReadyBefore = player->IsReadyToSpawn();
+
+            PacketCodec::Bunch request;
+            switch (profile.request) {
+                case CapturedRoleRequest::ResortSouth:
+                    request = ResortSouthFinalRoleBunch();
+                    break;
+                case CapturedRoleRequest::CuChiSouth:
+                    request = CuChiFinalRoleBunch(/*south=*/true);
+                    break;
+                case CapturedRoleRequest::InstalledCompoundSouth:
+                    request = InstalledCompoundSouthFinalRoleBunch();
+                    break;
+            }
+            Harness::DeliverActorBunch(manager_, clientId, request);
+
+            const std::vector<PacketCodec::Packet> packets =
+                DrainDecodedPackets(artifactIndex);
+            for (const PacketCodec::Packet& packet : packets) {
+                EXPECT_TRUE(packet.ok) << caseLabel;
+            }
+            const std::vector<PacketCodec::Bunch> wireBunches =
+                FlattenBunches(packets);
+            const Harness::RoleLedgerSnapshot ledgerAfter =
+                Harness::RoleLedger(manager_, clientId);
+            const std::optional<RetailSquadAssignment> assignmentAfter =
+                roles->GetRetailSquadAssignment(clientId);
+            const int roleCountAfter = roles->GetRoleCount(
+                RoleSelectionRepl::kCompoundUsServerTeam,
+                CombatRole::Rifleman);
+            const std::optional<DeploymentCoordinator::ClientStateSnapshot>
+                deploymentAfter = Harness::DeploymentState(
+                    manager_, clientId);
+            const bool expectedAccepted = artifact.canonical
+                ? profile.canonicalAccepted
+                : profile.installedAccepted;
+
+            EXPECT_FALSE(connection->IsDisconnected()) << caseLabel;
+            EXPECT_EQ(teams->GetPlayerTeam(clientId), teamBefore) << caseLabel;
+            if (expectedAccepted) {
+                EXPECT_TRUE(ledgerAfter.accepted) << caseLabel;
+                EXPECT_TRUE(ledgerAfter.finalized) << caseLabel;
+                EXPECT_TRUE(ledgerAfter.priClassReplicated) << caseLabel;
+                EXPECT_EQ(ledgerAfter.roleInfoObjectRef,
+                          profile.expectedRoleInfoRef) << caseLabel;
+                EXPECT_EQ(ledgerAfter.classIndex,
+                          profile.expectedClassIndex) << caseLabel;
+                EXPECT_EQ(ledgerAfter.squadIndex,
+                          profile.expectedSquadIndex) << caseLabel;
+                EXPECT_EQ(ledgerAfter.roleIndex,
+                          profile.expectedRoleIndex) << caseLabel;
+                EXPECT_EQ(roleCountAfter, roleCountBefore + 1) << caseLabel;
+                EXPECT_EQ(Harness::NextCh2Reliable(manager_, clientId),
+                          nextReliableBefore + 1u) << caseLabel;
+                EXPECT_EQ(Harness::PendingReliableCount(manager_, clientId),
+                          pendingBefore + 1u) << caseLabel;
+                EXPECT_NE(Harness::NextOutboundPacketId(manager_, clientId),
+                          packetIdBefore) << caseLabel;
+
+                if (profile.runtimeSquad) {
+                    EXPECT_TRUE(assignmentAfter.has_value()) << caseLabel;
+                    if (assignmentAfter) {
+                        EXPECT_EQ(assignmentAfter->teamId, teamBefore)
+                            << caseLabel;
+                        EXPECT_EQ(assignmentAfter->squadIndex,
+                                  profile.expectedSquadIndex) << caseLabel;
+                        EXPECT_EQ(assignmentAfter->roleIndex,
+                                  profile.expectedRoleIndex) << caseLabel;
+                    }
+                } else {
+                    EXPECT_EQ(assignmentAfter.has_value(),
+                              assignmentBefore.has_value()) << caseLabel;
+                }
+
+                EXPECT_TRUE(ledgerAfter.changedRole.has_value()) << caseLabel;
+                if (ledgerAfter.changedRole) {
+                    const PacketCodec::Bunch expectedTransition =
+                        ExpectedChangedRole(*ledgerAfter.changedRole);
+                    const size_t transitionPosition =
+                        FindWireBunch(wireBunches, expectedTransition);
+                    EXPECT_LT(transitionPosition, wireBunches.size())
+                        << caseLabel;
+                    if (transitionPosition < wireBunches.size()) {
+                        EXPECT_EQ(wireBunches[transitionPosition].chSequence,
+                                  nextReliableBefore) << caseLabel;
+                    }
+                }
+                EXPECT_LT(FindWireBunch(
+                              wireBunches,
+                              ExpectedOwnerPriClass(
+                                  profile.expectedClassIndex)),
+                          wireBunches.size()) << caseLabel;
+            } else {
+                EXPECT_EQ(roleCountAfter, roleCountBefore) << caseLabel;
+                EXPECT_EQ(assignmentAfter.has_value(),
+                          assignmentBefore.has_value()) << caseLabel;
+                if (assignmentBefore && assignmentAfter) {
+                    EXPECT_EQ(assignmentAfter->teamId,
+                              assignmentBefore->teamId) << caseLabel;
+                    EXPECT_EQ(assignmentAfter->squadIndex,
+                              assignmentBefore->squadIndex) << caseLabel;
+                    EXPECT_EQ(assignmentAfter->roleIndex,
+                              assignmentBefore->roleIndex) << caseLabel;
+                    EXPECT_EQ(assignmentAfter->generation,
+                              assignmentBefore->generation) << caseLabel;
+                }
+                EXPECT_EQ(ledgerAfter.accepted, ledgerBefore.accepted)
+                    << caseLabel;
+                EXPECT_EQ(ledgerAfter.finalized, ledgerBefore.finalized)
+                    << caseLabel;
+                EXPECT_EQ(ledgerAfter.priClassReplicated,
+                          ledgerBefore.priClassReplicated) << caseLabel;
+                EXPECT_EQ(ledgerAfter.roleInfoObjectRef,
+                          ledgerBefore.roleInfoObjectRef) << caseLabel;
+                EXPECT_EQ(ledgerAfter.classIndex, ledgerBefore.classIndex)
+                    << caseLabel;
+                EXPECT_EQ(ledgerAfter.squadIndex, ledgerBefore.squadIndex)
+                    << caseLabel;
+                EXPECT_EQ(ledgerAfter.roleIndex, ledgerBefore.roleIndex)
+                    << caseLabel;
+                EXPECT_EQ(ledgerAfter.changedRole.has_value(),
+                          ledgerBefore.changedRole.has_value()) << caseLabel;
+                EXPECT_EQ(Harness::NextCh2Reliable(manager_, clientId),
+                          nextReliableBefore) << caseLabel;
+                EXPECT_EQ(Harness::PendingReliableCount(manager_, clientId),
+                          pendingBefore) << caseLabel;
+                EXPECT_EQ(Harness::NextOutboundPacketId(manager_, clientId),
+                          packetIdBefore) << caseLabel;
+                EXPECT_EQ(deploymentAfter.has_value(),
+                          deploymentBefore.has_value()) << caseLabel;
+                if (deploymentBefore && deploymentAfter) {
+                    EXPECT_EQ(deploymentAfter->generation,
+                              deploymentBefore->generation) << caseLabel;
+                    EXPECT_EQ(deploymentAfter->roleFinalized,
+                              deploymentBefore->roleFinalized) << caseLabel;
+                    EXPECT_EQ(deploymentAfter->selectedSlot,
+                              deploymentBefore->selectedSlot) << caseLabel;
+                    EXPECT_EQ(deploymentAfter->selectedSpawnId,
+                              deploymentBefore->selectedSpawnId) << caseLabel;
+                    EXPECT_EQ(deploymentAfter->readyStatus,
+                              deploymentBefore->readyStatus) << caseLabel;
+                    EXPECT_EQ(deploymentAfter->deploymentAuthorized,
+                              deploymentBefore->deploymentAuthorized)
+                        << caseLabel;
+                }
+                EXPECT_EQ(player->IsAlive(), playerAliveBefore) << caseLabel;
+                EXPECT_EQ(player->IsReadyToSpawn(), playerReadyBefore)
+                    << caseLabel;
+                EXPECT_TRUE(wireBunches.empty()) << caseLabel;
+                EXPECT_FALSE(std::any_of(
+                    wireBunches.begin(), wireBunches.end(),
+                    [](const PacketCodec::Bunch& bunch) {
+                        return bunch.bReliable;
+                    })) << caseLabel;
+            }
+
+            Harness::RemoveClientSession(manager_, connection);
+            (void)DrainDecodedPackets(artifactIndex);
+        }
+    }
 }
 
 TEST_F(ConnectionTravelCuChiRoleIntegrationTest,

@@ -147,6 +147,37 @@ bool HasGroundedCompoundWeaponSelection(
 
 } // namespace
 
+GroundedRoleProfile ClassifyGroundedRoleProfile(
+    std::string_view mapUrl, std::string_view modeName,
+    uint32_t profileRoleRegistryObjectBase,
+    std::string_view artifactVariant, uint32_t artifactRoGameObjectBase,
+    bool roleRegistryGrounded) noexcept {
+  if (artifactVariant == kCanonicalArtifactVariant &&
+      profileRoleRegistryObjectBase ==
+          RetailBootstrap::kCapturedRoGameObjectBase &&
+      artifactRoGameObjectBase == kCanonicalRoGameObjectBase &&
+      roleRegistryGrounded) {
+    if (EqualsInsensitive(mapUrl, "VNTE-Resort") &&
+        EqualsInsensitive(modeName, "Territories")) {
+      return GroundedRoleProfile::CanonicalResort;
+    }
+    if (EqualsInsensitive(mapUrl, "VNTE-CuChi") &&
+        EqualsInsensitive(modeName, "Territories")) {
+      return GroundedRoleProfile::CanonicalCuChi;
+    }
+  }
+
+  if (artifactVariant == kInstalledArtifactVariant &&
+      profileRoleRegistryObjectBase == 0u &&
+      artifactRoGameObjectBase == kInstalledRoGameObjectBase &&
+      EqualsInsensitive(mapUrl, "VNSK-Compound") &&
+      EqualsInsensitive(modeName, "Skirmish")) {
+    return GroundedRoleProfile::InstalledCompound;
+  }
+
+  return GroundedRoleProfile::Unsupported;
+}
+
 bool DecodeOne(BitReader &reader, SelectRoleByClass &output,
                DecodeError &error) {
   BitReader trial = reader;

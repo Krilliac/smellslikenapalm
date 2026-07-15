@@ -468,9 +468,25 @@ for reverse-engineering comparisons. This process switch is not an INI override 
 not hot-reloaded.
 
 The live actor cohort has grounded class/GameClass refs for all four exact profiles
-across both artifact layouts. That is bootstrap compatibility, not a claim that every
-downstream role resolver is complete: current h175 role selection remains intentionally
-fail-closed outside its narrower grounded profile/artifact combinations.
+across both artifact layouts. Actor-bootstrap compatibility and h175 role/spawn support
+are separate gates:
+
+| Exact profile | Canonical actor bootstrap | Installed actor bootstrap | Canonical h175 + spawn | Installed h175 + spawn |
+|---|---:|---:|---:|---:|
+| Resort / Territories | yes | yes | **yes** | no |
+| Cu Chi / Territories | yes | yes | **yes** | no |
+| Hue City / Supremacy | yes | yes | no | no |
+| Compound / Skirmish | yes | yes | no | **yes** |
+
+Thus actor-bootstrap validation remains a full 4x2 matrix, while role/spawn validation
+accepts only canonical Resort, canonical Cu Chi, and installed Compound. Every other pair
+is decoded and rejected by the server before role, squad, PRI, or deployment authority
+can mutate; in particular, Hue City never falls through to Resort's captured role object.
+The mock client fails unsupported pairs even earlier, before opening a socket or authoring
+h175. It exposes the pairing explicitly as `--profile` plus `--artifact`, which must match
+the server's `RS2V_REPLICATION_BOOTSTRAP_VARIANT`; for example
+`spawn --profile cu-chi --artifact canonical` or
+`spawn --profile compound --artifact installed`.
 
 ### 4.3 Open-bunch (SerializeNewActor) payload layout
 

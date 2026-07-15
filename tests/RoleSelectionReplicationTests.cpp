@@ -79,6 +79,114 @@ EncodeRequest(bool southDesired, bool rolePresent,
 
 } // namespace
 
+TEST(RoleSelectionReplication, ClassifiesOnlyGroundedFourByTwoProfiles) {
+  using Profile = RoleSelectionRepl::GroundedRoleProfile;
+  struct MapCase {
+    const char *mapUrl;
+    const char *modeName;
+    uint32_t profileRoleRegistryObjectBase;
+    Profile canonicalExpected;
+    Profile installedExpected;
+  };
+  const MapCase maps[] = {
+      {"VNTE-Resort", "Territories",
+       RetailBootstrap::kCapturedRoGameObjectBase,
+       Profile::CanonicalResort, Profile::Unsupported},
+      {"VNTE-CuChi", "Territories",
+       RetailBootstrap::kCapturedRoGameObjectBase,
+       Profile::CanonicalCuChi, Profile::Unsupported},
+      {"VNSU-HueCity", "Supremacy", 0u, Profile::Unsupported,
+       Profile::Unsupported},
+      {"VNSK-Compound", "Skirmish", 0u, Profile::Unsupported,
+       Profile::InstalledCompound},
+  };
+  struct ArtifactCase {
+    std::string_view variant;
+    uint32_t actualObjectBase;
+    bool roleRegistryGrounded;
+    bool canonical;
+  };
+  const ArtifactCase artifacts[] = {
+      {RoleSelectionRepl::kCanonicalArtifactVariant,
+       RoleSelectionRepl::kCanonicalRoGameObjectBase, true, true},
+      {RoleSelectionRepl::kInstalledArtifactVariant,
+       RoleSelectionRepl::kInstalledRoGameObjectBase, false, false},
+  };
+
+  for (const MapCase &map : maps) {
+    for (const ArtifactCase &artifact : artifacts) {
+      const Profile expected = artifact.canonical
+                                   ? map.canonicalExpected
+                                   : map.installedExpected;
+      EXPECT_EQ(RoleSelectionRepl::ClassifyGroundedRoleProfile(
+                    map.mapUrl, map.modeName,
+                    map.profileRoleRegistryObjectBase, artifact.variant,
+                    artifact.actualObjectBase,
+                    artifact.roleRegistryGrounded),
+                expected);
+    }
+  }
+}
+
+TEST(RoleSelectionReplication, GroundedProfileClassifierRejectsLayoutDrift) {
+  using Profile = RoleSelectionRepl::GroundedRoleProfile;
+  auto classifyCanonicalResort =
+      [](std::string_view mapUrl, std::string_view modeName,
+         uint32_t profileBase, std::string_view variant,
+         uint32_t artifactBase, bool roleRegistryGrounded) {
+        return RoleSelectionRepl::ClassifyGroundedRoleProfile(
+            mapUrl, modeName, profileBase, variant, artifactBase,
+            roleRegistryGrounded);
+      };
+
+  EXPECT_EQ(classifyCanonicalResort(
+                "VNTE-Resort", "Skirmish",
+                RetailBootstrap::kCapturedRoGameObjectBase, "canonical",
+                RoleSelectionRepl::kCanonicalRoGameObjectBase, true),
+            Profile::Unsupported);
+  EXPECT_EQ(classifyCanonicalResort(
+                "VNTE-Resort", "Territories",
+                RetailBootstrap::kCapturedRoGameObjectBase + 1u, "canonical",
+                RoleSelectionRepl::kCanonicalRoGameObjectBase, true),
+            Profile::Unsupported);
+  EXPECT_EQ(classifyCanonicalResort(
+                "VNTE-Resort", "Territories",
+                RetailBootstrap::kCapturedRoGameObjectBase, "canonical",
+                RoleSelectionRepl::kCanonicalRoGameObjectBase + 1u, true),
+            Profile::Unsupported);
+  EXPECT_EQ(classifyCanonicalResort(
+                "VNTE-Resort", "Territories",
+                RetailBootstrap::kCapturedRoGameObjectBase, "canonical",
+                RoleSelectionRepl::kCanonicalRoGameObjectBase, false),
+            Profile::Unsupported);
+  EXPECT_EQ(classifyCanonicalResort(
+                "VNTE-Resort", "Territories",
+                RetailBootstrap::kCapturedRoGameObjectBase, "Canonical",
+                RoleSelectionRepl::kCanonicalRoGameObjectBase, true),
+            Profile::Unsupported);
+
+  // UE map/mode identity matching remains case-insensitive after an exact
+  // profile has been resolved; only process-policy artifact tokens are exact.
+  EXPECT_EQ(classifyCanonicalResort(
+                "vnte-resort", "territories",
+                RetailBootstrap::kCapturedRoGameObjectBase, "canonical",
+                RoleSelectionRepl::kCanonicalRoGameObjectBase, true),
+            Profile::CanonicalResort);
+
+  EXPECT_EQ(RoleSelectionRepl::ClassifyGroundedRoleProfile(
+                "VNSK-Compound", "Skirmish", 1u, "installed",
+                RoleSelectionRepl::kInstalledRoGameObjectBase, false),
+            Profile::Unsupported);
+  EXPECT_EQ(RoleSelectionRepl::ClassifyGroundedRoleProfile(
+                "VNSK-Compound", "Skirmish", 0u, "Installed",
+                RoleSelectionRepl::kInstalledRoGameObjectBase, false),
+            Profile::Unsupported);
+  EXPECT_EQ(RoleSelectionRepl::ClassifyGroundedRoleProfile(
+                "VNSK-Compound", "Skirmish", 0u, "installed",
+                RoleSelectionRepl::kInstalledRoGameObjectBase + 1u, false),
+            Profile::Unsupported);
+}
+
 TEST(RoleSelectionReplication, DecodesExactInterimRetailCapture) {
   // rs2_realserver_capture.pcapng frame 2326, ch2 reliable seq24. The numeric
   // class ref remains tied to the legacy capture grounding token.

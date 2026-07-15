@@ -31,6 +31,19 @@ constexpr uint32_t kChangedRoleHandle = 210;
 constexpr uint32_t kChangedSquadHandle = 211;
 constexpr uint32_t kMaximumRoleSelectionBunchBits = 256;
 
+// Exact map/mode and PackageMap-layout combinations for which h175 has a
+// grounded semantic resolver. Unsupported is deliberately a first-class
+// result so callers cannot fall through to a different map's registry.
+enum class GroundedRoleProfile : uint8_t {
+  Unsupported,
+  CanonicalResort,
+  CanonicalCuChi,
+  InstalledCompound,
+};
+
+constexpr std::string_view kCanonicalArtifactVariant = "canonical";
+constexpr uint32_t kCanonicalRoGameObjectBase = 39478;
+
 // Legacy Resort role-registry references recovered from captures grounded with
 // the historical 39479 token. Keep these numeric values stable until that
 // registry is independently migrated to an actual PackageMap layout.
@@ -49,6 +62,19 @@ constexpr uint32_t kInstalledRoGameObjectBase = 39478;
 constexpr std::string_view kInstalledArtifactVariant = "installed";
 constexpr uint8_t kCompoundUsServerTeam = 1;
 constexpr uint8_t kCompoundNlfServerTeam = 2;
+
+// Classify only the currently grounded h175 combinations. Map and mode names
+// follow UE profile matching and are case-insensitive; artifact variants are
+// process-policy tokens and therefore exact/case-sensitive. Canonical role
+// profiles additionally require the artifact's global role registry gate.
+// Installed Compound is independently grounded by its exact ten-class table,
+// so its known installed layout remains supported while that global gate is
+// false.
+GroundedRoleProfile ClassifyGroundedRoleProfile(
+    std::string_view mapUrl, std::string_view modeName,
+    uint32_t profileRoleRegistryObjectBase,
+    std::string_view artifactVariant, uint32_t artifactRoGameObjectBase,
+    bool roleRegistryGrounded) noexcept;
 
 constexpr uint32_t kCompoundNorthGuerillaRoleClassRef = 87401;
 constexpr uint32_t kCompoundNorthScoutRoleClassRef = 87439;
