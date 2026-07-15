@@ -40,8 +40,11 @@ find_package(OpenSSL QUIET)
 find_package(Threads REQUIRED)
 find_package(ZLIB QUIET)
 
-# Collect all source files
-file(GLOB_RECURSE CORE_SOURCES
+# Collect all source files. CONFIGURE_DEPENDS attaches each glob to CMake's
+# build-system check target, so adding/removing a .cpp regenerates an already
+# configured Ninja, Ninja Multi-Config, or Visual Studio/MSBuild tree before
+# compilation instead of surfacing later as an unresolved external.
+file(GLOB_RECURSE CORE_SOURCES CONFIGURE_DEPENDS
     src/Config/*.cpp
     src/Game/*.cpp
     src/Math/*.cpp
@@ -64,14 +67,16 @@ list(FILTER CORE_SOURCES EXCLUDE REGEX "Generated/Handlers/")
 
 # Scripting sources (optional)
 if(ENABLE_SCRIPTING)
-    file(GLOB_RECURSE SCRIPTING_SOURCES src/Scripting/*.cpp)
+    file(GLOB_RECURSE SCRIPTING_SOURCES CONFIGURE_DEPENDS
+        src/Scripting/*.cpp)
     list(APPEND CORE_SOURCES ${SCRIPTING_SOURCES})
     add_compile_definitions(RS2V_SCRIPTING_ENABLED)
 endif()
 
 # Telemetry sources (optional)
 if(ENABLE_TELEMETRY)
-    file(GLOB_RECURSE TELEMETRY_SOURCES telemetry/*.cpp)
+    file(GLOB_RECURSE TELEMETRY_SOURCES CONFIGURE_DEPENDS
+        telemetry/*.cpp)
     list(APPEND CORE_SOURCES ${TELEMETRY_SOURCES})
     include_directories(${CMAKE_SOURCE_DIR}/telemetry)
     add_compile_definitions(RS2V_TELEMETRY_ENABLED)
