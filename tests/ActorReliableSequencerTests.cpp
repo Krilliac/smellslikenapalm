@@ -326,7 +326,7 @@ TEST(ActorReliableSequencer, RetirePendingAdvancesAcrossSequenceWrap) {
 TEST(ActorReliableSequencer, ExactHalfCycleIsStaleLikeUe3MakeRelative) {
     ActorReliableSequencer sequencer;
     ExpectStatus(
-        sequencer.Push(MakeReliable(42, PacketCodec::kMaxChSequence / 2u + 1u)),
+        sequencer.Push(MakeReliable(42, PacketCodec::kMaxChSequence / 2u)),
         ActorReliableSequenceStatus::Stale);
 }
 

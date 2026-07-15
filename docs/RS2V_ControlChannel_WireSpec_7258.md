@@ -56,8 +56,15 @@ packet's terminator byte (e.g. the 10-byte retransmitted Hello datagram carries 
 9-byte packet); the decoder treats the longest leading prefix that parses exactly
 to its last-byte terminator (overflow-free) as the packet and ignores any trailer.
 
-`PacketId` is reconstructed from the 14-bit wire value as a rolling sequence
-(`(wire - last - 0x2000) & 0x3fff` delta math against the last received id).
+`PacketId` is monotonic inside the connection and only its low 14 bits are written.
+On receive, UE3 reconstructs the full value relative to the current PacketId/ACK
+reference with `MakeRelative` half-range semantics. The emulator applies the same
+rule to outbound ACKs, rejects pre-session/future/exact-half ambiguous values without
+moving its reference, and tracks the actual peer-ACK high-water separately. Bunch-bearing
+builders stop before the exact 8192-packet ambiguous distance. Because UE3 does not ACK
+bunch-less ACK-only/keepalive packets, the emulator locally retires those identities only
+while every live retry ledger has a newer attempt inside the half-range. Retry ledgers
+match the reconstructed full serial, not the repeating raw wire value.
 Reader/demux: `UNetConnection::ReceivedPacket` @ `0x1404a4e60`; PreSend (writer) @ `0x14049e4a0`.
 
 ## 3. Bunch header (7258 EOS) — DEFINITIVE
@@ -79,7 +86,7 @@ Bunch (read order, LSB-first):
     bReliable = ReadBit()
     ChIndex   = ReadInt(1023)            # MAX_CHANNELS wire bound = 1023 (0x3ff). Control channel = 0.
     if bReliable:
-        ChSequence = ReadInt(1024)       # 0x400, delta-decoded ((raw - prevSeq - 0x200) & 0x3ff) + prevSeq
+        ChSequence = ReadInt(1024)       # low 10 bits; MakeRelative(raw, InReliable[ChIndex], 1024)
     if (bReliable || bOpen):
         ChType = ReadInt(8)              # CHTYPE_MAX = 8. Control channel ChType = 1.
     BunchDataBits = ReadInt(MaxPacket*8) # receive path: ReadInt([conn+0x10c] << 3)
@@ -145,11 +152,11 @@ gates reading bOpen/bClose; a clear `bControl` forces both to 0. This matches ou
 `BunchDataBits = ReadInt([conn+0x10c] << 3)` where `[conn+0x10c]` = **MaxPacket bytes**.
 `[conn+0x10c]` is negotiated (set from several register-sourced stores near the
 connection-init code, e.g. `0x14049751f`, `0x1404a167b`; no constant immediate — it is
-**not** a fixed `8`). Empirically the bound is ≥ 16384 (=2048 bytes·8) for the entire
-captured session, **including the handshake-phase Welcome/Challenge frames** — see the
-bit-evidence below. The earlier "MaxPacket = 8 ⇒ ReadInt(64)" claim was wrong and is the
-direct cause of the `mock_client.py` bug (`rint(64)`): it must be `rint(MaxPacket*8)`,
-i.e. `rint(16384)` for this capture.
+**not** a fixed `8`). Early small-frame analysis used 16384 as a compatible bound, but
+those frames did not pin the exact value. Saturated traffic later resolved the production
+directions: retail C2S uses MaxPacket 1280 (bound 10240) and dedicated-server S2C uses
+the 1500-byte MTU choice (bound 12000, within the capture-compatible interval). Both
+apply from the first packet; there is no small-bound handshake phase.
 
 ### Capture bit-evidence (cross-check; the "partial flags" hypothesis is REFUTED)
 
@@ -158,21 +165,20 @@ ends exactly on the last-byte terminator. "npart=N" = N speculative partial-flag
 inserted between ChType and BunchDataBits.
 
 - **f165 (Challenge, NMT 0x03)** — `rint(64)`: garbage (err, 4 phantom bunches).
-  `rint(16384)` npart=0: **one** bunch `ch0 sq4 ct1 bd=144 NMT=0x03`,
+  `rint(12000)` npart=0: **one** bunch `ch0 sq4 ct1 bd=144 NMT=0x03`,
   payload `03 5a1c0000 09000000 30 32 35 34 37 43 35 38 00` = `int32, FString` (Challenge
   body), clean. (Confidence **HIGH**.)
-- **f162 (Welcome, control handshake)** — `rint(16384)` npart=0: one bunch
+- **f162 (Welcome, control handshake)** — `rint(12000)` npart=0: one bunch
   `ch0 sq3 ct1 bd=80`, clean; `rint(64)` produces phantom bunches. Proves the large
   bound is in force even **during** the handshake. (Confidence **HIGH**.)
-- **f167 (PackageMap export, ~10 000 bits)** — `rint(16384)` **npart=0**: **one** bunch,
+- **f167 (PackageMap export, ~10 000 bits)** — `rint(12000)` **npart=0**: **one** bunch,
   `ch0 sq5 ct1 bd=10032 NMT=0x07`, err=False, consumes_all=True, and the payload is a
   clean UE3 package-name table: ASCII `Core`, `None`, `Engine`, `ROGame`,
   `GameFramework`, … With **npart=5** the same frame parses to err=True / 6 phantom
   bunches and pure noise (`pzs+`, `(r;Ks+`). The clean decode is the **no-partial-flags**
   one; inserting 5 partial bits **destroys** it. (Confidence **HIGH**.)
-- **f185** — `rint(16384)` npart=0: single bunch, consumes_all=True (terminal-overflow on
-  the final SerializeInt is benign, exactly as `PacketCodec::Decode` tolerates).
-  npart=5: garbage. (Confidence **HIGH**.)
+- **f185** — `rint(12000)` npart=0: single bunch with `bd=5736`, consumes_all=True,
+  and no trailing bits. `npart=5`: garbage. (Confidence **HIGH**.)
 - **f160** — pure ack burst: PacketId then 133× `IsAck=1, AckPacketId=ReadInt(16384)`
   (acks 0..132), no bunches. Confirms the ack path and the layout under load.
   (Confidence **HIGH**.)
@@ -182,25 +188,26 @@ conclusion was an artifact of the `mock_client.py` `rint(64)` bug. With the wron
 `ReadInt` consumes ~6 bits for BunchDataBits instead of ~14, so every large bunch's
 length and payload were misaligned; the analyst recovered a readable payload by adding
 ~5 fudge bits, which coincidentally re-aligned ONE frame. The actual fix is the correct
-BunchDataBits bound (`MaxPacket*8`, ≥16384), under which **every** frame — small handshake
-bunches, NMT bunches, and the large PackageMap bunches — decodes cleanly with **zero**
-partial flags. The package-map GUID/name exports are payload content handled by
-`UControlChannel`, not header bits.
+direction-specific `BunchDataBits` bound. A 16384 analysis bound happened to decode these
+particular S2C values because it selected the same SerializeInt widths; it was not proof
+of MaxPacket 2048. With the resolved bound, small handshake bunches, NMT bunches, and the
+large PackageMap bunches decode cleanly with **zero** partial flags. The package-map
+GUID/name exports are payload content handled by `UControlChannel`, not header bits.
 
 ### Flag values by bunch class
 
 | Bunch class | bControl | bOpen | bClose | bReliable | partial flags |
 |-------------|:--------:|:-----:|:------:|:---------:|:-------------:|
 | (a) handshake opening (Hello/Challenge/Welcome) | 1 (open) | 1 | 0 | 1 | none exist |
-| (b) small NMT continuation bunches | 0 | 0 | 0 | 1 | none exist |
+| (b) subsequent small NMT bunches | 0 | 0 | 0 | 1 | none exist |
 | (c) large PackageMap export (f167…f185) | 0 | 0 | 0 | 1 | none exist |
 | (d) actor-channel open | 1 | 1 | 0 | 1 | none exist |
 
-There is no "partial" concept on the wire in 7258 EOS: a logical message larger than one
-datagram is split across **multiple reliable bunches** ordered by `ChSequence` and
-reassembled by the channel — there are no `bPartialInitial/bPartial/bPartialFinal` bits to
-chain them. (This is the older UE3 FInBunch model, before the partial-bunch flags that
-appear in later UE3/UE4 builds.)
+There is no `bPartial` concept on the wire in 7258 EOS. Every observed retail control
+message fits in one correctly bounded reliable bunch. If future evidence exposes a
+logical stream spanning bunches, its boundary must come from channel/message semantics;
+there are no `bPartialInitial/bPartial/bPartialFinal` bits to chain it. Do not infer such a
+stream from the header alone.
 
 Writer (mirror): bunch-header serializer @ `0x1404a79d0`.
 
@@ -237,11 +244,10 @@ Notes:
 ## 5. Handshake sequence (from capture)
 
 ```
-C→S  Hello (opening reliable bunch, ChSeq 1; retransmitted until acked)
-C→S  ...continuation reliable bunches (ChSeq 2,3,…) carrying the rest of the Hello body
+C→S  Hello (one opening reliable bunch, ChSeq 1; retransmitted until acked)
 S→C  ack(client PacketId) + Challenge
 C→S  ack + Netspeed
-C→S  Login  (large; EOS/Leech auth ticket blob, many bunches)
+C→S  Login  (large; EOS/Leech auth ticket blob in one MaxPacket-bounded bunch)
 S→C  Welcome + NetGUID/PackageMap
 …    world/actor replication (join complete)
 ```
@@ -260,44 +266,61 @@ responded). The emulator's outbound path must send acks and assign PacketId/ChSe
   header, BunchDataBits) and emit acks for received packets.
 - Validate with the captured frames as byte-exact fixtures (see §5 frame ids).
 
-### 6.1 Required `PacketCodec` changes (post-Join replication)
+### 6.1 Current `PacketCodec` requirements (post-Join replication)
 
 Good news: the §3 disassembly confirms the bunch **header layout is exactly what
 `PacketCodec::Decode`/`Encode` already implement** — `bControl, [bOpen,bClose], bReliable,
 ChIndex(1023), [ChSequence(1024)], [ChType(8)], BunchDataBits` and payload, in that order.
-There are **no partial/extra flag bits to add**. Only ONE change is required, plus one
-already-correct piece to keep:
+There are **no partial/extra flag bits to add**. The current implementation must preserve
+these three requirements:
 
-1. **BunchDataBits bound (the only real change).** Both `Decode` and `Encode` already take
+1. **Direction-specific BunchDataBits bound.** Both `Decode` and `Encode` take
    `maxPacketBytes` and use `bunchDataBitsMax = maxPacketBytes * 8` for
    `r.ReadInt(bunchDataBitsMax)` / `w.WriteInt(b.payloadBits, bunchDataBitsMax)`. This is
-   **correct** and matches `ReadInt([conn+0x10c]<<3)`. The fix is purely at the **call
-   site**: callers must pass the negotiated `MaxPacket` (the value of `[conn+0x10c]`), NOT
-   a hardcoded handshake-phase `8`. Capture evidence shows `MaxPacket*8 ≥ 16384` for the
-   whole session, including the handshake. Concretely:
-   - Wherever the control-handshake path calls `PacketCodec::Decode(..., maxPacketBytes)`
-     with a small/handshake value (the analogue of `mock_client.py`'s `rint(64)`), pass the
-     real negotiated value instead. Until netspeed/MaxPacket parsing is wired, hardcode
-     `maxPacketBytes = 2048` (⇒ `bunchDataBitsMax = 16384`); this decodes every captured
-     frame, small and large. Do the same for `Encode`.
-   - Track the negotiated MaxPacket on the connection (mirror `[conn+0x10c]`) and feed it to
-     both `Decode` and `Encode` once netspeed handling exists.
+   **correct** and matches `ReadInt([conn+0x10c]<<3)`. Live callers pass
+   `kClientSendMaxPacketBytes=1280` for C2S decode and
+   `kServerSendMaxPacketBytes=1500` for S2C encode from the first packet. The legacy
+   8-byte default exists only for low-level historical fixtures.
    - No struct/field changes to `Bunch` or `Packet`; no new header bits to serialize.
 
-2. **No partial-bunch reassembly by flags.** Do NOT add `bPartial*` handling. Logical
-   messages that exceed one datagram are carried as **multiple reliable bunches on the same
-   channel**, ordered by `ChSequence`, and reassembled by **concatenating their payload
-   bits in ChSequence order** until the channel-level message is complete (control-channel:
-   the NMT byte + body; actor channels: the replication stream). Reassembly key is
-   `(ChIndex, ChSequence)` with wraparound delta-decoding as in §3 — not any header flag.
-   Where the current code reassembles control bunches "by ChSequence" (§6 inbound bullet),
-   that is already the right model; it just needs the corrected BunchDataBits bound so each
-   bunch's payload length is read correctly.
+2. **No invented partial-bunch flags.** Do NOT add `bPartial*` handling. Every observed
+   retail C2S control message fits in one correctly bounded reliable bunch, and the current
+   `ControlReassembler` orders/deduplicates those bunches before dispatching one payload per
+   callback. A future general `UControlChannel` continuous-stream parser would need explicit
+   message delimiting and evidence; the current class does not claim cross-bunch logical
+   message concatenation.
 
 3. **Keep the benign terminal-overflow tolerance.** `Decode` already stops on
    `IsOverflowed()` at the terminator and still returns `ok`. The large frames (f185) rely
    on this — do not tighten it.
 
-Net effect: a one-line/call-site change (pass real `MaxPacket`, default 2048) makes the
-existing codec decode the post-Join PackageMap and actor-open bunches correctly. No new
-flag plumbing.
+The resolved implementation therefore needs direction-correct call sites, strict
+per-channel reliable ordering, and the existing no-extra-flags header — no new flag
+plumbing.
+
+### 6.2 Reliable ChSequence ownership and wrap
+
+`ChSequence` is **per channel**, not connection-global. UE3 stores
+`InReliable[MAX_CHANNELS]` and `OutReliable[MAX_CHANNELS]`; the receive path applies
+`MakeRelative(raw, InReliable[ChIndex], MAX_CHSEQUENCE)` before `UChannel` accepts only
+the exact `InReliable[ChIndex] + 1` successor. Later same-channel bunches are buffered
+strictly until the missing reliable arrives. A pending-count heuristic must not skip a
+gap: the corrected C2S `MaxPacket=1280` decode removed the phantom channels and apparent
+ch0 holes that originally motivated that workaround.
+
+On the wire this is a modulo-1024 value (`1023 -> 0`). Emulator ordering therefore uses
+the equivalent half-range relation: distances `1..511` are newer, distance `512` is on
+the older side exactly like UE3 `MakeRelative`, and values outside `0..1023` are invalid.
+The sender's `RELIABLE_BUFFER=128` limits ordinary forward successors to `1..127`.
+`PacketAssembler` applies that same bound to outbound ch0: ACKed successors remain
+issuance-window tombstones behind an older gap, and a full window rejects a new logical
+control message without consuming its `PacketId`, `ChSequence`, or queued ACKs. The caller
+must never issue sequence 128 past the gap. `ConnectionManager` retains required messages
+in a bounded FIFO (127 messages, 256 KiB) and flushes them in protocol order when contiguous
+ACK progress reopens capacity. It fails the session closed if that queue is exhausted, the
+complete encoded packet exceeds S2C MaxPacket, or the prepare/ledger/commit transaction
+cannot be completed consistently. An ACK-free full-packet preflight occurs before queueing,
+so an impossible payload never waits behind backpressure. Join completion, handshake
+visibility, actor bootstrap, and the Game callback also wait for this earlier ch0 work to
+drain; the bootstrap then publishes ch2 OPEN and NMT 0x24 as consecutive reliable
+bunches under one PacketId/retry ledger before later actors.

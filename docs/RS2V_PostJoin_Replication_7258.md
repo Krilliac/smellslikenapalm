@@ -1,13 +1,16 @@
 # RS2V Post-Join World / Actor Replication Spec (EngineVersion 7258)
 
 Reverse-engineered from the real client<->server loopback capture
-`D:\RE-Tools\rs2_handshake_capture.pcapng`, decoded byte-exact with the validated
-UE3 FBitReader framing at **MaxPacket = 2048** (`BunchDataBits = ReadInt(16384)`).
+`D:\RE-Tools\rs2_handshake_capture.pcapng`, decoded byte-exact with UE3 FBitReader
+framing and the sender-direction `BunchDataBits = ReadInt(MaxPacket*8)` bound.
+Retail C2S uses MaxPacket 1280; the captured dedicated-server S2C stream uses the
+1500-byte MTU choice.
 
-Decoder: `tools/mock_client.py` framing, re-run with the 2048 bunch-width fix
-(the mock's `bd = r.rint(64)` is wrong for this phase — it must be `r.rint(16384)`).
-Scratch decoder used here: `decode2048.py` (LSB-first, terminator = high set bit of
-last byte, per-entry bIsAck/bunch parse exactly as documented in MEMORY).
+The historical `tools/mock_client.py` analysis first replaced its incorrect
+`rint(64)` with the compatible `rint(16384)` bound. The scratch decoder was named
+`decode2048.py`; those names record the investigation, not the resolved production
+MaxPacket. Later saturated traffic and the terminal f185 shape pinned the directional
+bounds documented below.
 
 This document covers the S2C stream **from NMT_Welcome (f162) onward** — the part
 that takes a real client off the loading screen and into the map.
@@ -53,7 +56,7 @@ channel opened and replicated.
 
 `ct` = ChType (1 = control channel, 2 = actor channel, 0 = subsequent/continued
 actor bunch on an already-open channel). Flags `O/Cl/R` = bOpen/bClose/bReliable.
-`sq` = reliable ChSequence (connection-global). All decodes are `trail=0` (clean)
+`sq` = reliable ChSequence (per-channel, modulo 1024). All decodes are `trail=0` (clean)
 unless noted.
 
 | Frame | PacketId | ChIndex | ct | O/Cl/R | sq | Bits  | First byte | Decode |
@@ -333,12 +336,12 @@ separate complete bunches), never at the bunch layer.
   ChIndex=0, ChType=1, bPartial=N/A`. One bunch per UDP datagram (the retail server
   coalesces a couple of tiny ones, e.g. f183 carried chSeq 21+22, but one-per-packet
   is fine). Each payload is ≤ ~1260 bytes and fits inside MaxPacket. Increment the
-  connection-global `ChSequence` per bunch. The 20th bunch (chSeq 24) is just
+  control-channel `ChSequence` per bunch. The 20th bunch (chSeq 24) is just
   another such bunch carrying the last 8 package records + the 153-byte control
   trailer — **no special partial handling needed**. The simplest correct emulator
   loop: for each captured chunk payload in `packagemap_chunks.json` (sorted by
   chSeq), call the existing reliable-control-bunch send with that payload.
-- ACK discipline is unchanged: each is a reliable bunch with a connection-global
+- ACK discipline is unchanged: each is a reliable bunch with a ch0-local
   ChSequence; the client ACKs them and the server must hold the resend window (the
   capture shows the client bulk-ACKing via f186+).
 
@@ -416,7 +419,7 @@ Goal: get a real client from the loading screen into the map after Join.
    property block.
 5. **ACK discipline** — the server ACKs the client's packets aggressively
    (f159/f160/f186 etc. are pure/bulk ACK packets). Reliable channel sequencing is
-   connection-global; our emulator must already do this (handshake works), but the
+   per-channel; our emulator must already do this (handshake works), but the
    replication phase generates far more reliable bunches, so the resend/ack window
    must hold.
 
@@ -453,9 +456,9 @@ in §5.6-5.8 can follow.
   -Y "udp.srcport==7777" -T fields -e frame.number -e data.data
 ```
 Two decoder fixes vs the original `tools/mock_client.py`:
-1. Handshake phase uses `bd = r.rint(64)`; the established (NMT/replication) phase
-   uses `bd = r.rint(MaxPacket*8)`.
-2. The established-phase `BunchDataBits` bound is **MaxPacket*8 ≈ 12000**
+1. Use the sender-direction bound from the first packet: **12000 for captured S2C**
+   and **10240 for retail C2S**. Do not switch to `rint(64)` for handshake traffic.
+2. The captured S2C `BunchDataBits` bound is **MaxPacket*8 ≈ 12000**
    (MaxPacket ≈ 1500), **NOT 16384**. With 16384 every export frame decodes EXCEPT
    f185, which over-reads its `BunchDataBits` by one bit (the false "partial bunch").
    With the correct ~12000 bound, all 20 export bunches (f167-f185) decode with

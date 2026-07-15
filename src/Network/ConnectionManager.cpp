@@ -45,6 +45,7 @@
 #include <chrono>
 #include <climits>
 #include <cmath>
+#include <exception>
 #include <fstream>
 #include <iterator>
 #include <limits>
@@ -733,9 +734,9 @@ void ConnectionManager::SynchronizeRetailTeamReinforcements() {
             stagedValues[retailTeam] = wireCount;
         }
 
-        uint32_t sentPacketId = 0u;
+        int64_t sentPacketSerial = -1;
         if (deltas.empty() ||
-            !SendReliableBunches(clientId, deltas, &sentPacketId)) {
+            !SendReliableBunches(clientId, deltas, &sentPacketSerial)) {
             continue;
         }
         for (uint8_t retailTeam = 0; retailTeam < 2u; ++retailTeam) {
@@ -748,10 +749,10 @@ void ConnectionManager::SynchronizeRetailTeamReinforcements() {
                 pending->wireValue = *stagedValues[retailTeam];
             }
             pending->lastSendMs = now;
-            if (pending->packetIds.size() >= kMaximumTrackedPacketIds) {
-                pending->packetIds.erase(pending->packetIds.begin());
+            if (pending->packetSerials.size() >= kMaximumTrackedPacketIds) {
+                pending->packetSerials.erase(pending->packetSerials.begin());
             }
-            pending->packetIds.push_back(sentPacketId);
+            pending->packetSerials.push_back(sentPacketSerial);
         }
     }
 }
@@ -1227,7 +1228,7 @@ void ConnectionManager::SetClientJoinedCallback(ClientJoinedCallback cb) {
     m_clientJoinedCb = std::move(cb);
 }
 
-void ConnectionManager::FireClientLoggedIn(const ClientLoggedInEvent& ev) {
+void ConnectionManager::FireClientLoggedIn(const ClientLoggedInEvent& ev) try {
     Logger::Info("[ConnectionManager::FireClientLoggedIn] client %u logged in (steamId=%llu, name='%s')",
                  ev.clientId, (unsigned long long)ev.steamId, ev.options.PlayerName().c_str());
     // Mirror the parsed player name onto the connection for convenience.
@@ -1286,23 +1287,52 @@ void ConnectionManager::FireClientLoggedIn(const ClientLoggedInEvent& ev) {
     }
     UpdateTelemetryPlayerCounts();
     SendReplicationBootstrap(ev.clientId);
+} catch (const std::exception& ex) {
+    if (const auto connection = GetConnection(ev.clientId)) {
+        connection->MarkDisconnected();
+    }
+    Logger::Error("[ConnectionManager::FireClientLoggedIn] client %u callback/bootstrap "
+                  "threw '%s'; retiring protocol session",
+                  ev.clientId, ex.what());
+} catch (...) {
+    if (const auto connection = GetConnection(ev.clientId)) {
+        connection->MarkDisconnected();
+    }
+    Logger::Error("[ConnectionManager::FireClientLoggedIn] client %u callback/bootstrap "
+                  "threw a non-standard exception; retiring protocol session",
+                  ev.clientId);
 }
 
-void ConnectionManager::FireClientJoined(const ClientJoinedEvent& ev) {
+void ConnectionManager::FireClientJoined(const ClientJoinedEvent& ev) try {
     Logger::Info("[ConnectionManager::FireClientJoined] client %u joined", ev.clientId);
-    // The UE3 handshake is complete: from here the game layer may send to this
-    // client (until now SendPacket was suppressed to keep the handshake's wire
-    // stream clean).
-    if (auto conn = GetConnection(ev.clientId)) {
-        // A client rejected at PreLogin was MarkDisconnected() but not necessarily
-        // erased yet; don't let a Join that races the teardown drive actor bootstrap.
-        if (conn->IsDisconnected()) {
-            Logger::Info("[ConnectionManager::FireClientJoined] client %u is disconnected (rejected login); "
-                         "suppressing actor bootstrap", ev.clientId);
-            return;
-        }
-        conn->SetHandshakeComplete(true);
+    const auto conn = GetConnection(ev.clientId);
+    // A client rejected at PreLogin was MarkDisconnected() but not necessarily
+    // erased yet; don't let a Join that races the teardown drive actor bootstrap.
+    if (!conn || conn->IsDisconnected()) {
+        Logger::Info("[ConnectionManager::FireClientJoined] client %u is disconnected (rejected login); "
+                     "suppressing actor bootstrap", ev.clientId);
+        return;
     }
+
+    ControlState& controlState = GetControlState(ev.clientId);
+    if (!controlState.deferredControlMessages.empty() ||
+        controlState.outbound.OutstandingControlBunchCount() != 0u) {
+        controlState.joinCompletionDeferred = true;
+        Logger::Info(
+            "[ConnectionManager::FireClientJoined] client %u join completion "
+            "deferred until earlier ch0 traffic drains (outstanding=%zu, "
+            "queued=%zu)",
+            ev.clientId,
+            controlState.outbound.OutstandingControlBunchCount(),
+            controlState.deferredControlMessages.size());
+        return;
+    }
+    controlState.joinCompletionDeferred = false;
+
+    // Only expose the session as established after earlier reliable ch0 work is
+    // drained. Periodic/game replication gates on this flag, so moving it before
+    // the drain barrier could publish actors ahead of ch2 OPEN/NMT 0x24.
+    conn->SetHandshakeComplete(true);
     UpdateTelemetryPlayerCounts();
     // The PackageMap export went out earlier (on ClientLoggedIn / right after
     // Welcome). Now that the client has Joined, open the bootstrap ACTOR channels
@@ -1311,81 +1341,396 @@ void ConnectionManager::FireClientJoined(const ClientJoinedEvent& ev) {
     // burst - see SendActorBootstrap.
     SendActorBootstrap(ev.clientId);
 
+    if (const auto connection = GetConnection(ev.clientId);
+        !connection || connection->IsDisconnected()) {
+        return;
+    }
+
     if (m_clientJoinedCb) {
         m_clientJoinedCb(ev);
     } else {
         Logger::Debug("[ConnectionManager::FireClientJoined] no Game subscriber for ClientJoined (client %u)",
                       ev.clientId);
     }
+} catch (const std::exception& ex) {
+    if (const auto connection = GetConnection(ev.clientId)) {
+        connection->MarkDisconnected();
+    }
+    Logger::Error("[ConnectionManager::FireClientJoined] client %u callback/bootstrap "
+                  "threw '%s'; retiring protocol session",
+                  ev.clientId, ex.what());
+} catch (...) {
+    if (const auto connection = GetConnection(ev.clientId)) {
+        connection->MarkDisconnected();
+    }
+    Logger::Error("[ConnectionManager::FireClientJoined] client %u callback/bootstrap "
+                  "threw a non-standard exception; retiring protocol session",
+                  ev.clientId);
 }
 
-bool ConnectionManager::SendRawToClient(uint32_t clientId, const std::vector<uint8_t>& bytes) {
-    auto conn = GetConnection(clientId);
-    if (!conn) {
-        Logger::Error("[ConnectionManager::SendRawToClient] No connection for client %u (%zu bytes dropped)",
-                      clientId, bytes.size());
+void ConnectionManager::FailCloseControlPublication(uint32_t clientId,
+                                                     const char* context) {
+    const std::shared_ptr<ClientConnection> connection = GetConnection(clientId);
+    if (connection && !connection->IsDisconnected()) {
+        connection->MarkDisconnected();
+    }
+    Logger::Error(
+        "[OutboundReliable] client %u fail-closed after %s could not be "
+        "published consistently",
+        clientId, context ? context : "a load-bearing ch0 transition");
+}
+
+bool ConnectionManager::EnsureNextOutboundPacketIdAvailable(
+    uint32_t clientId, const char* context) {
+    const auto stateIt = m_controlState.find(clientId);
+    if (stateIt == m_controlState.end()) return true;
+
+    const PacketCodec::PacketAssembler& outbound = stateIt->second.outbound;
+    if (outbound.HasPacketIdCapacity()) return true;
+
+    Logger::Error(
+        "[OutboundPacketId] client %u reached the 8191-packet unacknowledged "
+        "half-window while %s (nextSerial=%lld, unwrapReference=%lld, "
+        "peerAck=%lld); retiring ambiguous protocol session",
+        clientId, context ? context : "allocating an outbound packet",
+        static_cast<long long>(outbound.NextPacketSerial()),
+        static_cast<long long>(outbound.AckUnwrapReferenceSerial()),
+        static_cast<long long>(outbound.HighestPeerAckSerial()));
+    if (const auto connection = GetConnection(clientId)) {
+        connection->MarkDisconnected();
+    }
+    return false;
+}
+
+bool ConnectionManager::EnsureBunchlessAckReferenceSafe(
+    uint32_t clientId, const char* context) {
+    const auto stateIt = m_controlState.find(clientId);
+    if (stateIt == m_controlState.end()) return true;
+    const ControlState& cs = stateIt->second;
+    const int64_t nextSerial = cs.outbound.NextPacketSerial();
+    constexpr int64_t halfRange =
+        static_cast<int64_t>(kMaxPacketId) / 2;
+
+    const auto attemptIsFresh = [nextSerial, halfRange](
+                                    const std::vector<int64_t>& attempts) {
+        return !attempts.empty() && attempts.back() <= nextSerial &&
+               nextSerial - attempts.back() < halfRange;
+    };
+    for (const ControlState::SentReliable& reliable : cs.pendingReliable) {
+        if (attemptIsFresh(reliable.packetSerials)) continue;
+        Logger::Error(
+            "[OutboundPacketId] client %u cannot locally retire bunch-less "
+            "packet %lld while %s: a pending reliable has no retry attempt "
+            "inside the 8192-packet unwrap half-range",
+            clientId, static_cast<long long>(nextSerial),
+            context ? context : "sending a bunch-less packet");
+        FailCloseControlPublication(clientId,
+                                    "stale reliable packet identity");
         return false;
     }
+    for (const auto& publication : cs.pendingTeamReinforcements) {
+        if (!publication || attemptIsFresh(publication->packetSerials)) continue;
+        Logger::Error(
+            "[OutboundPacketId] client %u cannot locally retire bunch-less "
+            "packet %lld while %s: a reinforcement publication has no packet "
+            "attempt inside the 8192-packet unwrap half-range",
+            clientId, static_cast<long long>(nextSerial),
+            context ? context : "sending a bunch-less packet");
+        FailCloseControlPublication(clientId,
+                                    "stale reinforcement packet identity");
+        return false;
+    }
+    return true;
+}
+
+ConnectionManager::ControlPublishResult
+ConnectionManager::TryPublishControlMessage(
+    uint32_t clientId, const std::vector<uint8_t>& bytes,
+    const std::vector<PacketCodec::Bunch>& leadingBunches) {
+    auto conn = GetConnection(clientId);
+    if (!conn || conn->IsDisconnected()) return ControlPublishResult::Fatal;
+
     // `bytes` is a control-channel MESSAGE payload (a ControlChannel::Build*
-    // result: <BYTE NMT><fields>). Frame it into UE3 packets - reliable control
-    // bunch(es) with a rolling PacketId/ChSequence, fragmented to MaxPacket, with
-    // any pending acks drained onto the first packet - then encode and send each.
-    // The BunchDataBits SerializeInt bound is phase-dependent on the wire and MUST
+    // result: <BYTE NMT><fields>). Frame it into one reliable control bunch with
+    // rolling PacketId/ChSequence and a bounded prefix of pending ACKs.
+    // The BunchDataBits SerializeInt bound is direction-dependent and MUST
     // match what the client decodes with, or the client mis-reads the bunch (it
-    // still acks at the packet level, masking the bug). During the StatelessConnect
-    // We are the SERVER: encode S2C bunches with the server's MaxPacket (~1500,
-    // bound ~12000) from the FIRST packet (including the HandshakeChallenge) - the
-    // client decodes server bunches at that bound from the start. (Asymmetric vs the
-    // client's 1280 that we DECODE inbound with - see PacketCodec.h. There is NO
-    // small-bound handshake phase; the old bound-64 encode made our challenge
-    // unparseable to the real client, stalling it on the loading screen.)
-    const uint32_t maxPacketBytes = PacketCodec::kServerSendMaxPacketBytes;
-    const uint32_t maxBunchDataBits = maxPacketBytes * 8u - 1u;
+    // still acks at the packet level, masking the bug). We are the SERVER: encode
+    // S2C bunches with the server's MaxPacket (~1500, bound ~12000) from the FIRST
+    // packet (including the HandshakeChallenge) - the client decodes server bunches
+    // at that bound from the start. (Asymmetric vs the client's 1280 that we DECODE
+    // inbound with - see PacketCodec.h. There is NO small-bound handshake phase;
+    // the old bound-64 encode made our challenge unparseable to the real client,
+    // stalling it on the loading screen.)
+    ControlState& cs = GetControlState(clientId);
+    if (!EnsureNextOutboundPacketIdAvailable(
+            clientId, "publishing a control message")) {
+        return ControlPublishResult::Fatal;
+    }
+
+    auto prepared = leadingBunches.empty()
+        ? cs.outbound.PrepareControlMessagePackets(
+              bytes, PacketCodec::kServerSendMaxPacketBytes)
+        : cs.outbound.PrepareControlMessagePacketWithLeadingBunches(
+              leadingBunches, bytes,
+              PacketCodec::kServerSendMaxPacketBytes);
+    if (!prepared) {
+        if (prepared.error() ==
+            PacketCodec::ControlMessageBuildError::ReliableWindowFull) {
+            return ControlPublishResult::ReliableWindowFull;
+        }
+        if (prepared.error() ==
+            PacketCodec::ControlMessageBuildError::PayloadTooLarge) {
+            Logger::Error(
+                "[ConnectionManager::TryPublishControlMessage] complete control "
+                "packet for client %u exceeds MaxPacket=%u (%zu payload bytes)",
+                clientId, PacketCodec::kServerSendMaxPacketBytes, bytes.size());
+            FailCloseControlPublication(clientId, "oversized ch0 message");
+        } else {
+            FailCloseControlPublication(clientId, "ch0 allocator failure");
+        }
+        return ControlPublishResult::Fatal;
+    }
+
+    const std::vector<PacketCodec::Packet>& packets = prepared->Packets();
+    const size_t expectedBunches = leadingBunches.size() + 1u;
+    if (packets.size() != 1u ||
+        packets.front().bunches.size() != expectedBunches ||
+        !packets.front().bunches.back().bReliable ||
+        packets.front().bunches.back().chIndex != 0u) {
+        (void)cs.outbound.CancelPreparedControlMessage(*prepared);
+        FailCloseControlPublication(clientId, "invalid prepared ch0 packet");
+        return ControlPublishResult::Fatal;
+    }
+
+    const PacketCodec::Packet& pkt = packets.front();
+    const uint64_t sentAtMs = NowMs();
+    try {
+        // Every allocation involved in ledger construction is inside the
+        // rollback boundary. A thrown vector copy must not strand the prepared
+        // ch0 reservation and deadlock all later publications.
+        ControlState::SentReliable pending;
+        pending.packetSerials.push_back(pkt.outboundPacketSerial);
+        pending.lastSendMs = sentAtMs;
+        pending.retryDelayMs = 8000;
+        pending.maxResends = 22;  // 176s bounded cold-load headroom.
+        pending.bunches = pkt.bunches;
+
+        // Establish retry ownership before publishing the reserved ChSequence.
+        cs.pendingReliable.push_back(std::move(pending));
+    } catch (...) {
+        (void)cs.outbound.CancelPreparedControlMessage(*prepared);
+        FailCloseControlPublication(clientId, "ch0 retry-ledger staging exception");
+        return ControlPublishResult::Fatal;
+    }
+
+    const auto committed =
+        cs.outbound.CommitPreparedControlMessage(*prepared);
+    if (!committed) {
+        cs.pendingReliable.pop_back();
+        if (prepared->IsActive()) {
+            (void)cs.outbound.CancelPreparedControlMessage(*prepared);
+        }
+        FailCloseControlPublication(clientId, "ch0 reservation commit");
+        return ControlPublishResult::Fatal;
+    }
+
+    const std::vector<uint8_t>& wire = prepared->WireBytes();
+    if (wire.size() <= 80u) {  // HANDSHAKE WIRE TRACE (small control sends)
+        std::string hex;
+        hex.reserve(wire.size() * 2u);
+        static const char* H = "0123456789abcdef";
+        for (uint8_t byte : wire) {
+            hex += H[byte >> 4u];
+            hex += H[byte & 0xFu];
+        }
+        Logger::Debug("[WIRE->] client %u %zuB: %s", clientId, wire.size(),
+                      hex.c_str());
+    }
+    if (conn->SendRaw(wire.data(), wire.size())) {
+        cs.lastServerSendMs = sentAtMs;
+    }
+
+    // The retry ledger owns the message even if the first UDP handoff fails.
+    return ControlPublishResult::Published;
+}
+
+bool ConnectionManager::PublishControlMessageImmediately(
+    uint32_t clientId, const std::vector<uint8_t>& bytes,
+    const char* context) {
+    const ControlPublishResult result =
+        TryPublishControlMessage(clientId, bytes);
+    if (result == ControlPublishResult::Published) return true;
+    if (result == ControlPublishResult::ReliableWindowFull) {
+        Logger::Error(
+            "[OutboundReliable] client %u could not immediately publish %s; "
+            "refusing to reorder later actor traffic around ch0",
+            clientId, context ? context : "an ordered control message");
+        FailCloseControlPublication(clientId,
+                                    context ? context
+                                            : "ordered ch0 publication");
+    }
+    return false;
+}
+
+bool ConnectionManager::PublishBootstrapEntryPacket(
+    uint32_t clientId,
+    const PacketCodec::Bunch& playerControllerOpen,
+    const std::vector<uint8_t>& controlMessage) {
+    if (!playerControllerOpen.bReliable || !playerControllerOpen.bOpen ||
+        playerControllerOpen.bClose || playerControllerOpen.chIndex != 2u) {
+        FailCloseControlPublication(
+            clientId, "invalid PlayerController bootstrap open");
+        return false;
+    }
+
+    const ControlPublishResult result = TryPublishControlMessage(
+        clientId, controlMessage, {playerControllerOpen});
+    if (result != ControlPublishResult::Published) {
+        if (result == ControlPublishResult::ReliableWindowFull) {
+            FailCloseControlPublication(
+                clientId, "atomic ch2 OPEN/NMT 0x24 publication");
+        }
+        return false;
+    }
 
     ControlState& cs = GetControlState(clientId);
-    bool ok = true;
-    for (const PacketCodec::Packet& pkt :
-         cs.outbound.BuildControlMessagePackets(bytes, maxBunchDataBits)) {
-        const std::vector<uint8_t> wire = PacketCodec::Encode(pkt, maxPacketBytes);
-        if (wire.size() <= 80) {  // HANDSHAKE WIRE TRACE (small control sends)
-            std::string hex; hex.reserve(wire.size() * 2);
-            static const char* H = "0123456789abcdef";
-            for (uint8_t b : wire) { hex += H[b >> 4]; hex += H[b & 0xF]; }
-            Logger::Debug("[WIRE->] client %u %zuB: %s", clientId, wire.size(), hex.c_str());
-        }
-        const uint64_t sentAtMs = NowMs();
-        if (!conn->SendRaw(wire.data(), wire.size())) {
-            ok = false;
-        } else {
-            cs.lastServerSendMs = sentAtMs;
-        }
-
-        // BuildControlMessagePackets emits reliable ch0 bunches, but this path
-        // historically bypassed the retransmission ledger used by actor sends.
-        // A single dropped PackageMap tail then left the retail client waiting
-        // forever before NMT_Join. Record EACH packet independently: ACKing one
-        // fragment must never retire a sibling fragment that rode in another
-        // PacketId. Cold clients may take ~20s to answer the first challenge, so
-        // control traffic uses a deliberately slower/longer retry schedule than
-        // the latency-sensitive actor defaults. A cold Steam/EAC launch plus a
-        // first Compound load has been observed to spend more than 64 seconds
-        // between PackageMap delivery and NMT_Join, so retain almost three
-        // minutes of bounded headroom before retiring only this session.
-        std::vector<PacketCodec::Bunch> reliable;
-        for (const PacketCodec::Bunch& bunch : pkt.bunches) {
-            if (bunch.bReliable) reliable.push_back(bunch);
-        }
-        if (!reliable.empty()) {
-            ControlState::SentReliable pending;
-            pending.packetIds.push_back(pkt.packetId);
-            pending.lastSendMs = sentAtMs;
-            pending.retryDelayMs = 8000;
-            pending.maxResends = 22;  // 176s bounded cold-load headroom.
-            pending.bunches = std::move(reliable);
-            cs.pendingReliable.push_back(std::move(pending));
-        }
+    if (playerControllerOpen.chIndex < cs.outboundActorChannels.size()) {
+        cs.outboundActorChannels.set(playerControllerOpen.chIndex);
     }
-    return ok;
+    return true;
+}
+
+bool ConnectionManager::DeferControlMessage(
+    uint32_t clientId, const std::vector<uint8_t>& bytes) {
+    ControlState& cs = GetControlState(clientId);
+    if (cs.deferredControlMessages.size() >= kMaxDeferredControlMessages ||
+        bytes.size() > kMaxDeferredControlBytes -
+                           std::min(cs.deferredControlBytes,
+                                    kMaxDeferredControlBytes)) {
+        FailCloseControlPublication(clientId, "bounded ch0 defer queue exhaustion");
+        return false;
+    }
+
+    try {
+        cs.deferredControlMessages.push_back(bytes);
+        cs.deferredControlBytes += bytes.size();
+    } catch (...) {
+        FailCloseControlPublication(clientId, "ch0 defer queue allocation");
+        return false;
+    }
+    Logger::Debug(
+        "[OutboundReliable] client %u deferred ch0 message (%zu bytes; "
+        "queue=%zu/%zu, queuedBytes=%zu/%zu)",
+        clientId, bytes.size(), cs.deferredControlMessages.size(),
+        kMaxDeferredControlMessages, cs.deferredControlBytes,
+        kMaxDeferredControlBytes);
+    return true;
+}
+
+void ConnectionManager::FlushDeferredControlMessages(uint32_t clientId) {
+    auto stateIt = m_controlState.find(clientId);
+    if (stateIt == m_controlState.end()) return;
+    ControlState& cs = stateIt->second;
+    if (cs.flushingDeferredControlMessages) return;
+
+    cs.flushingDeferredControlMessages = true;
+    struct FlushGuard final {
+        bool& active;
+        ~FlushGuard() noexcept { active = false; }
+    } flushGuard{cs.flushingDeferredControlMessages};
+
+    try {
+        while (!cs.deferredControlMessages.empty()) {
+            const ControlPublishResult result = TryPublishControlMessage(
+                clientId, cs.deferredControlMessages.front());
+            if (result == ControlPublishResult::ReliableWindowFull) return;
+            if (result == ControlPublishResult::Fatal) {
+                cs.deferredControlMessages.clear();
+                cs.deferredControlBytes = 0u;
+                return;
+            }
+
+            cs.deferredControlBytes -=
+                cs.deferredControlMessages.front().size();
+            cs.deferredControlMessages.pop_front();
+        }
+    } catch (...) {
+        cs.deferredControlMessages.clear();
+        cs.deferredControlBytes = 0u;
+        FailCloseControlPublication(clientId, "deferred ch0 publication exception");
+    }
+}
+
+void ConnectionManager::TryResumeDeferredClientJoin(uint32_t clientId) {
+    const auto stateIt = m_controlState.find(clientId);
+    if (stateIt == m_controlState.end()) return;
+    ControlState& cs = stateIt->second;
+    if (!cs.joinCompletionDeferred || cs.inboundPacketDispatchActive ||
+        !cs.deferredControlMessages.empty() ||
+        cs.outbound.OutstandingControlBunchCount() != 0u) {
+        return;
+    }
+
+    const auto connection = GetConnection(clientId);
+    if (!connection || connection->IsDisconnected()) {
+        cs.joinCompletionDeferred = false;
+        return;
+    }
+
+    // Clear before re-entering FireClientJoined. If the precondition changes
+    // unexpectedly, that function will set the latch again without duplicating
+    // either actor bootstrap or the Game callback.
+    cs.joinCompletionDeferred = false;
+    FireClientJoined(ClientJoinedEvent{clientId});
+}
+
+bool ConnectionManager::SendRawToClient(uint32_t clientId,
+                                        const std::vector<uint8_t>& bytes) {
+    auto conn = GetConnection(clientId);
+    if (!conn || conn->IsDisconnected()) {
+        Logger::Error(
+            "[ConnectionManager::SendRawToClient] no live connection for client "
+            "%u (%zu bytes rejected)",
+            clientId, bytes.size());
+        return false;
+    }
+
+    ControlState& cs = GetControlState(clientId);
+    try {
+        const auto valid = cs.outbound.ValidateControlMessagePacket(
+            bytes, PacketCodec::kServerSendMaxPacketBytes);
+        if (!valid) {
+            Logger::Error(
+                "[ConnectionManager::SendRawToClient] complete control packet "
+                "for client %u can never fit MaxPacket=%u (%zu payload bytes)",
+                clientId, PacketCodec::kServerSendMaxPacketBytes, bytes.size());
+            FailCloseControlPublication(
+                clientId, "deferred ch0 packet size preflight");
+            return false;
+        }
+    } catch (...) {
+        FailCloseControlPublication(
+            clientId, "deferred ch0 packet preflight exception");
+        return false;
+    }
+    if (!cs.deferredControlMessages.empty()) {
+        if (!DeferControlMessage(clientId, bytes)) return false;
+        FlushDeferredControlMessages(clientId);
+        return !conn->IsDisconnected();
+    }
+
+    const ControlPublishResult result =
+        TryPublishControlMessage(clientId, bytes);
+    if (result == ControlPublishResult::Published) return true;
+    if (result == ControlPublishResult::Fatal) return false;
+
+    Logger::Warn(
+        "[ConnectionManager::SendRawToClient] ch0 reliable window full for "
+        "client %u (outstanding=%zu window=%zu); deferring in protocol order",
+        clientId, cs.outbound.OutstandingControlBunchCount(),
+        cs.outbound.ControlIssuanceWindowSize());
+    return DeferControlMessage(clientId, bytes);
 }
 
 HandshakeState& ConnectionManager::GetOrCreateHandshake(uint32_t clientId) {
@@ -1411,7 +1756,7 @@ HandshakeState& ConnectionManager::GetOrCreateHandshake(uint32_t clientId) {
 ConnectionManager::ControlState& ConnectionManager::GetControlState(uint32_t clientId) {
     ControlState& cs = m_controlState[clientId];
     if (!cs.reassembler) {
-        // Reassembled control messages are dispatched straight into the client's
+        // Ordered control-bunch payloads are dispatched straight into the client's
         // handshake state machine. Capturing `this` + clientId is safe: both maps
         // outlive no later than this ConnectionManager.
         cs.reassembler = std::make_unique<PacketCodec::ControlReassembler>(
@@ -1761,12 +2106,11 @@ void ConnectionManager::SendActorBootstrap(uint32_t clientId) {
         batch.clear();
         batchBits = 0;
     };
-    // Deliver the PlayerController channel (ch2) FIRST, in its own packet, before the
-    // rest of the flood. The client adopts ch2 (NetPlayerIndex==0) as its LOCAL
-    // PlayerController via HandleClientPlayer - and the team menu only opens when that
-    // adoption succeeds (ShowTeamSelect's LocalPlayer(Player)!=none gate). Burying the
-    // ch2 open in the middle of 138 other opens makes the adoption intermittent; giving
-    // it a clean, standalone packet up front makes it reliable.
+    // Capture f1484 places the PlayerController OPEN immediately before NMT 0x24
+    // in the same packet. Keep that pair under one PacketId/retry ledger: merely
+    // sending two datagrams in this order would let UDP loss expose the ch0 state
+    // transition before HandleClientPlayer adopts the owning controller.
+    std::optional<PacketCodec::Bunch> playerControllerOpen;
     for (const ActorBunchRecord& r : records) {
         if (r.chIndex == 2 && shouldReplay(r.chIndex)) {
             if (!r.bOpen || !r.bReliable || r.bClose) {
@@ -1792,32 +2136,36 @@ void ConnectionManager::SendActorBootstrap(uint32_t clientId) {
                 conn->MarkDisconnected();
                 return;
             }
-            const size_t pendingBefore = cs.pendingReliable.size();
-            (void)SendReliableBunches(
-                clientId, {pcb}); // ch2 standalone, recorded for retransmit
-            if (cs.pendingReliable.size() == pendingBefore) {
-                Logger::Error(
-                    "[ConnectionManager::SendActorBootstrap] client %u could "
-                    "not queue the adopted ch2 open; failing closed",
-                    clientId);
-                conn->MarkDisconnected();
-                return;
-            }
+            playerControllerOpen = std::move(pcb);
             break;
         }
     }
 
-    // Official f1484: ch2 OPEN precedes this control message.
-    SendRawToClient(clientId, kPreActorNmt24);
+    if (!playerControllerOpen) {
+        Logger::Error(
+            "[ConnectionManager::SendActorBootstrap] client %u captured "
+            "bootstrap has no owning ch2 open; failing closed",
+            clientId);
+        conn->MarkDisconnected();
+        return;
+    }
+    if (!PublishBootstrapEntryPacket(
+            clientId, *playerControllerOpen, kPreActorNmt24)) {
+        return;
+    }
 
     for (const ActorBunchRecord& r : records) {
-        if (r.chIndex == 2) continue;   // already sent first, standalone
+        if (r.chIndex == 2) continue;   // already sent in the entry packet
         if (!shouldReplay(r.chIndex)) continue;
         if (r.chIndex == 0) {
             // A ch0 control bunch in the burst rides the normal control path; flush the
             // pending actor batch first so ordering is preserved.
             flushBatch();
-            SendRawToClient(clientId, r.payload);
+            if (!PublishControlMessageImmediately(
+                    clientId, r.payload,
+                    "captured actor-bootstrap ch0 record")) {
+                return;
+            }
             continue;
         }
         PacketCodec::Bunch b;
@@ -1973,12 +2321,12 @@ void ConnectionManager::SendLiveActorBootstrap(uint32_t clientId) {
         return h;
     };
 
-    // Deliver the PlayerController (ch2) FIRST in its own reliable packet. The
-    // header-only open is sufficient for ownership: once the class ref matches the
-    // selected PackageMap, NetPlayerIndex=0 makes HandleClientPlayer bind it to
-    // LocalPlayer_0. Retail Compound dogfood on 2026-07-14 confirmed SetPlayer plus
-    // normal inbound h104/h37 traffic with no captured PC property tail. Keeping
-    // the tail live/minimal avoids replaying Resort location and RPC parameters.
+    // Put the PlayerController OPEN and NMT 0x24 in one reliable packet, matching
+    // capture f1484. The header-only open is sufficient for ownership: once the
+    // class ref matches the selected PackageMap, NetPlayerIndex=0 makes
+    // HandleClientPlayer bind it to LocalPlayer_0. Retail Compound dogfood on
+    // 2026-07-14 confirmed SetPlayer plus normal inbound h104/h37 traffic with no
+    // captured PC property tail.
     {
         auto pc = MakeOpeningActorBunch(kChPC, 1, hdrFor(kClsPC, true), nullptr);
         const auto adopted = cs.ch2Reliable.Adopt(pc.chSequence);
@@ -1992,19 +2340,11 @@ void ConnectionManager::SendLiveActorBootstrap(uint32_t clientId) {
             return;
         }
         cs.actorChType    = 2;
-        const size_t pendingBefore = cs.pendingReliable.size();
-        (void)SendReliableBunches(clientId, {pc});
-        if (cs.pendingReliable.size() == pendingBefore) {
-            Logger::Error(
-                "[ConnectionManager::SendLiveActorBootstrap] client %u could "
-                "not queue the adopted ch2 open; failing closed",
-                clientId);
-            conn->MarkDisconnected();
+        if (!PublishBootstrapEntryPacket(
+                clientId, pc, kPreActorNmt24)) {
             return;
         }
     }
-
-    SendRawToClient(clientId, kPreActorNmt24);
 
     // BATCH the remaining opens (GRI, TeamInfo x2, PRI) into ONE reliable packet.
     // Sending each as its own packet made all five retransmit independently until
@@ -3097,7 +3437,25 @@ void ConnectionManager::TransportKeepAliveTick() {
         // FlushPendingAcks ran earlier in this pump, so this is normally a truly
         // empty packet. BuildAckOnlyPacket is still the correct allocator: it
         // advances the connection's shared outbound PacketId exactly once.
-        SendEncodedPacket(clientId, cs.outbound.BuildAckOnlyPacket());
+        if (!EnsureNextOutboundPacketIdAvailable(
+                clientId, "sending a transport keepalive")) {
+            continue;
+        }
+        if (!EnsureBunchlessAckReferenceSafe(
+                clientId, "sending a transport keepalive")) {
+            continue;
+        }
+        auto keepalive = cs.outbound.BuildAckOnlyPacket();
+        if (!keepalive) {
+            FailCloseControlPublication(
+                clientId,
+                keepalive.error() ==
+                        PacketCodec::OutboundPacketBuildError::PacketTooLarge
+                    ? "oversized keepalive/ACK packet"
+                    : "keepalive PacketId half-window exhaustion");
+            continue;
+        }
+        SendEncodedPacket(clientId, *keepalive);
         Logger::Trace("[ConnectionManager::TransportKeepAliveTick] client %u: sent empty UE3 idle keepalive",
                       clientId);
     }
@@ -3105,7 +3463,7 @@ void ConnectionManager::TransportKeepAliveTick() {
 
 bool ConnectionManager::SendReliableBunches(
     uint32_t clientId, const std::vector<PacketCodec::Bunch>& bunches,
-    uint32_t* sentPacketId) {
+    int64_t* sentPacketSerial) {
     auto conn = GetConnection(clientId);
     if (!conn || conn->IsDisconnected() || bunches.empty()) return false;
     ControlState& cs = GetControlState(clientId);
@@ -3130,26 +3488,58 @@ bool ConnectionManager::SendReliableBunches(
             cs.outboundActorChannels.set(bunch.chIndex);
         }
     }
-    const PacketCodec::Packet pkt = cs.outbound.BuildRawBunchesPacket(bunches);
-    const std::vector<uint8_t> wire =
-        PacketCodec::Encode(pkt, PacketCodec::kServerSendMaxPacketBytes);
-    const bool sent = conn->SendRaw(wire.data(), wire.size());
-    if (sent) {
-        if (sentPacketId) *sentPacketId = pkt.packetId;
-        cs.lastServerSendMs = NowMs();
+    if (!EnsureNextOutboundPacketIdAvailable(
+            clientId, "publishing actor-channel bunches")) {
+        return false;
     }
-    // Record the reliable bunches so we can retransmit until the client acks this packet.
-    std::vector<PacketCodec::Bunch> rel;
-    for (const auto& b : bunches) if (b.bReliable) rel.push_back(b);
-    if (!rel.empty()) {
-        ControlState::SentReliable sr;
-        sr.packetIds.push_back(pkt.packetId);
-        sr.lastSendMs = NowMs();
-        sr.resendCount = 0;
-        sr.bunches = std::move(rel);
-        cs.pendingReliable.push_back(std::move(sr));
+    try {
+        auto built = cs.outbound.BuildRawBunchesPacket(bunches);
+        if (!built) {
+            FailCloseControlPublication(
+                clientId,
+                built.error() ==
+                        PacketCodec::OutboundPacketBuildError::PacketTooLarge
+                    ? "oversized outbound actor packet"
+                    : "outbound PacketId half-window exhaustion");
+            return false;
+        }
+        const PacketCodec::Packet& pkt = *built;
+        const std::vector<uint8_t> wire =
+            PacketCodec::Encode(pkt, PacketCodec::kServerSendMaxPacketBytes);
+
+        // Establish retry ownership before any reliable bunch reaches UDP. If
+        // allocation fails, the session closes with no untracked sequence on
+        // the wire and an unpublished ch2 reservation can be discarded safely.
+        std::vector<PacketCodec::Bunch> reliableBunches;
+        for (const PacketCodec::Bunch& bunch : bunches) {
+            if (bunch.bReliable) reliableBunches.push_back(bunch);
+        }
+        const bool reliableOwned = !reliableBunches.empty();
+        if (reliableOwned) {
+            ControlState::SentReliable pending;
+            pending.packetSerials.push_back(pkt.outboundPacketSerial);
+            pending.lastSendMs = NowMs();
+            pending.resendCount = 0;
+            pending.bunches = std::move(reliableBunches);
+            cs.pendingReliable.push_back(std::move(pending));
+            if (sentPacketSerial) {
+                *sentPacketSerial = pkt.outboundPacketSerial;
+            }
+        }
+
+        const bool sent = conn->SendRaw(wire.data(), wire.size());
+        if (sent) {
+            if (!reliableOwned && sentPacketSerial) {
+                *sentPacketSerial = pkt.outboundPacketSerial;
+            }
+            cs.lastServerSendMs = NowMs();
+        }
+        return reliableOwned || sent;
+    } catch (...) {
+        FailCloseControlPublication(
+            clientId, "actor retry-ledger staging exception");
+        return false;
     }
-    return sent;
 }
 
 std::optional<PacketCodec::OutboundReliableSequencer::Reservation>
@@ -3268,41 +3658,78 @@ void ConnectionManager::OnClientAck(uint32_t clientId, uint32_t ackedPacketId) {
     if (it == m_controlState.end()) return;
     ControlState& cs = it->second;
 
+    const auto resolvedAck = cs.outbound.ResolveOutboundAck(ackedPacketId);
+    if (!resolvedAck) {
+        Logger::Warn(
+            "[OutboundPacketId] client %u sent invalid/future/ambiguous ACK "
+            "wire=%u (error=%u, nextSerial=%lld, unwrapReference=%lld, "
+            "peerAck=%lld); ignored",
+            clientId, ackedPacketId,
+            static_cast<unsigned>(resolvedAck.error()),
+            static_cast<long long>(cs.outbound.NextPacketSerial()),
+            static_cast<long long>(cs.outbound.AckUnwrapReferenceSerial()),
+            static_cast<long long>(cs.outbound.HighestPeerAckSerial()));
+        return;
+    }
+    const int64_t ackedPacketSerial = *resolvedAck;
+
     for (uint8_t retailTeam = 0; retailTeam < 2u; ++retailTeam) {
         auto& publication = cs.pendingTeamReinforcements[retailTeam];
         if (!publication ||
-            std::find(publication->packetIds.begin(),
-                      publication->packetIds.end(),
-                      ackedPacketId) == publication->packetIds.end()) {
+            std::find(publication->packetSerials.begin(),
+                      publication->packetSerials.end(),
+                      ackedPacketSerial) ==
+                publication->packetSerials.end()) {
             continue;
         }
         cs.publishedTeamReinforcements[retailTeam] =
             publication->wireValue;
         Logger::Trace(
             "[ReinforcementReplication] client %u ACKed retail team %u "
-            "h62=%d in packet %u",
+            "h62=%d in packet wire=%u serial=%lld",
             clientId, static_cast<unsigned>(retailTeam),
-            publication->wireValue, ackedPacketId);
+            publication->wireValue, ackedPacketId,
+            static_cast<long long>(ackedPacketSerial));
         publication.reset();
     }
 
     auto& pending = cs.pendingReliable;
-    auto packetWasAcked = [ackedPacketId](
+    auto packetWasAcked = [ackedPacketSerial](
                               const ControlState::SentReliable& reliable) {
-        return std::find(reliable.packetIds.begin(), reliable.packetIds.end(),
-                         ackedPacketId) != reliable.packetIds.end();
+        return std::find(reliable.packetSerials.begin(),
+                         reliable.packetSerials.end(),
+                         ackedPacketSerial) !=
+               reliable.packetSerials.end();
     };
     for (const ControlState::SentReliable& reliable : pending) {
         if (!packetWasAcked(reliable)) continue;
         for (const PacketCodec::Bunch& bunch : reliable.bunches) {
+            if (bunch.bReliable && bunch.chIndex == 0u) {
+                const auto released = cs.outbound.AcknowledgeControlSequence(bunch.chSequence);
+                if (!released) {
+                    Logger::Error(
+                        "[OutboundReliable] client %u ACKed untracked ch0 "
+                        "sequence %u (error=%u); retaining retry ledger and "
+                        "failing closed",
+                        clientId, bunch.chSequence,
+                        static_cast<unsigned>(released.error()));
+                    FailCloseControlPublication(
+                        clientId, "ch0 ACK allocator inconsistency");
+                    return;
+                }
+            }
             if (bunch.bReliable && bunch.chIndex == 2u) {
                 const auto released = cs.ch2Reliable.Release(bunch.chSequence);
                 if (!released) {
-                    Logger::Warn(
+                    Logger::Error(
                         "[OutboundReliable] client %u ACKed untracked ch2 "
-                        "sequence %u (error=%u)",
+                        "sequence %u (error=%u); retaining retry ledger and "
+                        "failing closed",
                         clientId, bunch.chSequence,
                         static_cast<unsigned>(released.error()));
+                    FailCloseCh2Publication(
+                        clientId, "ch2 ACK allocator inconsistency");
+                    return;
                 }
             }
             if (bunch.bReliable) {
@@ -3313,11 +3740,16 @@ void ConnectionManager::OnClientAck(uint32_t clientId, uint32_t ackedPacketId) {
                     const auto released = sequencer->Release(
                         bunch.chSequence);
                     if (!released) {
-                        Logger::Warn(
+                        Logger::Error(
                             "[OwningPawnGraph] client %u ACKed untracked "
-                            "ch%u sequence %u (error=%u)",
+                            "ch%u sequence %u (error=%u); retaining retry "
+                            "ledger and failing closed",
                             clientId, bunch.chIndex, bunch.chSequence,
                             static_cast<unsigned>(released.error()));
+                        FailCloseControlPublication(
+                            clientId,
+                            "owning-pawn ACK allocator inconsistency");
+                        return;
                     }
                 }
             }
@@ -3401,6 +3833,11 @@ void ConnectionManager::OnClientAck(uint32_t clientId, uint32_t ackedPacketId) {
             CompleteOwningPawnGraphClose(clientId);
         }
     }
+
+    // A contiguous ch0 ACK may have collapsed one or many issuance-window
+    // tombstones. Publish deferred control messages immediately in FIFO order.
+    FlushDeferredControlMessages(clientId);
+    TryResumeDeferredClientJoin(clientId);
 }
 
 void ConnectionManager::RetransmitTick() {
@@ -3430,17 +3867,60 @@ void ConnectionManager::RetransmitTick() {
             }
             // Resend the SAME reliable bunches (verbatim, same per-channel ChSequence) in a
             // NEW packet (new PacketId). The client fills the gap or ignores the duplicate.
-            const PacketCodec::Packet pkt = cs.outbound.BuildRawBunchesPacket(sr.bunches);
-            const std::vector<uint8_t> wire =
-                PacketCodec::Encode(pkt, PacketCodec::kServerSendMaxPacketBytes);
-            if (conn->SendRaw(wire.data(), wire.size())) {
-                cs.lastServerSendMs = now;
+            if (!EnsureNextOutboundPacketIdAvailable(
+                    kv.first, "retransmitting reliable bunches")) {
+                break;
             }
-            sr.packetIds.push_back(pkt.packetId);
-            sr.lastSendMs = now;
-            ++sr.resendCount;
-            Logger::Debug("[ConnectionManager::RetransmitTick] client %u: resent %zu reliable bunch(es) attempt %d (pkt %u)",
-                          kv.first, sr.bunches.size(), sr.resendCount, pkt.packetId);
+            try {
+                auto built = cs.outbound.BuildRawBunchesPacket(sr.bunches);
+                if (!built) {
+                    FailCloseControlPublication(
+                        kv.first,
+                        built.error() == PacketCodec::
+                                             OutboundPacketBuildError::
+                                                 PacketTooLarge
+                            ? "oversized reliable retransmit packet"
+                            : "retransmit PacketId half-window exhaustion");
+                    break;
+                }
+                const PacketCodec::Packet& pkt = *built;
+                const std::vector<uint8_t> wire = PacketCodec::Encode(
+                    pkt, PacketCodec::kServerSendMaxPacketBytes);
+
+                // Retry ownership must exist before bytes can leave this
+                // process. A failed UDP handoff remains a valid attempt: the
+                // next timeout will build another packet around the same
+                // reliable bunches, and an ACK for this identity still retires
+                // the ledger if the socket reported a false negative.
+                sr.packetSerials.push_back(pkt.outboundPacketSerial);
+                sr.lastSendMs = now;
+                ++sr.resendCount;
+
+                if (conn->SendRaw(wire.data(), wire.size())) {
+                    cs.lastServerSendMs = now;
+                }
+                Logger::Debug(
+                    "[ConnectionManager::RetransmitTick] client %u: resent "
+                    "%zu reliable bunch(es) attempt %d (pkt %u)",
+                    kv.first, sr.bunches.size(), sr.resendCount, pkt.packetId);
+            } catch (const std::exception& ex) {
+                Logger::Error(
+                    "[ConnectionManager::RetransmitTick] client %u: failed "
+                    "to stage reliable retransmit ownership: %s",
+                    kv.first, ex.what());
+                FailCloseControlPublication(
+                    kv.first, "reliable retransmit staging exception");
+                break;
+            } catch (...) {
+                Logger::Error(
+                    "[ConnectionManager::RetransmitTick] client %u: failed "
+                    "to stage reliable retransmit ownership: unknown "
+                    "exception",
+                    kv.first);
+                FailCloseControlPublication(
+                    kv.first, "reliable retransmit staging exception");
+                break;
+            }
         }
     }
 }
@@ -3459,7 +3939,25 @@ void ConnectionManager::FlushPendingAcks() {
         if (now - cs.lastAckFlushMs < 20 && nAcks < 32) continue;
         auto conn = GetConnection(kv.first);
         if (!conn) continue;
-        SendEncodedPacket(kv.first, cs.outbound.BuildAckOnlyPacket());
+        if (!EnsureNextOutboundPacketIdAvailable(
+                kv.first, "flushing packet ACKs")) {
+            continue;
+        }
+        if (!EnsureBunchlessAckReferenceSafe(
+                kv.first, "flushing packet ACKs")) {
+            continue;
+        }
+        auto ackPacket = cs.outbound.BuildAckOnlyPacket();
+        if (!ackPacket) {
+            FailCloseControlPublication(
+                kv.first,
+                ackPacket.error() ==
+                        PacketCodec::OutboundPacketBuildError::PacketTooLarge
+                    ? "oversized ACK-only packet"
+                    : "ACK flush PacketId half-window exhaustion");
+            continue;
+        }
+        SendEncodedPacket(kv.first, *ackPacket);
         cs.lastAckFlushMs = now;
     }
 }
@@ -7411,8 +7909,8 @@ void ConnectionManager::DispatchInboundActorBunch(
     uint32_t clientId, const PacketCodec::Bunch& bunch,
     bool suppressOwningGraphSemantics,
     bool suppressReleasedCohort) {
-    // ch0 has different semantics: ControlReassembler concatenates ordered
-    // reliable fragments into complete NMT messages. Never let it enter the
+    // ch0 has different semantics: ControlReassembler orders/deduplicates reliable
+    // bunches and dispatches each payload to HandshakeState. Never let it enter the
     // actor sequencer, even if a future caller bypasses ParseIncomingControl.
     if (bunch.chIndex == 0) {
         Logger::Warn(
@@ -9537,7 +10035,7 @@ bool ConnectionManager::ParseIncomingControl(uint32_t clientId, const std::vecto
     // first packet onward. Small handshake messages are ambiguous across several
     // 14-bit bounds; the saturated post-login NMT_Have batches pin 1280 exactly.
     // Using 2048 here desynchronizes those batches into phantom actor channels and
-    // reliable ch0 gaps, so the later real NMT_Join can never be reassembled.
+    // stalls the reliable ch0 cursor before the later NMT_Join can be dispatched.
     const uint32_t maxPacketBytes = PacketCodec::kClientSendMaxPacketBytes;
     PacketCodec::Packet pkt =
         PacketCodec::Decode(datagram.data(), datagram.size(), maxPacketBytes);
@@ -9549,8 +10047,8 @@ bool ConnectionManager::ParseIncomingControl(uint32_t clientId, const std::vecto
 
     // A close on ch0 ends the entire UE3 connection, unlike actor-channel
     // closes.  Classify it before UE3 marking, ACK queuing, reliable-ack
-    // processing, or reassembly so teardown can never emit more bytes or treat a
-    // close payload as an NMT message.  Malformed ch0 closes consume the packet
+    // processing, or control sequencing so teardown can never emit more bytes or
+    // treat a close payload as an NMT message.  Malformed ch0 closes consume the packet
     // but leave the existing session intact; malformed dominates mixed packets.
     const PacketCodec::PeerCloseClassification close =
         PacketCodec::ClassifyPeerClose(pkt);
@@ -9606,126 +10104,157 @@ bool ConnectionManager::ParseIncomingControl(uint32_t clientId, const std::vecto
 
     ControlState& cs = GetControlState(clientId);
     cs.inboundPacketDispatchActive = true;
+    struct DispatchFlagReset final {
+        bool& active;
+        ~DispatchFlagReset() noexcept { active = false; }
+    } dispatchFlagReset{cs.inboundPacketDispatchActive};
 
-    // Keep a bounded modular PacketId floor for the current fixed-channel
-    // incarnation. The close-ACK packet establishes the initial floor. As
-    // newer traffic advances, retain a normal reordering window while making
-    // progress across PacketId wrap without ever admitting packets from the
-    // prior incarnation.
-    constexpr uint32_t kOwningGraphInboundPacketReorderWindow = 64u;
-    constexpr uint32_t kPacketIdModulus =
-        static_cast<uint32_t>(kMaxPacketId);
-    const auto packetForwardDistance = [](uint32_t from, uint32_t to) {
-        constexpr uint32_t modulus = static_cast<uint32_t>(kMaxPacketId);
-        return (to + modulus - from) % modulus;
-    };
-    if (cs.owningPawnGraphInboundPacketFloorValid) {
-        const uint32_t distance = packetForwardDistance(
-            cs.owningPawnGraphInboundPacketFloor, pkt.packetId);
-        if (distance > kOwningGraphInboundPacketReorderWindow &&
-            distance < kPacketIdModulus / 2u) {
-            cs.owningPawnGraphInboundPacketFloor =
-                (pkt.packetId + kPacketIdModulus -
-                 kOwningGraphInboundPacketReorderWindow) %
-                kPacketIdModulus;
-        }
-    }
-
-    // Acknowledge this received packet ONLY if it carried bunch data. Acking a
-    // pure-ack packet would make the peer ack our ack, and us ack that, forever
-    // (an infinite ack ping-pong with no data - observed against the live client).
-    // UE3 only acks packets that delivered bunches. The ack rides on the next
-    // outbound packet (e.g. the handshake response), or a standalone ack below.
-    if (!pkt.bunches.empty()) {
-        cs.outbound.QueueAck(pkt.packetId);
-    }
-
-    // pkt.acks confirm OUR reliable bunches arrived: clear any pending reliable
-    // bunch-set that rode in an acked packet so RetransmitTick stops resending it.
-    for (uint32_t ackedId : pkt.acks) {
-        OnClientAck(clientId, ackedId);
-    }
-
-    // Feed control-channel bunches to the reassembler. Complete messages are
-    // dispatched to the handshake, which may emit responses via SendRawToClient
-    // (draining the queued ack onto the response packet).
-    // Per-packet dispatch backstop. The bunch count is already bounded by the
-    // datagram size (a single inbound datagram is <= the receive buffer), but cap
-    // the dispatch loop explicitly so a pathological packet can't drive an outsized
-    // amount of work. The cap is far above any decodable datagram's real bunch count,
-    // so valid handshake/bootstrap/actor traffic is never truncated.
-    constexpr size_t kMaxBunchesPerPacket = 4096;
-    size_t processed = 0;
-    for (const PacketCodec::Bunch& b : pkt.bunches) {
-        if (++processed > kMaxBunchesPerPacket) {
-            Logger::Warn("[ConnectionManager::ParseIncomingControl] client %u: packet %u carried %zu bunches (> cap %zu), dropping remainder",
-                         clientId, pkt.packetId, pkt.bunches.size(), kMaxBunchesPerPacket);
-            break;
-        }
-        const bool fixedGraphChannel =
-            OwningPawnGraphChannelIndex(b.chIndex).has_value();
-        const uint32_t graphPacketDistance =
-            cs.owningPawnGraphInboundPacketFloorValid
-            ? packetForwardDistance(
-                  cs.owningPawnGraphInboundPacketFloor, pkt.packetId)
-            : 1u;
-        const bool fixedGraphSemanticsRetiredInThisPacket =
-            fixedGraphChannel && cs.owningPawnGraphCompletionDeferred;
-        const bool fixedGraphPacketAtOrBeforeFloor =
-            fixedGraphChannel &&
-            cs.owningPawnGraphInboundPacketFloorValid &&
-            (graphPacketDistance == 0u ||
-             graphPacketDistance >= kPacketIdModulus / 2u);
-        if (fixedGraphSemanticsRetiredInThisPacket ||
-            fixedGraphPacketAtOrBeforeFloor) {
-            if (b.bReliable) {
-                DispatchInboundActorBunch(
-                    clientId, b,
-                    /*suppressOwningGraphSemantics=*/true,
-                    /*suppressReleasedCohort=*/
-                        fixedGraphSemanticsRetiredInThisPacket);
-            } else {
-                Logger::Info(
-                    "[OwningPawnGraph] client %u dropped retired-incarnation "
-                    "unreliable ch%u bunch from packet %u (floor %u, "
-                    "close ACK in packet=%u)",
-                    clientId, b.chIndex, pkt.packetId,
-                    cs.owningPawnGraphInboundPacketFloor,
-                    fixedGraphSemanticsRetiredInThisPacket ? 1u : 0u);
+    try {
+        // Keep a bounded modular PacketId floor for the current fixed-channel
+        // incarnation. The close-ACK packet establishes the initial floor. As
+        // newer traffic advances, retain a normal reordering window while making
+        // progress across PacketId wrap without ever admitting packets from the
+        // prior incarnation.
+        constexpr uint32_t kOwningGraphInboundPacketReorderWindow = 64u;
+        constexpr uint32_t kPacketIdModulus =
+            static_cast<uint32_t>(kMaxPacketId);
+        const auto packetForwardDistance = [](uint32_t from, uint32_t to) {
+            constexpr uint32_t modulus = static_cast<uint32_t>(kMaxPacketId);
+            return (to + modulus - from) % modulus;
+        };
+        if (cs.owningPawnGraphInboundPacketFloorValid) {
+            const uint32_t distance = packetForwardDistance(
+                cs.owningPawnGraphInboundPacketFloor, pkt.packetId);
+            if (distance > kOwningGraphInboundPacketReorderWindow &&
+                distance < kPacketIdModulus / 2u) {
+                cs.owningPawnGraphInboundPacketFloor =
+                    (pkt.packetId + kPacketIdModulus -
+                     kOwningGraphInboundPacketReorderWindow) %
+                    kPacketIdModulus;
             }
-            if (conn && conn->IsDisconnected()) break;
-            continue;
         }
-        if (b.chIndex == 0) {
-            cs.reassembler->OnBunch(b);          // control channel (handshake/NMT)
-        } else if (cs.mapTravelPending) {
-            // Keep packet ACK and ch0 processing alive so ClientTravel and every
-            // earlier reliable can drain. Actor RPCs still describe the old
-            // world, however, and must not mutate the freshly loaded server map.
-            // ResetEstablishedSessionForFreshHandshake runs before this decode;
-            // a genuine reconnect therefore owns a new ControlState with this
-            // flag clear and is not suppressed here.
-            Logger::Trace(
-                "[ClientTravel] client %u sent old-world ch%u traffic while "
-                "travel is pending; acknowledged packet but ignored bunch",
-                clientId, b.chIndex);
-        } else if (b.chIndex == 1) {
-            // Channel 1 is reserved/non-actor in UE3. Preserve the previous
-            // direct dispatch behavior, but never give it actor sequencing state.
-            DecodeInboundActorBunch(clientId, b);
-        } else {
-            DispatchInboundActorBunch(clientId, b); // ch>=2 actor-channel RPCs
-        }
-        // Fail-closed handlers deliberately invalidate the entire session. Do
-        // not let later bunches in the same datagram commit unrelated menu,
-        // team, role, or combat mutations after that terminal boundary.
-        if (conn && conn->IsDisconnected()) break;
-    }
 
-    cs.inboundPacketDispatchActive = false;
-    if (cs.owningPawnGraphCompletionDeferred) {
+        // Acknowledge this received packet ONLY if it carried bunch data. Acking a
+        // pure-ack packet would make the peer ack our ack, and us ack that, forever
+        // (an infinite ack ping-pong with no data - observed against the live client).
+        // UE3 only acks packets that delivered bunches. The ack rides on the next
+        // outbound packet (e.g. the handshake response), or a standalone ack below.
+        if (!pkt.bunches.empty()) {
+            cs.outbound.QueueAck(pkt.packetId);
+        }
+
+        // pkt.acks confirm OUR reliable bunches arrived: clear any pending reliable
+        // bunch-set that rode in an acked packet so RetransmitTick stops resending it.
+        for (uint32_t ackedId : pkt.acks) {
+            OnClientAck(clientId, ackedId);
+            // An allocator inconsistency is a terminal protocol boundary. Do
+            // not dispatch this packet's bunches (or even process a later ACK)
+            // after OnClientAck has failed the session closed.
+            if (conn && conn->IsDisconnected()) {
+                cs.owningPawnGraphCompletionDeferred = false;
+                return true;
+            }
+        }
+
+        // Feed control-channel bunches to the reassembler. Each ordered bunch payload
+        // is dispatched to the handshake, which may emit responses via SendRawToClient
+        // (draining the queued ack onto the response packet).
+        // Per-packet dispatch backstop. The bunch count is already bounded by the
+        // datagram size (a single inbound datagram is <= the receive buffer), but cap
+        // the dispatch loop explicitly so a pathological packet can't drive an outsized
+        // amount of work. The cap is far above any decodable datagram's real bunch count,
+        // so valid handshake/bootstrap/actor traffic is never truncated.
+        constexpr size_t kMaxBunchesPerPacket = 4096;
+        size_t processed = 0;
+        for (const PacketCodec::Bunch& b : pkt.bunches) {
+            if (++processed > kMaxBunchesPerPacket) {
+                Logger::Warn("[ConnectionManager::ParseIncomingControl] client %u: packet %u carried %zu bunches (> cap %zu), dropping remainder",
+                             clientId, pkt.packetId, pkt.bunches.size(), kMaxBunchesPerPacket);
+                break;
+            }
+            const bool fixedGraphChannel =
+                OwningPawnGraphChannelIndex(b.chIndex).has_value();
+            const uint32_t graphPacketDistance =
+                cs.owningPawnGraphInboundPacketFloorValid
+                ? packetForwardDistance(
+                      cs.owningPawnGraphInboundPacketFloor, pkt.packetId)
+                : 1u;
+            const bool fixedGraphSemanticsRetiredInThisPacket =
+                fixedGraphChannel && cs.owningPawnGraphCompletionDeferred;
+            const bool fixedGraphPacketAtOrBeforeFloor =
+                fixedGraphChannel &&
+                cs.owningPawnGraphInboundPacketFloorValid &&
+                (graphPacketDistance == 0u ||
+                 graphPacketDistance >= kPacketIdModulus / 2u);
+            if (fixedGraphSemanticsRetiredInThisPacket ||
+                fixedGraphPacketAtOrBeforeFloor) {
+                if (b.bReliable) {
+                    DispatchInboundActorBunch(
+                        clientId, b,
+                        /*suppressOwningGraphSemantics=*/true,
+                        /*suppressReleasedCohort=*/
+                            fixedGraphSemanticsRetiredInThisPacket);
+                } else {
+                    Logger::Info(
+                        "[OwningPawnGraph] client %u dropped retired-incarnation "
+                        "unreliable ch%u bunch from packet %u (floor %u, "
+                        "close ACK in packet=%u)",
+                        clientId, b.chIndex, pkt.packetId,
+                        cs.owningPawnGraphInboundPacketFloor,
+                        fixedGraphSemanticsRetiredInThisPacket ? 1u : 0u);
+                }
+                if (conn && conn->IsDisconnected()) break;
+                continue;
+            }
+            if (b.chIndex == 0) {
+                cs.reassembler->OnBunch(b);          // control channel (handshake/NMT)
+            } else if (cs.mapTravelPending) {
+                // Keep packet ACK and ch0 processing alive so ClientTravel and every
+                // earlier reliable can drain. Actor RPCs still describe the old
+                // world, however, and must not mutate the freshly loaded server map.
+                // ResetEstablishedSessionForFreshHandshake runs before this decode;
+                // a genuine reconnect therefore owns a new ControlState with this
+                // flag clear and is not suppressed here.
+                Logger::Trace(
+                    "[ClientTravel] client %u sent old-world ch%u traffic while "
+                    "travel is pending; acknowledged packet but ignored bunch",
+                    clientId, b.chIndex);
+            } else if (b.chIndex == 1) {
+                // Channel 1 is reserved/non-actor in UE3. Preserve the previous
+                // direct dispatch behavior, but never give it actor sequencing state.
+                DecodeInboundActorBunch(clientId, b);
+            } else {
+                DispatchInboundActorBunch(clientId, b); // ch>=2 actor-channel RPCs
+            }
+            // Fail-closed handlers deliberately invalidate the entire session. Do
+            // not let later bunches in the same datagram commit unrelated menu,
+            // team, role, or combat mutations after that terminal boundary.
+            if (conn && conn->IsDisconnected()) break;
+        }
+
+        cs.inboundPacketDispatchActive = false;
+        if (cs.owningPawnGraphCompletionDeferred) {
+            cs.owningPawnGraphCompletionDeferred = false;
+            CompleteOwningPawnGraphClose(clientId, pkt.packetId);
+        }
+        TryResumeDeferredClientJoin(clientId);
+    } catch (const std::exception& ex) {
+        // The current packet may have partially mutated game state. Retrying it
+        // against a half-committed lifecycle is less safe than retiring only this
+        // protocol session. The scope guard always clears the dispatch latch.
         cs.owningPawnGraphCompletionDeferred = false;
-        CompleteOwningPawnGraphClose(clientId, pkt.packetId);
+        if (conn && !conn->IsDisconnected()) conn->MarkDisconnected();
+        Logger::Error("[ConnectionManager::ParseIncomingControl] client %u dispatch "
+                      "threw '%s'; retiring protocol session",
+                      clientId, ex.what());
+        return true;
+    } catch (...) {
+        cs.owningPawnGraphCompletionDeferred = false;
+        if (conn && !conn->IsDisconnected()) conn->MarkDisconnected();
+        Logger::Error("[ConnectionManager::ParseIncomingControl] client %u dispatch "
+                      "threw a non-standard exception; retiring protocol session",
+                      clientId);
+        return true;
     }
 
     // NOTE: acks are NOT flushed here per-packet (that produced an S2C ack-storm that

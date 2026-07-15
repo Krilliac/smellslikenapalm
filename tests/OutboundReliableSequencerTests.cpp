@@ -30,7 +30,8 @@ TEST(OutboundReliableSequencer, StartsUninitializedAndRejectsOperations) {
     EXPECT_FALSE(sequencer.NextSequence().has_value());
     EXPECT_EQ(sequencer.OutstandingCount(), 0u);
     EXPECT_EQ(sequencer.IssuanceWindowSize(), 0u);
-    EXPECT_EQ(sequencer.AvailableCapacity(), 511u);
+    EXPECT_EQ(sequencer.AvailableCapacity(),
+              OutboundReliableSequencer::kMaximumOutstanding);
     ExpectError(sequencer.ReserveBatch(1u),
                 OutboundReliableSequenceError::Uninitialized);
     ExpectError(sequencer.Release(0u),
@@ -95,7 +96,7 @@ TEST(OutboundReliableSequencer, AdoptsExternalBootstrapAndValidatesDuplicates) {
     EXPECT_EQ(sequencer.OutstandingCount(), 2u);
 }
 
-TEST(OutboundReliableSequencer, EnforcesHalfCycleOutstandingLimitAtomically) {
+TEST(OutboundReliableSequencer, EnforcesUe3ReliableBufferLimitAtomically) {
     OutboundReliableSequencer sequencer;
     ASSERT_TRUE(sequencer.Seed(0u).has_value());
 
@@ -109,8 +110,10 @@ TEST(OutboundReliableSequencer, EnforcesHalfCycleOutstandingLimitAtomically) {
     const auto full =
         sequencer.ReserveBatch(OutboundReliableSequencer::kMaximumOutstanding);
     ASSERT_TRUE(full.has_value());
-    ASSERT_EQ(full->size(), 511u);
-    EXPECT_EQ(sequencer.OutstandingCount(), 511u);
+    ASSERT_EQ(full->size(),
+              OutboundReliableSequencer::kMaximumOutstanding);
+    EXPECT_EQ(sequencer.OutstandingCount(),
+              OutboundReliableSequencer::kMaximumOutstanding);
     EXPECT_EQ(sequencer.AvailableCapacity(), 0u);
     ASSERT_TRUE(sequencer.NextSequence().has_value());
     const uint32_t cursorAtLimit = *sequencer.NextSequence();
@@ -124,12 +127,14 @@ TEST(OutboundReliableSequencer, EnforcesHalfCycleOutstandingLimitAtomically) {
                     std::numeric_limits<size_t>::max()),
                 OutboundReliableSequenceError::OutstandingLimit);
     EXPECT_EQ(*sequencer.NextSequence(), cursorAtLimit);
-    EXPECT_EQ(sequencer.OutstandingCount(), 511u);
+    EXPECT_EQ(sequencer.OutstandingCount(),
+              OutboundReliableSequencer::kMaximumOutstanding);
 
     ASSERT_TRUE(sequencer.Release(full->front()).has_value());
     const auto replacement = sequencer.ReserveBatch(1u);
     ASSERT_TRUE(replacement.has_value());
-    EXPECT_EQ(sequencer.OutstandingCount(), 511u);
+    EXPECT_EQ(sequencer.OutstandingCount(),
+              OutboundReliableSequencer::kMaximumOutstanding);
 }
 
 TEST(OutboundReliableSequencer, EmptyBatchFailureDoesNotMutateState) {
@@ -173,7 +178,7 @@ TEST(OutboundReliableSequencer,
     EXPECT_EQ(sequencer.NextSequence(), nextBefore);
 }
 
-TEST(OutboundReliableSequencer, OldGapCapsForwardIssuanceAtHalfCycle) {
+TEST(OutboundReliableSequencer, OldGapCapsForwardIssuanceAtReliableBuffer) {
     OutboundReliableSequencer sequencer;
     ASSERT_TRUE(sequencer.Seed(0u).has_value());
 
@@ -184,8 +189,8 @@ TEST(OutboundReliableSequencer, OldGapCapsForwardIssuanceAtHalfCycle) {
 
     // ACK successors out of order while retaining sequence 1. They no longer
     // need retransmission, but they must remain in the issuance window until
-    // the oldest gap closes or the cursor could advance into ambiguous modulo
-    // ordering at the receiver.
+    // the oldest gap closes or the sender could exceed UE3's ordinary reliable
+    // record window at the receiver.
     for (size_t index = 0;
          index < OutboundReliableSequencer::kMaximumOutstanding - 1u;
          ++index) {
@@ -195,23 +200,25 @@ TEST(OutboundReliableSequencer, OldGapCapsForwardIssuanceAtHalfCycle) {
         ASSERT_TRUE(sequencer.Release(successor->front()).has_value());
     }
     ASSERT_TRUE(sequencer.NextSequence().has_value());
-    EXPECT_EQ(*sequencer.NextSequence(), 512u);
+    EXPECT_EQ(*sequencer.NextSequence(), 128u);
     EXPECT_EQ(sequencer.OutstandingCount(), 1u);
-    EXPECT_EQ(sequencer.IssuanceWindowSize(), 511u);
+    EXPECT_EQ(sequencer.IssuanceWindowSize(),
+              OutboundReliableSequencer::kMaximumOutstanding);
     EXPECT_EQ(sequencer.AvailableCapacity(), 0u);
 
     ExpectError(sequencer.ReserveBatch(1u),
                 OutboundReliableSequenceError::OutstandingLimit);
-    EXPECT_EQ(*sequencer.NextSequence(), 512u);
+    EXPECT_EQ(*sequencer.NextSequence(), 128u);
     EXPECT_EQ(sequencer.OutstandingCount(), 1u);
 
     ASSERT_TRUE(sequencer.Release(1u).has_value());
     EXPECT_EQ(sequencer.IssuanceWindowSize(), 0u);
-    EXPECT_EQ(sequencer.AvailableCapacity(), 511u);
+    EXPECT_EQ(sequencer.AvailableCapacity(),
+              OutboundReliableSequencer::kMaximumOutstanding);
     const auto resumed = sequencer.ReserveBatch(1u);
     ASSERT_TRUE(resumed.has_value());
     ASSERT_EQ(resumed->size(), 1u);
-    EXPECT_EQ(resumed->front(), 512u);
+    EXPECT_EQ(resumed->front(), 128u);
 }
 
 TEST(OutboundReliableSequencer, OutOfOrderAcksReclaimOnlyContiguousPrefix) {
@@ -443,7 +450,8 @@ TEST(OutboundReliableSequencer, ReleaseValidatesAckAndClearDropsAllState) {
     EXPECT_FALSE(sequencer.NextSequence().has_value());
     EXPECT_EQ(sequencer.OutstandingCount(), 0u);
     EXPECT_FALSE(sequencer.IsInFlight(11u));
-    EXPECT_EQ(sequencer.AvailableCapacity(), 511u);
+    EXPECT_EQ(sequencer.AvailableCapacity(),
+              OutboundReliableSequencer::kMaximumOutstanding);
 }
 
 RS2V_TEST_MAIN()

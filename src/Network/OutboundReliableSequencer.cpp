@@ -138,8 +138,11 @@ OutboundReliableSequencer::CanReserveBatch(size_t count) const {
         return std::unexpected(
             OutboundReliableSequenceError::InvalidBatchSize);
     }
-    // Subtraction avoids overflowing size_t for a hostile/direct huge count.
-    if (count > kMaximumOutstanding - m_issuanceWindow.size()) {
+    // Subtraction avoids overflowing size_t for a hostile/direct huge count. The
+    // first guard also fails closed if an invariant violation ever leaves a stale
+    // window larger than UE3's ordinary reliable-record capacity.
+    if (m_issuanceWindow.size() > kMaximumOutstanding ||
+        count > kMaximumOutstanding - m_issuanceWindow.size()) {
         return std::unexpected(
             OutboundReliableSequenceError::OutstandingLimit);
     }

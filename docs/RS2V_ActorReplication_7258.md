@@ -7,7 +7,7 @@ client actually spawns, deploys, moves and fights:
   - Session A (primary): `udp.port==57867 && udp.port==7777` (~59k frames).
   - Session B (corroboration): `udp.port==56400 && udp.port==7777`.
 
-Decoder: `tools/mock_client.py` (`mc.decode_packet(data, bd_max=BD)`), **bd_max=16384
+Decoder: `tools/mock_client.py` (`mc.decode_packet(data, bd_max=BD)`), **bd_max=10240
 for C->S, bd_max=12000 for S->C** (asymmetric MaxPacket, already RE'd). Bunch framing
 and the control-channel handshake are documented in
 `docs/RS2V_ControlChannel_WireSpec_7258.md` and
@@ -420,8 +420,9 @@ ch0 `NMT 0x23` heartbeat, and opening new actor channels as actors become releva
 - **RESOLVED [H]:** NetGUID codec = 1 flag bit + minimal-bit `SerializeInt` (max 1023
   static / 0x80000000 export), `SerializeObject @0x140696070` (§2.1). Property/function
   handle = `SerializeInt(handle, max = ClassNetCache field count)` (per-class runtime
-  max, §3.1). Bunch `BunchDataBits` max = `[NetConnection+0x10c] << 3` (negotiated
-  MaxPacket*8, runtime — read conn+0x10c live; it is **not** a hardcoded 1500/2048).
+  max, §3.1). The retail engine reads BunchDataBits max from
+  `[NetConnection+0x10c] << 3`; this captured build is pinned directionally from the
+  first packet to C2S 10240 and S2C 12000, with no small handshake-phase switch.
   Bunch header field maxes: ChIndex `SerializeInt(1023)`, ChSequence `SerializeInt(1024)`,
   ChType `SerializeInt(8)` (`SendRawBunch @0x1404a79d0`).
 - **OPEN [M]:** whether `SerializeNewActor` reads Location/Rotation inside the header
@@ -443,7 +444,7 @@ PCAP="D:\RE-Tools\rs2_realserver_capture.pcapng"
 ```
 ```python
 import sys; sys.path.insert(0, r"D:\smellslikenapalm\tools"); import mock_client as mc
-mc.decode_packet(data, bd_max=16384)   # C->S
+mc.decode_packet(data, bd_max=10240)   # C->S
 mc.decode_packet(data, bd_max=12000)   # S->C  (srcport==7777)
 # milestone landmarks (session A): join f1477, actor burst f1484, first ServerMove f1522
 # session B: join f60857, burst f60859, first ServerMove f60867

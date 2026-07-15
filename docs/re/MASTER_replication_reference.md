@@ -23,7 +23,7 @@ Companion files (do not duplicate — cite):
 | Thing | Value | Source |
 |---|---|---|
 | S2C decode bound `bd_max` | 12000 (MaxPacket 1500B) | [H] |
-| C2S decode bound `bd_max` | 16384 | [H] |
+| C2S decode bound `bd_max` | 10240 (MaxPacket 1280B) | [H] |
 | Bunch chIndex field | `SerializeInt(ci, 1023)` | [H] |
 | Bunch chSequence (reliable) | `SerializeInt(sq, 1024)` | [H] |
 | `MAX_OBJECT_INDEX` (static ref) | `0x80000000` (1<<31) → 31 ranged bits | [S] UnCoreNet.h:100 |
@@ -295,10 +295,10 @@ reliable, BIDIRECTIONAL, rolling trailing nonce.
 ---
 
 ## 8. Tooling / reproduce
-- `tools/mock_client.py` — `decode_packet(data, bd_max=12000 S2C / 16384 C2S)`.
+- `tools/mock_client.py` — `decode_packet(data, bd_max=12000 S2C / 10240 C2S)`.
 - `tools/netfields_all.ps1 -Class <ALL|Class>` — regenerate handle+type tables.
 - `tools/gen_actor_bootstrap.py` — capture→`data/actor_bootstrap.bin` (record:
   `u16 chIndex | u8 chType | u8 flags(b0 bOpen,b1 bClose,b2 bReliable,b3 bControl) | u16 chSeq | u32 bunchDataBits | payload`).
-- Consumer: `ConnectionManager::SendActorBootstrap` (src/Network/ConnectionManager.cpp:631).
+- Consumers: `ConnectionManager::SendActorBootstrap` / `SendLiveActorBootstrap`.
 - Builders: `ActorRepl::WriteActorOpenHeader` + `WriteProp*` (src/Network/ActorReplication.h).
 - Wire filters: S2C `udp.srcport==7777 && udp.dstport==57867`; C2S swap.

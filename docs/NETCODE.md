@@ -37,8 +37,13 @@ PacketCodec::Decode  ───────────────────�
   └─ ch≥2 bunches → DecodeInboundActorBunch              (actor-channel RPCs: SelectTeam…)
 ```
 
-Outbound is the mirror: a caller builds bunches → `PacketAssembler::BuildRawBunches…` stamps
-PacketId/ChSequence/acks → `PacketCodec::Encode` → `UDPSocket::SendRaw`.
+Outbound is the mirror: a caller builds a complete ch0 message or actor bunches,
+and `PacketAssembler` stamps the monotonic internal PacketId (projected to 14 bits
+on the wire). Every builder validates the complete framed packet against the
+direction-correct MaxPacket and packs only the largest FIFO prefix of queued ACKs
+that fits. The ch0 path additionally owns the modulo-1024 sequence plus 127-record
+ACK window. `PacketCodec::Encode` then feeds the already-bounded wire image to
+`UDPSocket::SendRaw`.
 
 Three things never mix:
 1. **Framing** (`PacketCodec`) — PacketId, acks, bunch headers, BunchDataBits. Knows nothing about NMT or actors.
@@ -122,7 +127,7 @@ The decoded `Bunch` is `{bControl,bOpen,bClose,bReliable,chIndex,chSequence,chTy
 (`PacketCodec.h:64`). `payload` holds the bunch data bits packed LSB-first; `payloadBits` is
 the exact count.
 
-### 1.3 BunchDataBits / MaxPacket — the phase- and direction-dependent bound
+### 1.3 BunchDataBits / MaxPacket — the direction-dependent bound
 
 `BunchDataBits = SerializeInt(MaxPacket*8)`. The **width** of that `SerializeInt`, and thus
 where the payload starts, depends on `MaxPacket`. This is the single most error-prone
@@ -130,24 +135,24 @@ constant in the codec. Values (`PacketCodec.h:38-60`):
 
 | Constant | Value | Bound | Used for |
 |---|---|---|---|
-| `kHandshakeMaxPacketBytes` | 8 | 64 | historical StatelessConnect default (see note) |
-| `kNmtMaxPacketBytes` | 2048 | 16384 | **DECODE all inbound (C2S)** |
+| `kHandshakeMaxPacketBytes` | 8 | 64 | legacy codec/fixture default only (see note) |
+| `kClientSendMaxPacketBytes` / `kNmtMaxPacketBytes` | 1280 | 10240 | **DECODE all inbound (C2S)** |
 | `kServerSendMaxPacketBytes` | 1500 | 12000 | **ENCODE all outbound (S2C, we are the server)** |
 
 Key facts, hard-won (see the long comments at `PacketCodec.h:29-60` and
 `ConnectionManager.cpp:1029-1040`):
 
-- **MaxPacket is asymmetric.** The retail client encodes its C2S bunches at MaxPacket 2048
-  (bound 16384 — proven byte-exact against the Login version fields 7038/7258, the SteamID,
-  rate 80000, and the login URL). A dedicated server encodes S2C at ~MTU (1500 → bound
-  12000), which is what the client expects from a server. So: **decode inbound at 16384,
-  encode outbound at 12000.**
+- **MaxPacket is asymmetric.** Saturated retail package-inventory traffic pins the
+  client's C2S MaxPacket at 1280 (bound 10240); smaller handshake/Login packets were
+  ambiguous across several bounds. A dedicated server encodes S2C at ~MTU
+  (1500 → bound 12000), which is what the client expects from a server. So:
+  **decode inbound at 10240, encode outbound at 12000.**
 - **There is no small-bound "handshake phase" on decode.** The client frames BunchDataBits
-  at 2048 from the very first packet, including the StatelessConnect bunches. Decoding the
+  at 1280 from the very first packet, including the StatelessConnect bunches. Decoding the
   handshake bunches at the old bound 64 misaligned them (the NMT byte landed in the 2nd
   byte) and mis-keyed HandshakeStart/Response. `ParseIncomingControl` therefore **always**
-  decodes at `kNmtMaxPacketBytes` (`ConnectionManager.cpp:1038`). `kHandshakeMaxPacketBytes`
-  is retained only as the codec's API default.
+  decodes at `kClientSendMaxPacketBytes`. `kHandshakeMaxPacketBytes` is retained only as
+  the codec's legacy fixture/API default.
 - One bit too narrow (1024 → bound 8192, width 13) right-shifts the entire NMT payload by
   one bit per bunch and mis-reads every byte (Hello `0x00`→`0x20`, Login `0x10`→`0x08`).
 
@@ -160,8 +165,15 @@ never alters the wire bytes or parse result — observability only.
 ## 2. The StatelessConnect handshake
 
 Driven by `HandshakeState` (`src/Network/HandshakeState.{h,cpp}`), one instance per
-connection, fed complete ch0 control messages by the reassembler. It **uses** the
-`ControlChannel` message codec; it never re-implements framing.
+connection, fed ordered/deduplicated ch0 bunch payloads by the reassembler. The
+current retail path treats each bunch payload as one handshake/NMT callback and
+does no cross-bunch concatenation. It **uses** the `ControlChannel` message codec;
+it never re-implements framing.
+
+Outbound ch0 uses the same UE3 `RELIABLE_BUFFER=128` rule as actor channels: at most
+127 ordinary reliable records may occupy the issuance window. Out-of-order ACKed
+successors remain tombstones until the oldest gap clears, so retransmission cannot let
+the sender lap an unacknowledged control message across modulo-1024 wrap.
 
 There are two sub-phases. Until the StatelessConnect handshake completes, inbound control
 messages route by **subtype** (the payload's first byte), not the NMT switch
@@ -221,18 +233,36 @@ ChSequence values used by ch2 actor bunches:
 
 ```cpp
 struct SentReliable {
-    std::vector<uint32_t> packetIds;          // every PacketId this set has gone out in
+    std::vector<int64_t> packetSerials;       // every monotonic PacketId attempt
     uint64_t lastSendMs;
     int      resendCount;
     std::vector<PacketCodec::Bunch> bunches;  // the reliable bunches, verbatim
 };
 ```
 
-**Reserve and record.** `OutboundReliableSequencer::ReserveBatch` reserves a contiguous
+**ch0 prepare, record, and commit.** `PacketAssembler::PrepareControlMessagePackets`
+reserves one ch0 sequence without publishing it, constructs exactly one complete bunch,
+and verifies the encoded packet (headers, queued ACKs, terminator, and padding included)
+against the 1500-byte S2C MaxPacket. It includes only the largest FIFO prefix of queued
+ACKs that fits; the suffix remains queued. `TryPublishControlMessage` first inserts a
+`SentReliable` entry keyed by the prepared packet's monotonic serial, then commits the
+sequence/PacketId/ACK transaction and sends the already-bounded wire image. A failed
+first UDP handoff is still recoverable because the retry ledger already owns the message.
+
+When the 127-record ch0 window is full, required messages enter a per-connection FIFO
+bounded to 127 messages and 256 KiB. ACK processing flushes that FIFO only as capacity
+really reopens; out-of-order successor ACK tombstones do not bypass the oldest sequence
+gap. An ACK-free full-packet preflight runs before window/queue handling, so a message
+that can never fit fails immediately instead of becoming deferred poison. Queue
+exhaustion, an oversized complete control packet, or an inconsistent allocator transition
+fails the connection closed instead of dropping a required lifecycle message.
+
+**ch2 reserve and record.** `OutboundReliableSequencer::ReserveBatch` reserves a contiguous
 batch atomically in the modulo-1024 ch2 sequence space. Sequence **0 is valid after wrap**;
-there is no zero sentinel once the allocator has been initialized. At most **511** values
-may span the forward issuance window from the oldest unresolved value through the cursor,
-keeping modular ordering strictly inside half a cycle. An out-of-order packet ACK stops
+there is no zero sentinel once the allocator has been initialized. At most **127** ordinary
+reliable records may span the issuance window from the oldest unresolved value through the
+cursor, matching UE3's `RELIABLE_BUFFER=128` send rule (the engine's 128th close-bunch
+exception is not modeled by this generic allocator). An out-of-order packet ACK stops
 retransmission but leaves a window tombstone until every older gap is ACKed; raw in-flight
 count therefore cannot reopen capacity prematurely. A failed reservation changes neither
 the cursor nor the in-flight/window state, so sequence pressure is transient backpressure
@@ -241,34 +271,50 @@ monotonic token prevents an ancient same-shaped batch from cancelling a later mo
 reservation.
 
 `SendReservedCh2Bunches` verifies that the reliable ch2 bunches consume the reservation
-in order, then passes them to `SendReliableBunches`. The latter builds one packet, attempts
-the initial datagram send, and records its reliable bunches in `pendingReliable`. Once that
-retry ledger owns the batch, `CommitBatch` removes rollback eligibility. This commit is
-based on successful queueing in `pendingReliable`, not on the first UDP send succeeding;
-`RetransmitTick` can recover a failed first send. If a batch is rejected before queueing,
-the latest unpublished reservation is cancelled and the cursor is rewound without a gap.
+in order, then passes them to `SendReliableBunches`. The latter builds and encodes one
+packet, records its reliable bunches and monotonic packet serial in `pendingReliable`, and
+only then hands bytes to UDP. Once that retry ledger owns the batch, `CommitBatch` removes
+rollback eligibility. This commit is based on successful queueing in `pendingReliable`,
+not on the first UDP send succeeding; `RetransmitTick` can recover a failed first send. If
+a batch is rejected before queueing, the latest unpublished reservation is cancelled and
+the cursor is rewound without a gap.
 
-**Ack-clear — `OnClientAck`:** when a client ack names any PacketId associated with a
-`SentReliable`, release each tracked reliable ch2 ChSequence from `ch2Reliable`, then drop
-the pending set. Non-ch2 reliable state continues to use its owning subsystem's lifecycle.
+**Ack-clear — `OnClientAck`:** a raw 14-bit ACK is first expanded relative to a monotonic
+unwrap reference. That reference advances on a valid peer ACK or on local retirement of a
+bunch-less packet; the actual peer-ACK high-water is tracked separately. Pre-session,
+future, and exact-half-range ambiguous values are rejected without moving either value. A
+valid peer ACK then matches retry and reinforcement ledgers by exact full serial, so a
+wrapped wire value cannot retire an older generation. When it names a `SentReliable`, ch0
+sequences are released through `PacketAssembler` and tracked ch2 sequences through
+`ch2Reliable`, then the pending set is dropped.
+
+Bunch-bearing builders stop before their next identity reaches the exact 8192-packet
+ambiguous half-range from the unwrap reference. ACK-only and transport-keepalive packets
+carry no bunch and UE3 intentionally does not ACK them, so the assembler locally retires
+their identities. `ConnectionManager` permits that advance only when every live reliable
+and TeamInfo reinforcement ledger has a retry attempt strictly inside the new half-range;
+otherwise it fails closed before an old attempt can become ambiguous.
 
 **RTO resend — `RetransmitTick`:** called every pump cycle from `PumpNetwork`. For each
 pending set older than `kRtoMs = 250` and under
 `kMaxResends = 12`, it rebuilds a packet from the **same bunches verbatim** — same
-per-channel ChSequence — in a **NEW PacketId**, sends it, and appends the new PacketId to the
-set. The client fills the gap or ignores the duplicate.
+per-channel ChSequence — in a **new monotonic PacketId** (with its wrapped 14-bit wire
+projection), encodes it, appends the full packet serial to the retry set, and only then
+hands the datagram to UDP. A failed handoff therefore leaves a fully owned retry attempt.
+The client fills the gap or ignores the duplicate.
 
 **Critical invariant — never manufacture a sequence gap.** Resends keep the *original*
-ChSequence; a NEW PacketId is fine, a new ChSequence is not. The old "proof-of-life re-send"
+ChSequence; a new packet serial/wire PacketId is fine, a new ChSequence is not. The old "proof-of-life re-send"
 of ClientShowTeamSelect sent a fresh bunch at `seq+1`, which (if the original seq was
 dropped) created a ch2 reliable-sequence hole → permanent ch2 stall → soft-lock. That code
-was removed; retransmission now redelivers the original (`ConnectionManager.cpp:889-892`).
+was removed; retransmission now redelivers the original.
 
 **Ack policy (receive side).** We ack an inbound packet **only if it carried bunch data**
-(`ParseIncomingControl:1060-1062`). Acking a pure-ack packet makes the peer ack our ack, and
+(`ParseIncomingControl`). Acking a pure-ack packet makes the peer ack our ack, and
 us ack that, forever — an observed infinite ack ping-pong against the live client. The ack
 rides on the next outbound packet (drained by the PacketAssembler), or a standalone
-ack-only packet if nothing else is going out (`:1096-1098`).
+ack-only packet if nothing else is going out. Such bunch-less outbound identities are
+locally retired under the fresh-retry invariant above; they do not enter a peer-ACK loop.
 
 ---
 
@@ -392,18 +438,22 @@ client from loading Resort while the server is authoritative for a different wor
 a stream of full bunch descriptors
 `[u16 chIndex][u8 chType][u8 flags][u16 chSeq][u32 bunchDataBits][payload]`
 (`GetActorBootstrapRecords`, `:613`; flags: b0 bOpen, b1 bClose, b2 bReliable, b3 bControl).
-Three deliberate framing decisions, each fixing a real soft-lock:
+Join completion first waits for every earlier reliable ch0 message and deferred ch0 FIFO
+entry to drain. Until that barrier clears, `HandshakeComplete`, actor/game traffic, and the
+Game callback remain gated. The bootstrap then preserves these capture-grounded ordering
+decisions:
 
-1. **NMT 0x24 first** (`:678-679`). The real server sends one NMT 0x24 (`24 01 00 00 00`,
-   int32 LE = 1) on ch0 *immediately after Join and before any actor channel*. Our flow
-   lacked it; we now send it first.
-2. **ch2 (the PlayerController) opened first, standalone** (`:706-716`). The client adopts
+1. **ch2 (the PlayerController) opened first.** The client adopts
    ch2 (NetPlayerIndex==0) as its LOCAL PlayerController via `HandleClientPlayer`, and the
    team menu only opens once that adoption succeeds (ShowTeamSelect's
    `LocalPlayer(Player)!=none` gate). Burying ch2 in the middle of 138 other opens made
-   adoption intermittent; a clean standalone packet up front makes it reliable.
-3. **Batched opens** (`:683-744`). The rest of the opens are packed into
-   ~`kBatchBitBudget = 11000`-bit (~1400-byte) packets (≈10–14 opens each) instead of one
+   adoption intermittent.
+2. **NMT 0x24 immediately after ch2 in the same packet.** Official f1484 places the
+   control message `24 01 00 00 00` (int32 LE = 1) as the second bunch after ch2 OPEN.
+   Both reliable bunches share one PacketId and retry ledger, so UDP loss or a failed
+   first handoff cannot expose the ch0 transition without the adoption bunch.
+3. **Batched opens.** The rest of the opens are packed into
+   `kBatchBitBudget = 8192`-bit (~1024-byte) packets instead of one
    datagram per bunch. 139 back-to-back single-bunch datagrams overflow the client's UDP
    receive buffer (even on loopback) and intermittently drop the ch2 open. Batching matches
    how the real server frames its burst (multiple bunches per packet). A ch0 record in the
@@ -523,7 +573,7 @@ SaveNum`+chars, UniqueNetId=64-bit LE SteamID64, etc.): `MASTER` §4 /
 chType=actorChType`. Its ChSequence comes from a one-value atomic reservation in
 `ch2Reliable`, which adopts the externally assigned ch2-open sequence during actor
 bootstrap. Allocation advances modulo 1024, including sequence 0, and returns transient
-backpressure when the 511-value issuance window cannot accept the reservation. The payload
+backpressure when the 127-record issuance window cannot accept the reservation. The payload
 the caller packs is:
 
 ```
@@ -692,15 +742,15 @@ role, squad, PRI, or deployment mutation.
 
 1. **Bunch header conditionals**: ChSequence only if `bReliable`; ChType only if
    `bReliable||bOpen`. Wrong condition = whole-datagram bit shift.
-2. **Decode at 16384, encode at 12000.** MaxPacket is asymmetric; never decode inbound at the
+2. **Decode at 10240, encode at 12000.** MaxPacket is asymmetric; never decode inbound at the
    server-send bound.
-3. **A reliable resend keeps the original ChSequence** (new PacketId only). A new ChSequence
+3. **A reliable resend keeps the original ChSequence** (new packet serial/wire PacketId only). A new ChSequence
    manufactures a gap → channel stall → soft-lock.
 4. **Only ack packets that carried bunches.** Acking acks = infinite ping-pong.
 5. **Non-bool RPC params have a Send bit; bools don't.** Send==0 ⇒ value omitted. (§6.3.)
 6. **Property/open bunches must end exactly on the last bit** — no trailing pad, or the next
    "handle" is garbage.
 7. **Dynamic channel / object-ref bound is 1024 on this build**, not 2048.
-8. **ch2 opens standalone and first**; the rest batch under ~11000 bits/packet.
+8. **ch2 OPEN and NMT 0x24 share the first packet**; the rest batch under 8192 bits/packet.
 9. **PackageMap goes on ClientLoggedIn (pre-Join); the actor burst on ClientJoined.** Swapping
    the order deadlocks a real client.

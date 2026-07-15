@@ -5,16 +5,15 @@
 // the receive path:
 //
 //   client: ControlChannel::Build* -> ONE reliable control bunch per message
-//           -> PacketCodec::Encode (phase-appropriate MaxPacket) -> wire datagram
-//   server: PacketCodec::Decode (MaxPacket gated on IsControlHandshakeComplete)
+//           -> PacketCodec::Encode (C2S MaxPacket=1280) -> wire datagram
+//   server: PacketCodec::Decode (same C2S bound from the first packet)
 //           -> ack -> ControlReassembler (order/dedup) -> HandshakeState
 //   server responses: captured directly from HandshakeState's rawSend callback
 //           (the raw message payloads the state machine emits).
 //
-// The real RS2 client sends each control message as a SINGLE reliable bunch (at
-// the established-phase MaxPacket of 1280 a single bunch holds up to 10240 data
-// bits), and the MaxPacket grows from the tiny StatelessConnect-handshake value
-// to the NMT value once the handshake completes - so this test does the same.
+// The real RS2 client sends each observed control message as a single reliable
+// bunch. Its C2S MaxPacket is 1280 from StatelessConnect onward, so one bunch can
+// hold up to 10239 data bits and this test uses that bound throughout.
 
 #include "TestFramework.h"
 

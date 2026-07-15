@@ -36,6 +36,7 @@
 #include <memory>
 #include <optional>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -267,6 +268,40 @@ public:
         manager.HandleIncomingPacket(datagram, ClientAddress{ip, port});
     }
 
+    static void InstallThrowingControlReassembler(
+        ConnectionManager& manager, uint32_t clientId) {
+        auto& state = manager.m_controlState.at(clientId);
+        state.reassembler =
+            std::make_unique<PacketCodec::ControlReassembler>(
+                [](const std::vector<uint8_t>&) {
+                    throw std::runtime_error("test control dispatch failure");
+                });
+    }
+
+    static bool ParseIncomingControl(
+        ConnectionManager& manager, uint32_t clientId,
+        const std::vector<uint8_t>& datagram) {
+        return manager.ParseIncomingControl(clientId, datagram);
+    }
+
+    static void SetOwningPawnGraphCompletionDeferred(
+        ConnectionManager& manager, uint32_t clientId) {
+        manager.m_controlState.at(clientId)
+            .owningPawnGraphCompletionDeferred = true;
+    }
+
+    static bool InboundPacketDispatchActive(
+        const ConnectionManager& manager, uint32_t clientId) {
+        return manager.m_controlState.at(clientId)
+            .inboundPacketDispatchActive;
+    }
+
+    static bool OwningPawnGraphCompletionDeferred(
+        const ConnectionManager& manager, uint32_t clientId) {
+        return manager.m_controlState.at(clientId)
+            .owningPawnGraphCompletionDeferred;
+    }
+
     static bool SeedJoinedHandshake(ConnectionManager& manager,
                                     uint32_t clientId) {
         auto handshake = std::make_unique<HandshakeState>(
@@ -492,8 +527,10 @@ public:
                            (!open || bunch.bOpen) &&
                            (!close || bunch.bClose);
                 });
-            if (matches && !pending.packetIds.empty()) {
-                return pending.packetIds.front();
+            if (matches && !pending.packetSerials.empty()) {
+                return static_cast<uint32_t>(
+                    pending.packetSerials.front() %
+                    static_cast<int64_t>(kMaxPacketId));
             }
         }
         return std::nullopt;
@@ -608,7 +645,7 @@ public:
                                         uint32_t clientId,
                                         uint32_t channel) {
         ConnectionManager::ControlState::SentReliable pending;
-        pending.packetIds.push_back(900u);
+        pending.packetSerials.push_back(900);
         PacketCodec::Bunch open;
         open.bOpen = true;
         open.bReliable = true;
@@ -837,16 +874,131 @@ public:
             clientId, {0x01u}, 1u, "PriorReliableForTest");
     }
 
-    static void SendControlReliable(ConnectionManager& manager,
+    static bool SendControlReliable(ConnectionManager& manager,
                                     uint32_t clientId,
                                     const std::vector<uint8_t>& payload) {
-        (void)manager.SendRawToClient(clientId, payload);
+        return manager.SendRawToClient(clientId, payload);
+    }
+
+    static size_t DeferredControlMessageCount(
+        const ConnectionManager& manager, uint32_t clientId) {
+        return manager.m_controlState.at(clientId)
+            .deferredControlMessages.size();
+    }
+
+    static size_t DeferredControlBytes(const ConnectionManager& manager,
+                                       uint32_t clientId) {
+        return manager.m_controlState.at(clientId).deferredControlBytes;
+    }
+
+    static bool JoinCompletionDeferred(const ConnectionManager& manager,
+                                       uint32_t clientId) {
+        return manager.m_controlState.at(clientId).joinCompletionDeferred;
+    }
+
+    static bool OutboundActorChannelOpen(const ConnectionManager& manager,
+                                         uint32_t clientId,
+                                         uint32_t channel) {
+        const auto& channels =
+            manager.m_controlState.at(clientId).outboundActorChannels;
+        return channel < channels.size() && channels.test(channel);
+    }
+
+    static std::vector<uint32_t> PendingReliablePacketIds(
+        const ConnectionManager& manager, uint32_t clientId) {
+        std::vector<uint32_t> packetIds;
+        for (const auto& pending :
+             manager.m_controlState.at(clientId).pendingReliable) {
+            if (pending.packetSerials.empty()) return {};
+            packetIds.push_back(static_cast<uint32_t>(
+                pending.packetSerials.front() %
+                static_cast<int64_t>(kMaxPacketId)));
+        }
+        return packetIds;
+    }
+
+    static uint32_t LastPendingReliableSequence(
+        const ConnectionManager& manager, uint32_t clientId) {
+        const auto& pending =
+            manager.m_controlState.at(clientId).pendingReliable.back();
+        return pending.bunches.front().chSequence;
+    }
+
+    static std::vector<uint8_t> LastPendingReliablePayload(
+        const ConnectionManager& manager, uint32_t clientId) {
+        const auto& pending =
+            manager.m_controlState.at(clientId).pendingReliable.back();
+        return pending.bunches.front().payload;
+    }
+
+    static void AllocateAndResolveUntrackedOutboundPacket(
+        ConnectionManager& manager, uint32_t clientId) {
+        auto& outbound = manager.m_controlState.at(clientId).outbound;
+        const auto built = outbound.BuildAckOnlyPacket();
+        ASSERT_TRUE(built.has_value());
+        const auto resolved = outbound.ResolveOutboundAck(built->packetId);
+        ASSERT_TRUE(resolved.has_value());
+        EXPECT_EQ(*resolved, built->outboundPacketSerial);
+    }
+
+    static void AllocateLocallyRetiredBunchlessPacket(
+        ConnectionManager& manager, uint32_t clientId) {
+        auto& outbound = manager.m_controlState.at(clientId).outbound;
+        const auto built = outbound.BuildAckOnlyPacket();
+        ASSERT_TRUE(built.has_value());
+    }
+
+    static bool EnsureBunchlessAckReferenceSafe(
+        ConnectionManager& manager, uint32_t clientId) {
+        return manager.EnsureBunchlessAckReferenceSafe(
+            clientId, "lifecycle regression test");
+    }
+
+    static bool ReleaseFirstPendingCh0SequenceOutOfBand(
+        ConnectionManager& manager, uint32_t clientId) {
+        auto& state = manager.m_controlState.at(clientId);
+        if (state.pendingReliable.empty() ||
+            state.pendingReliable.front().bunches.empty()) {
+            return false;
+        }
+        return state.outbound.AcknowledgeControlSequence(
+            state.pendingReliable.front().bunches.front().chSequence)
+            .has_value();
+    }
+
+    static uint32_t RetransmitFirstPendingReliableForTest(
+        ConnectionManager& manager, uint32_t clientId) {
+        auto& state = manager.m_controlState.at(clientId);
+        auto& pending = state.pendingReliable.front();
+        const auto built =
+            state.outbound.BuildRawBunchesPacket(pending.bunches);
+        if (!built) return kMaxPacketId;
+        pending.packetSerials.push_back(built->outboundPacketSerial);
+        return built->packetId;
+    }
+
+    static void ExpireAndRetransmitFirstPendingReliable(
+        ConnectionManager& manager, uint32_t clientId) {
+        auto& pending =
+            manager.m_controlState.at(clientId).pendingReliable.front();
+        pending.lastSendMs = 0u;
+        pending.retryDelayMs = 0u;
+        manager.RetransmitTick();
+    }
+
+    static std::vector<int64_t> FirstPendingPacketSerials(
+        const ConnectionManager& manager, uint32_t clientId) {
+        return manager.m_controlState.at(clientId)
+            .pendingReliable.front()
+            .packetSerials;
     }
 
     static uint32_t FirstPendingPacketId(const ConnectionManager& manager,
                                          uint32_t clientId) {
-        return manager.m_controlState.at(clientId)
-            .pendingReliable.front().packetIds.front();
+        return static_cast<uint32_t>(
+            manager.m_controlState.at(clientId)
+                .pendingReliable.front().packetSerials.front() %
+            static_cast<int64_t>(kMaxPacketId));
     }
 
     static size_t FirstPendingBunchCount(const ConnectionManager& manager,
@@ -871,8 +1023,12 @@ public:
     static void AcknowledgeAllPendingReliables(
         ConnectionManager& manager, uint32_t clientId) {
         auto& pending = manager.m_controlState.at(clientId).pendingReliable;
-        while (!pending.empty() && !pending.front().packetIds.empty()) {
-            manager.OnClientAck(clientId, pending.front().packetIds.front());
+        while (!pending.empty() && !pending.front().packetSerials.empty()) {
+            manager.OnClientAck(
+                clientId,
+                static_cast<uint32_t>(
+                    pending.front().packetSerials.front() %
+                    static_cast<int64_t>(kMaxPacketId)));
         }
     }
 
@@ -2982,6 +3138,270 @@ TEST(ConnectionTravelLifecycle,
     EXPECT_EQ(ConnectionTravelLifecycleTestHarness::PendingReliableCount(
                   manager, 1),
               static_cast<size_t>(1));
+}
+
+TEST(ConnectionTravelLifecycle,
+     FullControlWindowDefersRequiredMessageUntilOldestGapIsAcked) {
+    using Harness = ConnectionTravelLifecycleTestHarness;
+    ConnectionManager manager(nullptr);
+    const std::shared_ptr<ClientConnection> connection = Harness::AddClient(
+        manager, 1u, "127.0.0.1", 30126u, false, 0u, false);
+
+    for (uint32_t sequence = 1u;
+         sequence <= PacketCodec::kReliableBuffer - 1u;
+         ++sequence) {
+        ASSERT_TRUE(Harness::SendControlReliable(
+            manager, 1u, {NMTByte(NMT::Uses),
+                           static_cast<uint8_t>(sequence)}));
+    }
+    ASSERT_EQ(Harness::PendingReliableCount(manager, 1u), 127u);
+    const std::vector<uint32_t> packetIds =
+        Harness::PendingReliablePacketIds(manager, 1u);
+    ASSERT_EQ(packetIds.size(), 127u);
+
+    const std::vector<uint8_t> deferredPayload = {
+        NMTByte(NMT::Uses), 0xFEu};
+    EXPECT_TRUE(Harness::SendControlReliable(
+        manager, 1u, deferredPayload));
+    EXPECT_FALSE(connection->IsDisconnected());
+    EXPECT_EQ(Harness::PendingReliableCount(manager, 1u), 127u);
+    EXPECT_EQ(Harness::DeferredControlMessageCount(manager, 1u), 1u);
+    EXPECT_EQ(Harness::DeferredControlBytes(manager, 1u),
+              deferredPayload.size());
+
+    // Successor ACKs become tombstones and cannot reopen capacity while the
+    // oldest sequence remains missing.
+    for (size_t index = 1u; index < packetIds.size(); ++index) {
+        Harness::Acknowledge(manager, 1u, packetIds[index]);
+    }
+    EXPECT_EQ(Harness::PendingReliableCount(manager, 1u), 1u);
+    EXPECT_EQ(Harness::DeferredControlMessageCount(manager, 1u), 1u);
+
+    Harness::Acknowledge(manager, 1u, packetIds.front());
+    ASSERT_EQ(Harness::PendingReliableCount(manager, 1u), 1u);
+    EXPECT_EQ(Harness::DeferredControlMessageCount(manager, 1u), 0u);
+    EXPECT_EQ(Harness::DeferredControlBytes(manager, 1u), 0u);
+    EXPECT_EQ(Harness::LastPendingReliableSequence(manager, 1u), 128u);
+    EXPECT_EQ(Harness::LastPendingReliablePayload(manager, 1u),
+              deferredPayload);
+}
+
+TEST(ConnectionTravelLifecycle,
+     JoinedBootstrapAndGameCallbackWaitForEarlierControlDrain) {
+    using Harness = ConnectionTravelLifecycleTestHarness;
+    ConnectionManager manager(nullptr);
+    const std::shared_ptr<ClientConnection> connection = Harness::AddClient(
+        manager, 1u, "127.0.0.1", 30129u, false, 0u, false);
+    ASSERT_TRUE(Harness::SendControlReliable(
+        manager, 1u, {NMTByte(NMT::Uses), 0x44u}));
+    ASSERT_EQ(Harness::PendingReliableCount(manager, 1u), 1u);
+    const uint32_t earlierControlPacket =
+        Harness::FirstPendingPacketId(manager, 1u);
+
+    int joinedCallbacks = 0;
+    manager.SetClientJoinedCallback(
+        [&](const ClientJoinedEvent&) { ++joinedCallbacks; });
+    manager.FireClientJoined(ClientJoinedEvent{1u});
+
+    EXPECT_TRUE(Harness::JoinCompletionDeferred(manager, 1u));
+    EXPECT_EQ(joinedCallbacks, 0);
+    EXPECT_EQ(Harness::PendingReliableCount(manager, 1u), 1u);
+    EXPECT_FALSE(connection->IsHandshakeComplete());
+    EXPECT_FALSE(Harness::OutboundActorChannelOpen(manager, 1u, 2u));
+
+    Harness::Acknowledge(manager, 1u, earlierControlPacket);
+    EXPECT_FALSE(Harness::JoinCompletionDeferred(manager, 1u));
+    EXPECT_EQ(joinedCallbacks, 1);
+    EXPECT_TRUE(connection->IsHandshakeComplete());
+    EXPECT_TRUE(Harness::OutboundActorChannelOpen(manager, 1u, 2u));
+    ASSERT_EQ(Harness::FirstPendingBunchCount(manager, 1u), 2u);
+    const std::vector<PacketCodec::Bunch> bootstrap =
+        Harness::QueuedReliableBunches(manager, 1u);
+    ASSERT_GE(bootstrap.size(), 2u);
+    EXPECT_EQ(bootstrap[0].chIndex, 2u);
+    EXPECT_TRUE(bootstrap[0].bOpen);
+    EXPECT_TRUE(bootstrap[0].bReliable);
+    EXPECT_EQ(bootstrap[1].chIndex, 0u);
+    EXPECT_TRUE(bootstrap[1].bReliable);
+    EXPECT_EQ(bootstrap[1].payload,
+              (std::vector<uint8_t>{0x24u, 0x01u, 0x00u, 0x00u, 0x00u}));
+    EXPECT_EQ(bootstrap[1].payloadBits, 40u);
+}
+
+TEST(ConnectionTravelLifecycle,
+     OversizedControlMessageFailClosesInsteadOfAdvancingLifecycle) {
+    using Harness = ConnectionTravelLifecycleTestHarness;
+    ConnectionManager manager(nullptr);
+    const std::shared_ptr<ClientConnection> connection = Harness::AddClient(
+        manager, 1u, "127.0.0.1", 30127u, false, 0u, false);
+
+    EXPECT_FALSE(Harness::SendControlReliable(
+        manager, 1u, std::vector<uint8_t>(1499u, 0x5Au)));
+    EXPECT_TRUE(connection->IsDisconnected());
+    EXPECT_EQ(Harness::PendingReliableCount(manager, 1u), 0u);
+    EXPECT_EQ(Harness::DeferredControlMessageCount(manager, 1u), 0u);
+}
+
+TEST(ConnectionTravelLifecycle,
+     OversizedControlMessageBehindDeferredWorkFailsImmediately) {
+    using Harness = ConnectionTravelLifecycleTestHarness;
+    ConnectionManager manager(nullptr);
+    const std::shared_ptr<ClientConnection> connection = Harness::AddClient(
+        manager, 1u, "127.0.0.1", 30130u, false, 0u, false);
+
+    for (uint32_t sequence = 1u;
+         sequence <= PacketCodec::kReliableBuffer - 1u;
+         ++sequence) {
+        ASSERT_TRUE(Harness::SendControlReliable(
+            manager, 1u, {NMTByte(NMT::Uses),
+                           static_cast<uint8_t>(sequence)}));
+    }
+    ASSERT_TRUE(Harness::SendControlReliable(
+        manager, 1u, {NMTByte(NMT::Uses), 0xEEu}));
+    ASSERT_EQ(Harness::DeferredControlMessageCount(manager, 1u), 1u);
+
+    EXPECT_FALSE(Harness::SendControlReliable(
+        manager, 1u, std::vector<uint8_t>(1499u, 0x5Au)));
+    EXPECT_TRUE(connection->IsDisconnected());
+    EXPECT_EQ(Harness::DeferredControlMessageCount(manager, 1u), 1u);
+}
+
+TEST(ConnectionTravelLifecycle,
+     AckAllocatorFailureRetainsRetryLedgerAndFailsClosed) {
+    using Harness = ConnectionTravelLifecycleTestHarness;
+    ConnectionManager manager(nullptr);
+    const std::shared_ptr<ClientConnection> connection = Harness::AddClient(
+        manager, 1u, "127.0.0.1", 30131u, false, 0u, false);
+    ASSERT_TRUE(Harness::SendControlReliable(
+        manager, 1u, {NMTByte(NMT::Uses), 0x55u}));
+    const uint32_t packetId = Harness::FirstPendingPacketId(manager, 1u);
+    ASSERT_TRUE(Harness::ReleaseFirstPendingCh0SequenceOutOfBand(
+        manager, 1u));
+
+    Harness::Acknowledge(manager, 1u, packetId);
+
+    EXPECT_TRUE(connection->IsDisconnected());
+    EXPECT_EQ(Harness::PendingReliableCount(manager, 1u), 1u);
+}
+
+TEST(ConnectionTravelLifecycle,
+     AckAllocatorFailureStopsLaterBunchDispatchInSamePacket) {
+    using Harness = ConnectionTravelLifecycleTestHarness;
+    ConnectionManager manager(nullptr);
+    const std::shared_ptr<ClientConnection> connection = Harness::AddClient(
+        manager, 1u, "127.0.0.1", 30134u, false, 0u, false);
+    ASSERT_TRUE(Harness::SendControlReliable(
+        manager, 1u, {NMTByte(NMT::Uses), 0x56u}));
+    const uint32_t packetId = Harness::FirstPendingPacketId(manager, 1u);
+    ASSERT_TRUE(Harness::ReleaseFirstPendingCh0SequenceOutOfBand(
+        manager, 1u));
+
+    PacketCodec::Bunch actor;
+    actor.bReliable = true;
+    actor.chIndex = 2u;
+    actor.chType = 2u;
+    actor.chSequence = 1u;
+    actor.payload = {0u};
+    actor.payloadBits = 1u;
+    PacketCodec::Packet mixed;
+    mixed.packetId = 7u;
+    mixed.acks.push_back(packetId);
+    mixed.bunches.push_back(std::move(actor));
+
+    EXPECT_TRUE(Harness::ParseIncomingControl(
+        manager, 1u, EncodeClientPacket(mixed)));
+
+    EXPECT_TRUE(connection->IsDisconnected());
+    EXPECT_EQ(Harness::PendingReliableCount(manager, 1u), 1u);
+    EXPECT_EQ(Harness::NextInboundActorReliable(manager, 1u, 2u), 1u);
+    EXPECT_FALSE(Harness::InboundPacketDispatchActive(manager, 1u));
+}
+
+TEST(ConnectionTravelLifecycle,
+     BunchlessReferenceCannotOutrunLatestReliableAttemptByHalfRange) {
+    using Harness = ConnectionTravelLifecycleTestHarness;
+    ConnectionManager manager(nullptr);
+    const std::shared_ptr<ClientConnection> connection = Harness::AddClient(
+        manager, 1u, "127.0.0.1", 30132u, false, 0u, false);
+    ASSERT_TRUE(Harness::SendControlReliable(
+        manager, 1u, {NMTByte(NMT::Uses), 0x66u}));
+
+    constexpr int64_t halfRange =
+        static_cast<int64_t>(kMaxPacketId) / 2;
+    for (int64_t serial = 1; serial < halfRange; ++serial) {
+        Harness::AllocateLocallyRetiredBunchlessPacket(manager, 1u);
+    }
+    EXPECT_FALSE(Harness::EnsureBunchlessAckReferenceSafe(manager, 1u));
+    EXPECT_TRUE(connection->IsDisconnected());
+    EXPECT_EQ(Harness::PendingReliableCount(manager, 1u), 1u);
+}
+
+TEST(ConnectionTravelLifecycle,
+     WrappedWireAckRetiresOnlyMatchingMonotonicPacketGeneration) {
+    using Harness = ConnectionTravelLifecycleTestHarness;
+    ConnectionManager manager(nullptr);
+    const std::shared_ptr<ClientConnection> connection = Harness::AddClient(
+        manager, 1u, "127.0.0.1", 30128u, false, 0u, false);
+
+    const std::vector<uint8_t> firstPayload = {
+        NMTByte(NMT::Uses), 0x01u};
+    ASSERT_TRUE(Harness::SendControlReliable(manager, 1u, firstPayload));
+    ASSERT_EQ(Harness::PendingReliableCount(manager, 1u), 1u);
+
+    // Advance and ACK ordinary packet identities without ACKing reliable serial
+    // zero. This carries UE3's ACK generation cleanly across the 14-bit wrap.
+    for (uint32_t serial = 1u;
+         serial < kMaxPacketId;
+         ++serial) {
+        Harness::AllocateAndResolveUntrackedOutboundPacket(
+            manager, 1u);
+    }
+
+    const std::vector<uint8_t> wrappedPayload = {
+        NMTByte(NMT::Uses), 0x02u};
+    ASSERT_TRUE(Harness::SendControlReliable(
+        manager, 1u, wrappedPayload));
+    ASSERT_EQ(Harness::PendingReliableCount(manager, 1u), 2u);
+
+    // Wire PacketId zero now identifies serial 16384, not the old serial zero.
+    Harness::Acknowledge(manager, 1u, 0u);
+    ASSERT_EQ(Harness::PendingReliableCount(manager, 1u), 1u);
+    EXPECT_EQ(Harness::LastPendingReliablePayload(manager, 1u),
+              firstPayload);
+
+    // The old reliable remains deliverable through a new-generation retry.
+    const uint32_t retryPacket =
+        Harness::RetransmitFirstPendingReliableForTest(manager, 1u);
+    ASSERT_LT(retryPacket, kMaxPacketId);
+    Harness::Acknowledge(manager, 1u, retryPacket);
+    EXPECT_EQ(Harness::PendingReliableCount(manager, 1u), 0u);
+    EXPECT_FALSE(connection->IsDisconnected());
+}
+
+TEST(ConnectionTravelLifecycle,
+     ReliableRetransmitOwnsAttemptBeforeFailedSocketHandoff) {
+    using Harness = ConnectionTravelLifecycleTestHarness;
+    ConnectionManager manager(nullptr);
+    const std::shared_ptr<ClientConnection> connection = Harness::AddClient(
+        manager, 1u, "127.0.0.1", 30133u, false, 0u, false);
+
+    ASSERT_TRUE(Harness::SendControlReliable(
+        manager, 1u, {NMTByte(NMT::Uses), 0x42u}));
+    const std::vector<int64_t> initialAttempts =
+        Harness::FirstPendingPacketSerials(manager, 1u);
+    ASSERT_EQ(initialAttempts.size(), 1u);
+
+    // AddClient deliberately has no socket. The retry is still owned before
+    // SendRaw reports failure, so either packet identity may later retire the
+    // reliable ledger and another timeout remains eligible.
+    Harness::ExpireAndRetransmitFirstPendingReliable(manager, 1u);
+
+    const std::vector<int64_t> attempts =
+        Harness::FirstPendingPacketSerials(manager, 1u);
+    ASSERT_EQ(attempts.size(), 2u);
+    EXPECT_EQ(attempts.front(), initialAttempts.front());
+    EXPECT_GT(attempts.back(), attempts.front());
+    EXPECT_FALSE(connection->IsDisconnected());
 }
 
 TEST(ConnectionTravelLifecycle,
@@ -5576,6 +5996,17 @@ TEST(ConnectionTravelLifecycle,
             ConnectionTravelLifecycleTestHarness::QueuedReliableBunches(
                 manager, 1);
 
+        ASSERT_GE(queued.size(), 2u);
+        EXPECT_EQ(queued[0].chIndex, 2u);
+        EXPECT_TRUE(queued[0].bOpen);
+        EXPECT_EQ(queued[1].chIndex, 0u);
+        EXPECT_EQ(queued[1].payload,
+                  (std::vector<uint8_t>{0x24u, 0x01u, 0x00u, 0x00u, 0x00u}));
+        EXPECT_EQ(queued[1].payloadBits, 40u);
+        EXPECT_EQ(ConnectionTravelLifecycleTestHarness::FirstPendingBunchCount(
+                      manager, 1),
+                  2u);
+
         const PacketCodec::Bunch* pc = FindQueuedOpen(queued, 2);
         const PacketCodec::Bunch* gri = FindQueuedOpen(queued, 3);
         const PacketCodec::Bunch* team0 = FindQueuedOpen(queued, 4);
@@ -5761,6 +6192,73 @@ TEST(ConnectionTravelLifecycle,
 
     ConnectionTravelLifecycleTestHarness::RetireSuperseded(manager, 43, 42);
     EXPECT_EQ(manager.FindClientByAddress("127.0.0.1", 30301), 42u);
+}
+
+TEST(ConnectionTravelLifecycle,
+     ThrowingClientLoggedInCallbackIsContainedAndDisconnectsClient) {
+    ConnectionManager manager(nullptr);
+    const std::shared_ptr<ClientConnection> connection =
+        ConnectionTravelLifecycleTestHarness::AddClient(
+            manager, 1u, "127.0.0.1", 30303u, false, 0u, false);
+    bool callbackInvoked = false;
+    manager.SetClientLoggedInCallback(
+        [&](const ClientLoggedInEvent&) {
+            callbackInvoked = true;
+            throw std::runtime_error("test login observer failure");
+        });
+
+    ClientLoggedInEvent event;
+    event.clientId = 1u;
+    EXPECT_NO_THROW(manager.FireClientLoggedIn(event));
+
+    EXPECT_TRUE(callbackInvoked);
+    EXPECT_TRUE(connection->IsDisconnected());
+}
+
+TEST(ConnectionTravelLifecycle,
+     ThrowingClientJoinedCallbackIsContainedAndDisconnectsClient) {
+    ConnectionManager manager(nullptr);
+    const std::shared_ptr<ClientConnection> connection =
+        ConnectionTravelLifecycleTestHarness::AddClient(
+            manager, 1u, "127.0.0.1", 30304u, false, 0u, false);
+    bool callbackInvoked = false;
+    manager.SetClientJoinedCallback(
+        [&](const ClientJoinedEvent&) {
+            callbackInvoked = true;
+            throw std::runtime_error("test join observer failure");
+        });
+
+    EXPECT_NO_THROW(manager.FireClientJoined(ClientJoinedEvent{1u}));
+
+    EXPECT_TRUE(callbackInvoked);
+    EXPECT_TRUE(connection->IsDisconnected());
+}
+
+TEST(ConnectionTravelLifecycle,
+     ThrowingControlDispatchClearsPacketLatchesAndDisconnectsClient) {
+    ConnectionManager manager(nullptr);
+    const std::shared_ptr<ClientConnection> connection =
+        ConnectionTravelLifecycleTestHarness::AddClient(
+            manager, 1u, "127.0.0.1", 30305u, false, 0u, false);
+    ConnectionTravelLifecycleTestHarness::InstallThrowingControlReassembler(
+        manager, 1u);
+    ConnectionTravelLifecycleTestHarness::
+        SetOwningPawnGraphCompletionDeferred(manager, 1u);
+
+    bool parsed = false;
+    EXPECT_NO_THROW(parsed =
+        ConnectionTravelLifecycleTestHarness::ParseIncomingControl(
+            manager, 1u,
+            EncodeClientPacket(FreshHandshakeStartPacket())));
+
+    EXPECT_TRUE(parsed);
+    EXPECT_TRUE(connection->IsDisconnected());
+    EXPECT_FALSE(
+        ConnectionTravelLifecycleTestHarness::InboundPacketDispatchActive(
+            manager, 1u));
+    EXPECT_FALSE(
+        ConnectionTravelLifecycleTestHarness::
+            OwningPawnGraphCompletionDeferred(manager, 1u));
 }
 
 TEST(ConnectionTravelLifecycle,

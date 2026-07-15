@@ -85,19 +85,31 @@ cites the function that does the work.
 **Framing detail (Network).** `PacketCodec` decodes/encodes the
 `<PacketId><acks><bunches><terminator>` UE3 wire structure using LSB-first
 `BitReader`/`BitWriter` (FBitReader/FBitWriter-compatible). `MaxPacket` is
-phase-dependent: 8 bytes during StatelessConnect, then 2048 for inbound NMT
-decode and 1500 for our outbound encode — the exact bounds matter bit-for-bit
-(`src/Network/PacketCodec.h` documents why). Outbound framing (PacketId
-assignment, bunch serialization/fragmentation, acks) is `PacketAssembler`; inbound
-ordering/dedup of reliable control bunches is `ControlReassembler`. Reliable
+direction-dependent from the first packet: 1280 for inbound C2S decode and 1500
+for our outbound S2C encode — the exact bounds matter bit-for-bit
+(`src/Network/PacketCodec.h` documents why). Outbound framing (monotonic internal
+PacketId assignment with 14-bit wire projection and ch0's 127-record reliable
+issuance window) is `PacketAssembler`; every outbound builder performs full-packet
+size validation and queued-ACK prefix packing, while its transactional ch0 path
+also reserves and commits the reliable sequence atomically. Inbound
+ordering/dedup of reliable control bunches is `ControlReassembler`, which mirrors
+UE3's strict per-channel modulo-1024 `InReliable[ChIndex]` cursor and never skips a
+missing reliable based on later arrivals. Reliable
 bunches are retransmitted until acked — `ConnectionManager::SendReliableBunches`
 records them, `OnClientAck` clears them, `RetransmitTick` (run every pump) resends.
-Explicit reliable ch2 actor sequences are owned by one
-`OutboundReliableSequencer` per connection: it reserves modulo-1024 batches
-(including sequence 0), caps the forward issuance window at 511, and commits a
+Outbound ch0 and explicit reliable ch2 actor sequences each own an
+`OutboundReliableSequencer` per connection/channel. It reserves modulo-1024 batches
+(including sequence 0), caps the ordinary forward issuance window at UE3's 127
+reliable records, and commits a
 tokenized reservation only after `pendingReliable` owns the retry. Out-of-order
 ACKed successors remain window tombstones until the oldest gap closes. ACK
-processing releases the values; retransmission reuses them with a new PacketId.
+processing first unwraps each raw PacketId against a monotonic reference, then
+releases exact full-serial ledger matches; the actual peer-ACK high-water remains
+separate. Bunch-less packet identities are locally retired because UE3 does not ACK
+them, but only while every live retry ledger retains a fresh attempt inside the
+14-bit half-range. Bunch-bearing allocation stops before the exact ambiguous half.
+Retransmission reuses the original ChSequence with a new packet serial and records
+that attempt before UDP handoff.
 
 **Decoupling.** The Network layer never `#include`s anything from Game. The
 handshake notifies Game purely through `std::function` observers
@@ -164,7 +176,7 @@ allocates a `clientId`). Its progression, with the owning state:
 
 | Phase | Where the state lives | What happens |
 |-------|----------------------|--------------|
-| **StatelessConnect** | `HandshakeState` (`m_controlHandshakeComplete`) | UE3 cookie handshake `0x1d→0x1e→0x1f→0x20`; on completion `MaxPacket` grows 8→2048 and the NMT phase begins. |
+| **StatelessConnect** | `HandshakeState` (`m_controlHandshakeComplete`) | UE3 cookie handshake `0x1d→0x1e→0x1f→0x20`; completion changes message semantics while the direction-specific MaxPacket remains constant. |
 | **Hello → Challenge** | `HandshakePhase::ChallengeSent` | Client `NMT_Hello` (version, SteamId, rate, URL); server emits Challenge nonce. Steam auth is **stubbed** (accepted blindly). |
 | **Login → Welcome** | `HandshakePhase::WelcomeSent` | `NMT_Login` parsed → `ClientLoggedIn` fires → `ConnectionLoginBridge` runs PreLogin + Login, creates the PRI and (lazily) the single GRI. |
 | **Join** | `HandshakePhase::Joined` | `NMT_Join` → `ClientJoined` fires → bridge runs PostLogin (team pick + spawn). |
@@ -175,10 +187,17 @@ allocates a `clientId`). Its progression, with the owning state:
 Reliability spans the whole post-Join phase: every reliable server→client bunch
 is retransmitted (same per-channel `ChSequence`, new `PacketId`) until the client
 acks the packet it rode in — without this, a single dropped bootstrap bunch
-soft-locks the client. A full ch2 reliable window is transient backpressure: a
+soft-locks the client. A full ch0 or ch2 reliable window is transient backpressure: a
 new atomic reservation is deferred without consuming a sequence or a
 possession-recovery response. See `ConnectionManager::ControlState::SentReliable`
-and `PacketCodec::OutboundReliableSequencer`.
+and `PacketCodec::OutboundReliableSequencer`. Required ch0 messages are retained in
+a bounded per-connection FIFO and published in order when contiguous ACK progress
+reopens capacity; exhaustion or an oversized complete packet fails closed.
+`NMT_Join` completion is also held behind that drain barrier: only then may the
+connection become handshake-complete, publish the same-packet ch2 OPEN/NMT 0x24
+entry transaction and the actor cohort, or invoke the Game callback. This prevents
+deferred ch0 lifecycle work from being overtaken and prevents UDP loss from exposing
+NMT 0x24 without the owning PlayerController open.
 
 ---
 

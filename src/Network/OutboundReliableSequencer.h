@@ -39,9 +39,10 @@ enum class OutboundReliableSequenceError : uint8_t {
 
 class OutboundReliableSequencer {
 public:
-    // Modular ordering is unambiguous only strictly inside half a cycle.
-    static constexpr size_t kMaximumOutstanding =
-        (static_cast<size_t>(kMaxChSequence) / 2u) - 1u;
+    // UE3 permits 127 ordinary reliable records in its RELIABLE_BUFFER=128
+    // send window. UChannel has a one-record exception for a close bunch; this
+    // generic allocator does not model close and therefore exposes only 127.
+    static constexpr size_t kMaximumOutstanding = kReliableBuffer - 1u;
 
     OutboundReliableSequencer() noexcept;
     OutboundReliableSequencer(const OutboundReliableSequencer&) = delete;
@@ -100,7 +101,7 @@ public:
     // Adopt an externally assigned reliable sequence. On an uninitialized
     // instance this establishes the cursor and marks the adopted sequence as
     // in flight. Later adoptions must be exactly contiguous with the cursor
-    // and remain inside the half-cycle issuance window.
+    // and remain inside UE3's ordinary reliable issuance window.
     [[nodiscard]] MutationResult Adopt(uint32_t sequence);
 
     // Reserve count contiguous values and mark all of them in flight. At most
@@ -168,10 +169,10 @@ private:
     };
 
     static constexpr bool IsValidSequence(uint32_t sequence) noexcept {
-        return sequence < kMaxChSequence;
+        return IsValidChSequence(sequence);
     }
     static constexpr uint32_t Following(uint32_t sequence) noexcept {
-        return (sequence + 1u) % kMaxChSequence;
+        return AdvanceChSequence(sequence);
     }
     [[nodiscard]] MutationResult
     ValidateLatestBatch(const Reservation& reservation) const;
@@ -185,13 +186,13 @@ private:
     // Contiguous issuance order from the oldest not-yet-contiguously-ACKed
     // sequence through the most recently issued sequence. An entry remains in
     // this deque after an out-of-order ACK so a single old gap cannot let the
-    // cursor advance more than half a modulo cycle.
+    // cursor advance beyond UE3's ordinary reliable send window.
     std::deque<WindowEntry> m_issuanceWindow;
     std::optional<BatchRecord> m_latestReservation;
     uint64_t m_nextReservationId = 1u;
 };
 
-static_assert(OutboundReliableSequencer::kMaximumOutstanding == 511u);
+static_assert(OutboundReliableSequencer::kMaximumOutstanding == 127u);
 static_assert(kMaxChSequence == 1024u);
 
 } // namespace PacketCodec

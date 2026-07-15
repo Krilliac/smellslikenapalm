@@ -110,9 +110,8 @@ public:
     bool IsJoined() const { return m_phase == HandshakePhase::Joined; }
 
     // True once the StatelessConnect handshake (0x1d/0x1e/0x1f/0x20) is done and
-    // the NMT phase has begun. The packet framing's MaxPacket grows from 8 to the
-    // established value at this point, so the decoder uses this to pick the right
-    // BunchDataBits bound.
+    // the NMT phase has begun. This gates message semantics only: retail packet
+    // framing uses its direction-specific MaxPacket from the first packet.
     bool IsControlHandshakeComplete() const { return m_controlHandshakeComplete; }
 
     // The (stubbed, accepted-blindly) identity captured from Hello.

@@ -118,6 +118,8 @@ Packet Decode(const uint8_t* data, size_t numBytes, uint32_t maxPacketBytes) {
     // a datagram-level trailing byte parse as a harmless trailing ack rather than
     // requiring a length-walk.)
     Packet pkt;
+    // Decode owns no outbound identity; this remains local-only send metadata.
+    pkt.outboundPacketSerial = -1;
     if (numBytes == 0) {
         if (g_debugTrace) {
             Logger::Warn("PacketCodec RX malformed: empty datagram (0 bytes), ok=false");

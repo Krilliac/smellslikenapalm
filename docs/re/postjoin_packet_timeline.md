@@ -2,7 +2,9 @@
 
 Source capture: `D:\RE-Tools\rs2_realserver_capture.pcapng`
 Wire filters: S2C = `udp.srcport==7777 && udp.dstport==57867`, C2S = `udp.srcport==57867 && udp.dstport==7777`.
-Decoder: `tools/mock_client.py` `decode_packet(bytes, bd_max=...)` — S2C `bd_max=12000`, C2S `bd_max=16384`.
+Decoder: `tools/mock_client.py` `decode_packet(bytes, bd_max=...)` — S2C `bd_max=12000`, C2S `bd_max=10240`.
+The primary timeline is S2C. Any legacy C2S annotation produced with the former
+16384 analysis bound must be revalidated at 10240 before being treated as canonical.
 
 This documents the exact packet-level shape of the server's response from the client's
 **Join** (NMT 0x09) through the first ~80 frames, so our actor-bootstrap send path can match it.
@@ -97,7 +99,7 @@ f1489  80   1131   0.0     6    6     58     <- GRI opens here: ch54 sq1 O1 4662
 f1490  81   614    2.7    21    4     62
 f1491  82   1185  49.1    23    7     69
 f1493  83   1030  45.2    27    5     74
-f1494  84   1222  71.7     5    4     78     <- GRI ch54 partial continues: 7096b bunch
+f1494  84   1222  71.7     5    4     78     <- next ordinary GRI ch54 bunch: 7096b
 f1495  85   432    0.0    21    1     79
 f1496  86   561   41.7    24    2     81
 f1497  87   347   40.9    24    1     82
@@ -139,8 +141,9 @@ Pacing model:
 - ch0 control bunches (0x24, 0x23) and ch2 (PC) bunches are interleaved **inside** the actor
   packets, never on their own dedicated packet.
 - The single biggest actor is **ch54 = GameReplicationInfo**: opened f1489 with a 4662-bit
-  bunch, continued f1494 (7096 bits) and f1527 (7190 bits) — it spans multiple packets via
-  partial bunches. ch21/56/76 = TeamInfo; ch2 = PlayerController; ch13/14/16/17… = the
+  bunch, continued f1494 (7096 bits) and f1527 (7190 bits) — its property deltas span
+  multiple ordinary complete bunches. ch21/56/76 = TeamInfo; ch2 = PlayerController;
+  ch13/14/16/17… = the
   PlayerReplicationInfo chain.
 
 ---
@@ -168,9 +171,9 @@ Pacing model:
    as fit, flush, repeat; allow multiple datagrams per tick when backlog is deep. Our current
    "~12 packet" batch is too few and likely too uniform — we should keep coalescing until the
    send queue drains and spread it across ticks.
-3. **GameReplicationInfo (ch54) and the big actors split across packets** via partial bunches;
-   we must support multi-packet partial bunches for the large GRI/TeamInfo property blobs
-   rather than assuming one bunch = one channel's full state.
+3. **GameReplicationInfo (ch54) and the big actors span packets** via multiple ordinary
+   complete bunches/property deltas. Preserve each bunch boundary and per-channel sequence;
+   EngineVersion 7258 has no partial-bunch flags. One bunch is not a channel's full state.
 4. **NMT 0x23** is a periodic bidirectional reliable ch0 heartbeat/challenge
    (`23` + int32 len 24 + 24 opaque bytes, trailing nonce changes each time). The client
    sends it back (ch0 sq45→47); if our server never sends 0x23 the client may still proceed,

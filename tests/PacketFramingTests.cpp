@@ -108,18 +108,16 @@ TEST(PacketFraming, ChallengeFrame157) {
     EXPECT_EQ(b.chType, 1u);
     EXPECT_EQ(b.payloadBits, 40u);
     ASSERT_FALSE(b.payload.empty());
-    EXPECT_EQ(b.payload[0], 0x00);  // first reassembly fragment leads with 0x00
+    EXPECT_EQ(b.payload[0], 0x00);  // captured bunch payload leads with 0x00
 
     ExpectRoundTrip(challenge, /*packetBytes=*/11);
 }
 
-// Frame 161 (C->S): the real 72-byte datagram captured AFTER netspeed
-// negotiation. Per spec §3 the connection's MaxPacket grows past the handshake
-// value of 8 here, so BunchDataBits is bounded by a larger value than this
-// codec's handshake-phase kBunchDataBitsMax (64). We therefore only assert that
-// Decode does not crash / read out of bounds and recovers the rolling PacketId
-// (133); a byte-exact round-trip of this post-handshake frame requires the
-// negotiated MaxPacket, which is out of scope for the handshake framing codec.
+// Frame 161 (C->S): the real 72-byte datagram captured after Netspeed. Production
+// C2S framing uses MaxPacket 1280 from the first packet; the no-argument codec
+// default remains a historical 8-byte fixture bound. This legacy-default test
+// therefore asserts only that Decode stays bounded and recovers PacketId 133;
+// direction-correct byte-exact coverage lives in RetailClientMaxPacket* below.
 //
 // NOTE: the task brief's inline Netspeed fixture was truncated/garbled (it
 // ended "...0c 2" / 68 bytes). These are the true bytes from the pcap

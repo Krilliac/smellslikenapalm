@@ -3,7 +3,7 @@
 Reverse-engineered from the real client↔real server capture
 `D:\RE-Tools\rs2_realserver_capture.pcapng` (S2C filter `udp.srcport==7777 && udp.dstport==57867`,
 C2S `udp.srcport==57867 && udp.dstport==7777`). Bunches decoded with
-`tools/mock_client.py decode_packet(..., bd_max=12000)` for S2C / `16384` for C2S. Open class refs
+`tools/mock_client.py decode_packet(..., bd_max=12000)` for S2C / `10240` for C2S. Open class refs
 decoded as `UPackageMap::SerializeObject` = `[1 selector bit][static: SerializeInt(0x80000000) |
 dynamic: SerializeInt(1023)]` (see `docs/UE3_ActorChannel.md §3`).
 

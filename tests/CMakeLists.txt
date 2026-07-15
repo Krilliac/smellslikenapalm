@@ -83,7 +83,7 @@ rs2v_add_test(INIParserTests)    # reconciled: self-contained TestINIParser; dea
 rs2v_add_test(AuthenticationTests) # implemented: Security/{EACProxy,AuthManager,PasswordHasher,TokenManager}
 rs2v_add_test(PacketFramingTests)  # UE3 packet/bunch framing codec; fixtures = real handshake capture
 rs2v_add_test(ControlChannelTests) # UE3 control-channel message-body codec; round-trips per spec §4
-rs2v_add_test(PacketAssemblerTests) # UE3 outbound control-channel packet assembler (sequencing/fragmentation)
+rs2v_add_test(PacketAssemblerTests) # UE3 outbound control-channel packet assembler (sequencing/boundaries)
 rs2v_add_test(ControlReassemblerTests) # UE3 inbound control-channel reassembler (ordering/dedup/delimiting)
 rs2v_add_test(ControlReassemblerFuzzTests) # fuzz/hostile-input: out-of-order/dup/huge-seq/oversized bunches -> bounded buffering, no crash/over-read/hang
 rs2v_add_test(HandshakeStateFuzzTests)     # fuzz/hostile-input: malformed/truncated/oversized NMT + bad type bytes -> never throws/crashes, phase stays valid

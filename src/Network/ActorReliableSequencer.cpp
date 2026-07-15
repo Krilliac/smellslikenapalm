@@ -18,10 +18,6 @@ ActorReliableSequencer::ActorReliableSequencer(uint32_t reorderWindow,
       m_maximumPendingBunches(maximumPendingBunches),
       m_maximumPendingPayloadBytes(maximumPendingPayloadBytes) {}
 
-uint32_t ActorReliableSequencer::ForwardDistance(uint32_t from, uint32_t to) {
-    return (to + kMaxChSequence - from) % kMaxChSequence;
-}
-
 bool ActorReliableSequencer::IsValidChannel(uint32_t channelIndex) {
     return channelIndex < static_cast<uint32_t>(kMaxChannels);
 }
@@ -59,7 +55,7 @@ void ActorReliableSequencer::ReleaseOne(
     ActorReliableSequenceResult& result) const {
     result.released.push_back(bunch);
     RememberReleased(state, bunch.chSequence);
-    state.nextSequence = (state.nextSequence + 1u) % kMaxChSequence;
+    state.nextSequence = AdvanceChSequence(state.nextSequence);
 }
 
 void ActorReliableSequencer::RemovePendingAccounting(const Bunch& bunch) {
@@ -106,9 +102,9 @@ ActorReliableSequenceResult ActorReliableSequencer::Push(const Bunch& bunch) {
         return result;
     }
 
-    const uint32_t distance =
-        ForwardDistance(state.nextSequence, bunch.chSequence);
-    if (distance == 0u) {
+    const ChSequenceDelta sequence =
+        ClassifyChSequenceFromExpected(state.nextSequence, bunch.chSequence);
+    if (sequence.relation == ChSequenceRelation::Equal) {
         result.status = ActorReliableSequenceStatus::Released;
         ReleaseOne(state, bunch, result);
 
@@ -126,7 +122,8 @@ ActorReliableSequenceResult ActorReliableSequencer::Push(const Bunch& bunch) {
         return result;
     }
 
-    if (distance <= m_reorderWindow) {
+    if (sequence.relation == ChSequenceRelation::Ahead &&
+        sequence.forwardDistance <= m_reorderWindow) {
         const size_t payloadBytes = bunch.payload.size();
         // Subtraction after checking the addend avoids size_t addition overflow.
         // A zero-byte bunch still consumes one entry from the bunch-count cap.
@@ -147,7 +144,7 @@ ActorReliableSequenceResult ActorReliableSequencer::Push(const Bunch& bunch) {
     // UE3 MakeRelative treats an exact half-cycle as the older side of the
     // cursor. It is still dropped either way, but matching that classification
     // keeps diagnostics and boundary behavior faithful to the engine.
-    if (distance >= (kMaxChSequence / 2u)) {
+    if (sequence.relation == ChSequenceRelation::Behind) {
         result.status = ActorReliableSequenceStatus::Stale;
     } else {
         result.status = ActorReliableSequenceStatus::GapOverflow;
@@ -202,13 +199,14 @@ size_t ActorReliableSequencer::RetirePending(uint32_t channelIndex) {
         (void)bunch;
         farthestDistance = std::max(
             farthestDistance,
-            ForwardDistance(state.nextSequence, sequence));
+            ClassifyChSequenceFromExpected(
+                state.nextSequence, sequence).forwardDistance);
     }
     const size_t retired = state.pending.size();
     RemoveChannelPendingAccounting(state);
     state.pending.clear();
     state.nextSequence =
-        (state.nextSequence + farthestDistance + 1u) % kMaxChSequence;
+        AdvanceChSequence(state.nextSequence, farthestDistance + 1u);
     return retired;
 }
 

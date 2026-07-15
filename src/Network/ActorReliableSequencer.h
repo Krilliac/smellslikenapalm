@@ -41,10 +41,10 @@ public:
     // every legal successor at distance 1..127; ACKing and dropping one of
     // those bunches would stop retransmission and permanently strand the
     // channel behind its missing sequence.
-    static constexpr uint32_t kDefaultReorderWindow = 127;
+    static constexpr uint32_t kDefaultReorderWindow = kReliableBuffer - 1u;
     // Modular ordering is unambiguous only inside half of the sequence space.
     static constexpr uint32_t kMaximumReorderWindow =
-        (kMaxChSequence / 2u) - 1u;
+        (kMaxChSequence / 2u) - 2u;
     // These connection-wide caps complement the per-channel sequence window.
     // Without them, a peer could fill the window on many different channels and
     // retain far more memory than any single-channel bound suggests.
@@ -108,7 +108,6 @@ private:
         std::deque<uint32_t> recentlyReleased;
     };
 
-    static uint32_t ForwardDistance(uint32_t from, uint32_t to);
     static bool WasRecentlyReleased(const ChannelState& state, uint32_t sequence);
     void RememberReleased(ChannelState& state, uint32_t sequence) const;
     void ReleaseOne(ChannelState& state, const Bunch& bunch,

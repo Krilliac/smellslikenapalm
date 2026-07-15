@@ -170,10 +170,12 @@ bool PeekType(const uint8_t* data, size_t len, NMT& outType);
 // unspecified) if `r` does not yet hold a complete message OR the NMT is not a
 // recognized control message whose body length we can determine.
 //
-// This is the message DELIMITER used by the inbound reassembler to peel complete
-// messages off the continuous control-channel bit stream (UE3 has no per-message
-// length marker - the size is implicit in the NMT's fields). Its per-NMT field
-// reads MUST stay in lockstep with the Parse* functions above.
+// This is the message delimiter for callers that parse a continuous
+// control-channel bit stream (UE3 has no per-message length marker - the size is
+// implicit in the NMT's fields). The current inbound ControlReassembler dispatches
+// one retail bunch payload per callback and does not call this helper. Its per-NMT
+// field reads MUST stay in lockstep with the Parse* functions above before a
+// continuous-stream caller relies on it.
 bool ConsumeMessage(BitReader& r, NMT& outType);
 
 // ---------------------------------------------------------------------------

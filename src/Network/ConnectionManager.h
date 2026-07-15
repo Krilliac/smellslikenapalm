@@ -4,6 +4,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <memory>
 #include <vector>
 #include <unordered_map>
@@ -61,8 +62,9 @@ public:
     void FireClientLoggedIn(const ClientLoggedInEvent& ev);
     void FireClientJoined(const ClientJoinedEvent& ev);
 
-    // Send raw control-channel bytes (a ControlChannel::Build* payload) to a
-    // client without the Packet tag/serialize wrapper. Used by HandshakeState.
+    // Accept raw control-channel bytes (a ControlChannel::Build* payload) for
+    // reliable delivery without the legacy Packet wrapper. Sends immediately
+    // when ch0 has capacity, otherwise retains the message in a bounded FIFO.
     bool SendRawToClient(uint32_t clientId, const std::vector<uint8_t>& bytes);
 
     // Main loop: receive raw data and dispatch to handlers
@@ -234,22 +236,24 @@ private:
     std::unordered_map<uint32_t, std::unique_ptr<HandshakeState>> m_handshakes;
 
     // Per-connection UE3 control-channel framing state, keyed by clientId:
-    //   * outbound    - assigns PacketId/ChSequence, fragments + acks (send side).
-    //   * reassembler - orders/dedups inbound reliable control bunches and peels
-    //                   complete messages into the handshake (receive side).
+    //   * outbound    - assigns PacketId/ChSequence, enforces ch0's 127-record
+    //                   ACK window, and frames one-bunch messages with pending
+    //                   acks (send side).
+    //   * reassembler - orders/dedups inbound reliable control bunches and
+    //                   dispatches each accepted payload (receive side).
     struct ControlState {
         struct PendingTeamReinforcementPublication {
             int32_t wireValue = 0;
-            std::vector<uint32_t> packetIds;
+            std::vector<int64_t> packetSerials;
             uint64_t lastSendMs = 0;
         };
 
         PacketCodec::PacketAssembler outbound;
         std::unique_ptr<PacketCodec::ControlReassembler> reassembler;
         // Reliable actor traffic has an independent ChSequence cursor per actor
-        // channel. Keep it separate from ch0's message reassembler: actor bunches
-        // are released whole, while control bunches are reassembled into NMT
-        // messages. Unreliable actor traffic deliberately bypasses this object.
+        // channel. Keep it separate from ch0's sequencer: actor bunches are
+        // released to actor dispatch while ch0 bunch payloads go to HandshakeState.
+        // Unreliable actor traffic deliberately bypasses this object.
         PacketCodec::ActorReliableSequencer actorReliableInbound;
         // Per-channel state for the owning client's PlayerController (ch2). The actor
         // bootstrap opens ch2 (seq 1) then sends ClientShowTeamSelect (seq 2).
@@ -485,9 +489,11 @@ private:
         // bootstrap burst stalls that channel forever -> the client soft-locks (can't
         // disconnect). We record each reliable bunch-set we send, clear it when the
         // client acks any packet it rode in, and resend (verbatim, SAME per-channel
-        // ChSequence; NEW PacketId) on an ack-timeout.
+        // ChSequence; NEW monotonic packet serial / wrapped wire PacketId) on timeout.
         struct SentReliable {
-            std::vector<uint32_t> packetIds;     // every packet this set has gone out in
+            // Every monotonic internal PacketId this set has gone out in. The
+            // 14-bit wire projection may repeat after wrap; the serial may not.
+            std::vector<int64_t> packetSerials;
             uint64_t lastSendMs = 0;
             // Control-channel messages can legitimately wait tens of seconds
             // for the cold retail client to finish loading. Actor traffic uses
@@ -498,6 +504,17 @@ private:
             std::vector<PacketCodec::Bunch> bunches;  // the reliable bunches, verbatim
         };
         std::vector<SentReliable> pendingReliable;
+
+        // Required ch0 messages wait here when UE3's 127-record ordinary
+        // reliable window is full. FIFO order is protocol order; bounds prevent
+        // an unresponsive peer from turning backpressure into unbounded memory.
+        std::deque<std::vector<uint8_t>> deferredControlMessages;
+        size_t deferredControlBytes = 0u;
+        bool flushingDeferredControlMessages = false;
+        // NMT_Join completion is held until all earlier reliable ch0 work is
+        // ACKed. The bootstrap can then put capture f1484's ch2 OPEN and NMT
+        // 0x24 in one packet before publishing the remaining actor cohort.
+        bool joinCompletionDeferred = false;
     };
 
     enum class PossessionRecoveryDecision : uint8_t {
@@ -603,7 +620,7 @@ private:
     HandshakeState& GetOrCreateHandshake(uint32_t clientId);
 
     // Get-or-create the per-connection control-channel framing state (lazily wires
-    // the reassembler's message callback to the client's handshake).
+    // the reassembler's per-bunch callback to the client's handshake).
     ControlState& GetControlState(uint32_t clientId);
 
     // Resolve and freeze the map/mode/bootstrap identity for one UE3 session.
@@ -776,11 +793,13 @@ private:
         bool suppressReleasedCohort = false);
 
     // ---- Reliable retransmission ------------------------------------------------
-    // Build ONE packet from `bunches`, send it, and record any reliable bunches for
-    // retransmission until acked. The single choke-point for sending actor bunches.
+    // Build ONE packet from `bunches` and establish retry ownership before UDP.
+    // Reliable batches return true once the ledger accepts them even if the first
+    // handoff fails; unreliable-only batches retain raw socket-send semantics.
+    // This is the single choke-point for sending actor bunches.
     bool SendReliableBunches(
         uint32_t clientId, const std::vector<PacketCodec::Bunch>& bunches,
-        uint32_t* sentPacketId = nullptr);
+        int64_t* sentPacketSerial = nullptr);
     std::optional<PacketCodec::OutboundReliableSequencer::Reservation>
     ReserveCh2Reliable(ControlState& state, uint32_t clientId, size_t count,
                        const char* context);
@@ -789,6 +808,43 @@ private:
         const PacketCodec::OutboundReliableSequencer::Reservation& reservation,
         const char* context);
     void FailCloseCh2Publication(uint32_t clientId, const char* context);
+
+    enum class ControlPublishResult : uint8_t {
+        Published,
+        ReliableWindowFull,
+        Fatal,
+    };
+    static constexpr size_t kMaxDeferredControlMessages =
+        PacketCodec::kReliableBuffer - 1u;
+    static constexpr size_t kMaxDeferredControlBytes = 256u * 1024u;
+    ControlPublishResult TryPublishControlMessage(
+        uint32_t clientId, const std::vector<uint8_t>& bytes,
+        const std::vector<PacketCodec::Bunch>& leadingBunches = {});
+    bool PublishControlMessageImmediately(
+        uint32_t clientId, const std::vector<uint8_t>& bytes,
+        const char* context);
+    // Capture f1484 places the owning ch2 OPEN and NMT 0x24 in one packet.
+    // Publish both under one packet identity/retry ledger so UDP loss cannot
+    // expose the ch0 transition without the PlayerController adoption bunch.
+    bool PublishBootstrapEntryPacket(
+        uint32_t clientId, const PacketCodec::Bunch& playerControllerOpen,
+        const std::vector<uint8_t>& controlMessage);
+    bool DeferControlMessage(uint32_t clientId,
+                             const std::vector<uint8_t>& bytes);
+    void FlushDeferredControlMessages(uint32_t clientId);
+    void TryResumeDeferredClientJoin(uint32_t clientId);
+    void FailCloseControlPublication(uint32_t clientId,
+                                     const char* context);
+
+    // UE3 unwraps 14-bit wire ACKs against a monotonic internal PacketId. Do not
+    // let unacknowledged issuance reach the exact 8192-packet ambiguous half.
+    bool EnsureNextOutboundPacketIdAvailable(uint32_t clientId,
+                                             const char* context);
+    // Bunch-less packets are intentionally not ACKed by UE3 peers. Before one
+    // advances the local ACK-unwrapping reference, every live reliable ledger
+    // must have a retry attempt strictly inside the current 14-bit half-range.
+    bool EnsureBunchlessAckReferenceSafe(uint32_t clientId,
+                                         const char* context);
 
     // Coalesce + throttle pending acks into at most one standalone ack-only datagram per
     // client per pump cycle (~20ms). Acks also piggyback on any data packet we send. Replaces
@@ -827,8 +883,8 @@ private:
     //
     //  Decodes a raw inbound UDP datagram as a UE3 packet (PacketCodec::Decode),
     //  acknowledges it, feeds its control-channel bunches to the per-connection
-    //  reassembler (which orders/dedups them and peels complete messages into the
-    //  handshake), and flushes a standalone ack if no response carried it. Wire
+    //  reassembler (which orders/dedups them and dispatches each bunch payload to
+    //  the handshake), and flushes a standalone ack if no response carried it. Wire
     //  format: docs/RS2V_ControlChannel_WireSpec_7258.md.
     // ------------------------------------------------------------------------
     // Returns true if `datagram` was a well-formed UE3 packet and was handled

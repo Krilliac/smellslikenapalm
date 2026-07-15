@@ -1,5 +1,9 @@
 # SAFE State-Replication Plan — populate the team buttons WITHOUT hanging the client
 
+> Historical pre-live-bootstrap plan retained for rationale. Current behavior lives
+> in `ConnectionManager::SendActorBootstrap` / `SendLiveActorBootstrap` and is
+> documented in `docs/NETCODE.md`; action items below may already be superseded.
+
 Goal: make the team-select menu's team buttons render (not black squares) and make a
 team pick stick, on the real retail client, **without re-triggering the hang**. Grounded
 in `docs/re/hang_rootcause_teaminfo.md`, `open_bunch_structure.md`,
@@ -109,15 +113,14 @@ unresolved → black square. Order matters (§5).
 
 ## 5. Order of operations (single tick / bootstrap order)
 
-1. Open **ch2** (ROPlayerController, NetPlayerIndex=0) FIRST, standalone packet (already
-   done — client adoption gate).
-2. Send NMT 0x24 (`24 01 00 00 00`) — already done.
-3. Open the **3 TeamInfo channels** (ch76=team0, ch56=team1, ch21=team2) each with the
+1. Open **ch2** (ROPlayerController, NetPlayerIndex=0) FIRST and place NMT 0x24
+   (`24 01 00 00 00`) immediately after it in the same packet, matching f1484.
+2. Open the **3 TeamInfo channels** (ch76=team0, ch56=team1, ch21=team2) each with the
    §4.1 81-bit open bunch, BEFORE any PRI.Team ref can point at them.
-4. Open **GRI ch54** with §4.2 props (ServerName/bMatchHasBegun/MaxPlayers).
-5. Open **PRI channels** (incl. local ch26) with §4.3 PlayerName in the open block.
+3. Open **GRI ch54** with §4.2 props (ServerName/bMatchHasBegun/MaxPlayers).
+4. Open **PRI channels** (incl. local ch26) with §4.3 PlayerName in the open block.
    Do NOT put Team in the open block (it's a non-initial delta).
-6. Send **ClientShowTeamSelect (h206)** then **ClientGotoState (h41)** on ch2 (reliable,
+5. Send **ClientShowTeamSelect (h206)** then **ClientGotoState (h41)** on ch2 (reliable,
    normal chSeq progression) to open the menu shell.
 7. On team pick: send PRI.Team (§4.3) as an UNRELIABLE delta. Optionally ChangedTeams(172)
    / ChangedRole(210) on ch2 as the post-pick confirmation.
@@ -160,7 +163,7 @@ do NOT eyeball the client:
   instantly. If after sending the team bunches the client STOPS acking (no C2S pure-ack)
   and stops its ch2 menu RPC traffic → reliable-sequence stall (the hang). If it sends
   empty `bClose` bunches on the new channels → ActorChannelFailure (bad class ref /
-  unresolved object ref), not a sequence bug. Decode C2S with `bd_max=16384`.
+  unresolved object ref), not a sequence bug. Decode C2S with `bd_max=10240`.
 - Compare your generated bunch byte-for-byte against the capture's equivalent bunch
   (gen_actor_bootstrap already pulls them) — any diff in bunchDataBits is the bug.
 
@@ -179,7 +182,8 @@ later as an UNRELIABLE delta (selector=1 + channel index of an open TeamInfo) on
 the pick. Validate every bunch with a re-decode-to-exactly-0-bits assertion (WireTrace +
 BitReader) before it hits the wire; bisect one field at a time.
 
-**SINGLE MOST IMPORTANT NEXT ACTION:** Rebuild `data/actor_bootstrap.bin` so the three
+**HISTORICAL NEXT ACTION — COMPLETED/SUPERSEDED BY LIVE BOOTSTRAP:** Rebuild
+`data/actor_bootstrap.bin` so the three
 ROTeamInfo channels (ch76/ch56/ch21) each open with the verified 81-bit bunch carrying
 ONLY `TeamIndex` (= 0 / 1 / 2; handle `SerializeInt(23,78)` + int32), assert each
 re-decodes to exactly 0 bits remaining via the new BitReader/WireTrace invariants, then
