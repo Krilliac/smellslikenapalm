@@ -542,6 +542,21 @@ void ConnectionManager::HandleIncomingPacket(const std::vector<uint8_t>& data, c
         return;
     }
 
+    // Protocol classification is sticky. Once an endpoint has supplied genuine
+    // UE3 framing, a later malformed datagram must never be reinterpreted as the
+    // emulator's legacy tagged-Packet format. In particular, PacketCodec rejects
+    // a zero-tailed datagram because it has no UE3 terminator; without this gate
+    // an established retail client could wrap an arbitrary legacy gameplay tag,
+    // append a zero byte, and reach the parallel GameServer dispatcher below.
+    if (conn->IsUE3Client()) {
+        Logger::Debug(
+            "[ConnectionManager::HandleIncomingPacket] client %u is already "
+            "classified as UE3; dropping %zu-byte non-UE3/malformed datagram",
+            clientId, data.size());
+        TELEMETRY_INCREMENT_PACKETS_DROPPED();
+        return;
+    }
+
     // The reverse-engineering observer's UE3Protocol parser models an obsolete,
     // byte-aligned synthetic header and cannot decode retail's bit-packed UE3
     // framing. Do not feed real UE3 datagrams to it: PacketCodec above is the

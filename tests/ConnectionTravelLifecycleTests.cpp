@@ -767,6 +767,23 @@ std::vector<uint8_t> PureAckDatagram() {
     return EncodeClientPacket(packet);
 }
 
+std::vector<uint8_t> ZeroTailedLegacyDatagram(
+    const std::string& tag, const std::vector<uint8_t>& payload = {}) {
+    Packet packet(tag, payload);
+    std::vector<uint8_t> datagram = packet.Serialize();
+    // PacketCodec requires a non-zero final byte containing the UE3 terminator.
+    // Packet::FromBuffer historically tolerates this byte after its declared
+    // payload, making this a valid probe for protocol-confusion fallback.
+    datagram.push_back(0u);
+    return datagram;
+}
+
+std::vector<uint8_t> LegacyStringPayload(const std::string& value) {
+    Packet payload;
+    payload.WriteString(value);
+    return payload.RawData();
+}
+
 std::vector<uint8_t> KeepAliveDatagram() {
     PacketCodec::Packet packet;
     packet.packetId = 8;
@@ -2192,6 +2209,87 @@ TEST(ConnectionTravelLifecycle,
     const std::shared_ptr<ClientConnection> connection = manager.GetConnection(1);
     ASSERT_TRUE(connection != nullptr);
     EXPECT_TRUE(connection->IsUE3Client());
+}
+
+TEST(ConnectionTravelLifecycle,
+     PreJoinUE3EndpointCannotFallBackToLegacyPacketDispatch) {
+    ConnectionManager manager(nullptr);
+    size_t legacyDispatches = 0;
+    manager.SetPacketCallback(
+        [&](uint32_t, const Packet&, const PacketMetadata&) {
+            ++legacyDispatches;
+        });
+    const std::string ip = "192.0.2.47";
+    constexpr uint16_t port = 31010;
+
+    ConnectionTravelLifecycleTestHarness::Deliver(
+        manager, EncodeClientPacket(FreshHandshakeStartPacket()), ip, port);
+    const std::shared_ptr<ClientConnection> connection =
+        manager.GetConnection(1u);
+    ASSERT_TRUE(connection != nullptr);
+    ASSERT_TRUE(connection->IsUE3Client());
+    ASSERT_FALSE(connection->IsHandshakeComplete());
+
+    const std::vector<uint8_t> legacy = ZeroTailedLegacyDatagram(
+        "CHAT_MESSAGE", LegacyStringPayload("/votemap 1"));
+    ASSERT_FALSE(PacketCodec::Decode(
+        legacy.data(), legacy.size(),
+        PacketCodec::kClientSendMaxPacketBytes).ok);
+    ConnectionTravelLifecycleTestHarness::Deliver(manager, legacy, ip, port);
+
+    EXPECT_EQ(legacyDispatches, static_cast<size_t>(0));
+    EXPECT_TRUE(connection->IsUE3Client());
+    EXPECT_FALSE(connection->IsHandshakeComplete());
+}
+
+TEST(ConnectionTravelLifecycle,
+     JoinedUE3EndpointCannotFallBackToLegacyGameplayDispatch) {
+    ConnectionManager manager(nullptr);
+    const std::shared_ptr<ClientConnection> connection =
+        ConnectionTravelLifecycleTestHarness::AddClient(
+            manager, 1u, "192.0.2.48", 31011, true, 7u, false);
+    size_t legacyDispatches = 0;
+    manager.SetPacketCallback(
+        [&](uint32_t, const Packet&, const PacketMetadata&) {
+            ++legacyDispatches;
+        });
+
+    const std::vector<uint8_t> legacy = ZeroTailedLegacyDatagram(
+        "WEAPON_FIRE", std::vector<uint8_t>(30u, 0x01u));
+    ASSERT_FALSE(PacketCodec::Decode(
+        legacy.data(), legacy.size(),
+        PacketCodec::kClientSendMaxPacketBytes).ok);
+    ConnectionTravelLifecycleTestHarness::Deliver(
+        manager, legacy, "192.0.2.48", 31011);
+
+    EXPECT_EQ(legacyDispatches, static_cast<size_t>(0));
+    EXPECT_TRUE(connection->IsUE3Client());
+    EXPECT_TRUE(connection->IsHandshakeComplete());
+}
+
+TEST(ConnectionTravelLifecycle,
+     ExplicitNonUE3ToolEndpointRetainsLegacyPacketDispatch) {
+    ConnectionManager manager(nullptr);
+    const std::shared_ptr<ClientConnection> connection =
+        ConnectionTravelLifecycleTestHarness::AddClient(
+            manager, 1u, "192.0.2.49", 31012, false, 0u, false);
+    connection->SetUE3Client(false);
+    size_t legacyDispatches = 0;
+    std::string receivedTag;
+    manager.SetPacketCallback(
+        [&](uint32_t, const Packet& packet, const PacketMetadata&) {
+            ++legacyDispatches;
+            receivedTag = packet.GetTag();
+        });
+
+    const std::vector<uint8_t> legacy = ZeroTailedLegacyDatagram(
+        "CHAT_MESSAGE", LegacyStringPayload("tool probe"));
+    ConnectionTravelLifecycleTestHarness::Deliver(
+        manager, legacy, "192.0.2.49", 31012);
+
+    EXPECT_EQ(legacyDispatches, static_cast<size_t>(1));
+    EXPECT_EQ(receivedTag, std::string("CHAT_MESSAGE"));
+    EXPECT_FALSE(connection->IsUE3Client());
 }
 
 TEST(ConnectionTravelLifecycle,
