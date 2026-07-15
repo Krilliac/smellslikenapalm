@@ -577,6 +577,11 @@ DecodeChangeVivoxChannelsStateBunch(
     return result;
 }
 
+void WriteOwnerNextRespawnTime(BitWriter& writer, int32_t nextRespawnTime) {
+    ActorRepl::WritePropInt(writer, kNextRespawnTimeHandle,
+                            kRoPlayerControllerMaxHandle, nextRespawnTime);
+}
+
 bool IsValidRetailParticipantCombatState(
     const RetailParticipantCombatState& state) noexcept {
     return ParticipantActorChannelMap::EncodeWirePlayerId(state.participant)

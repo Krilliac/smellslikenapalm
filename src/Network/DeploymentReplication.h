@@ -22,6 +22,10 @@
 namespace DeploymentRepl {
 
 constexpr uint32_t kRoPlayerControllerMaxHandle = 531;
+constexpr uint32_t kNextRespawnTimeHandle = 316;
+// SerializeInt(316, 531) consumes nine bits; the IntProperty payload is the
+// following raw signed 32-bit value.
+constexpr size_t kNextRespawnTimePropertyBits = 41;
 constexpr uint32_t kServerSetSpawnSelectHandle = 261;
 constexpr uint32_t kServerSetReadyToSpawnHandle = 434;
 constexpr uint32_t kServerSetSpawnVolumeViewTargetHandle = 370;
@@ -243,6 +247,10 @@ SpawnVolumeViewTargetBunchDecodeResult DecodeSpawnVolumeViewTargetBunch(
 ChangeVivoxChannelsStateBunchDecodeResult
 DecodeChangeVivoxChannelsStateBunch(
     const uint8_t* payload, size_t payloadBytes, size_t payloadBits);
+
+// Encode the source-grounded ROPlayerController h316 IntProperty.  The caller
+// owns actor-channel selection and must publish this only to the owning client.
+void WriteOwnerNextRespawnTime(BitWriter& writer, int32_t nextRespawnTime);
 
 // Transactional actor-property writers: invalid input returns false before any
 // bits are appended.  Team is deliberately a separate reliable delta because

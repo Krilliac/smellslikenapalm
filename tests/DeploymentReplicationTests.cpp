@@ -1,5 +1,6 @@
 #include "TestFramework.h"
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -564,6 +565,44 @@ TEST(DeploymentReplication, RejectsInvalidBuffers) {
                   encoded.bytes.data(), encoded.bytes.size(),
                   encoded.bytes.size() * 8u + 1u).error,
               DeploymentRepl::DecodeError::InvalidBuffer);
+}
+
+TEST(DeploymentReplication, EncodesOwnerNextRespawnTimeExactly) {
+    constexpr std::array<int32_t, 5> values{
+        0, 9999999, -1, std::numeric_limits<int32_t>::min(),
+        std::numeric_limits<int32_t>::max()};
+
+    for (const int32_t value : values) {
+        BitWriter writer;
+        DeploymentRepl::WriteOwnerNextRespawnTime(writer, value);
+        ASSERT_EQ(writer.NumBits(),
+                  DeploymentRepl::kNextRespawnTimePropertyBits);
+
+        const std::vector<uint8_t> bytes = writer.GetBytes();
+        BitReader reader(bytes.data(), bytes.size(), writer.NumBits());
+        EXPECT_EQ(reader.SerializeInt(
+                      DeploymentRepl::kRoPlayerControllerMaxHandle),
+                  DeploymentRepl::kNextRespawnTimeHandle);
+        EXPECT_EQ(reader.ReadInt32(), value);
+        EXPECT_EQ(reader.BitsLeft(), 0u);
+        EXPECT_FALSE(reader.IsOverflowed());
+    }
+}
+
+TEST(DeploymentReplication, OwnerNextRespawnTimeTruncationOverflowsSafely) {
+    BitWriter writer;
+    DeploymentRepl::WriteOwnerNextRespawnTime(writer, 9999999);
+    const std::vector<uint8_t> bytes = writer.GetBytes();
+
+    for (size_t bits = 0;
+         bits < DeploymentRepl::kNextRespawnTimePropertyBits; ++bits) {
+        BitReader reader(bytes.data(), bytes.size(), bits);
+        reader.SetOverflowHandler([](const char*, size_t, size_t, size_t) {});
+        (void)reader.SerializeInt(
+            DeploymentRepl::kRoPlayerControllerMaxHandle);
+        (void)reader.ReadInt32();
+        EXPECT_TRUE(reader.IsOverflowed()) << bits;
+    }
 }
 
 TEST(DeploymentReplication, EncodesCaptureBackedRemoteHumanPriFields) {
