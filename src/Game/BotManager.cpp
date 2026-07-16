@@ -936,9 +936,15 @@ void BotManager::RunBuiltInCombat() {
     // death transaction/event, but its callback is replayed only after the
     // complete volley state is visible.
     const std::size_t firstVolleyDeathEvent = deathEvents_.size();
-    DeathCallback deferredDeathCallback = std::move(deathCallback_);
+    // A moved-from std::function is valid but its callable state is
+    // unspecified.  libc++ may leave a small callable active in the source,
+    // which would publish each death once during KillBot and again below.
+    // Exchange with an empty function so the transactional commit is silent
+    // on every standard-library implementation.
+    DeathCallback deferredDeathCallback =
+        std::exchange(deathCallback_, DeathCallback{});
     DeathBatchCallback deferredDeathBatchCallback =
-        std::move(deathBatchCallback_);
+        std::exchange(deathBatchCallback_, DeathBatchCallback{});
     for (const auto& [rawVictimId, damage] : damageByVictim) {
         const auto victim = bots_.find(rawVictimId);
         if (victim == bots_.end() ||
