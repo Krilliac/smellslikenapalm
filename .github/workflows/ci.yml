@@ -17,6 +17,7 @@ jobs:
     name: Build (Linux)
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
         compiler: [gcc, clang]
         include:
@@ -24,8 +25,8 @@ jobs:
             cc: gcc-12
             cxx: g++-12
           - compiler: clang
-            cc: clang-15
-            cxx: clang++-15
+            cc: clang-18
+            cxx: clang++-18
 
     steps:
       - name: Checkout code
@@ -39,7 +40,7 @@ jobs:
             ninja-build \
             libssl-dev \
             zlib1g-dev \
-            ${{ matrix.compiler == 'clang' && 'clang-15' || '' }}
+            ${{ matrix.compiler == 'clang' && 'clang-18' || '' }}
 
       - name: Configure CMake
         env:
