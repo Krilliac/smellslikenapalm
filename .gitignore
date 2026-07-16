@@ -111,5 +111,12 @@ __pycache__/
 # PacketRecorder sniff output (runtime-generated)
 packetlog/
 
+# Raw network captures may contain Steam/auth/network identifiers. Commit only
+# sanitized evidence records and synthetic packet fixtures.
+*.pcap
+*.pcapng
+*.pcap.manifest.json
+*.pcapng.manifest.json
+
 # Retail-client visual acceptance artifacts
 retail_*.png

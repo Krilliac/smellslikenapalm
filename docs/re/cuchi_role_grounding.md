@@ -287,6 +287,46 @@ tagged bot participation and reflected the emulator's then-missing AI squad
 owners. Current deterministic coverage pins the default filled-roster result at
 1/1 and separately keeps the empty-roster 0/0 fixture for wire encoding.
 
+## Bounded owning-client capture workflow
+
+`tools/capture_realserver.ps1` records one narrow real-server UDP endpoint for a
+bounded scenario. Start it before the retail client begins its handshake, then
+join VNTE-CuChi Territories, select South's non-squad-leader Machine Gunner,
+deploy with the default M60 loadout, move/fire, and complete one death/respawn
+cycle. The server address must be a literal IPv4 address and the port must be
+explicit:
+
+```powershell
+powershell -NoProfile -File tools\capture_realserver.ps1 `
+  -ServerAddress 203.0.113.10 -ServerPort 7777 `
+  -Scenario 'Cu Chi South Machine Gunner default M60 deploy and respawn'
+```
+
+The script resolves and validates the active route, captures non-promiscuously
+with the exact `udp and host <address> and port <port>` filter, and lets dumpcap's
+duration and file-size limits stop the process normally. A capture is promoted
+from its unique same-directory partial name only when dumpcap exits cleanly,
+reports at least one packet and zero drops, and a separately identified,
+hash-stability-checked `capinfos` process validates the pcapng structure. The
+adjacent manifest records the scenario, exact bounds/filter, route and adapter
+identity, tool hashes and
+versions, packet/drop statistics, capture size, and capture SHA-256. A raced
+destination is never overwritten; if manifest publication races after capture
+promotion, the script hash-verifies and rolls back only the capture it owns.
+
+Raw `.pcap`/`.pcapng` files and their capture manifests can contain Steam,
+endpoint, route, and adapter identifiers. They must remain outside every Git
+work tree and are ignored by this repository. Only sanitized JSONL evidence and
+synthetic packet fixtures may be committed. Re-run the safety harness with:
+
+```powershell
+powershell -NoProfile -File tools\tests\capture_realserver_smoke.ps1
+```
+
+Passing capture safety checks proves only that the input is bounded and
+provenance-stable. It does not type the Machine Gunner actor graph or authorize
+any runtime role/loadout path.
+
 Remaining evidence work for full role coverage is now capture-bound rather than
 index-bound. Each non-class-0 infantry role needs an exact accepted h175 and a
 role/loadout-keyed owning-pawn graph before runtime authorization. The current
