@@ -95,7 +95,7 @@ PrometheusMetricsReporter::PrometheusMetricsReporter(const PrometheusReporterCon
 
 PrometheusMetricsReporter::~PrometheusMetricsReporter() {
     Logger::Trace("[PrometheusMetricsReporter::~PrometheusMetricsReporter] Destructor invoked, initiating shutdown");
-    Shutdown();
+    PrometheusMetricsReporter::Shutdown();
 
 #ifdef _WIN32
     Logger::Debug("[PrometheusMetricsReporter::~PrometheusMetricsReporter] Cleaning up Winsock");

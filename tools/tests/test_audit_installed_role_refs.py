@@ -170,6 +170,26 @@ def _build_report(
 
 
 class ReportTests(unittest.TestCase):
+    def test_phase1_extractor_identity_pin_is_exact(self) -> None:
+        self.assertEqual(
+            (
+                audit.EXPECTED_WRAPPER_BYTES,
+                audit.EXPECTED_WRAPPER_SHA256,
+                audit.EXPECTED_EXTRACTOR_SOURCE_BYTES,
+                audit.EXPECTED_EXTRACTOR_SOURCE_SHA256,
+                audit.EXPECTED_EXTRACTOR_EXECUTABLE_BYTES,
+                audit.EXPECTED_EXTRACTOR_EXECUTABLE_SHA256,
+            ),
+            (
+                14_303,
+                "C18706D1B2E3E0A4462E5416623DC57E6764341E264206F5490D6C198EBA4B26",
+                158_772,
+                "56F59A70ED8FD61416E57CAD3122E01F4796AA6AC4A04EECCE3776C5AEEEB26D",
+                125_952,
+                "087D939AAD765B3F73A32ADCD738BFCD757FF3D2371AC598BF71FE5230C988E2",
+            ),
+        )
+
     def test_builds_exact_fail_closed_cuchi_role_report(self) -> None:
         report = _build_report()
 

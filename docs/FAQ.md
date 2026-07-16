@@ -27,7 +27,8 @@ For detailed configuration, see [CONFIGURATION.md](CONFIGURATION.md). For diagno
 ### What are the build prerequisites?
 
 You need:
-- **C++23 compiler**: GCC 12+, Clang 15+, or MSVC (VS 2022)
+- **C++23 toolchain**: GCC 14+ with libstdc++ 14+, Clang 18+ with libc++ 18+,
+  or MSVC (VS 2022)
 - **CMake 3.20+**
 - **Threads support** (POSIX threads on Linux, Windows threads on Windows)
 
@@ -44,7 +45,7 @@ See [DEVELOPMENT.md](DEVELOPMENT.md) for platform-specific installation commands
 
 | Platform | Status | Compiler |
 |---|---|---|
-| **Linux** (Ubuntu 22.04+, CentOS 9+, Debian 12+) | Fully supported | GCC 12+, Clang 15+ |
+| **Linux** (CI pins Ubuntu 24.04) | Fully supported | GCC 14/libstdc++ 14 or Clang 18/libc++ 18 |
 | **Windows** (Windows 10+) | Fully supported | MSVC (VS 2022), MinGW |
 | **macOS** | Experimental | Clang (Xcode 11+) |
 

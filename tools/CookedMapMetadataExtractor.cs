@@ -49,12 +49,62 @@ internal sealed class Options
     public int MaxValueChars = 1024;
     public int MaxErrors = 25;
     public int MaxClasses = 512;
+    public int ExpectedClassCount = -1;
     public long ObjectBase = -1;
     public string ExpectedPackageGuid;
     public string ExpectedSha256;
     public string VerifiedSha256;
     public bool Overwrite;
     public bool ClassPatternSpecified;
+}
+
+internal sealed class GenerationIdentity
+{
+    public int Ordinal;
+    public long Exports;
+    public long Names;
+    public long NetObjects;
+}
+
+internal sealed class ClassArtifactMember
+{
+    public string Name;
+    public string Kind;
+    public int UObjectNetIndex;
+    public string PropertyFlags;
+    public string FunctionFlags;
+    public string UELibType;
+    public int? ArrayDim;
+    public bool? FunctionSuperPresent;
+    public bool SpecialDeclaration;
+}
+
+internal sealed class DirectBoolTag
+{
+    public string PropertyPath;
+    public bool? Value;
+    public string ValueState;
+    public long SourceOffset;
+}
+
+internal sealed class ClassArtifact
+{
+    public string ClassPath;
+    public string SuperClassPath;
+    public int SuperTableReference;
+    public int UClassExportIndex;
+    public int UClassNetIndex;
+    public string CdoPath;
+    public int CdoExportIndex;
+    public int CdoNetIndex;
+    public int CdoClassTableReference;
+    public bool CdoClassLinkVerified;
+    public long CdoSerialOffset;
+    public long CdoSerialSize;
+    public ulong CdoObjectFlags;
+    public List<ClassArtifactMember> Members = new List<ClassArtifactMember>();
+    public List<DirectBoolTag> DirectBNetInitialRotationTags =
+        new List<DirectBoolTag>();
 }
 
 internal sealed class RoleExportPair
@@ -132,6 +182,9 @@ internal static class Program
     private const string UnsafeAssemblyFullName =
         "System.Runtime.CompilerServices.Unsafe, Version=6.0.3.0, " +
         "Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a";
+    private const string ClassArtifactSchema = "rs2.cooked-class-artifacts.raw.v1";
+    private const uint CpfNet = 0x20u;
+    private const uint FuncNet = 0x40u;
 
     public static int Main(string[] args)
     {
@@ -144,6 +197,11 @@ internal static class Program
             string.Equals(args[0], "--self-test-role-export-schema", StringComparison.Ordinal))
         {
             return RunRoleExportSchemaSelfTest();
+        }
+        if (args != null && args.Length == 1 &&
+            string.Equals(args[0], "--self-test-class-artifact-schema", StringComparison.Ordinal))
+        {
+            return RunClassArtifactSchemaSelfTest();
         }
         if (HasHelp(args))
         {
@@ -182,7 +240,10 @@ internal static class Program
 
     private static int Extract(Options options)
     {
-        if (string.Equals(options.Mode, "role-exports", StringComparison.Ordinal))
+        bool prehashedIdentityMode =
+            string.Equals(options.Mode, "role-exports", StringComparison.Ordinal) ||
+            string.Equals(options.Mode, "class-artifacts", StringComparison.Ordinal);
+        if (prehashedIdentityMode)
         {
             options.VerifiedSha256 = ComputeSha256(options.InputPath);
             if (!string.Equals(
@@ -190,12 +251,15 @@ internal static class Program
                     StringComparison.OrdinalIgnoreCase))
             {
                 throw new ValidationException(
-                    "role-exports SHA-256 mismatch: expected " +
+                    options.Mode + " SHA-256 mismatch: expected " +
                     options.ExpectedSha256 + " but found " + options.VerifiedSha256);
             }
         }
 
-        Regex classFilter = CreateRegex(options.ClassPattern, "class");
+        Regex classFilter = string.Equals(
+                options.Mode, "class-artifacts", StringComparison.Ordinal) ?
+            CreateClassArtifactRegex(options.ClassPattern) :
+            CreateRegex(options.ClassPattern, "class");
         Regex propertyFilter = CreateRegex(options.PropertyPattern, "property");
         string libraryDirectory = Path.GetDirectoryName(options.UELibPath);
         string unsafePath = Path.GetFullPath(Path.Combine(
@@ -324,12 +388,16 @@ internal static class Program
             int exportCount = CollectionCount(packageView.Exports, "export table");
             bool roleExportsMode = string.Equals(
                 options.Mode, "role-exports", StringComparison.Ordinal);
+            bool classArtifactsMode = string.Equals(
+                options.Mode, "class-artifacts", StringComparison.Ordinal);
+            bool tableIdentityMode = roleExportsMode || classArtifactsMode;
             long packageFlags = 0;
             int generationCount = 0;
             long finalGenerationExports = 0;
             long finalGenerationNames = 0;
             long finalGenerationNetObjects = 0;
-            if (roleExportsMode)
+            List<GenerationIdentity> generations = new List<GenerationIdentity>();
+            if (tableIdentityMode)
             {
                 packageFlags = Convert.ToInt64(packageView.PackageFlags, Invariant);
                 generationCount = CollectionCount(
@@ -343,6 +411,13 @@ internal static class Program
                         generation.NamesCount, Invariant);
                     finalGenerationNetObjects = Convert.ToInt64(
                         generation.NetObjectsCount, Invariant);
+                    generations.Add(new GenerationIdentity
+                    {
+                        Ordinal = generations.Count,
+                        Exports = finalGenerationExports,
+                        Names = finalGenerationNames,
+                        NetObjects = finalGenerationNetObjects
+                    });
                 }
             }
             if (exportCount > options.MaxExports)
@@ -370,6 +445,20 @@ internal static class Program
                         "role-exports input changed while package tables were read");
                 }
             }
+            else if (classArtifactsMode)
+            {
+                ValidateClassArtifactPackage(
+                    options, packageName, packageGuid, isMap, packageFlags,
+                    generationCount, exportCount, generations);
+                string recheckedSha256 = ComputeSha256(options.InputPath);
+                if (!string.Equals(
+                        recheckedSha256, options.VerifiedSha256,
+                        StringComparison.Ordinal))
+                {
+                    throw new ValidationException(
+                        "class-artifacts input changed while package tables were read");
+                }
+            }
 
             if (options.OutputPath == null)
             {
@@ -390,26 +479,29 @@ internal static class Program
             }
 
             FileVersionInfo libraryVersion = FileVersionInfo.GetVersionInfo(options.UELibPath);
-            EmitHeader(
-                output,
-                options,
-                library.GetName().Version == null ? null : library.GetName().Version.ToString(),
-                libraryVersion.ProductVersion,
-                packageName,
-                packageGuid,
-                Convert.ToInt64(packageView.Version, Invariant),
-                Convert.ToInt64(packageView.LicenseeVersion, Invariant),
-                Convert.ToInt64(packageView.EngineVersion, Invariant),
-                isMap,
-                isCooked,
-                nameCount,
-                importCount,
-                exportCount,
-                packageFlags,
-                generationCount,
-                finalGenerationExports,
-                finalGenerationNames,
-                finalGenerationNetObjects);
+            if (!classArtifactsMode)
+            {
+                EmitHeader(
+                    output,
+                    options,
+                    library.GetName().Version == null ? null : library.GetName().Version.ToString(),
+                    libraryVersion.ProductVersion,
+                    packageName,
+                    packageGuid,
+                    Convert.ToInt64(packageView.Version, Invariant),
+                    Convert.ToInt64(packageView.LicenseeVersion, Invariant),
+                    Convert.ToInt64(packageView.EngineVersion, Invariant),
+                    isMap,
+                    isCooked,
+                    nameCount,
+                    importCount,
+                    exportCount,
+                    packageFlags,
+                    generationCount,
+                    finalGenerationExports,
+                    finalGenerationNames,
+                    finalGenerationNetObjects);
+            }
 
             int result;
             if (string.Equals(options.Mode, "classes", StringComparison.Ordinal))
@@ -421,6 +513,19 @@ internal static class Program
                 result = ExtractRoleExports(
                     output, packageView, options, exportCount,
                     finalGenerationNetObjects);
+            }
+            else if (classArtifactsMode)
+            {
+                result = ExtractClassArtifacts(
+                    output, library, packageType, packageView, options,
+                    classFilter, unsafePath,
+                    library.GetName().Version == null ? null :
+                        library.GetName().Version.ToString(),
+                    libraryVersion.ProductVersion, packageName, packageGuid,
+                    Convert.ToInt64(packageView.Version, Invariant),
+                    Convert.ToInt64(packageView.LicenseeVersion, Invariant),
+                    Convert.ToInt64(packageView.EngineVersion, Invariant),
+                    packageFlags, exportCount, generations);
             }
             else if (string.Equals(options.Mode, "brush-bounds", StringComparison.Ordinal))
             {
@@ -763,6 +868,793 @@ internal static class Program
             }
         }
         return true;
+    }
+
+    private static void ValidateClassArtifactPackage(
+        Options options, string packageName, string packageGuid, bool isMap,
+        long packageFlags, int generationCount, int exportCount,
+        IList<GenerationIdentity> generations)
+    {
+        string artifactName = Path.GetFileNameWithoutExtension(options.InputPath);
+        if (string.IsNullOrEmpty(packageName) ||
+            !string.Equals(packageName, artifactName, StringComparison.OrdinalIgnoreCase))
+        {
+            throw new ValidationException(
+                "class-artifacts requires the root script package whose internal name " +
+                "matches its artifact name");
+        }
+        if (isMap)
+        {
+            throw new ValidationException(
+                "class-artifacts requires a non-map root script package");
+        }
+        if ((packageFlags & 0x00200000L) == 0 || exportCount <= 0 ||
+            generationCount <= 0 || generations == null ||
+            generations.Count != generationCount)
+        {
+            throw new ValidationException(
+                "class-artifacts requires a cooked script package with a complete " +
+                "generation table");
+        }
+        GenerationIdentity finalGeneration = generations[generations.Count - 1];
+        if (finalGeneration.Exports != exportCount ||
+            finalGeneration.Names < 0 || finalGeneration.NetObjects < 0)
+        {
+            throw new ValidationException(
+                "class-artifacts generation identity does not match the export table");
+        }
+        if (!IsExactHex(packageGuid, 32) || IsAllZeroHex(packageGuid))
+        {
+            throw new ValidationException(
+                "class-artifacts requires a valid nonzero 32-digit package GUID");
+        }
+        if (!string.Equals(
+                packageGuid, options.ExpectedPackageGuid,
+                StringComparison.OrdinalIgnoreCase))
+        {
+            throw new ValidationException(
+                "class-artifacts package GUID mismatch: expected " +
+                options.ExpectedPackageGuid + " but found " + packageGuid);
+        }
+    }
+
+    private static int ExtractClassArtifacts(
+        TextWriter output,
+        Assembly library,
+        Type packageType,
+        dynamic package,
+        Options options,
+        Regex classFilter,
+        string unsafePath,
+        string uelibAssemblyVersion,
+        string uelibProductVersion,
+        string packageName,
+        string packageGuid,
+        long packageVersion,
+        long licenseeVersion,
+        long engineVersion,
+        long packageFlags,
+        int exportCount,
+        IList<GenerationIdentity> generations)
+    {
+        InitializePackageAll(library, packageType, package);
+
+        Type uclassType = library.GetType("UELib.Core.UClass", true);
+        Type propertyType = library.GetType("UELib.Core.UProperty", true);
+        Type functionType = library.GetType("UELib.Core.UFunction", true);
+        Dictionary<string, object> classes =
+            new Dictionary<string, object>(StringComparer.Ordinal);
+        Dictionary<string, List<object>> cdos =
+            new Dictionary<string, List<object>>(StringComparer.Ordinal);
+
+        foreach (object rawObject in (IEnumerable)package.Objects)
+        {
+            dynamic candidate = rawObject;
+            if (candidate.ExportTable == null)
+            {
+                continue;
+            }
+            string objectName = SafeString(candidate.Name);
+            if (uclassType.IsInstanceOfType(rawObject) &&
+                IsMatch(classFilter, objectName, "class-artifacts class"))
+            {
+                if (classes.ContainsKey(objectName))
+                {
+                    throw new PackageException(
+                        "class-artifacts found a duplicate package-local UClass",
+                        new InvalidDataException(objectName));
+                }
+                classes.Add(objectName, rawObject);
+            }
+            if (objectName.StartsWith("Default__", StringComparison.Ordinal))
+            {
+                string ownerName = objectName.Substring("Default__".Length);
+                if (IsMatch(classFilter, ownerName, "class-artifacts class"))
+                {
+                    List<object> candidates;
+                    if (!cdos.TryGetValue(ownerName, out candidates))
+                    {
+                        candidates = new List<object>();
+                        cdos.Add(ownerName, candidates);
+                    }
+                    candidates.Add(rawObject);
+                }
+            }
+        }
+
+        ValidateExpectedClassCount(classes.Count, options.ExpectedClassCount);
+
+        List<ClassArtifact> artifacts = new List<ClassArtifact>();
+        foreach (KeyValuePair<string, object> entry in classes)
+        {
+            object rawUClass = entry.Value;
+            LoadObjectExactly(rawUClass, "UClass " + entry.Key);
+            dynamic uclass = rawUClass;
+            dynamic uclassExport = uclass.ExportTable;
+            int uclassExportIndex = Convert.ToInt32(uclassExport.Index, Invariant);
+            int uclassNetIndex = Convert.ToInt32(uclass.NetIndex, Invariant);
+            if (uclassExportIndex < 0 || uclassExportIndex >= exportCount ||
+                uclassNetIndex < 0)
+            {
+                throw new PackageException(
+                    "class-artifacts found an invalid UClass identity",
+                    new InvalidDataException(entry.Key));
+            }
+
+            List<object> cdoCandidates;
+            if (!cdos.TryGetValue(entry.Key, out cdoCandidates) ||
+                cdoCandidates.Count != 1)
+            {
+                throw new PackageException(
+                    "class-artifacts requires exactly one package-local CDO per UClass",
+                    new InvalidDataException(
+                        entry.Key + " cdoCount=" +
+                        (cdoCandidates == null ? 0 : cdoCandidates.Count).ToString(Invariant)));
+            }
+            object rawCdo = cdoCandidates[0];
+            LoadObjectExactly(rawCdo, "CDO Default__" + entry.Key);
+            dynamic cdo = rawCdo;
+            dynamic cdoExport = cdo.ExportTable;
+            int cdoExportIndex = Convert.ToInt32(cdoExport.Index, Invariant);
+            int cdoNetIndex = Convert.ToInt32(cdo.NetIndex, Invariant);
+            dynamic classIndex = cdoExport.ClassIndex;
+            int classTableReference = Convert.ToInt32(classIndex.Index, Invariant);
+            if (cdoExportIndex < 0 || cdoExportIndex >= exportCount)
+            {
+                throw new PackageException(
+                    "class-artifacts found an out-of-range CDO export identity",
+                    new InvalidDataException(
+                        entry.Key + " export=" +
+                        cdoExportIndex.ToString(Invariant)));
+            }
+            bool directObjectLink = object.ReferenceEquals(cdo.Class, rawUClass);
+            bool directTableLink = object.ReferenceEquals(
+                cdoExport.ClassTable, uclass.ExportTable);
+            ValidateClassArtifactLink(
+                entry.Key, uclassExportIndex, cdoExportIndex,
+                classTableReference, (bool)classIndex.IsExport,
+                directObjectLink, directTableLink);
+            if (cdoNetIndex < 0)
+            {
+                throw new PackageException(
+                    "class-artifacts found an invalid CDO UObject.NetIndex",
+                    new InvalidDataException(entry.Key));
+            }
+
+            object rawSuper = uclass.Super;
+            dynamic superIndex = uclassExport.SuperIndex;
+            int superTableReference = Convert.ToInt32(superIndex.Index, Invariant);
+            object rawSuperTable = uclassExport.SuperTable;
+            string superClassPath = null;
+            if (rawSuper == null)
+            {
+                if (!(bool)superIndex.IsNull || rawSuperTable != null)
+                {
+                    throw new PackageException(
+                        "class-artifacts found inconsistent null superclass metadata",
+                        new InvalidDataException(entry.Key));
+                }
+            }
+            else
+            {
+                dynamic superclass = rawSuper;
+                superClassPath = GetRequiredReferencePath(
+                    rawSuper, "superclass of " + entry.Key);
+                if ((bool)superIndex.IsNull || rawSuperTable == null ||
+                    !object.ReferenceEquals(rawSuperTable, superclass.Table))
+                {
+                    throw new PackageException(
+                        "class-artifacts superclass table reference does not match " +
+                        "the loaded superclass",
+                        new InvalidDataException(entry.Key));
+                }
+            }
+
+            string classPath = GetRequiredReferencePath(
+                rawUClass, "UClass " + entry.Key);
+            string cdoPath = GetRequiredReferencePath(
+                rawCdo, "CDO Default__" + entry.Key);
+            ClassArtifact artifact = new ClassArtifact
+            {
+                ClassPath = classPath,
+                SuperClassPath = superClassPath,
+                SuperTableReference = superTableReference,
+                UClassExportIndex = uclassExportIndex,
+                UClassNetIndex = uclassNetIndex,
+                CdoPath = cdoPath,
+                CdoExportIndex = cdoExportIndex,
+                CdoNetIndex = cdoNetIndex,
+                CdoClassTableReference = classTableReference,
+                CdoClassLinkVerified = directObjectLink && directTableLink,
+                CdoSerialOffset = Convert.ToInt64(cdoExport.SerialOffset, Invariant),
+                CdoSerialSize = Convert.ToInt64(cdoExport.SerialSize, Invariant),
+                CdoObjectFlags = Convert.ToUInt64(cdoExport.ObjectFlags, Invariant),
+                Members = EnumerateDeclaredNetworkMembers(
+                    rawUClass, propertyType, functionType, entry.Key),
+                DirectBNetInitialRotationTags = InspectDirectCdoBoolTags(
+                    rawCdo, cdoPath)
+            };
+            artifacts.Add(artifact);
+        }
+
+        artifacts.Sort(delegate(ClassArtifact left, ClassArtifact right)
+        {
+            int byExport = left.UClassExportIndex.CompareTo(right.UClassExportIndex);
+            return byExport != 0 ? byExport :
+                string.Compare(left.ClassPath, right.ClassPath, StringComparison.Ordinal);
+        });
+
+        string stableSha256 = ComputeSha256(options.InputPath);
+        if (!string.Equals(
+                stableSha256, options.VerifiedSha256, StringComparison.Ordinal))
+        {
+            throw new ValidationException(
+                "class-artifacts input changed while package objects were loaded");
+        }
+
+        EmitClassArtifactHeader(
+            output, options, library, unsafePath,
+            uelibAssemblyVersion, uelibProductVersion);
+        EmitClassArtifactPackage(
+            output, options, packageName, packageGuid, packageVersion,
+            licenseeVersion, engineVersion, packageFlags, generations);
+        foreach (ClassArtifact artifact in artifacts)
+        {
+            EmitClassArtifact(output, artifact);
+        }
+        EmitClassArtifactSummary(output, artifacts.Count);
+        return 0;
+    }
+
+    private static void InitializePackageAll(
+        Assembly library, Type packageType, object package)
+    {
+        Type initFlagsType = library.GetType("UELib.UnrealPackage+InitFlags", true);
+        object allFlags = Enum.Parse(initFlagsType, "All");
+        MethodInfo initialize = packageType.GetMethod(
+            "InitializePackage",
+            BindingFlags.Public | BindingFlags.Instance,
+            null,
+            new[] { initFlagsType },
+            null);
+        if (initialize == null)
+        {
+            throw new PackageException(
+                "could not initialize class-artifact package objects",
+                new MissingMethodException(
+                    "UELib.UnrealPackage.InitializePackage(InitFlags)"));
+        }
+        try
+        {
+            Quiet(delegate { return initialize.Invoke(package, new[] { allFlags }); });
+        }
+        catch (Exception ex)
+        {
+            throw new PackageException(
+                "could not initialize class-artifact package objects", Unwrap(ex));
+        }
+    }
+
+    private static void LoadObjectExactly(object rawObject, string label)
+    {
+        dynamic value = rawObject;
+        try
+        {
+            Quiet(delegate { value.Load(); return 0; });
+            Exception objectError = value.ThrownException as Exception;
+            if (objectError != null)
+            {
+                throw objectError;
+            }
+        }
+        catch (Exception ex)
+        {
+            throw new PackageException("could not load " + label, Unwrap(ex));
+        }
+    }
+
+    private static string GetRequiredReferencePath(object rawObject, string label)
+    {
+        dynamic value = rawObject;
+        string path = SafeString(value.GetReferencePath());
+        if (string.IsNullOrEmpty(path))
+        {
+            throw new PackageException(
+                "class-artifacts found an empty reference path",
+                new InvalidDataException(label));
+        }
+        return path;
+    }
+
+    private static void ValidateClassArtifactLink(
+        string className, int uclassExportIndex, int cdoExportIndex,
+        int cdoClassTableReference, bool cdoClassReferenceIsExport,
+        bool directObjectLink, bool directTableLink)
+    {
+        if (uclassExportIndex < 0 || cdoExportIndex < 0 ||
+            !cdoClassReferenceIsExport ||
+            cdoClassTableReference != uclassExportIndex + 1 ||
+            !directObjectLink || !directTableLink)
+        {
+            throw new PackageException(
+                "class-artifacts CDO does not reference its exact loaded UClass",
+                new InvalidDataException(
+                    className + " uclass=" + uclassExportIndex.ToString(Invariant) +
+                    " cdo=" + cdoExportIndex.ToString(Invariant) +
+                    " classReference=" +
+                    cdoClassTableReference.ToString(Invariant)));
+        }
+    }
+
+    private static List<ClassArtifactMember> EnumerateDeclaredNetworkMembers(
+        object rawUClass, Type propertyType, Type functionType, string className)
+    {
+        dynamic uclass = rawUClass;
+        List<ClassArtifactMember> members = new List<ClassArtifactMember>();
+        int specialDeclarations = 0;
+        foreach (object rawField in (IEnumerable)uclass.EnumerateFields())
+        {
+            LoadObjectExactly(rawField, "candidate field for " + className);
+            dynamic field = rawField;
+            if (!object.ReferenceEquals(field.Outer, rawUClass))
+            {
+                continue;
+            }
+
+            string name = SafeString(field.Name);
+            bool isProperty = propertyType.IsInstanceOfType(rawField);
+            bool isFunction = functionType.IsInstanceOfType(rawField);
+            bool specialDeclaration =
+                isProperty &&
+                string.Equals(className, "Actor", StringComparison.Ordinal) &&
+                string.Equals(name, "bNetInitialRotation", StringComparison.Ordinal);
+            ulong propertyFlags = 0;
+            ulong functionFlags = 0;
+            if (isProperty)
+            {
+                propertyFlags = ReadRawFlags(field.PropertyFlags, "property flags");
+            }
+            else if (isFunction)
+            {
+                functionFlags = ReadRawFlags(field.FunctionFlags, "function flags");
+            }
+            if (!specialDeclaration &&
+                (!isProperty || (propertyFlags & CpfNet) == 0) &&
+                (!isFunction || (functionFlags & FuncNet) == 0))
+            {
+                continue;
+            }
+            if (!isProperty && !isFunction)
+            {
+                continue;
+            }
+
+            if (specialDeclaration)
+            {
+                specialDeclarations++;
+            }
+            ClassArtifactMember member = new ClassArtifactMember
+            {
+                Name = name,
+                Kind = isProperty ? "property" : "function",
+                UObjectNetIndex = Convert.ToInt32(field.NetIndex, Invariant),
+                PropertyFlags = isProperty ? FormatFlags(propertyFlags) : null,
+                FunctionFlags = isFunction ? FormatFlags(functionFlags) : null,
+                UELibType = rawField.GetType().FullName,
+                ArrayDim = isProperty ?
+                    (int?)Convert.ToInt32(field.ArrayDim, Invariant) : null,
+                FunctionSuperPresent = isFunction ?
+                    (bool?)(field.Super != null) : null,
+                SpecialDeclaration = specialDeclaration
+            };
+            members.Add(member);
+        }
+        if (string.Equals(className, "Actor", StringComparison.Ordinal) &&
+            specialDeclarations != 1)
+        {
+            throw new PackageException(
+                "class-artifacts requires the exact Actor.bNetInitialRotation declaration",
+                new InvalidDataException(
+                    "declarations=" + specialDeclarations.ToString(Invariant)));
+        }
+        members.Sort(delegate(ClassArtifactMember left, ClassArtifactMember right)
+        {
+            int byNetIndex = left.UObjectNetIndex.CompareTo(right.UObjectNetIndex);
+            if (byNetIndex != 0)
+            {
+                return byNetIndex;
+            }
+            int byKind = string.Compare(left.Kind, right.Kind, StringComparison.Ordinal);
+            return byKind != 0 ? byKind :
+                string.Compare(left.Name, right.Name, StringComparison.Ordinal);
+        });
+        return members;
+    }
+
+    private static List<DirectBoolTag> InspectDirectCdoBoolTags(
+        object rawCdo, string cdoPath)
+    {
+        dynamic cdo = rawCdo;
+        List<DirectBoolTag> tags = new List<DirectBoolTag>();
+        object propertyCollection = cdo.Properties;
+        if (propertyCollection == null)
+        {
+            return tags;
+        }
+        foreach (object rawProperty in (IEnumerable)propertyCollection)
+        {
+            dynamic property = rawProperty;
+            string name = SafeString(property.Name);
+            if (!string.Equals(
+                    name, "bNetInitialRotation", StringComparison.Ordinal))
+            {
+                continue;
+            }
+            object boxedBool = property.BoolValue;
+            bool exactBool =
+                string.Equals(
+                    SafeString(property.Type), "BoolProperty",
+                    StringComparison.Ordinal) &&
+                boxedBool is bool;
+            tags.Add(new DirectBoolTag
+            {
+                PropertyPath = cdoPath + "." + name,
+                Value = exactBool ? (bool?)((bool)boxedBool) : null,
+                ValueState = exactBool ? "explicit" : "unknown",
+                SourceOffset = ReadTagPosition(rawProperty)
+            });
+        }
+        if (tags.Count > 1)
+        {
+            foreach (DirectBoolTag tag in tags)
+            {
+                tag.ValueState = "duplicate-" + tag.ValueState;
+            }
+        }
+        tags.Sort(delegate(DirectBoolTag left, DirectBoolTag right)
+        {
+            return left.SourceOffset.CompareTo(right.SourceOffset);
+        });
+        return tags;
+    }
+
+    private static long ReadTagPosition(object rawProperty)
+    {
+        PropertyInfo tagPosition = rawProperty.GetType().GetProperty(
+            "_TagPosition",
+            BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+        if (tagPosition == null || tagPosition.GetGetMethod(true) == null)
+        {
+            throw new PackageException(
+                "class-artifacts could not read a direct property tag offset",
+                new MissingMemberException(
+                    rawProperty.GetType().FullName, "_TagPosition"));
+        }
+        try
+        {
+            return Convert.ToInt64(tagPosition.GetValue(rawProperty, null), Invariant);
+        }
+        catch (Exception ex)
+        {
+            throw new PackageException(
+                "class-artifacts could not read a direct property tag offset",
+                Unwrap(ex));
+        }
+    }
+
+    private static ulong ReadRawFlags(object rawFlags, string label)
+    {
+        if (rawFlags == null)
+        {
+            throw new PackageException(
+                "class-artifacts could not read " + label,
+                new InvalidDataException("null flags"));
+        }
+        Type valueType = rawFlags.GetType();
+        if (valueType.IsEnum || rawFlags is byte || rawFlags is sbyte ||
+            rawFlags is short || rawFlags is ushort || rawFlags is int ||
+            rawFlags is uint || rawFlags is long || rawFlags is ulong)
+        {
+            return Convert.ToUInt64(rawFlags, Invariant);
+        }
+        for (Type current = valueType; current != null; current = current.BaseType)
+        {
+            FieldInfo rawValue = current.GetField(
+                "_RawValue",
+                BindingFlags.Instance | BindingFlags.Public |
+                BindingFlags.NonPublic | BindingFlags.DeclaredOnly);
+            if (rawValue != null)
+            {
+                return Convert.ToUInt64(rawValue.GetValue(rawFlags), Invariant);
+            }
+        }
+        throw new PackageException(
+            "class-artifacts could not read " + label,
+            new MissingFieldException(valueType.FullName, "_RawValue"));
+    }
+
+    private static string FormatFlags(ulong flags)
+    {
+        return "0x" + flags.ToString("X16", Invariant);
+    }
+
+    private static string PackageGuidToRaw(string packageGuid)
+    {
+        if (!IsExactHex(packageGuid, 32))
+        {
+            throw new ValidationException(
+                "cannot render a non-32-digit package GUID as raw bytes");
+        }
+        StringBuilder raw = new StringBuilder(32);
+        for (int word = 0; word < 4; word++)
+        {
+            int wordStart = word * 8;
+            for (int offset = 6; offset >= 0; offset -= 2)
+            {
+                raw.Append(packageGuid.Substring(wordStart + offset, 2));
+            }
+        }
+        return raw.ToString().ToUpperInvariant();
+    }
+
+    private static bool ClassArtifactLinkRejects(
+        int uclassExportIndex, int cdoExportIndex,
+        int classTableReference, bool referenceIsExport,
+        bool objectLink, bool tableLink)
+    {
+        try
+        {
+            ValidateClassArtifactLink(
+                "Synthetic", uclassExportIndex, cdoExportIndex,
+                classTableReference, referenceIsExport, objectLink, tableLink);
+            return false;
+        }
+        catch (PackageException)
+        {
+            return true;
+        }
+    }
+
+    private static void ValidateExpectedClassCount(int actual, int expected)
+    {
+        if (actual != expected)
+        {
+            throw new ValidationException(
+                "class-artifacts matched " + actual.ToString(Invariant) +
+                " package-local UClasses; expected " + expected.ToString(Invariant));
+        }
+    }
+
+    private static int RunClassArtifactSchemaSelfTest()
+    {
+        Regex anchored = CreateClassArtifactRegex("^(Actor|Inventory)$");
+        if (!anchored.IsMatch("Actor") || anchored.IsMatch("actor"))
+        {
+            WriteError("self-test", "class-artifacts regex is not exact and case-sensitive");
+            return ExitInternal;
+        }
+        Regex ungroupedAlternation = CreateClassArtifactRegex("^Actor|Inventory$");
+        if (!ungroupedAlternation.IsMatch("Actor") ||
+            !ungroupedAlternation.IsMatch("Inventory") ||
+            ungroupedAlternation.IsMatch("ActorSuffix") ||
+            ungroupedAlternation.IsMatch("PrefixInventory"))
+        {
+            WriteError(
+                "self-test",
+                "anchored ungrouped alternation escaped whole-pattern matching");
+            return ExitInternal;
+        }
+        bool unanchoredRejected = false;
+        try
+        {
+            CreateClassArtifactRegex("Actor|Inventory");
+        }
+        catch (ValidationException)
+        {
+            unanchoredRejected = true;
+        }
+        if (!unanchoredRejected)
+        {
+            WriteError("self-test", "unanchored class-artifacts regex was accepted");
+            return ExitInternal;
+        }
+        bool countMismatchRejected = false;
+        try
+        {
+            ValidateExpectedClassCount(1, 2);
+        }
+        catch (ValidationException)
+        {
+            countMismatchRejected = true;
+        }
+        if (!countMismatchRejected)
+        {
+            WriteError("self-test", "class-artifacts exact count mismatch was accepted");
+            return ExitInternal;
+        }
+        if (!string.Equals(
+                PackageGuidToRaw("FE4B4F2F4B3128C42FE5098ACAB560C8"),
+                "2F4F4BFEC428314B8A09E52FC860B5CA",
+                StringComparison.Ordinal))
+        {
+            WriteError("self-test", "raw package GUID byte ordering drifted");
+            return ExitInternal;
+        }
+
+        // The CDO is deliberately non-adjacent. Only its direct UObject and
+        // export-table class links authorize the relationship.
+        ValidateClassArtifactLink(
+            "Synthetic", 100, 777, 101, true, true, true);
+        if (!ClassArtifactLinkRejects(100, 777, 101, true, false, true) ||
+            !ClassArtifactLinkRejects(100, 777, 101, true, true, false) ||
+            !ClassArtifactLinkRejects(100, 777, 100, true, true, true) ||
+            !ClassArtifactLinkRejects(100, 777, 101, false, true, true))
+        {
+            WriteError("self-test", "invalid direct CDO linkage was accepted");
+            return ExitInternal;
+        }
+
+        ClassArtifact synthetic = new ClassArtifact
+        {
+            ClassPath = "Class'Synthetic.Actor'",
+            SuperClassPath = "Class'Synthetic.Object'",
+            SuperTableReference = 1,
+            UClassExportIndex = 100,
+            UClassNetIndex = 512,
+            CdoPath = "Actor'Synthetic.Default__Actor'",
+            CdoExportIndex = 777,
+            CdoNetIndex = 513,
+            CdoClassTableReference = 101,
+            CdoClassLinkVerified = true,
+            CdoSerialOffset = 4096,
+            CdoSerialSize = 64,
+            CdoObjectFlags = 3,
+            Members = new List<ClassArtifactMember>
+            {
+                new ClassArtifactMember
+                {
+                    Name = "bNetInitialRotation",
+                    Kind = "property",
+                    UObjectNetIndex = 7,
+                    PropertyFlags = "0x0000000000000000",
+                    FunctionFlags = null,
+                    UELibType = "UELib.Core.UBoolProperty",
+                    ArrayDim = 1,
+                    FunctionSuperPresent = null,
+                    SpecialDeclaration = true
+                }
+            },
+            DirectBNetInitialRotationTags = new List<DirectBoolTag>
+            {
+                new DirectBoolTag
+                {
+                    PropertyPath =
+                        "Actor'Synthetic.Default__Actor'.bNetInitialRotation",
+                    Value = true,
+                    ValueState = "explicit",
+                    SourceOffset = 10
+                },
+                new DirectBoolTag
+                {
+                    PropertyPath =
+                        "Actor'Synthetic.Default__Actor'.bNetInitialRotation",
+                    Value = null,
+                    ValueState = "unknown",
+                    SourceOffset = 20
+                },
+                new DirectBoolTag
+                {
+                    PropertyPath =
+                        "Actor'Synthetic.Default__Actor'.bNetInitialRotation",
+                    Value = false,
+                    ValueState = "duplicate-explicit",
+                    SourceOffset = 30
+                },
+                new DirectBoolTag
+                {
+                    PropertyPath =
+                        "Actor'Synthetic.Default__Actor'.bNetInitialRotation",
+                    Value = null,
+                    ValueState = "duplicate-unknown",
+                    SourceOffset = 40
+                }
+            }
+        };
+        StringWriter rendered = new StringWriter(Invariant);
+        EmitClassArtifact(synthetic: synthetic, output: rendered);
+        string json = rendered.ToString().TrimEnd('\r', '\n');
+        string expectedJson =
+            "{\"record\":\"class\",\"classPath\":\"Class'Synthetic.Actor'\"," +
+            "\"superClassPath\":\"Class'Synthetic.Object'\"," +
+            "\"superTableReference\":1," +
+            "\"UClass\":{\"exportIndex\":100,\"uobjectNetIndex\":512}," +
+            "\"CDO\":{\"path\":\"Actor'Synthetic.Default__Actor'\"," +
+            "\"exportIndex\":777,\"uobjectNetIndex\":513," +
+            "\"classTableReference\":101,\"classLinkVerified\":true," +
+            "\"serialOffset\":4096,\"serialSize\":64," +
+            "\"objectFlags\":\"0x0000000000000003\"}," +
+            "\"declaredNetworkMembers\":[{" +
+            "\"name\":\"bNetInitialRotation\",\"kind\":\"property\"," +
+            "\"uobjectNetIndex\":7," +
+            "\"propertyFlags\":\"0x0000000000000000\"," +
+            "\"functionFlags\":null," +
+            "\"uelibType\":\"UELib.Core.UBoolProperty\"," +
+            "\"arrayDim\":1,\"functionSuperPresent\":null," +
+            "\"specialDeclaration\":true}]," +
+            "\"directBNetInitialRotationTags\":[" +
+            "{\"propertyPath\":" +
+            "\"Actor'Synthetic.Default__Actor'.bNetInitialRotation\"," +
+            "\"value\":true,\"valueState\":\"explicit\",\"sourceOffset\":10}," +
+            "{\"propertyPath\":" +
+            "\"Actor'Synthetic.Default__Actor'.bNetInitialRotation\"," +
+            "\"value\":null,\"valueState\":\"unknown\",\"sourceOffset\":20}," +
+            "{\"propertyPath\":" +
+            "\"Actor'Synthetic.Default__Actor'.bNetInitialRotation\"," +
+            "\"value\":false,\"valueState\":\"duplicate-explicit\"," +
+            "\"sourceOffset\":30}," +
+            "{\"propertyPath\":" +
+            "\"Actor'Synthetic.Default__Actor'.bNetInitialRotation\"," +
+            "\"value\":null,\"valueState\":\"duplicate-unknown\"," +
+            "\"sourceOffset\":40}]}";
+        if (!string.Equals(json, expectedJson, StringComparison.Ordinal))
+        {
+            WriteError(
+                "self-test",
+                "class-artifact nested JSON key set or value types drifted");
+            return ExitInternal;
+        }
+        string[] requiredKeys =
+        {
+            "\"classPath\":", "\"superClassPath\":",
+            "\"superTableReference\":", "\"UClass\":", "\"CDO\":",
+            "\"declaredNetworkMembers\":",
+            "\"directBNetInitialRotationTags\":"
+        };
+        foreach (string requiredKey in requiredKeys)
+        {
+            if (json.IndexOf(requiredKey, StringComparison.Ordinal) < 0)
+            {
+                WriteError("self-test", "class-artifact schema key is missing: " + requiredKey);
+                return ExitInternal;
+            }
+        }
+        string[] forbiddenKeys =
+        {
+            "\"objectBase\":", "\"staticReference\":", "\"wireReference\":"
+        };
+        foreach (string forbiddenKey in forbiddenKeys)
+        {
+            if (json.IndexOf(forbiddenKey, StringComparison.Ordinal) >= 0)
+            {
+                WriteError("self-test", "class-artifact forbidden key was emitted: " + forbiddenKey);
+                return ExitInternal;
+            }
+        }
+
+        Console.Out.WriteLine(
+            "PASS: anchored class regex, exact count, non-adjacent CDO linkage, " +
+            "schema keys, and forbidden key absence are exact.");
+        return 0;
     }
 
     private static long CheckedStaticReference(long objectBase, int linkerIndex)
@@ -2099,6 +2991,7 @@ internal static class Program
                 case "--max-value-chars": options.MaxValueChars = ParseInt(NextValue(args, ref index, argument), argument, 16, 65536); break;
                 case "--max-errors": options.MaxErrors = ParseInt(NextValue(args, ref index, argument), argument, 1, 1000); break;
                 case "--max-classes": options.MaxClasses = ParseInt(NextValue(args, ref index, argument), argument, 1, 10000); break;
+                case "--expected-class-count": options.ExpectedClassCount = ParseInt(NextValue(args, ref index, argument), argument, 1, 10000); break;
                 case "--object-base": options.ObjectBase = ParseLong(NextValue(args, ref index, argument), argument, 0, 0x7FFFFFFF); break;
                 case "--expected-package-guid": options.ExpectedPackageGuid = NextValue(args, ref index, argument); break;
                 case "--expected-sha256": options.ExpectedSha256 = NextValue(args, ref index, argument); break;
@@ -2123,36 +3016,67 @@ internal static class Program
             !string.Equals(options.Mode, "classes", StringComparison.Ordinal) &&
             !string.Equals(options.Mode, "role-info", StringComparison.Ordinal) &&
             !string.Equals(options.Mode, "role-exports", StringComparison.Ordinal) &&
+            !string.Equals(options.Mode, "class-artifacts", StringComparison.Ordinal) &&
             !string.Equals(options.Mode, "brush-bounds", StringComparison.Ordinal))
         {
             throw new ValidationException(
-                "--mode must be actors, classes, role-info, role-exports, or brush-bounds");
+                "--mode must be actors, classes, role-info, role-exports, " +
+                "class-artifacts, or brush-bounds");
         }
         bool roleExports = string.Equals(
             options.Mode, "role-exports", StringComparison.Ordinal);
-        if (roleExports)
+        bool classArtifacts = string.Equals(
+            options.Mode, "class-artifacts", StringComparison.Ordinal);
+        bool identityPinnedMode = roleExports || classArtifacts;
+        if (identityPinnedMode)
         {
             if (!IsExactHex(options.ExpectedPackageGuid, 32) ||
                 IsAllZeroHex(options.ExpectedPackageGuid))
             {
                 throw new ValidationException(
-                    "role-exports requires --expected-package-guid with 32 nonzero hex digits");
+                    options.Mode +
+                    " requires --expected-package-guid with 32 nonzero hex digits");
             }
             if (!IsExactHex(options.ExpectedSha256, 64) ||
                 IsAllZeroHex(options.ExpectedSha256))
             {
                 throw new ValidationException(
-                    "role-exports requires --expected-sha256 with 64 nonzero hex digits");
+                    options.Mode +
+                    " requires --expected-sha256 with 64 nonzero hex digits");
             }
             options.ExpectedPackageGuid = options.ExpectedPackageGuid.ToUpperInvariant();
             options.ExpectedSha256 = options.ExpectedSha256.ToUpperInvariant();
         }
-        else if (options.ObjectBase >= 0 ||
+        if (classArtifacts)
+        {
+            if (options.ObjectBase >= 0)
+            {
+                throw new ValidationException(
+                    "class-artifacts rejects --object-base and never derives static references");
+            }
+            if (!options.ClassPatternSpecified)
+            {
+                throw new ValidationException(
+                    "class-artifacts requires --class-pattern");
+            }
+            if (options.ExpectedClassCount < 1)
+            {
+                throw new ValidationException(
+                    "class-artifacts requires --expected-class-count");
+            }
+            CreateClassArtifactRegex(options.ClassPattern);
+        }
+        else if (!roleExports && (options.ObjectBase >= 0 ||
                  options.ExpectedPackageGuid != null ||
-                 options.ExpectedSha256 != null)
+                 options.ExpectedSha256 != null))
         {
             throw new ValidationException(
                 "--object-base and expected package identity arguments require role-exports mode");
+        }
+        if (!classArtifacts && options.ExpectedClassCount >= 0)
+        {
+            throw new ValidationException(
+                "--expected-class-count requires class-artifacts mode");
         }
         if (string.Equals(options.Mode, "brush-bounds", StringComparison.Ordinal) &&
             !options.ClassPatternSpecified)
@@ -2180,7 +3104,7 @@ internal static class Program
         {
             throw new ValidationException("input package does not exist: " + options.InputPath);
         }
-        string expectedExtension = roleExports ? ".u" : ".roe";
+        string expectedExtension = identityPinnedMode ? ".u" : ".roe";
         if (!string.Equals(
                 Path.GetExtension(options.InputPath), expectedExtension,
                 StringComparison.OrdinalIgnoreCase))
@@ -2222,8 +3146,36 @@ internal static class Program
             }
         }
 
-        CreateRegex(options.ClassPattern, "class");
+        if (classArtifacts)
+        {
+            CreateClassArtifactRegex(options.ClassPattern);
+        }
+        else
+        {
+            CreateRegex(options.ClassPattern, "class");
+        }
         CreateRegex(options.PropertyPattern, "property");
+    }
+
+    private static Regex CreateClassArtifactRegex(string pattern)
+    {
+        if (string.IsNullOrWhiteSpace(pattern) ||
+            pattern[0] != '^' || pattern[pattern.Length - 1] != '$')
+        {
+            throw new ValidationException(
+                "class-artifacts class pattern must be explicitly anchored with ^ and $");
+        }
+        try
+        {
+            return new Regex(
+                "\\A(?:" + pattern + ")\\z",
+                RegexOptions.CultureInvariant,
+                RegexTimeout);
+        }
+        catch (ArgumentException ex)
+        {
+            throw new ValidationException("invalid class regex: " + ex.Message);
+        }
     }
 
     private static Regex CreateRegex(string pattern, string label)
@@ -2296,6 +3248,208 @@ internal static class Program
             double.TryParse(match.Groups["x"].Value, NumberStyles.Float, Invariant, out x) &&
             double.TryParse(match.Groups["y"].Value, NumberStyles.Float, Invariant, out y) &&
             double.TryParse(match.Groups["z"].Value, NumberStyles.Float, Invariant, out z);
+    }
+
+    private static void EmitClassArtifactHeader(
+        TextWriter output,
+        Options options,
+        Assembly uelib,
+        string unsafePath,
+        string uelibAssemblyVersion,
+        string uelibProductVersion)
+    {
+        string extractorPath = Assembly.GetExecutingAssembly().Location;
+        AssemblyName unsafeIdentity = AssemblyName.GetAssemblyName(unsafePath);
+        StringBuilder json = BeginRecord("header");
+        AddString(json, "schema", ClassArtifactSchema);
+        AddString(json, "mode", "class-artifacts");
+        AddString(json, "classPattern", options.ClassPattern);
+        AddLong(json, "expectedClassCount", options.ExpectedClassCount);
+        AddLong(json, "artifactBytes", new FileInfo(options.InputPath).Length);
+        AddString(json, "artifactSha256", options.VerifiedSha256);
+        AddString(
+            json, "extractorAssemblyIdentity",
+            Assembly.GetExecutingAssembly().GetName().FullName);
+        AddLong(json, "extractorBytes", new FileInfo(extractorPath).Length);
+        AddString(json, "extractorSha256", ComputeSha256(extractorPath));
+        AddString(json, "uelibAssemblyIdentity", uelib.GetName().FullName);
+        AddString(json, "uelibAssemblyVersion", uelibAssemblyVersion);
+        AddString(json, "uelibProductVersion", uelibProductVersion);
+        AddLong(json, "uelibBytes", new FileInfo(options.UELibPath).Length);
+        AddString(json, "uelibSha256", ComputeSha256(options.UELibPath));
+        AddString(json, "unsafeAssemblyIdentity", unsafeIdentity.FullName);
+        AddLong(json, "unsafeBytes", new FileInfo(unsafePath).Length);
+        AddString(json, "unsafeSha256", ComputeSha256(unsafePath));
+        AddBool(json, "wireStaticReferencesDerived", false);
+        AddBool(json, "reportAuthorizesRuntime", false);
+        EndRecord(output, json);
+    }
+
+    private static void EmitClassArtifactPackage(
+        TextWriter output,
+        Options options,
+        string packageName,
+        string packageGuid,
+        long packageVersion,
+        long licenseeVersion,
+        long engineVersion,
+        long packageFlags,
+        IList<GenerationIdentity> generations)
+    {
+        StringBuilder json = BeginRecord("package");
+        AddString(json, "package", packageName);
+        AddLong(json, "artifactBytes", new FileInfo(options.InputPath).Length);
+        AddString(json, "artifactSha256", options.VerifiedSha256);
+        AddString(json, "rawGuid", PackageGuidToRaw(packageGuid));
+        AddString(json, "packageGuid", packageGuid.ToUpperInvariant());
+        AddString(
+            json, "packageFlags",
+            "0x" + packageFlags.ToString("X8", Invariant));
+        AddLong(json, "packageVersion", packageVersion);
+        AddLong(json, "licenseeVersion", licenseeVersion);
+        AddLong(json, "engineVersion", engineVersion);
+        AddLong(json, "generationCount", generations.Count);
+        json.Append(",\"generations\":[");
+        for (int index = 0; index < generations.Count; index++)
+        {
+            if (index > 0)
+            {
+                json.Append(',');
+            }
+            GenerationIdentity generation = generations[index];
+            json.Append("{\"ordinal\":");
+            json.Append(generation.Ordinal.ToString(Invariant));
+            json.Append(",\"exports\":");
+            json.Append(generation.Exports.ToString(Invariant));
+            json.Append(",\"names\":");
+            json.Append(generation.Names.ToString(Invariant));
+            json.Append(",\"netObjects\":");
+            json.Append(generation.NetObjects.ToString(Invariant));
+            json.Append('}');
+        }
+        json.Append(']');
+        EndRecord(output, json);
+    }
+
+    private static void EmitClassArtifact(
+        TextWriter output, ClassArtifact synthetic)
+    {
+        ClassArtifact artifact = synthetic;
+        StringBuilder json = BeginRecord("class");
+        AddString(json, "classPath", artifact.ClassPath);
+        AddString(json, "superClassPath", artifact.SuperClassPath);
+        AddLong(json, "superTableReference", artifact.SuperTableReference);
+        AddRaw(
+            json, "UClass",
+            "{\"exportIndex\":" +
+            artifact.UClassExportIndex.ToString(Invariant) +
+            ",\"uobjectNetIndex\":" +
+            artifact.UClassNetIndex.ToString(Invariant) + "}");
+        StringBuilder cdo = new StringBuilder(256);
+        cdo.Append('{');
+        cdo.Append("\"path\":"); AppendJsonString(cdo, artifact.CdoPath);
+        cdo.Append(",\"exportIndex\":");
+        cdo.Append(artifact.CdoExportIndex.ToString(Invariant));
+        cdo.Append(",\"uobjectNetIndex\":");
+        cdo.Append(artifact.CdoNetIndex.ToString(Invariant));
+        cdo.Append(",\"classTableReference\":");
+        cdo.Append(artifact.CdoClassTableReference.ToString(Invariant));
+        cdo.Append(",\"classLinkVerified\":");
+        cdo.Append(artifact.CdoClassLinkVerified ? "true" : "false");
+        cdo.Append(",\"serialOffset\":");
+        cdo.Append(artifact.CdoSerialOffset.ToString(Invariant));
+        cdo.Append(",\"serialSize\":");
+        cdo.Append(artifact.CdoSerialSize.ToString(Invariant));
+        cdo.Append(",\"objectFlags\":");
+        AppendJsonString(cdo, FormatFlags(artifact.CdoObjectFlags));
+        cdo.Append('}');
+        AddRaw(json, "CDO", cdo.ToString());
+
+        json.Append(",\"declaredNetworkMembers\":[");
+        for (int index = 0; index < artifact.Members.Count; index++)
+        {
+            if (index > 0)
+            {
+                json.Append(',');
+            }
+            ClassArtifactMember member = artifact.Members[index];
+            json.Append('{');
+            json.Append("\"name\":"); AppendJsonString(json, member.Name);
+            json.Append(",\"kind\":"); AppendJsonString(json, member.Kind);
+            json.Append(",\"uobjectNetIndex\":");
+            json.Append(member.UObjectNetIndex.ToString(Invariant));
+            json.Append(",\"propertyFlags\":");
+            AppendJsonString(json, member.PropertyFlags);
+            json.Append(",\"functionFlags\":");
+            AppendJsonString(json, member.FunctionFlags);
+            json.Append(",\"uelibType\":");
+            AppendJsonString(json, member.UELibType);
+            json.Append(",\"arrayDim\":");
+            if (member.ArrayDim.HasValue)
+            {
+                json.Append(member.ArrayDim.Value.ToString(Invariant));
+            }
+            else
+            {
+                json.Append("null");
+            }
+            json.Append(",\"functionSuperPresent\":");
+            if (member.FunctionSuperPresent.HasValue)
+            {
+                json.Append(member.FunctionSuperPresent.Value ? "true" : "false");
+            }
+            else
+            {
+                json.Append("null");
+            }
+            json.Append(",\"specialDeclaration\":");
+            json.Append(member.SpecialDeclaration ? "true" : "false");
+            json.Append('}');
+        }
+        json.Append(']');
+
+        json.Append(",\"directBNetInitialRotationTags\":[");
+        for (int index = 0;
+             index < artifact.DirectBNetInitialRotationTags.Count;
+             index++)
+        {
+            if (index > 0)
+            {
+                json.Append(',');
+            }
+            DirectBoolTag tag = artifact.DirectBNetInitialRotationTags[index];
+            json.Append('{');
+            json.Append("\"propertyPath\":");
+            AppendJsonString(json, tag.PropertyPath);
+            json.Append(",\"value\":");
+            if (tag.Value.HasValue)
+            {
+                json.Append(tag.Value.Value ? "true" : "false");
+            }
+            else
+            {
+                json.Append("null");
+            }
+            json.Append(",\"valueState\":");
+            AppendJsonString(json, tag.ValueState);
+            json.Append(",\"sourceOffset\":");
+            json.Append(tag.SourceOffset.ToString(Invariant));
+            json.Append('}');
+        }
+        json.Append(']');
+        EndRecord(output, json);
+    }
+
+    private static void EmitClassArtifactSummary(TextWriter output, int classCount)
+    {
+        StringBuilder json = BeginRecord("summary");
+        AddString(json, "schema", ClassArtifactSchema);
+        AddString(json, "mode", "class-artifacts");
+        AddLong(json, "classesEmitted", classCount);
+        AddBool(json, "classLinksVerifiedDirectly", true);
+        AddBool(json, "wireStaticReferencesDerived", false);
+        AddBool(json, "reportAuthorizesRuntime", false);
+        EndRecord(output, json);
     }
 
     private static void EmitHeader(
@@ -2872,13 +4026,14 @@ internal static class Program
         output.WriteLine("CookedMapMetadataExtractor - bounded, read-only RS2 package metadata extraction");
         output.WriteLine();
         output.WriteLine("Required:");
-        output.WriteLine("  --input PATH              Cooked .roe map or ROGame.u package to inspect");
+        output.WriteLine("  --input PATH              Cooked .roe map or root .u package to inspect");
         output.WriteLine("  --uelib PATH              Eliot.UELib.dll (tested with 1.12.1)");
         output.WriteLine();
         output.WriteLine("Selection/output:");
-        output.WriteLine("  --mode actors|classes|role-info|role-exports|brush-bounds");
+        output.WriteLine("  --mode actors|classes|role-info|role-exports|class-artifacts|brush-bounds");
         output.WriteLine("                           Actor records (default), class inventory,");
-        output.WriteLine("                           exact ROMapInfo arrays, paired ROGame role exports, or");
+        output.WriteLine("                           exact ROMapInfo arrays, paired ROGame role exports,");
+        output.WriteLine("                           generic raw class artifacts, or");
         output.WriteLine("                           source-verified UModel bounds diagnostics");
         output.WriteLine("  --output PATH             JSONL file; stdout when omitted");
         output.WriteLine("  --overwrite               Replace an existing output file");
@@ -2896,10 +4051,19 @@ internal static class Program
         output.WriteLine("  --self-test-role-schema   Run synthetic exact-role-schema checks");
         output.WriteLine("  --self-test-role-export-schema");
         output.WriteLine("                           Run role-name/static-reference checks");
+        output.WriteLine("  --self-test-class-artifact-schema");
+        output.WriteLine("                           Run exact raw-class schema/linkage checks");
         output.WriteLine();
         output.WriteLine("Role-export artifact pinning:");
         output.WriteLine("  --expected-package-guid H Exact nonzero 32-digit ROGame package GUID");
         output.WriteLine("  --expected-sha256 H       Exact nonzero 64-digit ROGame.u SHA-256");
         output.WriteLine("  --object-base N           Optional PackageMap base for derived references");
+        output.WriteLine();
+        output.WriteLine("Class-artifact selection:");
+        output.WriteLine("  --class-pattern REGEX     Explicitly ^...$ anchored, case-sensitive regex");
+        output.WriteLine("  --expected-class-count N  Exact number of package-local UClasses required");
+        output.WriteLine("  --expected-package-guid H Exact nonzero 32-digit package GUID");
+        output.WriteLine("  --expected-sha256 H       Exact nonzero 64-digit artifact SHA-256");
+        output.WriteLine("                           --object-base is rejected in this mode");
     }
 }

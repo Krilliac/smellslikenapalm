@@ -71,7 +71,7 @@ CSVMetricsReporter::CSVMetricsReporter(const CSVReporterConfig& config)
 
 CSVMetricsReporter::~CSVMetricsReporter() {
     Logger::Trace("[CSVMetricsReporter::~CSVMetricsReporter] Entry");
-    Shutdown();
+    CSVMetricsReporter::Shutdown();
     Logger::Trace("[CSVMetricsReporter::~CSVMetricsReporter] Exit");
 }
 

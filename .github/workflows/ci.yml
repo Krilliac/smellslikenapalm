@@ -15,17 +15,22 @@ env:
 jobs:
   build-linux:
     name: Build (Linux)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     strategy:
+      fail-fast: false
       matrix:
         compiler: [gcc, clang]
         include:
           - compiler: gcc
-            cc: gcc-12
-            cxx: g++-12
+            cc: gcc-14
+            cxx: g++-14
+            packages: gcc-14 g++-14
+            cxxflags: ""
           - compiler: clang
-            cc: clang-15
-            cxx: clang++-15
+            cc: clang-18
+            cxx: clang++-18
+            packages: clang-18 libc++-18-dev libc++abi-18-dev
+            cxxflags: -stdlib=libc++
 
     steps:
       - name: Checkout code
@@ -39,12 +44,13 @@ jobs:
             ninja-build \
             libssl-dev \
             zlib1g-dev \
-            ${{ matrix.compiler == 'clang' && 'clang-15' || '' }}
+            ${{ matrix.packages }}
 
       - name: Configure CMake
         env:
           CC: ${{ matrix.cc }}
           CXX: ${{ matrix.cxx }}
+          CXXFLAGS: ${{ matrix.cxxflags }}
         run: |
           cmake -B build \
             -G Ninja \
@@ -100,9 +106,25 @@ jobs:
           path: build/${{ env.BUILD_TYPE }}/rs2v_server.exe
           retention-days: 7
 
+  evidence-tests:
+    name: Evidence Tests (Python)
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run evidence tests
+        run: python -m unittest discover -s tools/tests -p "test_*.py" -v
+
   static-analysis:
     name: Static Analysis
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: build-linux
 
     steps:
@@ -119,13 +141,13 @@ jobs:
             --suppress=missingIncludeSystem \
             --inline-suppr \
             --error-exitcode=1 \
-            -I src/ -I include/ -I telemetry/ \
+            -I src/ -I telemetry/ \
             --std=c++23 \
             src/ telemetry/
 
   docker:
     name: Docker Build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: build-linux
 
     steps:

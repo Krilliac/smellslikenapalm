@@ -13,6 +13,7 @@
 
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <vector>
 
@@ -136,7 +137,7 @@ struct Packet {
 // C2S). It sets the SerializeInt bound for BunchDataBits. Never reads out of
 // bounds; sets Packet::ok = false on any malformed/truncated input. The default
 // remains only for legacy low-level fixtures; live callers pass an explicit bound.
-Packet Decode(const uint8_t* data, size_t numBytes,
+Packet Decode(const uint8_t* data, std::size_t numBytes,
               uint32_t maxPacketBytes = kHandshakeMaxPacketBytes);
 
 // Encode a packet (PacketId, then acks, then bunches, then the terminator '1'

@@ -5,7 +5,7 @@ Build and run the bounded, read-only cooked-map metadata extractor.
 .DESCRIPTION
 Compiles tools/CookedMapMetadataExtractor.cs with the installed Visual Studio
 Roslyn compiler into a content-addressed LocalAppData cache, then inspects one
-.roe map or root ROGame.u package through Eliot.UELib.dll. The cache identity
+.roe map or root .u package through Eliot.UELib.dll. The cache identity
 pins the extractor source, wrapper, and compiler bytes. The extractor opens the
 package with FileAccess.Read and never writes to the input package.
 #>
@@ -51,11 +51,16 @@ param(
 
     [switch]$RoleExports,
 
+    [switch]$ClassArtifacts,
+
     [switch]$BrushBounds,
 
     [string]$ExpectedPackageGuid,
 
     [string]$ExpectedSha256,
+
+    [ValidateRange(-1, 10000)]
+    [int]$ExpectedClassCount = -1,
 
     [string]$ExpectedExecutableSha256,
 
@@ -73,6 +78,14 @@ param(
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 2.0
+
+$exclusiveModes = @(
+    @($ClassesOnly, $RoleInfo, $RoleExports, $ClassArtifacts, $BrushBounds) |
+        Where-Object { $_ }
+)
+if ($exclusiveModes.Count -gt 1) {
+    throw '-ClassesOnly, -RoleInfo, -RoleExports, -ClassArtifacts, and -BrushBounds are mutually exclusive.'
+}
 
 function Get-DirectoryManifestSha256 {
     param([Parameter(Mandatory = $true)][string]$Root)
@@ -286,9 +299,23 @@ if ($BuildOnly) {
 if ([string]::IsNullOrWhiteSpace($InputPath)) {
     throw 'InputPath is required unless -BuildOnly is used.'
 }
-$exclusiveModes = @(@($ClassesOnly, $RoleInfo, $RoleExports, $BrushBounds) | Where-Object { $_ })
-if ($exclusiveModes.Count -gt 1) {
-    throw '-ClassesOnly, -RoleInfo, -RoleExports, and -BrushBounds are mutually exclusive.'
+if ($ClassArtifacts) {
+    if ([string]::IsNullOrWhiteSpace($ClassPattern)) {
+        throw '-ClassArtifacts requires -ClassPattern.'
+    }
+    if ($ExpectedClassCount -lt 1) {
+        throw '-ClassArtifacts requires -ExpectedClassCount.'
+    }
+    if ([string]::IsNullOrWhiteSpace($ExpectedPackageGuid) -or
+        [string]::IsNullOrWhiteSpace($ExpectedSha256)) {
+        throw '-ClassArtifacts requires -ExpectedPackageGuid and -ExpectedSha256.'
+    }
+    if ($ObjectBase -ge 0) {
+        throw '-ClassArtifacts rejects -ObjectBase and never derives static references.'
+    }
+}
+elseif ($ExpectedClassCount -ge 0) {
+    throw '-ExpectedClassCount requires -ClassArtifacts.'
 }
 
 # ValidateRange caps this multiplication at 8 GiB, well inside Int64.
@@ -296,7 +323,7 @@ $maxInputBytes = [long]$MaxInputMiB * 1024L * 1024L
 $extractorArguments = @(
     '--input', $InputPath,
     '--uelib', $UELibPath,
-    '--mode', $(if ($ClassesOnly) { 'classes' } elseif ($RoleInfo) { 'role-info' } elseif ($RoleExports) { 'role-exports' } elseif ($BrushBounds) { 'brush-bounds' } else { 'actors' }),
+    '--mode', $(if ($ClassesOnly) { 'classes' } elseif ($RoleInfo) { 'role-info' } elseif ($RoleExports) { 'role-exports' } elseif ($ClassArtifacts) { 'class-artifacts' } elseif ($BrushBounds) { 'brush-bounds' } else { 'actors' }),
     '--max-input-bytes', $maxInputBytes.ToString([Globalization.CultureInfo]::InvariantCulture),
     '--max-exports', $MaxExports.ToString([Globalization.CultureInfo]::InvariantCulture),
     '--max-actors', $MaxActors.ToString([Globalization.CultureInfo]::InvariantCulture),
@@ -322,6 +349,12 @@ if (-not [string]::IsNullOrWhiteSpace($ExpectedPackageGuid)) {
 }
 if (-not [string]::IsNullOrWhiteSpace($ExpectedSha256)) {
     $extractorArguments += @('--expected-sha256', $ExpectedSha256)
+}
+if ($ExpectedClassCount -ge 0) {
+    $extractorArguments += @(
+        '--expected-class-count',
+        $ExpectedClassCount.ToString([Globalization.CultureInfo]::InvariantCulture)
+    )
 }
 if ($ObjectBase -ge 0) {
     $extractorArguments += @(

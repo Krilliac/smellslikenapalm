@@ -1,0 +1,23 @@
+.git
+.github
+.pytest_cache
+**/__pycache__
+*.pyc
+
+build/
+build-*/
+build_*/
+out/
+Testing/
+
+*.log
+packetlog/
+protocol_analysis/
+telemetry/output/
+
+# Raw captures and their private sidecars must never enter a Docker context.
+*.pcap
+*.pcapng
+*.pcap.manifest.json
+*.pcapng.manifest.json
+retail_*.png

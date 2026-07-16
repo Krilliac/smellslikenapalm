@@ -1,45 +1,48 @@
 # RS2V Server - Multi-stage Docker build
 # Stage 1: Build
-FROM ubuntu:22.04 AS builder
+FROM ubuntu:24.04 AS builder
 
 ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update && apt-get install -y \
-    build-essential \
+    gcc-14 \
+    g++-14 \
+    ninja-build \
     cmake \
     libssl-dev \
     zlib1g-dev \
-    git \
     && rm -rf /var/lib/apt/lists/*
+
+ENV CC=gcc-14
+ENV CXX=g++-14
 
 WORKDIR /build
 
 # Copy source code
 COPY CMakeLists.txt ./
 COPY src/ src/
-COPY include/ include/
 COPY telemetry/ telemetry/
 COPY config/ config/
 COPY data/ data/
 
 # Build release
-RUN mkdir -p build && cd build && \
-    cmake .. \
+RUN cmake -S . -B build -G Ninja \
         -DCMAKE_BUILD_TYPE=Release \
         -DENABLE_TELEMETRY=ON \
         -DENABLE_SCRIPTING=OFF \
         -DENABLE_COMPRESSION=ON \
         -DBUILD_TESTS=OFF && \
-    cmake --build . --parallel $(nproc) && \
-    cmake --install . --prefix /install
+    cmake --build build --parallel $(nproc) && \
+    cmake --install build --prefix /install
 
 # Stage 2: Runtime
-FROM ubuntu:22.04 AS runtime
+FROM ubuntu:24.04 AS runtime
 
 ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update && apt-get install -y \
-    libssl3 \
+    libssl3t64 \
+    libstdc++6 \
     zlib1g \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/* \

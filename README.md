@@ -87,7 +87,8 @@ For the full design, see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
 ## Building
 
-**Toolchain (C++23 baseline):** GCC 12+, Clang 15+, or MSVC (VS 2022); CMake 3.20+.
+**Toolchain (C++23 baseline):** GCC 14+ with libstdc++ 14+, Clang 18+ with
+libc++ 18+, or MSVC (VS 2022); CMake 3.20+.
 OpenSSL and zlib are optional (the build falls back to built-in implementations if
 they are absent). The test suite uses the project's own native framework — no
 GoogleTest, no network, builds and runs offline.

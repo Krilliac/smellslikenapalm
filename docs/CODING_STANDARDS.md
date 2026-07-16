@@ -20,17 +20,18 @@ safe."
 
 | Toolchain | Minimum | Notes |
 |-----------|---------|-------|
-| GCC       | 12+     | CI uses g++-12. `-std=c++23` (a.k.a. `c++2b` on 12). |
-| Clang     | 15+     | CI uses clang++-15. |
+| GCC       | 14+     | CI uses g++-14 with libstdc++ 14 and `-std=c++23`. |
+| Clang     | 18+     | CI uses clang++-18 with libc++ 18 and `-std=c++23`. |
 | MSVC      | VS 2022 (19.3x) | `/std:c++latest` where a feature isn't in `/std:c++23` yet. |
 
 CMake `cmake_minimum_required(VERSION 3.20)` — `CMAKE_CXX_STANDARD 23` is only
 recognised from CMake 3.20.
 
-If a specific C++23 library feature is missing on a supported compiler (e.g. a
-partial `<format>` or `std::expected` implementation), prefer a thin project-local
-shim in `src/Utils/` over downgrading the whole file's idioms — and record the gap
-in [Design Decisions](DESIGN_DECISIONS.md).
+The compiler and standard library are one support unit. A compiler paired with a
+library that lacks required surfaces such as `<format>` or `std::expected` is not
+a supported toolchain. For an unavoidable vendor gap on a supported pair, prefer
+a thin project-local shim in `src/Utils/` and record it in
+[Design Decisions](DESIGN_DECISIONS.md).
 
 ## Why C++23 here, specifically
 

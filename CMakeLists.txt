@@ -13,9 +13,10 @@ set(CMAKE_MSVC_DEBUG_INFORMATION_FORMAT
 
 project(RS2VServer VERSION 1.0.0 LANGUAGES CXX)
 
-# C++23 is the mandated baseline (was C++17). Toolchains: GCC 12+, Clang 15+,
-# MSVC VS 2022. Rationale + required idioms: docs/CODING_STANDARDS.md and
-# docs/DESIGN_DECISIONS.md (2026-06-27 entry).
+# C++23 is the mandated baseline (was C++17). Verified toolchains: GCC 14 with
+# libstdc++ 14, Clang 18 with libc++ 18, and MSVC VS 2022. Rationale + idioms:
+# docs/CODING_STANDARDS.md and
+# docs/DESIGN_DECISIONS.md (2026-07-15 entry).
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)

@@ -399,7 +399,7 @@ void ProtocolDecoder::AnalyzeUE3Bunch(const uint8_t* data, size_t len) {
     }
 }
 
-// Static class export index -> class name (names match the loaded
+// Static actor-archetype PackageMap ref -> class name (names match the loaded
 // netfields_u_<Class> tables). The four menu actors are bit-exact against the
 // capture (docs/re/open_bunch_structure.md §1); the Pawn/Weapon ranges are from
 // the MASTER_replication_reference §0 static-index table (used for channel
@@ -410,20 +410,29 @@ static std::string ResolveActorClassIndex(uint32_t idx) {
         case 86701: return "ROPlayerReplicationInfo";  // [H]
         case 90245: return "ROTeamInfo";               // [H]
         case 70887: return "ROGameReplicationInfo";    // [H]
+        // Actor opens serialize archetype CDO refs. These six values are the
+        // corrected ROGameContent ObjectBase 285943 plus exact CDO NetIndices,
+        // not the adjacent UClass exports (vehicle_replication_evidence.md).
+        case 285994: return "ROHeli_AH1G_Content";      // [H]
+        case 285996: return "ROHeli_OH6_Content";       // [H]
+        case 286038: return "ROHeli_UH1H_Content";      // [H]
+        case 286244: case 286252: case 286259:
+            return "ROVehicleFactory";                 // [H]
         case 82735: case 75939: case 286097:           // ROWeapon/Inventory
             return "ROWeapon";
         default: break;
     }
-    // ROPawn subclasses cluster in this export-index range (respawn clusters).
+    // ROPawn subclasses cluster in this static-ref range (respawn clusters).
     if (idx >= 285994 && idx <= 286464) return "ROPawn";
     return std::string();
 }
 
 // Decode the bit-packed property record stream inside an actor-channel bunch.
 // For an OPEN bunch we parse the SerializeNewActor header to identify the actor's
-// class EXACTLY (by its static export index) and to find where the property block
-// begins; the channel is then bound to that class. Non-open bunches reuse the
-// bound class. A best-fit scan remains only as a fallback for bunches seen before
+// runtime class from its exact static actor-archetype ref and to find where the
+// property block begins; the channel is then bound to that class. Non-open
+// bunches reuse the bound class. A best-fit scan remains only as a fallback for
+// bunches seen before
 // their open. This recovers real UE3 property NAMES + VALUES via the handle
 // tables instead of guessing a byte layout.
 void ProtocolDecoder::DecodeBunchProperties(const UE3BunchHeader& header,

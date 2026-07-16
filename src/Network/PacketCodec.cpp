@@ -102,7 +102,7 @@ void TraceBunch(const char* dir, uint32_t packetId, const Bunch& b,
 void SetDebugTracing(bool enabled) { g_debugTrace = enabled; }
 bool IsDebugTracing() { return g_debugTrace; }
 
-Packet Decode(const uint8_t* data, size_t numBytes, uint32_t maxPacketBytes) {
+Packet Decode(const uint8_t* data, std::size_t numBytes, uint32_t maxPacketBytes) {
     const uint32_t bunchDataBitsMax = maxPacketBytes * 8;
     // UE3 receive semantics (UNetConnection::ReceivedPacket): the readable bit
     // count is the high set bit of the LAST byte (the terminator '1' bit); data
