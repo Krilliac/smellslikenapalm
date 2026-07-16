@@ -5,6 +5,7 @@ param(
     [string]$RoleMapPath = 'D:\SteamLibrary\steamapps\common\Rising Storm 2\ROGame\BrewedPC\Maps\CuChi\VNTE-CuChi.roe',
     [string]$CollisionMapPath = 'D:\SteamLibrary\steamapps\common\Rising Storm 2\ROGame\BrewedPC\Maps\Resort\VNTE-Resort.roe',
     [string]$RolePackagePath = 'D:\SteamLibrary\steamapps\common\Rising Storm 2\ROGame\BrewedPC\ROGame.u',
+    [string]$ClassArtifactPackageRoot = 'D:\rs2dedicatedserver\ROGame\BrewedPCServer',
     [switch]$RequireIntegration
 )
 
@@ -45,6 +46,56 @@ function Invoke-Extractor {
     }
 }
 
+function Assert-NoForbiddenClassArtifactKeys {
+    param([object]$Value, [string]$Path = '$')
+    if ($null -eq $Value -or $Value -is [string] -or
+        $Value -is [ValueType]) {
+        return
+    }
+    if ($Value -is [Collections.IDictionary]) {
+        foreach ($key in $Value.Keys) {
+            Assert-True (@('objectBase', 'staticReference', 'wireReference') -notcontains [string]$key) `
+                "class-artifact JSON must not contain forbidden key $Path.$key"
+            Assert-NoForbiddenClassArtifactKeys $Value[$key] "$Path.$key"
+        }
+        return
+    }
+    if ($Value -is [Collections.IEnumerable]) {
+        $index = 0
+        foreach ($item in $Value) {
+            Assert-NoForbiddenClassArtifactKeys $item "$Path[$index]"
+            $index++
+        }
+        return
+    }
+    foreach ($property in $Value.PSObject.Properties) {
+        if ($property.MemberType -notin @('NoteProperty', 'Property')) {
+            continue
+        }
+        Assert-True (@('objectBase', 'staticReference', 'wireReference') -notcontains $property.Name) `
+            "class-artifact JSON must not contain forbidden key $Path.$($property.Name)"
+        Assert-NoForbiddenClassArtifactKeys $property.Value "$Path.$($property.Name)"
+    }
+}
+
+function Assert-ExactJsonPropertySet {
+    param(
+        [object]$Value,
+        [string[]]$Expected,
+        [string]$Label
+    )
+    $actualNames = @(
+        $Value.PSObject.Properties |
+            Where-Object MemberType -eq 'NoteProperty' |
+            ForEach-Object Name |
+            Sort-Object
+    )
+    $expectedNames = @($Expected | Sort-Object)
+    Assert-True ($actualNames.Count -eq $expectedNames.Count -and
+        (($actualNames -join ',') -eq ($expectedNames -join ','))) `
+        "$Label JSON keys must be exact; actual=$($actualNames -join ',')"
+}
+
 try {
     $buildOutput = @(& $wrapper -BuildOnly -UELibPath $UELibPath)
     Assert-True ($LASTEXITCODE -eq 0) 'wrapper compilation must succeed'
@@ -57,6 +108,9 @@ try {
     Assert-True ([string]($secondBuildOutput | Select-Object -Last 1) -eq $executable) `
         'identical source, wrapper, and compiler bytes must reuse one cache identity'
     $executableHash = (Get-FileHash -LiteralPath $executable -Algorithm SHA256).Hash
+    $extractorAssemblyIdentity =
+        [Reflection.AssemblyName]::GetAssemblyName($executable).FullName
+    $extractorBytes = (Get-Item -LiteralPath $executable).Length
     $hashManifest = $executable + '.sha256'
     Assert-True (Test-Path -LiteralPath $hashManifest -PathType Leaf) `
         'compiled extractor cache must include an executable-hash manifest'
@@ -114,6 +168,74 @@ try {
     Assert-True ($roleExportSchema.Stdout -match 'checked static references') `
         'role-export self-test must cover checked PackageMap reference arithmetic'
 
+    $classArtifactSchema = Invoke-Extractor $executable `
+        @('--self-test-class-artifact-schema') 'class-artifact-schema'
+    Assert-True ($classArtifactSchema.ExitCode -eq 0) `
+        'synthetic exact class-artifact checks must succeed'
+    Assert-True ($classArtifactSchema.Stdout -match `
+        'anchored class regex, exact count, non-adjacent CDO linkage') `
+        'class-artifact self-test must cover anchored selection, exact counts, and direct non-adjacent linkage'
+    Assert-True ($classArtifactSchema.Stdout -match 'forbidden key absence') `
+        'class-artifact self-test must recursively exclude runtime-reference keys'
+
+    $exclusiveClassModes = Invoke-Extractor 'powershell' @(
+        '-NoProfile', '-File', $wrapper, '-BuildOnly',
+        '-ClassesOnly', '-ClassArtifacts'
+    ) 'exclusive-class-modes'
+    Assert-True ($exclusiveClassModes.ExitCode -ne 0) `
+        'wrapper must reject class-artifacts combined with another extraction mode'
+    Assert-True ($exclusiveClassModes.Stderr -match 'mutually exclusive') `
+        'wrapper mode rejection must explain exclusivity'
+
+    $classIdentityArguments = @(
+        '--input', (Join-Path $tempRoot 'missing.u'),
+        '--uelib', $UELibPath,
+        '--mode', 'class-artifacts',
+        '--class-pattern', '^(Actor)$',
+        '--expected-package-guid', ('1' * 32),
+        '--expected-sha256', ('A' * 64)
+    )
+    $missingClassCount = Invoke-Extractor $executable `
+        $classIdentityArguments 'class-artifact-missing-count'
+    Assert-True ($missingClassCount.ExitCode -eq 65) `
+        'class-artifacts must reject a missing exact class count before opening a package'
+    Assert-True ($missingClassCount.Stderr -match 'requires --expected-class-count') `
+        'missing class count rejection must identify the required argument'
+
+    $unanchoredClassPattern = Invoke-Extractor $executable `
+        @($classIdentityArguments + @(
+            '--expected-class-count', '1',
+            '--class-pattern', 'Actor'
+        )) 'class-artifact-unanchored'
+    Assert-True ($unanchoredClassPattern.ExitCode -eq 65) `
+        'class-artifacts must reject an unanchored regex before opening a package'
+    Assert-True ($unanchoredClassPattern.Stderr -match 'explicitly anchored') `
+        'unanchored regex rejection must identify the exact selection contract'
+
+    $classObjectBase = Invoke-Extractor $executable `
+        @($classIdentityArguments + @(
+            '--expected-class-count', '1',
+            '--object-base', '39478'
+        )) 'class-artifact-object-base'
+    Assert-True ($classObjectBase.ExitCode -eq 65) `
+        'class-artifacts must reject object-base derivation before opening a package'
+    Assert-True ($classObjectBase.Stderr -match 'rejects --object-base') `
+        'object-base rejection must state that no static references are derived'
+
+    foreach ($forbiddenReferenceArgument in @(
+        '--static-reference', '--wire-reference')) {
+        $forbiddenReference = Invoke-Extractor $executable `
+            @($classIdentityArguments + @(
+                '--expected-class-count', '1',
+                $forbiddenReferenceArgument
+            )) ('class-artifact-' + $forbiddenReferenceArgument.TrimStart('-'))
+        Assert-True ($forbiddenReference.ExitCode -eq 64) `
+            "class-artifacts must reject $forbiddenReferenceArgument as an unknown CLI argument"
+        Assert-True ($forbiddenReference.Stderr -match `
+            [Regex]::Escape("unknown argument: $forbiddenReferenceArgument")) `
+            "$forbiddenReferenceArgument rejection must occur at CLI parsing"
+    }
+
     $missing = Invoke-Extractor $executable @(
         '--input', (Join-Path $tempRoot 'missing.roe'),
         '--uelib', $UELibPath
@@ -129,6 +251,22 @@ try {
         Write-Output 'SKIP: integration inputs are not installed; CLI/compile checks passed.'
         exit 0
     }
+
+    $uelibAssemblyName = [Reflection.AssemblyName]::GetAssemblyName($UELibPath)
+    $uelibAssemblyIdentity = $uelibAssemblyName.FullName
+    $uelibAssemblyVersion = $uelibAssemblyName.Version.ToString()
+    $uelibProductVersion =
+        [Diagnostics.FileVersionInfo]::GetVersionInfo($UELibPath).ProductVersion
+    $uelibBytes = (Get-Item -LiteralPath $UELibPath).Length
+    $uelibSha256 = (Get-FileHash -LiteralPath $UELibPath -Algorithm SHA256).Hash
+    $unsafePath = Join-Path (Split-Path -Parent $UELibPath) `
+        'System.Runtime.CompilerServices.Unsafe.dll'
+    Assert-True (Test-Path -LiteralPath $unsafePath -PathType Leaf) `
+        'pinned UELib Unsafe dependency must exist'
+    $unsafeAssemblyIdentity =
+        [Reflection.AssemblyName]::GetAssemblyName($unsafePath).FullName
+    $unsafeBytes = (Get-Item -LiteralPath $unsafePath).Length
+    $unsafeSha256 = (Get-FileHash -LiteralPath $unsafePath -Algorithm SHA256).Hash
 
     $beforeHash = (Get-FileHash -LiteralPath $MapPath -Algorithm SHA256).Hash
 
@@ -333,6 +471,370 @@ try {
         throw "Role package integration input is required but missing: $RolePackagePath"
     }
 
+    $classArtifactCases = @(
+        [PSCustomObject]@{
+            Package = 'Core'; Pattern = '^(Object)$'; Count = 1
+            Bytes = 226734; PackageFlags = '0x20204000'
+            PackageVersion = 765; LicenseeVersion = 771; EngineVersion = 7258
+            Generations = @('1535/803/1535', '1535/803/1535')
+            Sha256 = '9F48070EEFF458478792677B6E3D3CCB6A94678A070EB602D6FE00B51EBE1E6A'
+            Guid = '4E98E1A84B17D0773382759988198719'
+            RawGuid = 'A8E1984E77D0174B9975823319871988'
+            Targets = @()
+        },
+        [PSCustomObject]@{
+            Package = 'Engine'; Pattern = '^(Actor|Inventory|Weapon)$'; Count = 3
+            Bytes = 196406917; PackageFlags = '0x20204000'
+            PackageVersion = 765; LicenseeVersion = 771; EngineVersion = 7258
+            Generations = @('37942/22296/37942', '37943/23123/37943')
+            Sha256 = '068946B520AA5DC81F22E0DBB6CE78B096F171E88A2E25608FB49D261E48D98E'
+            Guid = '7AE12CB344747678743E5ABD12E28DA7'
+            RawGuid = 'B32CE17A78767444BD5A3E74A78DE212'
+            Targets = @([PSCustomObject]@{
+                Class = 'Actor'; UClassNetIndex = $null; CdoNetIndex = $null
+            })
+        },
+        [PSCustomObject]@{
+            Package = 'ROGame'
+            Pattern = '^(ROWeapon|ROProjectileWeapon|ROBipodWeapon|ROMGWeapon|ROWeap_M60_GPMG|ROOneShotWeapon|ROExplosiveWeapon|ROEggGrenadeWeapon|ROWeap_M61_Grenade)$'
+            Count = 9
+            Bytes = 26584752; PackageFlags = '0x20204001'
+            PackageVersion = 765; LicenseeVersion = 771; EngineVersion = 7258
+            Generations = @('64471/48070/64471', '64472/48357/64472')
+            Sha256 = '06D63FF85F2C9BC740E50FC127AE5DF4DFF8AD2678DA615C44184EF4D9D71A02'
+            Guid = '33EE724F43F851351795FD975E8D5AC1'
+            RawGuid = '4F72EE333551F84397FD9517C15A8D5E'
+            Targets = @()
+        },
+        [PSCustomObject]@{
+            Package = 'ROGameContent'
+            Pattern = '^(ROWeap_M60_GPMG_Content|ROWeap_M61_Grenade_Content|ROWeap_M61_Grenade_ContentSingle)$'
+            Count = 3
+            Bytes = 23934851; PackageFlags = '0x20204001'
+            PackageVersion = 765; LicenseeVersion = 771; EngineVersion = 7258
+            Generations = @('2351/3800/2351', '2352/4093/2352')
+            Sha256 = '2D6433144F00EB130D15193C414A4F401FCA40806AEFC9A6342B7670E376F992'
+            Guid = 'FE4B4F2F4B3128C42FE5098ACAB560C8'
+            RawGuid = '2F4F4BFEC428314B8A09E52FC860B5CA'
+            Targets = @(
+                [PSCustomObject]@{
+                    Class = 'ROWeap_M60_GPMG_Content'
+                    UClassNetIndex = 512; CdoNetIndex = 513
+                },
+                [PSCustomObject]@{
+                    Class = 'ROWeap_M61_Grenade_ContentSingle'
+                    UClassNetIndex = 529; CdoNetIndex = 530
+                }
+            )
+        }
+    )
+    $missingClassArtifactPackages = @(
+        $classArtifactCases | Where-Object {
+            -not (Test-Path -LiteralPath `
+                (Join-Path $ClassArtifactPackageRoot ($_.Package + '.u')) `
+                -PathType Leaf)
+        }
+    )
+    if ($missingClassArtifactPackages.Count -eq 0) {
+        foreach ($case in $classArtifactCases) {
+            $packagePath = Join-Path $ClassArtifactPackageRoot ($case.Package + '.u')
+            $beforeClassArtifactHash = `
+                (Get-FileHash -LiteralPath $packagePath -Algorithm SHA256).Hash
+            Assert-True ((Get-Item -LiteralPath $packagePath).Length -eq $case.Bytes) `
+                "$($case.Package).u byte length must remain exactly pinned"
+            Assert-True ($beforeClassArtifactHash -eq $case.Sha256) `
+                "$($case.Package).u must match the capture-compatible server artifact"
+            $classArtifactOutput = Join-Path $tempRoot `
+                ('class-artifacts-' + $case.Package + '.jsonl')
+            & $wrapper $packagePath -UELibPath $UELibPath -ClassArtifacts `
+                -ClassPattern $case.Pattern -ExpectedClassCount $case.Count `
+                -ExpectedPackageGuid $case.Guid -ExpectedSha256 $case.Sha256 `
+                -OutputPath $classArtifactOutput
+            Assert-True ($LASTEXITCODE -eq 0) `
+                "$($case.Package).u exact class-artifact extraction must succeed"
+
+            $rawClassArtifactJson = [IO.File]::ReadAllText($classArtifactOutput)
+            $classArtifactRecords = @(
+                [IO.File]::ReadAllLines($classArtifactOutput) |
+                    ForEach-Object { $_ | ConvertFrom-Json }
+            )
+            $classRecords = @(
+                $classArtifactRecords | Where-Object record -eq 'class'
+            )
+            $classHeader = $classArtifactRecords[0]
+            $classPackage = @(
+                $classArtifactRecords | Where-Object record -eq 'package'
+            )
+            Assert-True ($classArtifactRecords[-1].record -eq 'summary' -and
+                @($classArtifactRecords | Where-Object {
+                    $_.record -notin @('header', 'package', 'class', 'summary')
+                }).Count -eq 0) `
+                'class-artifact JSONL must contain only the frozen record kinds'
+            Assert-ExactJsonPropertySet $classHeader @(
+                'record', 'schema', 'mode', 'classPattern',
+                'expectedClassCount', 'artifactBytes', 'artifactSha256',
+                'extractorAssemblyIdentity', 'extractorBytes',
+                'extractorSha256', 'uelibAssemblyIdentity',
+                'uelibAssemblyVersion', 'uelibProductVersion', 'uelibBytes',
+                'uelibSha256', 'unsafeAssemblyIdentity', 'unsafeBytes',
+                'unsafeSha256', 'wireStaticReferencesDerived',
+                'reportAuthorizesRuntime'
+            ) 'class-artifact header'
+            Assert-True ($classHeader.record -eq 'header' -and
+                $classHeader.schema -eq 'rs2.cooked-class-artifacts.raw.v1' -and
+                $classHeader.mode -eq 'class-artifacts') `
+                'class-artifact JSONL must start with the exact raw schema header'
+            Assert-True ($classHeader.classPattern -eq $case.Pattern -and
+                $classHeader.expectedClassCount -eq $case.Count) `
+                'class-artifact header must preserve the exact anchored selector and count'
+            Assert-True ($classHeader.artifactBytes -eq $case.Bytes -and
+                $classHeader.artifactSha256 -eq $case.Sha256) `
+                'class-artifact header must pin the exact artifact bytes'
+            Assert-True ($classHeader.extractorAssemblyIdentity -eq
+                    $extractorAssemblyIdentity -and
+                $classHeader.extractorBytes -eq $extractorBytes -and
+                $classHeader.extractorSha256 -eq $executableHash) `
+                'class-artifact header must pin the exact invoked extractor identity'
+            Assert-True ($classHeader.uelibAssemblyIdentity -eq
+                    $uelibAssemblyIdentity -and
+                $classHeader.uelibAssemblyVersion -eq $uelibAssemblyVersion -and
+                $classHeader.uelibProductVersion -eq $uelibProductVersion -and
+                $classHeader.uelibBytes -eq $uelibBytes -and
+                $classHeader.uelibSha256 -eq $uelibSha256) `
+                'class-artifact header must pin the exact loaded UELib identity'
+            Assert-True ($classHeader.unsafeAssemblyIdentity -eq
+                    $unsafeAssemblyIdentity -and
+                $classHeader.unsafeBytes -eq $unsafeBytes -and
+                $classHeader.unsafeSha256 -eq $unsafeSha256) `
+                'class-artifact header must pin the exact loaded Unsafe identity'
+            Assert-True (-not $classHeader.wireStaticReferencesDerived -and
+                -not $classHeader.reportAuthorizesRuntime) `
+                'class-artifact header must fail closed on wire and runtime claims'
+            Assert-True ($classHeader.wireStaticReferencesDerived -is [bool] -and
+                $classHeader.reportAuthorizesRuntime -is [bool] -and
+                $classHeader.expectedClassCount -is [ValueType] -and
+                $classHeader.artifactBytes -is [ValueType]) `
+                'class-artifact header booleans and counts must retain JSON scalar types'
+            foreach ($stringIdentityField in @(
+                'record', 'schema', 'mode', 'classPattern', 'artifactSha256',
+                'extractorAssemblyIdentity', 'extractorSha256',
+                'uelibAssemblyIdentity', 'uelibAssemblyVersion',
+                'uelibProductVersion', 'uelibSha256',
+                'unsafeAssemblyIdentity', 'unsafeSha256')) {
+                Assert-True ($classHeader.$stringIdentityField -is [string]) `
+                    "header $stringIdentityField must retain its JSON string type"
+            }
+            foreach ($numericIdentityField in @(
+                'expectedClassCount', 'artifactBytes', 'extractorBytes',
+                'uelibBytes', 'unsafeBytes')) {
+                Assert-True ($classHeader.$numericIdentityField -is [ValueType]) `
+                    "header $numericIdentityField must retain its JSON numeric type"
+            }
+            Assert-ExactJsonPropertySet $classPackage[0] @(
+                'record', 'package', 'artifactBytes', 'artifactSha256',
+                'rawGuid', 'packageGuid', 'packageFlags', 'packageVersion',
+                'licenseeVersion', 'engineVersion', 'generationCount',
+                'generations'
+            ) 'class-artifact package'
+            Assert-True ($classPackage.Count -eq 1 -and
+                $classPackage[0].package -eq $case.Package -and
+                $classPackage[0].artifactBytes -eq $case.Bytes -and
+                $classPackage[0].artifactSha256 -eq $case.Sha256 -and
+                $classPackage[0].packageGuid -eq $case.Guid -and
+                $classPackage[0].rawGuid -eq $case.RawGuid) `
+                'package record must preserve exact artifact and GUID identities'
+            Assert-True ($classPackage[0].package -is [string] -and
+                $classPackage[0].artifactBytes -is [ValueType] -and
+                $classPackage[0].artifactSha256 -is [string] -and
+                $classPackage[0].rawGuid -is [string] -and
+                $classPackage[0].packageGuid -is [string] -and
+                $classPackage[0].packageFlags -is [string] -and
+                $classPackage[0].packageVersion -is [ValueType] -and
+                $classPackage[0].licenseeVersion -is [ValueType] -and
+                $classPackage[0].engineVersion -is [ValueType] -and
+                $classPackage[0].generationCount -is [ValueType]) `
+                'package identity fields must retain exact string and numeric JSON types'
+            Assert-True ($classPackage[0].packageFlags -eq $case.PackageFlags -and
+                $classPackage[0].packageVersion -eq $case.PackageVersion -and
+                $classPackage[0].licenseeVersion -eq $case.LicenseeVersion -and
+                $classPackage[0].engineVersion -eq $case.EngineVersion) `
+                'package record must preserve exact flags and package/licensee/engine versions'
+            $actualGenerationTuples = @()
+            for ($generationIndex = 0;
+                 $generationIndex -lt @($classPackage[0].generations).Count;
+                 $generationIndex++) {
+                $generation = @($classPackage[0].generations)[$generationIndex]
+                Assert-ExactJsonPropertySet $generation @(
+                    'ordinal', 'exports', 'names', 'netObjects'
+                ) 'class-artifact generation'
+                Assert-True ($generation.ordinal -eq $generationIndex -and
+                    $generation.ordinal -is [ValueType] -and
+                    $generation.exports -is [ValueType] -and
+                    $generation.names -is [ValueType] -and
+                    $generation.netObjects -is [ValueType]) `
+                    'generation ordinal must equal its array index and all counts must be numeric'
+                $actualGenerationTuples += '{0}/{1}/{2}' -f `
+                    $generation.exports, $generation.names, $generation.netObjects
+            }
+            Assert-True ($classPackage[0].generationCount -eq $case.Generations.Count -and
+                (($actualGenerationTuples -join ',') -eq
+                    ($case.Generations -join ','))) `
+                'package record must preserve every exact generation tuple in order'
+            Assert-True ($classRecords.Count -eq $case.Count) `
+                "$($case.Package).u must emit exactly $($case.Count) selected classes"
+            Assert-True (@($classRecords | Where-Object {
+                -not $_.CDO.classLinkVerified
+            }).Count -eq 0) `
+                'every emitted CDO must verify its direct loaded UClass/table linkage'
+            foreach ($classRecord in $classRecords) {
+                Assert-ExactJsonPropertySet $classRecord @(
+                    'record', 'classPath', 'superClassPath',
+                    'superTableReference', 'UClass', 'CDO',
+                    'declaredNetworkMembers', 'directBNetInitialRotationTags'
+                ) 'class-artifact class'
+                Assert-ExactJsonPropertySet $classRecord.UClass @(
+                    'exportIndex', 'uobjectNetIndex'
+                ) 'class-artifact UClass identity'
+                Assert-ExactJsonPropertySet $classRecord.CDO @(
+                    'path', 'exportIndex', 'uobjectNetIndex',
+                    'classTableReference', 'classLinkVerified', 'serialOffset',
+                    'serialSize', 'objectFlags'
+                ) 'class-artifact CDO identity'
+                Assert-True ($classRecord.CDO.classLinkVerified -is [bool] -and
+                    $classRecord.classPath -is [string] -and
+                    ($null -eq $classRecord.superClassPath -or
+                        $classRecord.superClassPath -is [string]) -and
+                    $classRecord.superTableReference -is [ValueType] -and
+                    $classRecord.UClass.exportIndex -is [ValueType] -and
+                    $classRecord.UClass.uobjectNetIndex -is [ValueType] -and
+                    $classRecord.CDO.path -is [string] -and
+                    $classRecord.CDO.exportIndex -is [ValueType] -and
+                    $classRecord.CDO.uobjectNetIndex -is [ValueType] -and
+                    $classRecord.CDO.classTableReference -is [ValueType] -and
+                    $classRecord.CDO.serialOffset -is [ValueType] -and
+                    $classRecord.CDO.serialSize -is [ValueType] -and
+                    $classRecord.CDO.objectFlags -is [string]) `
+                    'class/CDO identities must retain exact boolean and numeric JSON types'
+                foreach ($requiredClassKey in @(
+                    'classPath', 'superClassPath', 'superTableReference',
+                    'UClass', 'CDO', 'declaredNetworkMembers',
+                    'directBNetInitialRotationTags')) {
+                    Assert-True ($classRecord.PSObject.Properties.Name -contains
+                        $requiredClassKey) `
+                        "class-artifact record must retain $requiredClassKey"
+                }
+                foreach ($member in @($classRecord.declaredNetworkMembers)) {
+                    Assert-ExactJsonPropertySet $member @(
+                        'name', 'kind', 'uobjectNetIndex', 'propertyFlags',
+                        'functionFlags', 'uelibType', 'arrayDim',
+                        'functionSuperPresent', 'specialDeclaration'
+                    ) 'class-artifact declared member'
+                    Assert-True ($member.kind -in @('property', 'function') -and
+                        $member.name -is [string] -and
+                        $member.uelibType -is [string] -and
+                        $member.uobjectNetIndex -is [ValueType] -and
+                        $member.specialDeclaration -is [bool]) `
+                        'declared member discriminator, index, and special marker types must be exact'
+                    Assert-True (($member.kind -eq 'property' -and
+                            $member.propertyFlags -is [string] -and
+                            $null -eq $member.functionFlags -and
+                            $member.arrayDim -is [ValueType] -and
+                            $null -eq $member.functionSuperPresent) -or
+                        ($member.kind -eq 'function' -and
+                            $null -eq $member.propertyFlags -and
+                            $member.functionFlags -is [string] -and
+                            $null -eq $member.arrayDim -and
+                            $member.functionSuperPresent -is [bool])) `
+                        'member kind must select the exact property/function nullable fields'
+                }
+                foreach ($tag in @($classRecord.directBNetInitialRotationTags)) {
+                    Assert-ExactJsonPropertySet $tag @(
+                        'propertyPath', 'value', 'valueState', 'sourceOffset'
+                    ) 'class-artifact direct CDO bool tag'
+                    Assert-True ($tag.propertyPath -is [string] -and
+                        $tag.valueState -in @(
+                            'explicit', 'unknown',
+                            'duplicate-explicit', 'duplicate-unknown') -and
+                        ($null -eq $tag.value -or $tag.value -is [bool]) -and
+                        $tag.sourceOffset -is [ValueType]) `
+                        'direct CDO bool-tag value, state, and offset types must be exact'
+                }
+                Assert-True (@($classRecord.directBNetInitialRotationTags).Count -eq 0) `
+                    'selected capture-compatible CDOs must pin direct bNetInitialRotation tag absence'
+            }
+            Assert-ExactJsonPropertySet $classArtifactRecords[-1] @(
+                'record', 'schema', 'mode', 'classesEmitted',
+                'classLinksVerifiedDirectly', 'wireStaticReferencesDerived',
+                'reportAuthorizesRuntime'
+            ) 'class-artifact summary'
+            $classSummary = $classArtifactRecords[-1]
+            Assert-True ($classSummary.record -eq 'summary' -and
+                $classSummary.schema -eq 'rs2.cooked-class-artifacts.raw.v1' -and
+                $classSummary.mode -eq 'class-artifacts' -and
+                $classSummary.classesEmitted -eq $case.Count -and
+                $classSummary.classesEmitted -is [ValueType] -and
+                $classSummary.classLinksVerifiedDirectly -is [bool] -and
+                $classSummary.classLinksVerifiedDirectly -and
+                $classSummary.wireStaticReferencesDerived -is [bool] -and
+                -not $classSummary.wireStaticReferencesDerived -and
+                $classSummary.reportAuthorizesRuntime -is [bool] -and
+                -not $classSummary.reportAuthorizesRuntime) `
+                'class-artifact summary must pin verified links and fail closed on wire/runtime claims'
+            foreach ($record in $classArtifactRecords) {
+                Assert-NoForbiddenClassArtifactKeys $record
+            }
+            Assert-True ($rawClassArtifactJson -notmatch `
+                '"(objectBase|staticReference|wireReference)"\s*:') `
+                'raw class-artifact JSON must contain no forbidden runtime-reference key'
+
+            foreach ($targetSpec in @($case.Targets)) {
+                $target = @($classRecords | Where-Object {
+                    $_.classPath -match ("\." + [Regex]::Escape($targetSpec.Class) + "'$")
+                })
+                Assert-True ($target.Count -eq 1) `
+                    "$($case.Package).$($targetSpec.Class) must be emitted exactly once"
+                if ($null -ne $targetSpec.UClassNetIndex) {
+                    Assert-True ($target[0].UClass.uobjectNetIndex -eq
+                            $targetSpec.UClassNetIndex -and
+                        $target[0].CDO.uobjectNetIndex -eq
+                            $targetSpec.CdoNetIndex) `
+                        "$($targetSpec.Class) UClass/CDO UObject.NetIndex identities must remain exact"
+                }
+                if ($targetSpec.Class -eq 'Actor') {
+                    $rotationDeclaration = @(
+                        $target[0].declaredNetworkMembers | Where-Object {
+                            $_.name -eq 'bNetInitialRotation' -and
+                            $_.kind -eq 'property' -and $_.specialDeclaration
+                        }
+                    )
+                    Assert-True ($rotationDeclaration.Count -eq 1) `
+                        'Actor.bNetInitialRotation must be emitted as its exact special declaration'
+                    Assert-True ($rotationDeclaration[0].uelibType -eq
+                            'UELib.Core.UBoolProperty' -and
+                        $rotationDeclaration[0].arrayDim -eq 1 -and
+                        $rotationDeclaration[0].propertyFlags -eq
+                            '0x0000000000000002' -and
+                        (([Convert]::ToUInt64(
+                            $rotationDeclaration[0].propertyFlags.Substring(2),
+                            16) -band 0x20) -eq 0) -and
+                        $null -eq $rotationDeclaration[0].functionFlags -and
+                        $null -eq $rotationDeclaration[0].functionSuperPresent) `
+                        'Actor.bNetInitialRotation must preserve its exact Const/non-CPF_Net UBoolProperty declaration facts'
+                }
+            }
+            Assert-True ((Get-FileHash -LiteralPath $packagePath -Algorithm SHA256).Hash -eq
+                $beforeClassArtifactHash) `
+                "$($case.Package).u must remain byte-identical after extraction"
+        }
+    }
+    elseif ($RequireIntegration) {
+        throw ('Class-artifact integration packages are required but missing: ' +
+            (($missingClassArtifactPackages | ForEach-Object Package) -join ', '))
+    }
+    else {
+        Write-Output 'SKIP: capture-compatible class-artifact package set is not installed.'
+    }
+
     if (Test-Path -LiteralPath $CollisionMapPath -PathType Leaf) {
         $collisionBeforeHash = (Get-FileHash -LiteralPath $CollisionMapPath -Algorithm SHA256).Hash
         $boundsOutput = Join-Path $tempRoot 'brush-bounds.jsonl'
@@ -384,7 +886,7 @@ try {
     $afterHash = (Get-FileHash -LiteralPath $MapPath -Algorithm SHA256).Hash
     Assert-True ($beforeHash -eq $afterHash) 'the official .roe input must remain byte-identical'
 
-    Write-Output 'PASS: cooked-map extractor compile, validation, roles, bounds, JSONL, actor metadata, and read-only hash checks.'
+    Write-Output 'PASS: cooked-map extractor compile, class artifacts, validation, roles, bounds, JSONL, actor metadata, and read-only hash checks.'
 }
 finally {
     if (Test-Path -LiteralPath $tempRoot) {
