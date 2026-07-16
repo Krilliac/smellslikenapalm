@@ -106,6 +106,22 @@ jobs:
           path: build/${{ env.BUILD_TYPE }}/rs2v_server.exe
           retention-days: 7
 
+  evidence-tests:
+    name: Evidence Tests (Python)
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run evidence tests
+        run: python -m unittest discover -s tools/tests -p "test_*.py" -v
+
   static-analysis:
     name: Static Analysis
     runs-on: ubuntu-24.04
