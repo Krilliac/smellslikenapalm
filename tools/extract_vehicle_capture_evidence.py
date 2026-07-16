@@ -13,9 +13,10 @@ ROVehicleFactory h23/h24, ROTeamInfo h48/h49/h50/h72, and ROPRI h35/h63/h64.
 If every bit cannot be typed, the bunch stays opaque; bit-pattern searches are
 never promoted to semantic evidence.
 
-Class identities are pinned by installed package export tables.  Vehicle and
-factory refs use ROGameContent ObjectBase 285944.  TeamInfo/PRI refs are the
-existing capture-grounded ROGame PackageMap indices.
+Actor-open identities are archetype class-default objects (CDOs), not UClasses.
+They are pinned by the captured-GUID package's exact CDO export/NetIndex rows.
+Vehicle and factory refs use ROGameContent ObjectBase 285943.  TeamInfo/PRI refs
+are the existing capture-grounded ROGame PackageMap indices.
 """
 
 from __future__ import annotations
@@ -37,12 +38,16 @@ sys.path.insert(0, str(TOOLS_DIR))
 import mock_client as mc  # noqa: E402
 
 
-SCHEMA = "rs2.vehicle-transaction-evidence.v2"
+SCHEMA = "rs2.vehicle-transaction-evidence.v3"
 KNOWN_CAPTURE_SHA256 = (
     "08B9128409B8269100AA21B3DD2D596DE1F6BE50AABE53A3C7B53BE9E48A411F"
 )
 ROGAMECONTENT_PACKAGE_GUID = "FE4B4F2F4B3128C42FE5098ACAB560C8"
-ROGAMECONTENT_OBJECT_BASE = 285944
+ROGAMECONTENT_PACKAGE_BYTES = 23_934_851
+ROGAMECONTENT_PACKAGE_SHA256 = (
+    "2D6433144F00EB130D15193C414A4F401FCA40806AEFC9A6342B7670E376F992"
+)
+ROGAMECONTENT_OBJECT_BASE = 285943
 STATIC_OBJECT_MAX = 0x80000000
 MAX_BUNCH_BITS = 12000
 TEAMINFO_STATIC_INDEX = 90245
@@ -61,34 +66,41 @@ class EvidenceError(ValueError):
 @dataclass(frozen=True)
 class ArchetypeSpec:
     static_index: int
-    package_export_index: int
+    archetype_net_index: int
+    archetype_path: str
     class_path: str
     max_handle: int
 
 
 ARCHETYPES = {
     285994: ArchetypeSpec(
-        285994, 50, "ROGameContent.ROHeli_AH1G_Content", 130
+        285994, 51, "ROGameContent.Default__ROHeli_AH1G_Content",
+        "ROGameContent.ROHeli_AH1G_Content", 130,
     ),
     285996: ArchetypeSpec(
-        285996, 52, "ROGameContent.ROHeli_OH6_Content", 129
+        285996, 53, "ROGameContent.Default__ROHeli_OH6_Content",
+        "ROGameContent.ROHeli_OH6_Content", 129,
     ),
     286038: ArchetypeSpec(
-        286038, 94, "ROGameContent.ROHeli_UH1H_Content", 150
+        286038, 95, "ROGameContent.Default__ROHeli_UH1H_Content",
+        "ROGameContent.ROHeli_UH1H_Content", 150,
     ),
 }
 
-# Exact compiled ROGameContent.u class exports.  Placed map actors may instead
-# open through their map-package object ref; those are intentionally not guessed.
+# Exact compiled ROGameContent.u factory CDO exports. Placed map actors may
+# instead open through their map-package object ref; those are not guessed.
 FACTORY_ARCHETYPES = {
     286244: ArchetypeSpec(
-        286244, 300, "ROGameContent.ROVehicleFactory_AH1G", FACTORY_MAX_HANDLE
+        286244, 301, "ROGameContent.Default__ROVehicleFactory_AH1G",
+        "ROGameContent.ROVehicleFactory_AH1G", FACTORY_MAX_HANDLE,
     ),
     286252: ArchetypeSpec(
-        286252, 308, "ROGameContent.ROVehicleFactory_OH6", FACTORY_MAX_HANDLE
+        286252, 309, "ROGameContent.Default__ROVehicleFactory_OH6",
+        "ROGameContent.ROVehicleFactory_OH6", FACTORY_MAX_HANDLE,
     ),
     286259: ArchetypeSpec(
-        286259, 315, "ROGameContent.ROVehicleFactory_UH1H", FACTORY_MAX_HANDLE
+        286259, 316, "ROGameContent.Default__ROVehicleFactory_UH1H",
+        "ROGameContent.ROVehicleFactory_UH1H", FACTORY_MAX_HANDLE,
     ),
 }
 
@@ -612,8 +624,10 @@ def extract(args: argparse.Namespace, output: TextIO) -> int:
         "serverPort": args.server_port,
         "package": "ROGameContent",
         "packageGuid": ROGAMECONTENT_PACKAGE_GUID,
+        "packageBytes": ROGAMECONTENT_PACKAGE_BYTES,
+        "packageSha256": ROGAMECONTENT_PACKAGE_SHA256,
         "packageMapObjectBase": ROGAMECONTENT_OBJECT_BASE,
-        "classResolution": "ObjectBase + compiled package export index",
+        "archetypeResolution": "ObjectBase + exact CDO UObject.NetIndex",
         "decodedVehiclePrefix": "staticObjectRef+compressedLocation",
         "vehicleRotationAndPropertyTail": "opaque",
         "wholeBunchTypedFields": {
@@ -798,7 +812,8 @@ def extract(args: argparse.Namespace, output: TextIO) -> int:
                         "z": prefix.location[2],
                     }
                     vehicle_details = {
-                        "classStaticIndex": prefix.archetype.static_index,
+                        "archetypeStaticIndex": prefix.archetype.static_index,
+                        "archetypePath": prefix.archetype.archetype_path,
                         "classPath": prefix.archetype.class_path,
                         "location": location,
                     }
@@ -820,9 +835,12 @@ def extract(args: argparse.Namespace, output: TextIO) -> int:
                         "close": bool(bunch.get("bClose")),
                         "payloadBits": payload_bits,
                         "payloadSha256": payload_digest,
-                        "classStaticIndex": prefix.archetype.static_index,
+                        "archetypeStaticIndex": prefix.archetype.static_index,
+                        "archetypePath": prefix.archetype.archetype_path,
                         "classPath": prefix.archetype.class_path,
-                        "classPackageExportIndex": prefix.archetype.package_export_index,
+                        "archetypePackageNetIndex": (
+                            prefix.archetype.archetype_net_index
+                        ),
                         "classMaxHandle": prefix.archetype.max_handle,
                         "actorIdentity": {
                             "kind": "dynamicChannel", "channel": channel,

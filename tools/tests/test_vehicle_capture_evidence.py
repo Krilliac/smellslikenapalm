@@ -63,15 +63,38 @@ class VehicleOpenEvidenceTests(unittest.TestCase):
                 self.assertGreater(decoded.bits_consumed, 32)
                 self.assertLess(decoded.bits_consumed, bits)
 
-    def test_compiled_export_indices_reconstruct_capture_static_refs(self):
+    def test_exact_cdo_net_indices_reconstruct_capture_static_refs(self):
         specs = list(vehicle_evidence.ARCHETYPES.values())
         specs.extend(vehicle_evidence.FACTORY_ARCHETYPES.values())
         for spec in specs:
             self.assertEqual(
                 vehicle_evidence.ROGAMECONTENT_OBJECT_BASE
-                + spec.package_export_index,
+                + spec.archetype_net_index,
                 spec.static_index,
             )
+            self.assertIn(".Default__", spec.archetype_path)
+
+    def test_captured_guid_package_identity_is_pinned(self):
+        self.assertEqual(vehicle_evidence.ROGAMECONTENT_OBJECT_BASE, 285943)
+        self.assertEqual(vehicle_evidence.ROGAMECONTENT_PACKAGE_BYTES, 23_934_851)
+        self.assertEqual(
+            vehicle_evidence.ROGAMECONTENT_PACKAGE_SHA256,
+            "2D6433144F00EB130D15193C414A4F401FCA40806AEFC9A6342B7670E376F992",
+        )
+        expected = {
+            285994: (51, "ROGameContent.Default__ROHeli_AH1G_Content"),
+            285996: (53, "ROGameContent.Default__ROHeli_OH6_Content"),
+            286038: (95, "ROGameContent.Default__ROHeli_UH1H_Content"),
+            286244: (301, "ROGameContent.Default__ROVehicleFactory_AH1G"),
+            286252: (309, "ROGameContent.Default__ROVehicleFactory_OH6"),
+            286259: (316, "ROGameContent.Default__ROVehicleFactory_UH1H"),
+        }
+        actual = {
+            spec.static_index: (spec.archetype_net_index, spec.archetype_path)
+            for spec in (*vehicle_evidence.ARCHETYPES.values(),
+                         *vehicle_evidence.FACTORY_ARCHETYPES.values())
+        }
+        self.assertEqual(actual, expected)
 
     def test_unknown_and_dynamic_refs_are_not_misclassified(self):
         payload = bytearray.fromhex(SAMPLES[0][2])

@@ -15,6 +15,7 @@
 #include "Protocol/ReverseEngineering/NetFieldTable.h"
 #include "Protocol/ReverseEngineering/BunchPropertyDecoder.h"
 #include "Protocol/ReverseEngineering/ProtocolDecoder.h"
+#include "Protocol/UE3Protocol.h"
 #include "Network/BitWriter.h"
 
 #include <cstdio>
@@ -332,6 +333,52 @@ static void TestOpenBunchHeaderParse(const std::string& dir) {
     CHECK(!bad.ok);
 }
 
+// Exercise the production open-bunch path, including its file-local archetype
+// resolver. Actor opens carry CDO PackageMap refs, so these exact overrides must
+// win over the broad ROPawn static-ref fallback.
+static void TestProductionActorArchetypeResolution() {
+    std::printf("TestProductionActorArchetypeResolution\n");
+    ProtocolDecoderConfig cfg = MakeTestConfig(/*async=*/false);
+    cfg.decodeBunchProperties = true;
+    cfg.netfieldsDir = "build_re2/nonexistent_netfields_for_resolver_test";
+
+    ProtocolDecoder dec;
+    dec.Initialize(cfg);
+
+    const auto feedOpen = [&](uint8_t channel, uint32_t archetypeRef) {
+        BitWriter payload;
+        payload.WriteBit(false);                         // static object selector
+        payload.SerializeInt(archetypeRef, 0x80000000u);
+        payload.SerializeInt(0u, 20u);                  // compressed (0,0,0)
+        payload.SerializeInt(2u, 4u);
+        payload.SerializeInt(2u, 4u);
+        payload.SerializeInt(2u, 4u);
+
+        const auto bytes = payload.GetBytes();
+        UE3Protocol wire(channel);
+        const auto packet = wire.BuildBunch(
+            bytes.data(), bytes.size(), /*reliable=*/true,
+            /*openChannel=*/true, /*closeChannel=*/false);
+        dec.OnRawUDPReceived(1, packet.data(), packet.size());
+    };
+
+    feedOpen(41, 285994u);
+    feedOpen(42, 286244u);
+
+    const auto channels = dec.GetChannelPropertyStats();
+    const auto heli = channels.find(41);
+    const auto factory = channels.find(42);
+    CHECK(heli != channels.end());
+    CHECK(factory != channels.end());
+    if (heli != channels.end()) {
+        CHECK_EQ(heli->second.className, std::string("ROHeli_AH1G_Content"));
+    }
+    if (factory != channels.end()) {
+        CHECK_EQ(factory->second.className, std::string("ROVehicleFactory"));
+    }
+    dec.Shutdown();
+}
+
 // PRI value decode: the now-typed ROPlayerReplicationInfo table should decode a
 // scalar block (float/FString/UniqueNetId QWORD) and a static-array element
 // (byte[3] with its 8-bit element index), mirroring the capture's ch13 PRI.
@@ -433,6 +480,7 @@ int main() {
     TestDecodeRoundTrip(dir);
     TestDecodeStopsOnEnum(dir);
     TestOpenBunchHeaderParse(dir);
+    TestProductionActorArchetypeResolution();
     TestPRIValueDecode(dir);
     TestDecoderSyncLayout();
     TestDecoderAsyncDrain();

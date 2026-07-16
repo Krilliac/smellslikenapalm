@@ -10,39 +10,47 @@ replication.  The reproducible extractor is
 - real-server pcap: `D:\RE-Tools\rs2_realserver_capture.pcapng`
   - bytes: `20,878,200`
   - SHA-256: `08B9128409B8269100AA21B3DD2D596DE1F6BE50AABE53A3C7B53BE9E48A411F`
-- installed `ROGameContent.u`
+- capture-compatible server `ROGameContent.u`
+  - bytes: `23,934,851`
+  - SHA-256: `2D6433144F00EB130D15193C414A4F401FCA40806AEFC9A6342B7670E376F992`
   - package GUID: `FE4B4F2F4B3128C42FE5098ACAB560C8`
   - engine/package/licensee: `7258 / 765 / 771`
-  - `ROHeli_AH1G_Content`, `ROHeli_OH6_Content`, and
-    `ROHeli_UH1H_Content` are class exports `50`, `52`, and `94`.
+  - the helicopter UClasses are exports `50`, `52`, and `94`; their actor
+    archetype CDOs are exports/serialized `UObject.NetIndex` values `51`, `53`,
+    and `95`.
 - installed `VNTE-Resort.roe`
   - bytes: `1,162,107,869`
   - SHA-256: `58193C282D27B3D8E2A47B16C919618BBAE6EE2F43B64CCC738DA6FFEA7055AF`
   - package GUID: `C75E786345B77AA5243259ABAF16C294`
 
-## Exact class refs in actor opens
+## Exact archetype refs in actor opens
 
-The capture's transient vehicle opens begin with a static PackageMap class ref.
-The three refs independently produce the same `ROGameContent` ObjectBase:
+The capture's transient vehicle opens begin with a static PackageMap reference
+to an actor archetype CDO, not to its UClass. `UActorChannel::ReceivedBunch`
+loads that object and requires it to cast to `AActor`; a UClass reference cannot
+satisfy that contract. The three CDO refs independently produce the same
+`ROGameContent` ObjectBase:
 
-| class | package export | ObjectBase | captured static ref | maxHandle |
+| actor archetype CDO | CDO NetIndex | ObjectBase | captured static ref | class maxHandle |
 |---|---:|---:|---:|---:|
-| `ROGameContent.ROHeli_AH1G_Content` | 50 | 285944 | **285994** | 130 |
-| `ROGameContent.ROHeli_OH6_Content` | 52 | 285944 | **285996** | 129 |
-| `ROGameContent.ROHeli_UH1H_Content` | 94 | 285944 | **286038** | 150 |
+| `ROGameContent.Default__ROHeli_AH1G_Content` | 51 | 285943 | **285994** | 130 |
+| `ROGameContent.Default__ROHeli_OH6_Content` | 53 | 285943 | **285996** | 129 |
+| `ROGameContent.Default__ROHeli_UH1H_Content` | 95 | 285943 | **286038** | 150 |
 
-The compiled factory UClasses resolve through the same ObjectBase, but are not
+The compiled factory CDOs resolve through the same ObjectBase, but are not
 claimed as capture-observed actor opens:
 
-| factory UClass | package export | compiled static ref | maxHandle |
+| factory archetype CDO | CDO NetIndex | compiled static ref | class maxHandle |
 |---|---:|---:|---:|
-| `ROGameContent.ROVehicleFactory_AH1G` | 300 | **286244** | 25 |
-| `ROGameContent.ROVehicleFactory_OH6` | 308 | **286252** | 25 |
-| `ROGameContent.ROVehicleFactory_UH1H` | 315 | **286259** | 25 |
+| `ROGameContent.Default__ROVehicleFactory_AH1G` | 301 | **286244** | 25 |
+| `ROGameContent.Default__ROVehicleFactory_OH6` | 309 | **286252** | 25 |
+| `ROGameContent.Default__ROVehicleFactory_UH1H` | 316 | **286259** | 25 |
 
-This corrects the earlier empirical classification of `285994`, `285996`, and
-`286038` as generic `ROPawn` family entries.  They are exact compiled helicopter
-classes.  Representative bit-exact opens used by the tests are:
+This corrects both the earlier generic-`ROPawn` classification and the later
+off-by-one derivation that paired UClass exports `50/52/94` with ObjectBase
+`285944`. The summed wire refs happened to remain correct, hiding the mistake;
+the exact derivation is CDO NetIndex plus ObjectBase `285943`. Representative
+bit-exact opens used by the tests are:
 
 | class | frame | channel / sequence | payload bits | decoded location |
 |---|---:|---:|---:|---:|
@@ -110,7 +118,8 @@ The related already-grounded cross-actor fields are `ROTeamInfo` h48/h49/h50/h72
 
 ## Exact cross-actor correlations now extracted
 
-Schema `rs2.vehicle-transaction-evidence.v2` tracks channel generations per
+Schema `rs2.vehicle-transaction-evidence.v3` records the exact actor-archetype
+CDO path/NetIndex derivation and tracks channel generations per
 client endpoint.  It assigns semantics only after a source channel is grounded
 by its actor open, and only when the selected typed decoder consumes the exact
 `BunchDataBits`.  A target dynamic object ref must resolve to the *currently
@@ -146,8 +155,8 @@ generation-safe join.  In particular, the extractor will not carry an old PRI
 seat assignment forward across a later helicopter replacement merely because
 the same TeamInfo array index is reused.
 
-The scan also finds no actor open using one of the three grounded factory
-UClass refs and therefore emits zero typed `ChildVehicle` h24 observations.
+The scan also finds no actor open using one of the three grounded factory CDO
+refs and therefore emits zero typed `ChildVehicle` h24 observations.
 That is reported as `factoryEvidenceState=noGroundedFactoryChannelObserved`,
 not as proof that the server never replicated a child.  Resort's placed factory
 export-table indices remain insufficient to identify their PackageMap refs.
@@ -172,19 +181,19 @@ grounded TeamInfo/PRI channels contain unsupported fields and remain opaque.
 
 ## Still unknown; do not synthesize
 
-- The extractor stops after class ref plus compressed Location.  Whether and how
+- The extractor stops after the archetype CDO ref plus compressed Location.  Whether and how
   the remaining bits split into Rotation and initial fields is not yet decoded.
 - Exact initial values/order for `RBState`, seats, driver/PRI, engine/RPM, hit
   zones, and per-helicopter subclass fields remain opaque.
 - Factory `ChildVehicle` h24 and `bHasLockedVehicle` h23 handles plus the three
-  factory UClass refs are exact, but no grounded factory channel is observed in
+  factory CDO refs are exact, but no grounded factory channel is observed in
   this capture.  Bit-pattern matches on untyped actor channels are rejected.
 - TeamInfo h50 is now correlated to dynamic vehicle channel generations.  A
   fully typed h49 location update and a complete h50 + PRI h35/h63/h64 seat
   transaction have not yet been captured in compatible, exact-consumption
   bunches.
 
-Until those are captured and typed, runtime code should use the exact class refs
+Until those are captured and typed, runtime code should use the exact actor-archetype refs
 and handle tables only as decoding/building prerequisites, not fabricate a
 vehicle property tail.
 
