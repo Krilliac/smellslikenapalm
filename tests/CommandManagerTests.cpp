@@ -16,6 +16,13 @@
 #include <string>
 #include <vector>
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <future>
+#include <limits>
+#include <optional>
+#include <thread>
+#include <utility>
 
 namespace {
 
@@ -78,7 +85,43 @@ TEST(CommandManager, FindResolvesNamesAndAliasesCaseInsensitively) {
     EXPECT_TRUE(cm.Find("bc") != nullptr);          // alias of broadcast
     EXPECT_EQ(cm.Find("bc"), cm.Find("broadcast"));
     EXPECT_TRUE(cm.Find("?") != nullptr);           // alias of help
+    EXPECT_EQ(cm.Find("bot"), cm.Find("spawnbot"));
+    EXPECT_EQ(cm.Find("botfill"), cm.Find("spawnbot"));
     EXPECT_TRUE(cm.Find("does-not-exist") == nullptr);
+}
+
+TEST(CommandManager, BotFillFailsClosedWithoutServerAndRejectsExtraArguments) {
+    CommandManager cm(nullptr);
+    cm.Initialize();
+
+    auto unavailable = MakeCtx(CommandLevel::Dev);
+    EXPECT_FALSE(cm.Execute(unavailable->ctx, "bot"));
+    EXPECT_TRUE(AnyLineContains(unavailable->lines, "BotManager unavailable"));
+
+    auto malformed = MakeCtx(CommandLevel::Dev);
+    EXPECT_FALSE(cm.Execute(malformed->ctx, "botfill 2 unexpected"));
+    EXPECT_TRUE(AnyLineContains(malformed->lines, "Usage: spawnbot"));
+    EXPECT_FALSE(AnyLineContains(malformed->lines, "BotManager unavailable"));
+}
+
+TEST(CommandManager, TimeScaleRejectsNonFiniteTokensAndDirectMutation) {
+    CommandManager cm(nullptr);
+    cm.Initialize();
+
+    auto nan = MakeCtx(CommandLevel::Dev);
+    EXPECT_FALSE(cm.Execute(nan->ctx, "timescale nan"));
+    EXPECT_TRUE(AnyLineContains(nan->lines, "Usage: timescale"));
+
+    auto positiveInfinity = MakeCtx(CommandLevel::Dev);
+    EXPECT_FALSE(cm.Execute(positiveInfinity->ctx, "timescale inf"));
+    EXPECT_TRUE(AnyLineContains(positiveInfinity->lines, "Usage: timescale"));
+
+    GameServer server;
+    server.SetTimeScale(2.0f);
+    server.SetTimeScale(std::numeric_limits<float>::quiet_NaN());
+    EXPECT_EQ(server.GetTimeScale(), 2.0f);
+    server.SetTimeScale(std::numeric_limits<float>::infinity());
+    EXPECT_EQ(server.GetTimeScale(), 2.0f);
 }
 
 TEST(CommandManager, PermissionGateDeniesUnderprivileged) {
@@ -168,6 +211,111 @@ TEST(CommandManager, RegisterOverridesExistingCommand) {
     EXPECT_TRUE(cm.Execute(c->ctx, "ping"));
     EXPECT_TRUE(ran);
     EXPECT_TRUE(AnyLineContains(c->lines, "override"));
+}
+
+TEST(CommandManager, WorkerSubmissionRunsOnlyWhenAuthoritativeThreadDrainsQueue) {
+    CommandManager cm(nullptr);
+    cm.Initialize();
+
+    std::thread::id submitThread;
+    std::thread::id handlerThread;
+    std::atomic<int> transportCallbackCalls{0};
+    cm.Register(CommandDef{
+        "queuedprobe", {}, CommandLevel::Player, CommandCategory::Automation,
+        "queuedprobe", "test queued dispatch",
+        [&](CommandContext& ctx) {
+            handlerThread = std::this_thread::get_id();
+            ctx.Reply("ran");
+            return true;
+        }});
+
+    std::optional<std::future<QueuedCommandResult>> future;
+    std::thread submitter([&] {
+        submitThread = std::this_thread::get_id();
+        CommandContext ctx;
+        ctx.source = CommandSource::Remote;
+        ctx.level = CommandLevel::Player;
+        ctx.invoker = "queue-test";
+        ctx.out = [&](std::string_view) { ++transportCallbackCalls; };
+        future.emplace(cm.Enqueue(std::move(ctx), "queuedprobe"));
+    });
+    submitter.join();
+
+    ASSERT_TRUE(future.has_value());
+    EXPECT_TRUE(future->wait_for(std::chrono::milliseconds(0)) ==
+                std::future_status::timeout);
+    const std::thread::id authoritativeThread = std::this_thread::get_id();
+    EXPECT_EQ(cm.ProcessQueued(), 1u);
+
+    QueuedCommandResult result = future->get();
+    EXPECT_TRUE(result.executed);
+    EXPECT_TRUE(result.ok);
+    EXPECT_EQ(result.output, "ran\n");
+    EXPECT_EQ(handlerThread, authoritativeThread);
+    EXPECT_TRUE(handlerThread != submitThread);
+    // Enqueue must not retain/call a worker-owned output capture.
+    EXPECT_EQ(transportCallbackCalls.load(), 0);
+}
+
+TEST(CommandManager, QueueIsBoundedAndRejectsOverflowWithoutExecutingIt) {
+    CommandManager cm(nullptr);
+    cm.Initialize();
+
+    std::vector<std::future<QueuedCommandResult>> accepted;
+    accepted.reserve(CommandManager::MAX_QUEUED_COMMANDS);
+    for (size_t i = 0; i < CommandManager::MAX_QUEUED_COMMANDS; ++i) {
+        CommandContext ctx;
+        ctx.level = CommandLevel::Player;
+        ctx.invoker = "queue-fill";
+        accepted.push_back(cm.Enqueue(std::move(ctx), "ping"));
+    }
+
+    CommandContext overflowCtx;
+    overflowCtx.level = CommandLevel::Player;
+    overflowCtx.invoker = "queue-overflow";
+    auto overflow = cm.Enqueue(std::move(overflowCtx), "ping");
+    ASSERT_TRUE(overflow.wait_for(std::chrono::milliseconds(0)) ==
+                std::future_status::ready);
+    QueuedCommandResult rejected = overflow.get();
+    EXPECT_FALSE(rejected.executed);
+    EXPECT_FALSE(rejected.ok);
+    EXPECT_TRUE(rejected.output.find("queue full") != std::string::npos);
+
+    EXPECT_EQ(cm.ProcessQueued(CommandManager::MAX_QUEUED_COMMANDS),
+              CommandManager::MAX_QUEUED_COMMANDS);
+    for (auto& command : accepted) {
+        QueuedCommandResult result = command.get();
+        EXPECT_TRUE(result.executed);
+        EXPECT_TRUE(result.ok);
+    }
+}
+
+TEST(CommandManager, StopAcceptingCancelsPendingAndRejectsLateSubmission) {
+    CommandManager cm(nullptr);
+    cm.Initialize();
+
+    CommandContext pendingCtx;
+    pendingCtx.level = CommandLevel::Player;
+    pendingCtx.invoker = "before-stop";
+    auto pending = cm.Enqueue(std::move(pendingCtx), "ping");
+
+    cm.StopAccepting("test stop");
+    ASSERT_TRUE(pending.wait_for(std::chrono::milliseconds(0)) ==
+                std::future_status::ready);
+    QueuedCommandResult canceled = pending.get();
+    EXPECT_FALSE(canceled.executed);
+    EXPECT_TRUE(canceled.output.find("test stop") != std::string::npos);
+    EXPECT_EQ(cm.ProcessQueued(), 0u);
+
+    CommandContext lateCtx;
+    lateCtx.level = CommandLevel::Player;
+    lateCtx.invoker = "after-stop";
+    auto late = cm.Enqueue(std::move(lateCtx), "ping");
+    ASSERT_TRUE(late.wait_for(std::chrono::milliseconds(0)) ==
+                std::future_status::ready);
+    QueuedCommandResult lateResult = late.get();
+    EXPECT_FALSE(lateResult.executed);
+    EXPECT_TRUE(lateResult.output.find("shutting down") != std::string::npos);
 }
 
 // --- SOAP transport pure helpers ---

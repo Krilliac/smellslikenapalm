@@ -12,6 +12,31 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Comprehensive wiki-style documentation (Home, Configuration Reference, Admin Commands, Game Modes, Maps, FAQ)
 - CONTRIBUTING.md with development workflow and coding standards
 - Full CHANGELOG.md and CONTRIBUTORS.md
+- Installed-artifact Cu Chi role/spawn support for both factions. Its exact
+  57-bit h175 requests are source-constructed from the current retail-client
+  `ROGame.u` role UClass NetIndices and installed PackageMap base, and the mock
+  validator uses the installed pawn/loadout/attachment graph; this is not a
+  claim of a live Cu Chi role-selection capture.
+- Artifact-pinned, read-only Cu Chi role-reference evidence tooling. The
+  table-only extractor verifies every `RORoleInfo*` UClass/CDO pair in the exact
+  installed `ROGame.u`; `audit_installed_role_refs.py` validates the pinned Cu
+  Chi map, source substitutions, root class-index default, UELib binary, and
+  UELib dependency closure, then emits fourteen UClass references in
+  `data/installed_cuchi_role_refs.jsonl` without authorizing new gameplay. The
+  extractor helper cache is keyed by the exact source, wrapper, and complete
+  Roslyn-directory manifest, then atomically published with a verified hash;
+  the audit also requires an exact freshly compiled executable SHA-256. The
+  report distinguishes the two supported class-0 roles from twelve blocked
+  candidates.
+
+### Changed
+- **Breaking configuration validation:** `[General].server_name` now follows the
+  live retail-client wire policy: 1–128 encoded bytes, printable ASCII only, and
+  at least one non-space character. Existing non-ASCII, control-containing,
+  all-space, or longer names must be replaced before upgrading. Invalid startup
+  or reload candidates are rejected atomically; a value injected outside the
+  validated file path uses `Rising Storm 2: Vietnam Server` at the protocol
+  boundary instead of disconnecting joining clients.
 
 ---
 

@@ -37,7 +37,7 @@ public:
     int  GetVoteDurationSeconds() const { return m_voteDurationSeconds; }
 
     // Begin a vote. Picks up to GetOptionCount() weighted-random candidates from
-    // the available maps, excluding currentMap. Returns the chosen candidates.
+    // exact-profile maps, excluding currentMap. Returns the chosen candidates.
     const std::vector<Candidate>& StartVote(const std::string& currentMap);
 
     // Record a player's vote. optionIndex is into the candidate list returned by

@@ -7,6 +7,8 @@
 
 class SecurityConfig {
 public:
+    static constexpr int kDefaultEACListenPort = 7957;
+
     explicit SecurityConfig(const ServerConfig& cfg);
 
     bool        IsSteamAuthEnabled() const;
@@ -17,6 +19,8 @@ public:
     bool        IsAntiCheatEnabled() const;
     const std::string& GetAntiCheatMode() const;
     const std::string& GetEacScannerConfigFile() const;
+    int         GetEACListenPort() const;
+    static bool IsValidEACListenPort(int port);
 
 private:
     bool        m_steamAuthEnabled;
@@ -27,4 +31,5 @@ private:
     bool        m_antiCheatEnabled;
     std::string m_antiCheatMode;
     std::string m_eacScannerConfigFile;
+    int         m_eacListenPort;
 };

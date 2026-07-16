@@ -1,0 +1,19 @@
+# VNSK-Compound cooked initial deployment starts
+# Evidence package SHA-256: 68ED477061DFC44AA31D079D77D6DDD32244D164CEAA4F38F4E901B2E83D9D6E
+# Format: x y z teamId minTerritoryPhase maxTerritoryPhase retailSpawnVolumeRef
+# Static refs below are canonical; installed clients receive the artifact's
+# grounded +5 map-object rebase on the h59 wire payload.
+# Server team 1 = South/US; server team 2 = North/NVA. Starts are unbounded
+# because Skirmish has no linear Territory phase progression. Coordinates are
+# the cooked ROPlayerStart actors in "Spawns_All,Spawn : US_SK" and
+# "Spawns_All,Spawn : NVA_SK".
+
+# Team 1 / US
+-2246.944 4065.072 37.000 1 -1 -1 289129
+-2269.183 4018.069 36.557 1 -1 -1 289129
+-2293.127 3967.440 35.809 1 -1 -1 289129
+
+# Team 2 / NVA
+4882.678 -3823.667 42.000 2 -1 -1 289139
+4924.431 -3792.676 42.000 2 -1 -1 289139
+4969.417 -3759.330 42.000 2 -1 -1 289139

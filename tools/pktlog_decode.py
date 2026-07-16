@@ -16,6 +16,9 @@ Each datagram line:  [seq] DIR client peer  len=N  pid=.. <bunch summary>
 """
 import sys, os, json, glob
 
+C2S_BUNCH_DATA_BITS = 1280 * 8
+S2C_BUNCH_DATA_BITS = 1500 * 8
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__)))
 try:
     from mock_client import decode_packet, fmt_packet
@@ -81,7 +84,10 @@ def main():
         summary = ""
         if decode_packet and data:
             try:
-                dec = decode_packet(data, bd_max=16384)
+                # Retail RS2 negotiates asymmetric live packet sizes: client
+                # datagrams use MaxPacket=1280 while server datagrams use 1500.
+                bd_max = C2S_BUNCH_DATA_BITS if d == "C2S" else S2C_BUNCH_DATA_BITS
+                dec = decode_packet(data, bd_max=bd_max)
                 summary = fmt_packet(dec)
             except Exception as e:
                 summary = f"<decode err: {e}>"

@@ -29,9 +29,9 @@ bool DebugConfig::IsLogToFile() const {
     return result;
 }
 
-const std::string& DebugConfig::GetDebugLogPath() const {
+std::string DebugConfig::GetDebugLogPath() const {
     Logger::Trace("[DebugConfig::GetDebugLogPath] Entry");
-    const auto& result = m_cfg.GetManager()->GetString("Global.debug_log_path", "logs/debug.log");
+    auto result = m_cfg.GetManager()->GetString("Global.debug_log_path", "logs/debug.log");
     Logger::Trace("[DebugConfig::GetDebugLogPath] Exit - returning '%s'", result.c_str());
     return result;
 }

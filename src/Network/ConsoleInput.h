@@ -8,7 +8,7 @@
 
 #pragma once
 
-#include <atomic>
+#include <memory>
 #include <thread>
 
 class GameServer;
@@ -22,9 +22,12 @@ public:
     void Stop();
 
 private:
-    void ReadLoop();
+    struct State;
+    static void ReadLoop(const std::shared_ptr<State>& state);
 
-    GameServer*       m_server;
-    std::atomic<bool> m_running{false};
-    std::thread       m_thread;
+    // The Windows stdin read may remain blocked during shutdown. The worker
+    // therefore captures this shared state, never `this`; Stop() can detach
+    // without leaving a dangling ConsoleInput or GameServer pointer behind.
+    std::shared_ptr<State> m_state;
+    std::thread            m_thread;
 };

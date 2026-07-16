@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <filesystem>
 #include <chrono>
+#include <cstring>
 #include <thread>
 
 #ifdef _WIN32
@@ -100,13 +101,16 @@ bool ScriptManager::InitializeCLR()
     Logger::Debug("Initializing CLR hosting on Windows...");
 
     ICLRMetaHost* pMetaHost = nullptr;
-    if (FAILED(CLRCreateInstance(CLSID_CLRMetaHost, IID_ICLRMetaHost, (LPVOID*)&pMetaHost))) {
+    if (FAILED(CLRCreateInstance(
+            CLSID_CLRMetaHost, IID_ICLRMetaHost, reinterpret_cast<LPVOID*>(&pMetaHost)))) {
         Logger::Error("CLRCreateInstance failed");
         return false;
     }
 
     ICLRRuntimeInfo* pRuntimeInfo = nullptr;
-    if (FAILED(pMetaHost->GetRuntime(L"v4.0.30319", IID_ICLRRuntimeInfo, (LPVOID*)&pRuntimeInfo))) {
+    if (FAILED(pMetaHost->GetRuntime(
+            L"v4.0.30319", IID_ICLRRuntimeInfo,
+            reinterpret_cast<LPVOID*>(&pRuntimeInfo)))) {
         Logger::Error("GetRuntime failed");
         pMetaHost->Release();
         return false;
@@ -120,7 +124,9 @@ bool ScriptManager::InitializeCLR()
         return false;
     }
 
-    if (FAILED(pRuntimeInfo->GetInterface(CLSID_CorRuntimeHost, IID_ICorRuntimeHost, (LPVOID*)&m_clrHost))) {
+    if (FAILED(pRuntimeInfo->GetInterface(
+            CLSID_CorRuntimeHost, IID_ICorRuntimeHost,
+            reinterpret_cast<LPVOID*>(&m_clrHost)))) {
         Logger::Error("GetInterface failed");
         pRuntimeInfo->Release();
         pMetaHost->Release();
@@ -138,7 +144,8 @@ bool ScriptManager::InitializeCLR()
 
     IUnknown* pAppDomainThunk = nullptr;
     m_clrHost->GetDefaultDomain(&pAppDomainThunk);
-    pAppDomainThunk->QueryInterface(IID__AppDomain, (LPVOID*)&m_appDomain);
+    pAppDomainThunk->QueryInterface(
+        IID__AppDomain, reinterpret_cast<LPVOID*>(&m_appDomain));
     pAppDomainThunk->Release();
 
     pRuntimeInfo->Release();
@@ -284,13 +291,19 @@ void ScriptManager::FileWatcherThread()
         FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE, nullptr,
         OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
 
-    char buffer[4096];
-    DWORD bytesReturned;
+    alignas(FILE_NOTIFY_INFORMATION) char buffer[4096];
+    DWORD bytesReturned = 0;
     while (m_watcherRunning) {
         if (ReadDirectoryChangesA(hDir, buffer, sizeof(buffer), TRUE,
             FILE_NOTIFY_CHANGE_LAST_WRITE|FILE_NOTIFY_CHANGE_FILE_NAME,
             &bytesReturned, nullptr, nullptr)) {
-            FILE_NOTIFY_INFORMATION* info = (FILE_NOTIFY_INFORMATION*)buffer;
+            constexpr size_t kHeaderBytes =
+                offsetof(FILE_NOTIFY_INFORMATION, FileName);
+            if (bytesReturned < kHeaderBytes) continue;
+            FILE_NOTIFY_INFORMATION* info =
+                reinterpret_cast<FILE_NOTIFY_INFORMATION*>(buffer);
+            if (info->FileNameLength > bytesReturned - kHeaderBytes ||
+                info->FileNameLength % sizeof(WCHAR) != 0) continue;
             std::string name(info->FileName, info->FileNameLength/sizeof(WCHAR));
             if (name.rfind(".cs") != std::string::npos)
                 OnFileChanged(watchPath + "/" + name);
@@ -301,17 +314,36 @@ void ScriptManager::FileWatcherThread()
 #else
     std::string watchPath = m_scriptsPath + "/enabled";
     int fd = inotify_init();
+    if (fd < 0) {
+        Logger::Error("Failed to initialize script directory watcher: %s",
+                      std::strerror(errno));
+        return;
+    }
     int wd = inotify_add_watch(fd, watchPath.c_str(),
         IN_MODIFY|IN_CREATE|IN_DELETE|IN_MOVED_TO);
-    char buf[4096];
+    if (wd < 0) {
+        Logger::Error("Failed to watch script directory '%s': %s",
+                      watchPath.c_str(), std::strerror(errno));
+        close(fd);
+        return;
+    }
+    alignas(struct inotify_event) char buf[4096];
     while (m_watcherRunning) {
-        int len = read(fd, buf, sizeof(buf));
-        int i = 0;
-        while (i < len) {
-            auto* ev = (struct inotify_event*)&buf[i];
+        const ssize_t len = read(fd, buf, sizeof(buf));
+        if (len <= 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            continue;
+        }
+        size_t i = 0;
+        const size_t available = static_cast<size_t>(len);
+        while (i < available) {
+            if (available - i < sizeof(struct inotify_event)) break;
+            auto* ev = reinterpret_cast<struct inotify_event*>(&buf[i]);
+            const size_t recordBytes = sizeof(struct inotify_event) + ev->len;
+            if (recordBytes > available - i) break;
             if (ev->len && std::string(ev->name).rfind(".cs") != std::string::npos)
                 OnFileChanged(watchPath + "/" + ev->name);
-            i += sizeof(struct inotify_event) + ev->len;
+            i += recordBytes;
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }

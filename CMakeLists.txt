@@ -1,5 +1,16 @@
 # CMake 3.20 is the first version that recognises CMAKE_CXX_STANDARD 23.
 cmake_minimum_required(VERSION 3.20)
+
+# Let CMake select MSVC debug-information flags through the first-class
+# abstraction instead of appending legacy /Zi. Embedded /Z7 keeps Debug builds
+# compatible with the machine-wide sccache launcher and avoids shared PDB races.
+if(POLICY CMP0141)
+    cmake_policy(SET CMP0141 NEW)
+endif()
+set(CMAKE_MSVC_DEBUG_INFORMATION_FORMAT
+    "$<$<CONFIG:Debug,RelWithDebInfo>:Embedded>"
+    CACHE STRING "MSVC debug information format")
+
 project(RS2VServer VERSION 1.0.0 LANGUAGES CXX)
 
 # C++23 is the mandated baseline (was C++17). Toolchains: GCC 12+, Clang 15+,
@@ -40,8 +51,11 @@ find_package(OpenSSL QUIET)
 find_package(Threads REQUIRED)
 find_package(ZLIB QUIET)
 
-# Collect all source files
-file(GLOB_RECURSE CORE_SOURCES
+# Collect all source files. CONFIGURE_DEPENDS attaches each glob to CMake's
+# build-system check target, so adding/removing a .cpp regenerates an already
+# configured Ninja, Ninja Multi-Config, or Visual Studio/MSBuild tree before
+# compilation instead of surfacing later as an unresolved external.
+file(GLOB_RECURSE CORE_SOURCES CONFIGURE_DEPENDS
     src/Config/*.cpp
     src/Game/*.cpp
     src/Math/*.cpp
@@ -64,14 +78,16 @@ list(FILTER CORE_SOURCES EXCLUDE REGEX "Generated/Handlers/")
 
 # Scripting sources (optional)
 if(ENABLE_SCRIPTING)
-    file(GLOB_RECURSE SCRIPTING_SOURCES src/Scripting/*.cpp)
+    file(GLOB_RECURSE SCRIPTING_SOURCES CONFIGURE_DEPENDS
+        src/Scripting/*.cpp)
     list(APPEND CORE_SOURCES ${SCRIPTING_SOURCES})
     add_compile_definitions(RS2V_SCRIPTING_ENABLED)
 endif()
 
 # Telemetry sources (optional)
 if(ENABLE_TELEMETRY)
-    file(GLOB_RECURSE TELEMETRY_SOURCES telemetry/*.cpp)
+    file(GLOB_RECURSE TELEMETRY_SOURCES CONFIGURE_DEPENDS
+        telemetry/*.cpp)
     list(APPEND CORE_SOURCES ${TELEMETRY_SOURCES})
     include_directories(${CMAKE_SOURCE_DIR}/telemetry)
     add_compile_definitions(RS2V_TELEMETRY_ENABLED)
@@ -168,7 +184,7 @@ target_link_libraries(rs2v_core PUBLIC Threads::Threads)
 
 # Platform-specific link libraries (PUBLIC so consumers inherit them)
 if(WIN32)
-    target_link_libraries(rs2v_core PUBLIC ws2_32 iphlpapi pdh psapi dbghelp)
+    target_link_libraries(rs2v_core PUBLIC ws2_32 iphlpapi pdh psapi dbghelp advapi32)
 else()
     target_link_libraries(rs2v_core PUBLIC dl)
 endif()

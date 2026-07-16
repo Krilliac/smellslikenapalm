@@ -13,8 +13,13 @@ RoundManager::RoundManager(GameServer* server)
     , m_roundDuration(std::chrono::seconds(900))
     , m_postRoundDuration(std::chrono::seconds(10))
 {
-    auto settings = m_server->GetGameConfig()->GetGameSettings();
-    m_roundDuration       = std::chrono::seconds(settings.roundTimeLimit);
+    auto gameConfig = m_server ? m_server->GetGameConfig() : nullptr;
+    if (gameConfig) {
+        const auto settings = gameConfig->GetGameSettings();
+        if (settings.roundTimeLimit > 0) {
+            m_roundDuration = std::chrono::seconds(settings.roundTimeLimit);
+        }
+    }
 }
 
 RoundManager::~RoundManager() = default;
@@ -147,5 +152,7 @@ void RoundManager::BroadcastPhaseMessage() const
             msg = "Round " + std::to_string(m_roundNumber) + " ended. Showing results for " + std::to_string(m_postRoundDuration.count()) + " seconds.";
             break;
     }
-    m_server->BroadcastChatMessage("[RoundManager] " + msg);
+    if (m_server) {
+        m_server->BroadcastChatMessage("[RoundManager] " + msg);
+    }
 }

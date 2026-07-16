@@ -69,6 +69,13 @@ Priority (highest → lowest):
 
 **Environment variables** use the prefix `RS2V_` followed by the uppercase key name with underscores. For example, the `port` key in `[Network]` can be overridden by setting `RS2V_PORT=8777`.
 
+Two replication variables are direct process policy switches rather than INI-key
+overrides. `RS2V_REPLICATION_BOOTSTRAP_VARIANT=installed` selects the installed
+PackageMap/object layout; leaving it unset selects canonical. The exact
+`RS2V_REPLAY_CAPTURE_WORLD=1` diagnostic requests the populated canonical Resort
+capture and is rejected for installed or non-Resort sessions. Set either before
+launch; neither participates in `ConfigWatcher` hot reload.
+
 **Config files** can be layered. The production override file (`config/server_production.ini`) is loaded on top of the base `config/server.ini` when specified. Values in the override file replace values from the base file; keys not present in the override fall through to the base.
 
 ### 1.2 Hot Reload
@@ -117,7 +124,7 @@ General server identity and behavior settings.
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `server_name` | string | `RS2V Custom Server` | The display name of the server as shown in the server browser and connection messages. Supports spaces and special characters. Maximum 128 characters. |
+| `server_name` | string | `RS2V Custom Server` | Display name used by the server browser and connection messages. Normal live-authored actor bootstrap snapshots it into GRI h24 for each newly joining retail client. See the wire policy below. |
 | `version` | string | `1.0.0` | Server version string. Informational only; used in status responses and telemetry. Does not affect protocol compatibility. |
 | `max_players` | integer | `64` | Maximum number of concurrent player connections. Valid range: 1–128. Higher values require more CPU, memory, and bandwidth. See [System Requirements](DEPLOYMENT.md) for hardware guidelines. |
 | `map_rotation_file` | path | `config/maps.ini` | Path to the map rotation configuration file, relative to server root. This file defines all available maps, their properties, and the rotation order. See [Section 5](#5--mapsini--map-rotation--settings). |
@@ -129,6 +136,25 @@ General server identity and behavior settings.
 | `data_directory` | path | `data/` | Path to the runtime data directory, relative to server root. Contains map assets, scripts, and other runtime resources. |
 | `log_directory` | path | `logs/` | Path to the log output directory, relative to server root. All log files (server, security, performance, telemetry) are written here. Created automatically if it does not exist. |
 | `admin_rcon_only` | boolean | `false` | When `true`, admin commands can only be issued via RCON (remote console). In-game chat commands are disabled for all admin levels. When `false`, admins can use both RCON and in-game chat commands based on their permission level. |
+
+`server_name` has an emulator wire policy because retail GRI h24 is an ANSI
+`FString`: the encoded value must contain **1 through 128 bytes**, every byte must
+be printable 7-bit ASCII (`0x20` through `0x7E`), and at least one byte must not be
+a space. After normal INI parsing this permits ordinary spaces and printable ASCII
+punctuation, but rejects all-space names, control characters, DEL, embedded NULs,
+and bytes at or above `0x80` (including unconverted UTF-8). The parser trims outer
+whitespace. A `#` or `;` begins a comment only at the start of a line or when
+preceded by whitespace, so use `Clan#5` rather than `Clan #5` when the marker
+is part of the name. Startup and reload validate the complete candidate configuration
+before publication. An invalid name rejects that candidate atomically; a failed reload
+leaves the last valid live configuration unchanged.
+
+The normal live-authored bootstrap validates the value again at the protocol
+boundary. If configuration is unavailable or a programmatic caller supplies an
+invalid value, h24 uses the defensive retail-facing fallback
+`Rising Storm 2: Vietnam Server`. The explicit
+`RS2V_REPLAY_CAPTURE_WORLD=1` reverse-engineering diagnostic is different: it
+retains the captured GRI h24 instead of substituting `server_name`.
 
 ### 2.2 [DataPaths]
 
@@ -258,6 +284,15 @@ Administrative access and RCON (Remote Console) configuration.
 | `admin_list_file` | path | `config/admin_list.txt` | Path to the admin list file, relative to server root. This file maps SteamIDs to permission levels. See [Section 10.1](#101-admin_listtxt). |
 | `chat_auth_enabled` | boolean | `true` | When `true`, in-game admin commands (chat-based) require the issuing player to be listed in `admin_list.txt` with the appropriate permission level. When `false`, chat-based admin commands are disabled entirely (use RCON instead). |
 
+### 2.13 [Gameplay]
+
+Global gameplay startup behavior. Mode-specific scoring, timing, and respawn
+rules remain in `game_modes.ini`.
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `wait_for_ready_player` | boolean | `true` | When `true`, a retail-native round remains in Preparation until at least one joined retail client finishes the handshake and map travel and finalizes a role. The mode's full preparation countdown begins after that point, preventing bots and objectives from consuming the round before a player is ready. Set to `false` for intentional empty-server or headless bot simulation, which preserves automatic round-clock progression with no retail clients connected. |
+
 ---
 
 ## 3 · server_production.ini — Production Overrides
@@ -354,12 +389,14 @@ map_list         = hill_400, hacienda
 
 Defines all available maps, their properties, and the rotation order. The rotation order follows the section order in the file. For a detailed guide on each map, see [MAPS.md](MAPS.md).
 
+At load time the server also performs read-only Steam discovery for app 418460. It adds runtime-only fallback definitions for the four maps with exact replication profiles (`VNTE-Resort`, `VNTE-CuChi`, `VNSU-HueCity`, and `VNSK-Compound`) when their installed `.roe` package and repository sidecar directory are both present. An explicit `maps.ini` section always wins. Discovered absolute paths are never written to `maps.ini`, including when `MapConfig::Save()` is called, and malformed, ambiguous, or out-of-install paths fail closed.
+
 ### Schema
 
 | Key | Type | Required | Default | Description |
 |---|---|---|---|---|
 | `display_name` | string | Yes | — | Human-readable name shown in the server browser, map vote screen, and MOTD. |
-| `file` | path | Yes | — | Map asset filename, relative to the `maps_path` directory (configured in `[DataPaths]`). Typically a `.umap` file. |
+| `file` | path | Yes | — | Map asset filename relative to `maps_path`, or an absolute retail package path. Retail maps use `.roe`; legacy/custom definitions may use `.umap`. |
 | `supported_modes` | string | Yes | — | Comma-separated list of `ModeID` values from `game_modes.ini` that this map supports. |
 | `min_players` | integer | No | `2` | Minimum number of connected players required to start a round on this map. |
 | `max_players` | integer | No | `64` | Maximum player capacity for this map. Overrides `[General].max_players` if lower. |

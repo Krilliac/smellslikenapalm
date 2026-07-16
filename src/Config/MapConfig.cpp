@@ -1,12 +1,16 @@
 // src/Config/MapConfig.cpp
 
 #include "Config/MapConfig.h"
+#include "Config/RetailMapDiscovery.h"
 #include "Config/ServerConfig.h"
 #include "Utils/Logger.h"
 #include "Utils/StringUtils.h"
+#include <cmath>
 #include <fstream>
 #include <filesystem>
+#include <limits>
 #include <sstream>
+#include <utility>
 
 namespace {
 // Normalize a directory path so it always ends in exactly one separator. The
@@ -37,8 +41,16 @@ std::string ResolveMapsDir(const std::string& dataDir, const std::string& mapsPa
 } // namespace
 
 MapConfig::MapConfig(const ServerConfig& cfg)
+  : MapConfig(cfg, {})
+{
+    m_autoDiscoverRetailMaps = true;
+}
+
+MapConfig::MapConfig(const ServerConfig& cfg,
+                     std::vector<std::filesystem::path> retailDiscoveryRoots)
   : m_mapsDir(ResolveMapsDir(cfg.GetDataDirectory(), cfg.GetMapsDataPath())),
-    m_rotationFile(cfg.GetMapRotationFile())
+    m_rotationFile(cfg.GetMapRotationFile()),
+    m_retailDiscoveryRoots(std::move(retailDiscoveryRoots))
 {
     Logger::Info("MapConfig initialized with assets directory: %s", m_mapsDir.c_str());
 }
@@ -86,6 +98,7 @@ bool MapConfig::Load()
     }
 
     m_mapDefinitions.clear();
+    m_discoveredDefinitionNames.clear();
     std::string line, section;
     MapDefinition def;
     size_t lineNo = 0;
@@ -93,7 +106,7 @@ bool MapConfig::Load()
     while (std::getline(file, line)) {
         ++lineNo;
         line = StringUtils::Trim(line);
-        if (line.empty() || line[0] == '#') continue;
+        if (line.empty() || line[0] == '#' || line[0] == ';') continue;
 
         if (line.front() == '[' && line.back() == ']') {
             if (!section.empty()) {
@@ -118,6 +131,45 @@ bool MapConfig::Load()
         m_mapDefinitions[section] = def;
     }
     file.close();
+
+    // Steam-discovered definitions are runtime-only fallbacks. An explicit
+    // maps.ini section always wins, and discovery never rewrites the operator's
+    // config with a machine-local absolute path. Restrict activation to maps for
+    // which this checkout also owns map-specific gameplay sidecars.
+    const std::vector<RetailMapPackage> retailPackages =
+        m_autoDiscoverRetailMaps
+            ? RetailMapDiscovery::Discover()
+            : RetailMapDiscovery::DiscoverFromSteamRoots(m_retailDiscoveryRoots);
+    for (const RetailMapPackage& package : retailPackages) {
+        if (m_mapDefinitions.find(package.mapName) != m_mapDefinitions.end()) {
+            continue;
+        }
+
+        std::error_code sidecarError;
+        const std::filesystem::path sidecarDirectory =
+            std::filesystem::path(m_mapsDir) / package.mapName;
+        if (!std::filesystem::is_directory(sidecarDirectory, sidecarError) ||
+            sidecarError) {
+            Logger::Warn(
+                "MapConfig: discovered retail package '%s' but no local gameplay "
+                "data directory exists at %s; leaving it unavailable",
+                package.mapName.c_str(), sidecarDirectory.string().c_str());
+            continue;
+        }
+
+        MapDefinition retailDefinition;
+        retailDefinition.name = package.mapName;
+        retailDefinition.displayName = package.displayName;
+        retailDefinition.filePath = package.packagePath.string();
+        retailDefinition.maxPlayers = 64;
+        retailDefinition.defaultMode = package.defaultMode;
+        retailDefinition.supportedModes = {package.defaultMode};
+        m_mapDefinitions.emplace(package.mapName, std::move(retailDefinition));
+        m_discoveredDefinitionNames.insert(package.mapName);
+        Logger::Info("MapConfig: discovered runtime retail map '%s' at %s",
+                     package.mapName.c_str(),
+                     package.packagePath.string().c_str());
+    }
 
     // Post-process: fill in derived defaults that the file may have omitted.
     for (auto& [name, d] : m_mapDefinitions) {
@@ -146,6 +198,12 @@ bool MapConfig::Save() const
 
     file << "# RS2V Map Configuration\n";
     for (const auto& [name, def] : m_mapDefinitions) {
+        // Runtime discovery must never turn config/maps.ini into generated,
+        // machine-specific state, even if an explicit caller requests Save().
+        if (m_discoveredDefinitionNames.find(name) !=
+            m_discoveredDefinitionNames.end()) {
+            continue;
+        }
         file << "\n[" << name << "]\n";
         file << "display_name="    << def.displayName << "\n";
         file << "description="     << def.description << "\n";
@@ -167,6 +225,12 @@ bool MapConfig::Save() const
         file << "us_team_spawns="  << def.usTeamSpawns << "\n";
         file << "nva_team_spawns=" << def.nvaTeamSpawns << "\n";
         file << "vote_weight="     << def.voteWeight << "\n";
+        if (!def.bounds.min.IsZero() || !def.bounds.max.IsZero()) {
+            file << "bounds_min=" << def.bounds.min.x << ","
+                 << def.bounds.min.y << "," << def.bounds.min.z << "\n";
+            file << "bounds_max=" << def.bounds.max.x << ","
+                 << def.bounds.max.y << "," << def.bounds.max.z << "\n";
+        }
     }
     file.close();
 
@@ -177,6 +241,7 @@ bool MapConfig::Save() const
 void MapConfig::CreateDefaultConfig()
 {
     m_mapDefinitions.clear();
+    m_discoveredDefinitionNames.clear();
 
     MapDefinition d;
     d.name           = "VNTE-CuChi";
@@ -215,6 +280,33 @@ void MapConfig::ApplyProperty(MapDefinition& def, const std::string& key, const 
         return *v;
     };
 
+    auto safeVector3 = [&](const std::string& s, const Vector3& fallback) -> Vector3 {
+        const auto parts = StringUtils::Split(s, ',', true);
+        if (parts.size() != 3u) {
+            Logger::Warn("Map '%s': expected three comma-separated values for key '%s', "
+                         "using previous bounds value",
+                         def.name.c_str(), key.c_str());
+            return fallback;
+        }
+
+        double parsed[3]{};
+        for (size_t i = 0; i < 3u; ++i) {
+            const auto value = StringUtils::ToDouble(StringUtils::Trim(parts[i]));
+            if (!value || !std::isfinite(*value) ||
+                std::abs(*value) > static_cast<double>(std::numeric_limits<float>::max())) {
+                Logger::Warn("Map '%s': invalid bounds component '%s' for key '%s', "
+                             "using previous bounds value",
+                             def.name.c_str(), parts[i].c_str(), key.c_str());
+                return fallback;
+            }
+            parsed[i] = *value;
+        }
+
+        return Vector3(static_cast<float>(parsed[0]),
+                       static_cast<float>(parsed[1]),
+                       static_cast<float>(parsed[2]));
+    };
+
     if      (key == "displayName"    || key == "display_name")    def.displayName    = val;
     else if (key == "description")                                def.description    = val;
     else if (key == "file")                                       def.filePath       = ResolveMapFilePath(val);
@@ -231,6 +323,8 @@ void MapConfig::ApplyProperty(MapDefinition& def, const std::string& key, const 
     else if (key == "nvaTeamSpawns"  || key == "nva_team_spawns") def.nvaTeamSpawns  = safeInt(val, def.nvaTeamSpawns);
     else if (key == "defaultMode"    || key == "default_mode")    def.defaultMode    = val;
     else if (key == "voteWeight"     || key == "vote_weight")     def.voteWeight     = safeInt(val, def.voteWeight);
+    else if (key == "boundsMin"      || key == "bounds_min")      def.bounds.min     = safeVector3(val, def.bounds.min);
+    else if (key == "boundsMax"      || key == "bounds_max")      def.bounds.max     = safeVector3(val, def.bounds.max);
     else if (key == "supportedModes" || key == "supported_modes") {
         def.supportedModes.clear();
         for (auto& m : StringUtils::Split(val, ',')) {

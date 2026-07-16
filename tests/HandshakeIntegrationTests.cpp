@@ -5,16 +5,15 @@
 // the receive path:
 //
 //   client: ControlChannel::Build* -> ONE reliable control bunch per message
-//           -> PacketCodec::Encode (phase-appropriate MaxPacket) -> wire datagram
-//   server: PacketCodec::Decode (MaxPacket gated on IsControlHandshakeComplete)
+//           -> PacketCodec::Encode (C2S MaxPacket=1280) -> wire datagram
+//   server: PacketCodec::Decode (same C2S bound from the first packet)
 //           -> ack -> ControlReassembler (order/dedup) -> HandshakeState
 //   server responses: captured directly from HandshakeState's rawSend callback
 //           (the raw message payloads the state machine emits).
 //
-// The real RS2 client sends each control message as a SINGLE reliable bunch (at
-// the established-phase MaxPacket of 2048 a single bunch holds up to 16384 data
-// bits), and the MaxPacket grows from the tiny StatelessConnect-handshake value
-// to the NMT value once the handshake completes - so this test does the same.
+// The real RS2 client sends each observed control message as a single reliable
+// bunch. Its C2S MaxPacket is 1280 from StatelessConnect onward, so one bunch can
+// hold up to 10239 data bits and this test uses that bound throughout.
 
 #include "TestFramework.h"
 
@@ -31,8 +30,8 @@ namespace {
 
 // A faithful client: each control message is sent as ONE reliable control-channel
 // (chIndex 0) bunch with a consecutive ChSequence, encoded into its own datagram
-// at the caller-supplied MaxPacket (small during the StatelessConnect handshake,
-// 2048 once in the NMT phase) - exactly as the real client frames them.
+// at the caller-supplied MaxPacket (1280 for retail C2S) - exactly as the real
+// client frames them.
 struct WireClient {
     uint32_t seq = 1;
     uint32_t packetId = 0;
@@ -68,9 +67,9 @@ struct WireServer {
 
     void Deliver(const std::vector<std::vector<uint8_t>>& datagrams) {
         for (const std::vector<uint8_t>& dg : datagrams) {
-            // Mirror ConnectionManager::ParseIncomingControl: the client (C2S) frames
-            // at MaxPacket 2048 from the first packet - there is no small-bound phase.
-            const uint32_t maxPacketBytes = PacketCodec::kNmtMaxPacketBytes;
+            // Mirror ConnectionManager::ParseIncomingControl: retail C2S frames at
+            // MaxPacket 1280 from the first packet - there is no small-bound phase.
+            const uint32_t maxPacketBytes = PacketCodec::kClientSendMaxPacketBytes;
             PacketCodec::Packet pkt = PacketCodec::Decode(dg.data(), dg.size(), maxPacketBytes);
             ASSERT_TRUE(pkt.ok) << "server failed to decode a client datagram";
             for (const PacketCodec::Bunch& b : pkt.bunches) {
@@ -111,6 +110,48 @@ void CompleteStatelessHandshake(WireClient& client, WireServer& server) {
 }
 
 } // namespace
+
+TEST(HandshakeIntegration, SequentialHandshakeStartsEmitOnlyOneChallenge) {
+    WireServer server;
+    HandshakeState handshake(
+        /*clientId*/ 1u,
+        /*rawSend*/ [&](const std::vector<uint8_t>& payload) {
+            server.emitted.push_back(payload);
+        });
+    PacketCodec::ControlReassembler reasm(
+        [&](const std::vector<uint8_t>& msg) {
+            handshake.HandleControlMessage(msg);
+        });
+    server.handshake = &handshake;
+    server.reasm = &reasm;
+
+    WireClient client;
+    const std::vector<uint8_t> start = {
+        ControlChannel::Handshake::kStart, 0x01u};
+    client.Send(start, PacketCodec::kClientSendMaxPacketBytes); // seq 1
+    client.Send(start, PacketCodec::kClientSendMaxPacketBytes); // seq 2
+    client.Send(start, PacketCodec::kClientSendMaxPacketBytes); // seq 3
+    server.Deliver(client.sent);
+    client.Clear();
+
+    ASSERT_EQ(server.emitted.size(), static_cast<size_t>(1));
+    EXPECT_EQ(server.emitted.front().front(),
+              ControlChannel::Handshake::kChallenge);
+    EXPECT_FALSE(handshake.IsControlHandshakeComplete());
+
+    // Ignored sequential Starts still consume their reliable sequence slots;
+    // the following response remains in order and completes the handshake.
+    client.Send(
+        std::vector<uint8_t>{ControlChannel::Handshake::kResponse},
+        PacketCodec::kClientSendMaxPacketBytes); // seq 4
+    server.Deliver(client.sent);
+
+    ASSERT_EQ(server.emitted.size(), static_cast<size_t>(2));
+    EXPECT_EQ(server.emitted.back().front(),
+              ControlChannel::Handshake::kComplete);
+    EXPECT_TRUE(handshake.IsControlHandshakeComplete());
+    EXPECT_EQ(handshake.Phase(), HandshakePhase::AwaitingHello);
+}
 
 // After the StatelessConnect handshake, a single-bunch Hello reassembles
 // server-side, OnHello runs, the handshake advances to ChallengeSent, and the
@@ -195,6 +236,17 @@ TEST(HandshakeIntegration, FullHandshakeReachesJoined) {
     ASSERT_EQ(handshake.Phase(), HandshakePhase::WelcomeSent);
     EXPECT_TRUE(loggedIn);
     EXPECT_EQ(loggedInSteamId, 0x0110000112345678ull);
+
+    // During map/package loading retail sends many NMT_Have (0x08) reports. They
+    // must never promote the connection or fire ClientJoined; only the later 0x09
+    // NMT_Join does that after LoadMap completes.
+    std::vector<uint8_t> have(1u + 16u + 4u, 0u); // type + FGuid + generation
+    have[0] = NMTByte(NMT::Have);
+    client.Send(have, PacketCodec::kClientSendMaxPacketBytes);
+    server.Deliver(client.sent);
+    client.Clear();
+    EXPECT_EQ(handshake.Phase(), HandshakePhase::WelcomeSent);
+    EXPECT_FALSE(joined);
 
     client.Send(ControlChannel::BuildJoin(ControlChannel::JoinMessage{}), PacketCodec::kNmtMaxPacketBytes);
     server.Deliver(client.sent);

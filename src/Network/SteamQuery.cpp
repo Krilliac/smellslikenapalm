@@ -3,8 +3,21 @@
 #include "Network/SocketFactory.h"
 #include "Utils/Logger.h"
 #include "Network/PlatformSocket.h"
-#include <cstring>
+#include <array>
 #include <chrono>
+
+namespace {
+
+constexpr std::array<uint8_t, 25> kA2sInfoRequest = {
+    0xFF, 0xFF, 0xFF, 0xFF, 'T',
+    'S', 'o', 'u', 'r', 'c', 'e', ' ',
+    'E', 'n', 'g', 'i', 'n', 'e', ' ',
+    'Q', 'u', 'e', 'r', 'y', 0x00,
+};
+
+static_assert(kA2sInfoRequest.size() == 25);
+
+} // namespace
 
 SteamQuery::SteamQuery(const std::string& masterServerIp, uint16_t masterServerPort)
     : m_masterIp(masterServerIp), m_masterPort(masterServerPort)
@@ -64,10 +77,9 @@ bool SteamQuery::QueryServer(const std::string& ip, uint16_t port, SteamServerIn
 std::vector<uint8_t> SteamQuery::BuildInfoRequest() {
     Logger::Trace("[SteamQuery::BuildInfoRequest] Entry");
     // Format: 0xFF 0xFF 0xFF 0xFF 'T' "Source Engine Query" 0x00
-    const char* payload = "\xFF\xFF\xFF\xFFTSource Engine Query\x00";
-    size_t len = std::strlen(payload) + 4;
-    Logger::Debug("[SteamQuery::BuildInfoRequest] Building A2S_INFO request, payload length=%zu", len);
-    auto result = std::vector<uint8_t>(payload, payload + len);
+    Logger::Debug("[SteamQuery::BuildInfoRequest] Building A2S_INFO request, payload length=%zu",
+                  kA2sInfoRequest.size());
+    auto result = std::vector<uint8_t>(kA2sInfoRequest.begin(), kA2sInfoRequest.end());
     Logger::Debug("[SteamQuery::BuildInfoRequest] Request built: %zu bytes", result.size());
     Logger::Trace("[SteamQuery::BuildInfoRequest] Exit: returning %zu bytes", result.size());
     return result;

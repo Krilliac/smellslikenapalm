@@ -26,7 +26,8 @@ bool CSharpEngine::Initialize() {
     Logger::Info("Initializing C# scripting engine (Roslyn through CLR)...");
 
     Logger::Debug("[CSharpEngine::Initialize] Attempting CLRCreateInstance for CLSID_CLRMetaHost");
-    HRESULT hr = CLRCreateInstance(CLSID_CLRMetaHost, IID_ICLRMetaHost, (LPVOID*)&m_metaHost);
+    HRESULT hr = CLRCreateInstance(
+        CLSID_CLRMetaHost, IID_ICLRMetaHost, reinterpret_cast<LPVOID*>(&m_metaHost));
     if (FAILED(hr) || !m_metaHost) {
         Logger::Error("CLRCreateInstance failed: 0x%08lx", hr);
         Logger::Error("[CSharpEngine::Initialize] Unable to create CLR meta host instance, m_metaHost is %s", m_metaHost ? "non-null" : "null");
@@ -36,7 +37,8 @@ bool CSharpEngine::Initialize() {
     Logger::Debug("[CSharpEngine::Initialize] CLRCreateInstance succeeded, m_metaHost=%p, hr=0x%08lx", (void*)m_metaHost, hr);
 
     Logger::Debug("[CSharpEngine::Initialize] Requesting runtime v4.0.30319 via GetRuntime");
-    hr = m_metaHost->GetRuntime(L"v4.0.30319", IID_ICLRRuntimeInfo, (LPVOID*)&m_runtimeInfo);
+    hr = m_metaHost->GetRuntime(
+        L"v4.0.30319", IID_ICLRRuntimeInfo, reinterpret_cast<LPVOID*>(&m_runtimeInfo));
     if (FAILED(hr) || !m_runtimeInfo) {
         Logger::Error("ICLRMetaHost::GetRuntime failed: 0x%08lx", hr);
         Logger::Error("[CSharpEngine::Initialize] Could not obtain runtime info for v4.0.30319, m_runtimeInfo is %s", m_runtimeInfo ? "non-null" : "null");
@@ -62,7 +64,8 @@ bool CSharpEngine::Initialize() {
     Logger::Debug("[CSharpEngine::Initialize] Runtime is loadable, loadable=%d", (int)loadable);
 
     Logger::Debug("[CSharpEngine::Initialize] Getting ICorRuntimeHost interface via GetInterface");
-    hr = m_runtimeInfo->GetInterface(CLSID_CorRuntimeHost, IID_ICorRuntimeHost, (LPVOID*)&m_clrHost);
+    hr = m_runtimeInfo->GetInterface(
+        CLSID_CorRuntimeHost, IID_ICorRuntimeHost, reinterpret_cast<LPVOID*>(&m_clrHost));
     if (FAILED(hr) || !m_clrHost) {
         Logger::Error("GetInterface failed: 0x%08lx", hr);
         Logger::Error("[CSharpEngine::Initialize] Failed to get ICorRuntimeHost, m_clrHost is %s", m_clrHost ? "non-null" : "null");
@@ -104,7 +107,8 @@ bool CSharpEngine::Initialize() {
     Logger::Debug("[CSharpEngine::Initialize] GetDefaultDomain succeeded, pAppDomainThunk=%p", (void*)pAppDomainThunk);
 
     Logger::Debug("[CSharpEngine::Initialize] Querying IID__AppDomain interface from AppDomain thunk");
-    hr = pAppDomainThunk->QueryInterface(IID__AppDomain, (LPVOID*)&m_appDomain);
+    hr = pAppDomainThunk->QueryInterface(
+        IID__AppDomain, reinterpret_cast<LPVOID*>(&m_appDomain));
     pAppDomainThunk->Release();
     Logger::Debug("[CSharpEngine::Initialize] Released pAppDomainThunk after QueryInterface");
     if (FAILED(hr) || !m_appDomain) {

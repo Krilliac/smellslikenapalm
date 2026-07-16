@@ -30,27 +30,25 @@ void ControlReassembler::OnBunch(const Bunch& bunch) {
     if (bunch.chIndex != static_cast<uint32_t>(kControlChannelIndex) || !bunch.bReliable) {
         return;
     }
-    // Already-consumed sequence numbers are duplicate retransmits - ignore.
-    if (bunch.chSequence < m_nextSeq) {
+    const ChSequenceDelta sequence =
+        ClassifyChSequenceFromExpected(m_nextSeq, bunch.chSequence);
+    if (sequence.relation == ChSequenceRelation::Invalid ||
+        sequence.relation == ChSequenceRelation::Behind) {
         return;
     }
-    // Bound out-of-order buffering: a garbled/malicious client could send bunches
-    // with arbitrary far-future ChSequence (0..1023). Reject sequences too far
-    // ahead of what we expect, and cap the pending map, so reassembly can never
-    // grow without bound while waiting for a gap that will never arrive.
-    constexpr uint32_t kMaxSeqAhead = 64;
-    constexpr size_t kMaxPending = 128;
+    // Bound out-of-order buffering to UE3's RELIABLE_BUFFER window. Values in
+    // the newer half of the modulo space but beyond a legitimate sender's 127
+    // outstanding ordinary reliable bunches are rejected as a receive hole.
+    if (sequence.relation == ChSequenceRelation::Ahead &&
+        sequence.forwardDistance > kMaximumForwardDistance) {
+        return;
+    }
+    // Cap the pending map so hostile direct callers cannot retain unbounded data
+    // while the expected sequence is absent.
     // Total buffered payload cap. NMT-phase bunches can be ~kNmtMaxPacketBytes
     // each; without a byte cap an attacker could pin kMaxPending oversized bunches
     // in memory. 256 KiB is far above any legitimate handshake/NMT reassembly need
     // (control messages are tiny and almost always drain per-bunch immediately).
-    constexpr size_t kMaxPendingBytes = 256 * 1024;
-    // Use uint64_t for the seq-ahead comparison so m_nextSeq + kMaxSeqAhead can
-    // never wrap a uint32_t near the counter's top.
-    if (static_cast<uint64_t>(bunch.chSequence) >
-        static_cast<uint64_t>(m_nextSeq) + kMaxSeqAhead) {
-        return;
-    }
     // Reject a bunch whose declared payloadBits exceeds the bits actually present
     // in its payload buffer - a malformed/forged bunch. Valid bunches always have
     // payloadBits <= payload.size()*8, so this never rejects correct-path input.
@@ -61,15 +59,17 @@ void ControlReassembler::OnBunch(const Bunch& bunch) {
         return;
     }
     const bool alreadyBuffered = m_pending.find(bunch.chSequence) != m_pending.end();
-    if (m_pending.size() >= kMaxPending && !alreadyBuffered) {
+    if (m_pending.size() >= kMaximumPendingBunches && !alreadyBuffered) {
         Logger::Warn("[ControlReassembler] pending bunch cap (%zu) hit; dropping seq=%u",
-                     kMaxPending, bunch.chSequence);
+                     kMaximumPendingBunches, bunch.chSequence);
         return;
     }
     const size_t addBytes = BunchByteSize(bunch);
-    if (!alreadyBuffered && m_pendingBytes + addBytes > kMaxPendingBytes) {
+    if (!alreadyBuffered &&
+        m_pendingBytes + addBytes > kMaximumPendingPayloadBytes) {
         Logger::Warn("[ControlReassembler] pending byte cap (%zu) hit (have=%zu add=%zu); dropping seq=%u",
-                     kMaxPendingBytes, m_pendingBytes, addBytes, bunch.chSequence);
+                     kMaximumPendingPayloadBytes, m_pendingBytes, addBytes,
+                     bunch.chSequence);
         return;
     }
     // dedup: keep the first copy of a given sequence (ignore later differing copies)
@@ -81,49 +81,44 @@ void ControlReassembler::OnBunch(const Bunch& bunch) {
 }
 
 void ControlReassembler::Drain() {
-    // Deliver each in-order reliable control bunch's payload as ONE complete
-    // message. RS2 control messages in the handshake + early NMT phase
-    // (HandshakeStart/Challenge/Response/Complete, Hello, Netspeed, ...) each fit
-    // in a single bunch, so per-bunch delivery is correct here. (A genuinely
-    // multi-bunch message - e.g. the large Login auth blob - would need
-    // cross-bunch re-accumulation; that is deferred until the NMT phase needs it.)
-    //
-    // IMPORTANT: UE3's reliable ChSequence is effectively a connection-global
-    // counter shared across channels - so the control channel's (chIndex 0) own
-    // reliable bunches arrive with GAPS in their sequence numbers (e.g. 3,5,6,7,...
-    // where 4 was a bunch on another channel, or was lost and not retransmitted in
-    // this stream). A strictly-contiguous "deliver only m_nextSeq" loop would
-    // deadlock forever on the first such gap, blocking EVERY control message after
-    // it (observed live: login completed at seq 3, then seqs 5,6,7,11,12... piled
-    // up unread because seq 4 never arrived). So we skip a gap once enough later
-    // bunches have accumulated: the missing sequence is not coming.
-    constexpr size_t kSkipGapThreshold = 4; // buffered bunches before we skip a gap
-    for (;;) {
-        auto it = m_pending.find(m_nextSeq);
-        if (it == m_pending.end()) {
-            // m_nextSeq is missing. If enough later bunches have piled up, the gap
-            // won't fill - skip ahead to the lowest buffered sequence.
-            if (m_pending.size() >= kSkipGapThreshold) {
-                uint32_t lowest = m_pending.begin()->first;
-                if (lowest > m_nextSeq) {
-                    Logger::Debug("[ControlReassembler] skipping gap: m_nextSeq %u -> %u (%zu buffered)",
-                                  m_nextSeq, lowest, m_pending.size());
-                    m_nextSeq = lowest;
-                    continue;
-                }
-            }
-            break;
-        }
-        const Bunch& b = it->second;
-        const size_t nbytes = BunchByteSize(b);  // size_t math; cannot overflow or over-read
-        if (m_onMessage && b.payloadBits > 0 && nbytes > 0) {
-            m_onMessage(std::vector<uint8_t>(b.payload.begin(), b.payload.begin() + nbytes));
-        }
-        // Keep the buffered-byte accounting in lockstep with the map.
-        m_pendingBytes -= std::min(m_pendingBytes, BunchByteSize(b));
-        m_pending.erase(it);
-        ++m_nextSeq;
+    // A callback may synchronously feed another decoded packet. Keep those
+    // arrivals in the ordinary bounded pending map; the outer drain observes them
+    // after the callback returns instead of recursively redispatching this bunch.
+    if (m_dispatching) {
+        return;
     }
+    m_dispatching = true;
+
+    // UE3 reconstructs the 10-bit wire value relative to InReliable[ChIndex]
+    // and UChannel::ReceivedRawBunch releases only exactly InReliable+1. Ch0 is
+    // not connection-global: an apparent gap is a delayed/lost ch0 reliable (or
+    // an upstream decode bug), never evidence that another channel consumed it.
+    try {
+        for (;;) {
+            auto it = m_pending.find(m_nextSeq);
+            if (it == m_pending.end()) {
+                break;
+            }
+            const Bunch& b = it->second;
+            const size_t nbytes = BunchByteSize(b);  // cannot overflow or over-read
+            if (m_onMessage && b.payloadBits > 0 && nbytes > 0) {
+                // Build the callback value before mutating sequencing state. The
+                // current map node remains stable across reentrant std::map inserts.
+                const std::vector<uint8_t> message(
+                    b.payload.begin(), b.payload.begin() + nbytes);
+                m_onMessage(message);
+            }
+            // Commit only after the callback succeeds. A throw leaves this bunch,
+            // its accounting, and the cursor intact so a retransmit can retry it.
+            m_pendingBytes -= std::min(m_pendingBytes, BunchByteSize(b));
+            m_pending.erase(it);
+            m_nextSeq = AdvanceChSequence(m_nextSeq);
+        }
+    } catch (...) {
+        m_dispatching = false;
+        throw;
+    }
+    m_dispatching = false;
 }
 
 } // namespace PacketCodec

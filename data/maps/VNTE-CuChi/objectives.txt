@@ -1,0 +1,19 @@
+# VNTE-CuChi cooked ROObjective metadata
+# Retail package GUID: 1BE145E5457B54A941963282D62E012B
+#
+# Positions are exact ROPlaceableVolume.VolumeCenter values extracted from the
+# retail map. A 30 m radius approximates the cooked brush volume until its shape
+# can be represented directly. Cu Chi Town, Rice Farm, Cemetery, Bunker Complex,
+# Rocket Site, Factory Wall, and Rubber Factory map to retail replication indices
+# 2, 3, 4, 7, 5, 10, and 9 respectively. The Kismet activation phases are
+# 0,1,1,2,2,3,4; all objectives begin owned by team 2 (NVA).
+#
+# Format: "name" x y z radius phase tunnel clientSlot cookedRepIndex
+#         enabled connectedToBase initialOwner captureSeconds
+"Cu Chi Town"    -9588.805  1125.320 193.821 30.0 0 0 0  2 1 0 2 25.0
+"Rice Farm"       -4597.355 -1390.191  69.850 30.0 1 0 1  3 1 0 2 40.0
+"Cemetery"        -4839.257  5496.328  92.787 30.0 1 0 2  4 1 0 2 38.0
+"Bunker Complex"   5018.934  -789.122 151.284 30.0 2 0 3  7 1 0 2 42.0
+"Rocket Site"       4181.587  6266.505 167.946 30.0 2 0 4  5 1 0 2 42.0
+"Factory Wall"      9853.725  2669.695 181.172 30.0 3 0 5 10 1 0 2 45.0
+"Rubber Factory"   15783.680  2904.672 222.654 30.0 4 0 6  9 1 0 2 50.0

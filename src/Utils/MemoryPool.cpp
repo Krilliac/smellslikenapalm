@@ -3,7 +3,7 @@
 
 template <std::size_t BlockSize, std::size_t BlocksPerChunk>
 MemoryPool<BlockSize, BlocksPerChunk>::Chunk::Chunk()
-    : freeCount(BlocksPerChunk), next(nullptr)
+    : data{}, freeList{}, freeCount(BlocksPerChunk), next(nullptr)
 {
     Logger::Trace("[MemoryPool::Chunk::Chunk] Entry: BlockSize=%zu, BlocksPerChunk=%zu", BlockSize, BlocksPerChunk);
     // Initialize freeList to each block within data

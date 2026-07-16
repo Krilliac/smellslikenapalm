@@ -352,10 +352,11 @@ std::vector<std::string> INIParser::GetArrayValue(const std::string& section, co
 
 void INIParser::SetValue(const std::string& section, const std::string& key, const std::string& value) {
     // Ensure section exists
-    if (m_sections.find(section) == m_sections.end()) {
-        m_sections[section] = INISection();
-        m_sections[section].sectionName =section;
+    auto [sectionIt, inserted] = m_sections.try_emplace(section);
+    if (inserted) {
+        sectionIt->second.sectionName = section;
     }
+    INISection& target = sectionIt->second;
     
     // Set key-value pair
     INIKeyValue keyValue;
@@ -366,11 +367,12 @@ void INIParser::SetValue(const std::string& section, const std::string& key, con
     std::string normalizedKey = NormalizeKey(key);
     
     // Check for duplicate keys if not allowed
-    if (!m_parserConfig.allowDuplicateKeys && m_sections[section].keyValues.find(normalizedKey) != m_sections[section].keyValues.end()) {
+    if (!m_parserConfig.allowDuplicateKeys &&
+        target.keyValues.find(normalizedKey) != target.keyValues.end()) {
         Logger::Debug("Overwriting existing INI value: %s.%s", section.c_str(), key.c_str());
     }
     
-    m_sections[section].keyValues[normalizedKey] = keyValue;
+    target.keyValues[normalizedKey] = keyValue;
     
     Logger::Debug("Set INI value: %s.%s = %s", section.c_str(), key.c_str(), value.c_str());
 }
@@ -582,10 +584,10 @@ INIParser::LineType INIParser::ProcessSectionLine(const std::string& line, std::
     }
     
     // Create section if it doesn't exist
-    if (m_sections.find(sectionName) == m_sections.end()) {
-        m_sections[sectionName] = INISection();
-        m_sections[sectionName].sectionName =sectionName;
-        m_sections[sectionName].lineNumber = lineNumber;
+    auto [sectionIt, inserted] = m_sections.try_emplace(sectionName);
+    if (inserted) {
+        sectionIt->second.sectionName = sectionName;
+        sectionIt->second.lineNumber = lineNumber;
     }
     
     currentSection = sectionName;
@@ -668,16 +670,18 @@ INIParser::LineType INIParser::ProcessKeyValueLine(const std::string& line, cons
     
     // Ensure section exists
     std::string targetSection = currentSection;
-    if (m_sections.find(targetSection) == m_sections.end()) {
-        m_sections[targetSection] = INISection();
-        m_sections[targetSection].sectionName =targetSection;
+    auto [sectionIt, inserted] = m_sections.try_emplace(targetSection);
+    if (inserted) {
+        sectionIt->second.sectionName = targetSection;
     }
+    INISection& target = sectionIt->second;
     
     // Normalize key if case-insensitive
     std::string normalizedKey = NormalizeKey(key);
     
     // Check for duplicate keys
-    if (!m_parserConfig.allowDuplicateKeys && m_sections[targetSection].keyValues.find(normalizedKey) != m_sections[targetSection].keyValues.end()) {
+    if (!m_parserConfig.allowDuplicateKeys &&
+        target.keyValues.find(normalizedKey) != target.keyValues.end()) {
         ParsingError error;
         error.lineNumber = lineNumber;
         error.line = line;
@@ -691,7 +695,7 @@ INIParser::LineType INIParser::ProcessKeyValueLine(const std::string& line, cons
     }
     
     // Store key-value pair
-    m_sections[targetSection].keyValues[normalizedKey] = keyValue;
+    target.keyValues[normalizedKey] = keyValue;
     
     Logger::Debug("Found INI key-value: %s.%s = %s (line %zu)", 
                  targetSection.c_str(), key.c_str(), value.c_str(), lineNumber);

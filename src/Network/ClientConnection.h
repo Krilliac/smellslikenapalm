@@ -7,6 +7,7 @@
 #include <chrono>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <atomic>
 #include "Network/UDPSocket.h"
 #include "Network/Packet.h"
@@ -27,11 +28,11 @@ public:
     const std::string&  GetIP() const;
     uint16_t            GetPort() const;
     std::string         GetSteamID() const;
-    // Stamp the authenticated Steam id (decimal Steam64) once login resolves it. Admin/ban
-    // lookups (admin_list.txt / ban_list.txt) key on Steam64, so without this they matched
-    // against the ephemeral clientId and never hit. Unset (or 0) -> GetSteamID falls back to
-    // the clientId string, preserving prior behavior for clients that present no Steam id.
-    void                SetSteamID(const std::string& steamId);
+    bool                HasPresentedSteamID() const { return !m_steamId.empty(); }
+    // Stamp the client-presented Steam id (decimal Steam64) once login resolves
+    // it. Platform authentication is not implemented yet. Admin/ban lookups
+    // key on Steam64, while unset keeps the legacy clientId fallback.
+    void                SetPresentedSteamID(const std::string& steamId);
 
     // Packet I/O
     bool                SendPacket(const Packet& pkt);
@@ -69,6 +70,14 @@ public:
     // Player name management
     void                SetPlayerName(const std::string& name);
     const std::string&  GetPlayerName() const;
+    // UE3 PlayerReplicationInfo.PlayerID is allocated by the login bridge and
+    // is distinct from the transport clientId after reconnects or removals.
+    void                SetRetailPlayerId(int32_t playerId) {
+        m_retailPlayerId = playerId;
+    }
+    std::optional<int32_t> GetRetailPlayerId() const {
+        return m_retailPlayerId;
+    }
     uint32_t            GetTeamId() const;
     void                SetTeamId(uint32_t teamId);
 
@@ -103,7 +112,8 @@ private:
     std::chrono::steady_clock::time_point m_lastHeartbeat;
 
     std::string                 m_playerName;
-    std::string                 m_steamId;        // authenticated Steam64 (empty until login resolves it)
+    std::optional<int32_t>      m_retailPlayerId;
+    std::string                 m_steamId;        // client-presented Steam64 (empty until login resolves it)
     uint32_t                    m_teamId = 0;
 
     Packet                      m_lastPacket;

@@ -7,6 +7,7 @@
 #include <map>
 #include <chrono>
 #include <functional>
+#include <vector>
 
 class GameServer;
 
@@ -23,6 +24,9 @@ public:
 
     // Core ticket operations
     void ConsumeTicket(uint32_t teamId, uint32_t count = 1);
+    // Sets the current pool without changing its configured/reset value or
+    // the initial-zero unlimited designation.
+    void SetTickets(uint32_t teamId, uint32_t count);
     void AddTickets(uint32_t teamId, uint32_t count);
     uint32_t GetTickets(uint32_t teamId) const;
     bool HasTickets(uint32_t teamId) const;
@@ -38,6 +42,11 @@ public:
     // Events
     void SetOnTicketsDepleted(TicketDepletedCallback cb);
     void OnPlayerKilled(uint32_t victimTeamId);
+    // Applies one simultaneous death transaction. Every valid ticket debit is
+    // committed before the first depletion callback runs, so callback code can
+    // inspect both pools without observing an order-dependent partial volley.
+    // A one-element batch has the same observable ordering as OnPlayerKilled.
+    void OnPlayersKilled(const std::vector<uint32_t>& victimTeamIds);
     void OnObjectiveLost(uint32_t teamId, uint32_t ticketPenalty);
 
     // Configuration
@@ -63,5 +72,11 @@ private:
     bool m_bleedEnabled = false;
     TicketDepletedCallback m_depletedCallback;
 
-    void CheckDepletion(uint32_t teamId);
+    [[nodiscard]] static bool IsDepletionTransition(
+        const TeamTicketState& state, uint32_t previousTickets) noexcept;
+    [[nodiscard]] bool ApplyTicketConsumption(uint32_t teamId,
+                                              uint32_t count);
+    void NotifyTicketsDepleted(uint32_t teamId);
+    void NotifyTicketsDepletedBatch(
+        const std::vector<uint32_t>& teamIds);
 };

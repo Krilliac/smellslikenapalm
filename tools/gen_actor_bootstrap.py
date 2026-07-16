@@ -36,7 +36,7 @@ def decode_full(data, bd_max):
         if r.bit():  # ack
             r.rint(mc.MAX_PACKETID); continue
         bC = r.bit(); bO = r.bit() if bC else 0; bCl = r.bit() if bC else 0
-        bR = r.bit(); ci = r.rint(1023); sq = r.rint(1024) if bR else 0
+        bR = r.bit(); ci = r.rint(1024); sq = r.rint(1024) if bR else 0
         ct = r.rint(8) if (bR or bO) else 0
         bd = r.rint(bd_max)
         if r.p + bd > term:

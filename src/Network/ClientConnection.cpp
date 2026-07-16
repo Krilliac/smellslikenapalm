@@ -52,23 +52,23 @@ uint16_t ClientConnection::GetPort() const {
 
 std::string ClientConnection::GetSteamID() const {
     Logger::Trace("[ClientConnection::GetSteamID] Entry: clientId=%u", m_clientId);
-    // Prefer the authenticated Steam64 (stamped at login). Fall back to the clientId string
-    // only when no real Steam id was resolved, so admin/ban lists keyed on Steam64 can match
-    // for clients that present one, without breaking clients that don't.
+    // Prefer the client-presented Steam64 stamped at login. Fall back to the
+    // clientId string when none was supplied. Callers that require proof of
+    // identity must not treat this value as platform-authenticated.
     if (!m_steamId.empty()) {
-        Logger::Trace("[ClientConnection::GetSteamID] Exit: returning authenticated SteamID '%s'", m_steamId.c_str());
+        Logger::Trace("[ClientConnection::GetSteamID] Exit: returning presented SteamID '%s'", m_steamId.c_str());
         return m_steamId;
     }
     std::string steamId = std::to_string(m_clientId);
-    Logger::Debug("[ClientConnection::GetSteamID] No authenticated SteamID; falling back to clientId-derived '%s'", steamId.c_str());
+    Logger::Debug("[ClientConnection::GetSteamID] No presented SteamID; falling back to clientId-derived '%s'", steamId.c_str());
     Logger::Trace("[ClientConnection::GetSteamID] Exit: returning '%s'", steamId.c_str());
     return steamId;
 }
 
-void ClientConnection::SetSteamID(const std::string& steamId) {
-    Logger::Trace("[ClientConnection::SetSteamID] Entry: clientId=%u, steamId='%s'", m_clientId, steamId.c_str());
+void ClientConnection::SetPresentedSteamID(const std::string& steamId) {
+    Logger::Trace("[ClientConnection::SetPresentedSteamID] Entry: clientId=%u, steamId='%s'", m_clientId, steamId.c_str());
     m_steamId = steamId;
-    Logger::Debug("[ClientConnection::SetSteamID] client %u authenticated SteamID set to '%s'", m_clientId, steamId.c_str());
+    Logger::Debug("[ClientConnection::SetPresentedSteamID] client %u presented SteamID set to '%s'", m_clientId, steamId.c_str());
 }
 
 bool ClientConnection::SendPacket(const Packet& pkt) {

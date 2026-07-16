@@ -24,6 +24,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <cstddef>
 #include <fstream>
@@ -39,7 +40,9 @@ public:
     // Process-wide singleton.
     static PacketRecorder& Instance();
 
-    bool Enabled() const { return m_enabled; }
+    bool Enabled() const noexcept {
+        return m_enabled.load(std::memory_order_relaxed);
+    }
 
     // Record one raw datagram (either direction). `peer` is "ip:port". Safe to call
     // with len==0 / data==nullptr (recorded as an empty datagram). Never throws.
@@ -61,7 +64,7 @@ private:
     std::mutex    m_mu;
     std::ofstream m_pktOut;
     std::ofstream m_nullOut;
-    bool          m_enabled = false;   // honours RS2V_PKTLOG env (default on)
+    std::atomic<bool> m_enabled{false}; // honours RS2V_PKTLOG env (default on)
     bool          m_opened  = false;
     uint64_t      m_seq     = 0;
 };

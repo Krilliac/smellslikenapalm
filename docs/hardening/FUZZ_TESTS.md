@@ -97,8 +97,9 @@ flag, return a zero/default value, and never read OOB / throw / hang.
   after every op.
 
 ### PacketCodecFuzzTests (6 tests)
-UE3 packet+bunch framing codec. Decoded against all three MaxPacket phase bounds
-(handshake 8, S2C 1500, C2S/NMT 2048). A 5-second hard watchdog dumps the
+UE3 packet+bunch framing codec. Decoded against the legacy 8-byte fixture bound
+and both production sender-direction MaxPacket bounds (S2C 1500, C2S 1280). A
+5-second hard watchdog dumps the
 offending bytes and aborts on any hung call.
 - **RandomBytesNeverCrashOrOOB** — 60k random buffers (len 0..300).
 - **MutatedValidPacketsNeverCrashOrOOB** — 40k: encode a valid packet then

@@ -12,14 +12,16 @@ SecurityConfig::SecurityConfig(const ServerConfig& cfg)
   , m_antiCheatEnabled(cfg.IsAntiCheatEnabled())
   , m_antiCheatMode(cfg.GetAntiCheatMode())
   , m_eacScannerConfigFile(cfg.GetEacScannerConfigFile())
+  , m_eacListenPort(cfg.GetEACListenPort())
 {
     Logger::Trace("[SecurityConfig::SecurityConfig] Entry - constructing from ServerConfig");
-    Logger::Info("[SecurityConfig::SecurityConfig] SecurityConfig initialized: steamAuth=%s, fallbackAuth=%s, banMgr=%s, antiCheat=%s, acMode='%s'",
+    Logger::Info("[SecurityConfig::SecurityConfig] SecurityConfig initialized: steamAuth=%s, fallbackAuth=%s, banMgr=%s, antiCheat=%s, acMode='%s', eacListenPort=%d",
                  m_steamAuthEnabled ? "true" : "false",
                  m_fallbackCustomAuth ? "true" : "false",
                  m_banManagerEnabled ? "true" : "false",
                  m_antiCheatEnabled ? "true" : "false",
-                 m_antiCheatMode.c_str());
+                 m_antiCheatMode.c_str(),
+                 m_eacListenPort);
     Logger::Trace("[SecurityConfig::SecurityConfig] Exit");
 }
 
@@ -69,4 +71,14 @@ const std::string& SecurityConfig::GetEacScannerConfigFile() const {
     Logger::Trace("[SecurityConfig::GetEacScannerConfigFile] Entry");
     Logger::Trace("[SecurityConfig::GetEacScannerConfigFile] Exit - returning '%s'", m_eacScannerConfigFile.c_str());
     return m_eacScannerConfigFile;
+}
+
+int SecurityConfig::GetEACListenPort() const {
+    Logger::Trace("[SecurityConfig::GetEACListenPort] returning %d",
+                  m_eacListenPort);
+    return m_eacListenPort;
+}
+
+bool SecurityConfig::IsValidEACListenPort(int port) {
+    return port >= 1 && port <= 65535;
 }

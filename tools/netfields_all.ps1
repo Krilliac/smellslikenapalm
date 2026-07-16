@@ -3,11 +3,17 @@
 #   first-declared (Super==null), SORTED BY NetIndex (UClass::Link).
 #   Wire handle = FieldsBase(class) + rank-in-sorted. maxHandle = total over chain.
 # Also resolves each net property's UProperty subclass (type) and element/ref detail.
-param([string]$Class = "ALL")
+param(
+  [string]$Class = "ALL",
+  [switch]$SkipMaster,
+  [string]$UELibPath = "D:\RE-Tools\UE-Explorer\Eliot.UELib.dll",
+  [string]$BrewedPcServer = "D:\rs2dedicatedserver\ROGame\BrewedPCServer"
+)
 $ErrorActionPreference = "Stop"
-[void][System.Reflection.Assembly]::LoadFrom("D:\RE-Tools\UE-Explorer\Eliot.UELib.dll")
+$repoRoot = Split-Path -Parent $PSScriptRoot
+[void][System.Reflection.Assembly]::LoadFrom($UELibPath)
 $CPF_Net = [uint32]0x20; $FUNC_Net = [uint32]0x40
-$BREW = "D:\rs2dedicatedserver\ROGame\BrewedPCServer"
+$BREW = $BrewedPcServer
 
 $chains = @{
   "ROPlayerController" = @(
@@ -29,6 +35,32 @@ $chains = @{
   "ROPawn" = @(
     @{ cls="Object";pkg="Core.u" }, @{ cls="Actor";pkg="Engine.u" }, @{ cls="Pawn";pkg="Engine.u" },
     @{ cls="GamePawn";pkg="GameFramework.u" }, @{ cls="ROPawn";pkg="ROGame.u" })
+  "ROVehicleFactory" = @(
+    @{ cls="Object";pkg="Core.u" }, @{ cls="Actor";pkg="Engine.u" },
+    @{ cls="NavigationPoint";pkg="Engine.u" }, @{ cls="ROVehicleFactory";pkg="ROGame.u" })
+  "ROVehicleHelicopter" = @(
+    @{ cls="Object";pkg="Core.u" }, @{ cls="Actor";pkg="Engine.u" },
+    @{ cls="Pawn";pkg="Engine.u" }, @{ cls="Vehicle";pkg="Engine.u" },
+    @{ cls="SVehicle";pkg="Engine.u" }, @{ cls="ROVehicleBase";pkg="ROGame.u" },
+    @{ cls="ROVehicle";pkg="ROGame.u" }, @{ cls="ROVehicleHelicopter";pkg="ROGame.u" })
+  "ROHeli_AH1G_Content" = @(
+    @{ cls="Object";pkg="Core.u" }, @{ cls="Actor";pkg="Engine.u" },
+    @{ cls="Pawn";pkg="Engine.u" }, @{ cls="Vehicle";pkg="Engine.u" },
+    @{ cls="SVehicle";pkg="Engine.u" }, @{ cls="ROVehicleBase";pkg="ROGame.u" },
+    @{ cls="ROVehicle";pkg="ROGame.u" }, @{ cls="ROVehicleHelicopter";pkg="ROGame.u" },
+    @{ cls="ROHeli_AH1G";pkg="ROGame.u" }, @{ cls="ROHeli_AH1G_Content";pkg="ROGameContent.u" })
+  "ROHeli_OH6_Content" = @(
+    @{ cls="Object";pkg="Core.u" }, @{ cls="Actor";pkg="Engine.u" },
+    @{ cls="Pawn";pkg="Engine.u" }, @{ cls="Vehicle";pkg="Engine.u" },
+    @{ cls="SVehicle";pkg="Engine.u" }, @{ cls="ROVehicleBase";pkg="ROGame.u" },
+    @{ cls="ROVehicle";pkg="ROGame.u" }, @{ cls="ROVehicleHelicopter";pkg="ROGame.u" },
+    @{ cls="ROHeli_OH6";pkg="ROGame.u" }, @{ cls="ROHeli_OH6_Content";pkg="ROGameContent.u" })
+  "ROHeli_UH1H_Content" = @(
+    @{ cls="Object";pkg="Core.u" }, @{ cls="Actor";pkg="Engine.u" },
+    @{ cls="Pawn";pkg="Engine.u" }, @{ cls="Vehicle";pkg="Engine.u" },
+    @{ cls="SVehicle";pkg="Engine.u" }, @{ cls="ROVehicleBase";pkg="ROGame.u" },
+    @{ cls="ROVehicle";pkg="ROGame.u" }, @{ cls="ROVehicleHelicopter";pkg="ROGame.u" },
+    @{ cls="ROHeli_UH1H";pkg="ROGame.u" }, @{ cls="ROHeli_UH1H_Content";pkg="ROGameContent.u" })
 }
 
 $pkgCache = @{}
@@ -85,8 +117,8 @@ function Get-PropTypeCore($p) {
     default { return $short }
   }
 }
-# Wrap with static-array dim. ArrayDim>1 => one net handle, but wire sends
-# SerializeInt(elemIndex, ArrayDim) right after the handle, before each value.
+# Wrap with static-array dim. ArrayDim>1 => one net handle, but RS2/7258 sends
+# one raw uint8 element index right after the handle, before each value.
 function Get-PropType($p) {
   $core = Get-PropTypeCore $p
   $dim = 1
@@ -118,9 +150,9 @@ function Process-Class([string]$ClassName) {
         }
       }
     }
-    $sorted = $net | Sort-Object { $_.ni }
-    $nprops = ($sorted | Where-Object { $_.kind -eq "prop" }).Count
-    $nfuncs = ($sorted | Where-Object { $_.kind -eq "func" }).Count
+    $sorted = @($net | Sort-Object { $_.ni })
+    $nprops = @($sorted | Where-Object { $_.kind -eq "prop" }).Count
+    $nfuncs = @($sorted | Where-Object { $_.kind -eq "func" }).Count
     $results += @{ cls=$entry.cls; nprops=$nprops; nfuncs=$nfuncs; count=$sorted.Count; fb=$fieldsBase }
     foreach ($e in $sorted) {
       $globalLines += ("{0,4}  {1,-22} {2,-4} {3,-34} {4,-22} ni={5}" -f $gh, $entry.cls, $e.kind, $e.name, $e.type, $e.ni)
@@ -133,7 +165,7 @@ function Process-Class([string]$ClassName) {
   $header = @()
   $header += "# $ClassName  maxHandle=$fieldsBase"
   $header += ("{0,4}  {1,-22} {2,-4} {3,-34} {4,-22} {5}" -f "h","class","kind","name","type","netindex")
-  ($header + $globalLines) | Set-Content "D:\smellslikenapalm\tools\$outName" -Encoding utf8
+  ($header + $globalLines) | Set-Content (Join-Path $PSScriptRoot $outName) -Encoding utf8
   Write-Host ""
   Write-Host "===== $ClassName ====="
   Write-Host ("{0,-22} {1,9} {2,9} {3,6} {4,11}" -f "class","netProps","netFuncs","count","FieldsBase")
@@ -146,7 +178,9 @@ $targets = if ($Class -eq "ALL") { @("ROPlayerController","ROGameReplicationInfo
 $all = @()
 foreach ($t in $targets) { $all += (Process-Class $t) }
 
-# Emit master markdown
+# Emit master markdown unless a focused extraction requested otherwise. A
+# focused run should not replace the all-class reference with a one-class file.
+if (-not $SkipMaster) {
 $md = New-Object System.Collections.Generic.List[string]
 $md.Add("# Net-field master reference (handle + type) for RS2V replication")
 $md.Add("")
@@ -158,7 +192,7 @@ $md.Add("### Wire / decode gotchas")
 $md.Add("")
 $md.Add("- Each net field is ONE handle even when it is a static array (type shown as ``T[N]``).")
 $md.Add("  For a static array, the wire order is: ``SerializeInt(handle, maxHandle)`` then")
-$md.Add("  ``SerializeInt(elemIndex, ArrayDim=N)`` then the element value. (maxHandle counts the")
+$md.Add("  one raw uint8 ``elemIndex`` then the element value. (maxHandle counts the")
 $md.Add("  property once, NOT once per element - verified: handle totals match the known maxHandles.)")
 $md.Add("- Scalar (non-array, N=1) fields: handle then value directly, no index.")
 $md.Add("- Value encodings: byte=8b, bool=1b, int/float=32b, string=int32 len + chars,")
@@ -195,7 +229,10 @@ foreach ($a in $all) {
   }
   $md.Add("")
 }
-$null = New-Item -ItemType Directory -Force "D:\smellslikenapalm\docs\re"
-$md -join "`r`n" | Set-Content "D:\smellslikenapalm\docs\re\netfields_all_classes.md" -Encoding utf8
+$referenceDir = Join-Path $repoRoot "docs\re"
+$referencePath = Join-Path $referenceDir "netfields_all_classes.md"
+$null = New-Item -ItemType Directory -Force $referenceDir
+$md -join "`r`n" | Set-Content $referencePath -Encoding utf8
 Write-Host ""
-Write-Host "Wrote D:\smellslikenapalm\docs\re\netfields_all_classes.md"
+Write-Host "Wrote $referencePath"
+}

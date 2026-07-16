@@ -11,7 +11,7 @@ ScoreManager::ScoreManager(GameServer* server)
     : m_server(server)
 {
     Logger::Trace("[ScoreManager::ScoreManager] Entry, server=%p", static_cast<void*>(server));
-    m_teamManager = m_server->GetTeamManager();
+    m_teamManager = m_server ? m_server->GetTeamManager() : nullptr;
     Logger::Debug("[ScoreManager::ScoreManager] TeamManager obtained: %p", static_cast<void*>(m_teamManager));
     Logger::Trace("[ScoreManager::ScoreManager] Exit");
 }
@@ -39,7 +39,7 @@ void ScoreManager::Shutdown() {
 void ScoreManager::EnsureTeamExists(uint32_t teamId) {
     Logger::Trace("[ScoreManager::EnsureTeamExists] Entry, teamId=%u", teamId);
     if (m_scores.find(teamId) == m_scores.end()) {
-        m_scores[teamId] = TeamScore{};
+        m_scores[teamId] = TeamScoreSummary{};
         Logger::Debug("[ScoreManager::EnsureTeamExists] Created new TeamScore entry for team %u", teamId);
     } else {
         Logger::Debug("[ScoreManager::EnsureTeamExists] Team %u already exists", teamId);
@@ -101,7 +101,7 @@ void ScoreManager::SetPoints(uint32_t teamId, uint32_t points) {
     Logger::Trace("[ScoreManager::SetPoints] Exit");
 }
 
-TeamScore ScoreManager::GetTeamScore(uint32_t teamId) const {
+TeamScoreSummary ScoreManager::GetTeamScore(uint32_t teamId) const {
     Logger::Trace("[ScoreManager::GetTeamScore] Entry, teamId=%u", teamId);
     auto it = m_scores.find(teamId);
     if (it != m_scores.end()) {
@@ -112,7 +112,7 @@ TeamScore ScoreManager::GetTeamScore(uint32_t teamId) const {
     }
     Logger::Debug("[ScoreManager::GetTeamScore] No score found for team %u, returning default", teamId);
     Logger::Trace("[ScoreManager::GetTeamScore] Exit, return default TeamScore");
-    return TeamScore{};
+    return TeamScoreSummary{};
 }
 
 std::vector<uint32_t> ScoreManager::GetTeamsByScore() const {
@@ -137,7 +137,7 @@ void ScoreManager::ResetAll() {
         uint32_t teamCount = m_teamManager->GetTeamCount();
         Logger::Debug("[ScoreManager::ResetAll] Initializing scores for %u teams", teamCount);
         for (uint32_t teamId = 1; teamId <= teamCount; ++teamId) {
-            m_scores[teamId] = TeamScore{};
+            m_scores[teamId] = TeamScoreSummary{};
             Logger::Debug("[ScoreManager::ResetAll] Team %u score entry created", teamId);
         }
     } else {
@@ -158,7 +158,13 @@ void ScoreManager::BroadcastScores() const {
         data.insert(data.end(), reinterpret_cast<const uint8_t*>(&teamId), reinterpret_cast<const uint8_t*>(&teamId) + sizeof(teamId));
         data.insert(data.end(), reinterpret_cast<const uint8_t*>(&ts.score), reinterpret_cast<const uint8_t*>(&ts.score) + sizeof(ts.score));
     }
-    m_server->GetNetworkManager()->BroadcastPacket("SCORE_UPDATE", data);
+    NetworkManager* network = m_server ? m_server->GetNetworkManager() : nullptr;
+    if (!network) {
+        Logger::Debug("[ScoreManager::BroadcastScores] No network manager; "
+                      "score state retained without broadcast");
+        return;
+    }
+    network->BroadcastPacket("SCORE_UPDATE", data);
     Logger::Debug("Broadcasted scores for %u teams", count);
     Logger::Trace("[ScoreManager::BroadcastScores] Exit");
 }

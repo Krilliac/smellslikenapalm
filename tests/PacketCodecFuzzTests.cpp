@@ -62,18 +62,16 @@ namespace {
 
 // SerializeInt bounds the codec uses (mirror of PacketCodec / NetMessages).
 constexpr uint32_t kMaxPacketIdV    = 16384;  // kMaxPacketId
-constexpr uint32_t kMaxChannelsV    = 1023;   // kMaxChannels
+constexpr uint32_t kMaxChannelsV    = 1024;   // kMaxChannels
 constexpr uint32_t kMaxChSequenceV  = PacketCodec::kMaxChSequence; // 1024
 constexpr uint32_t kChTypeMaxV      = PacketCodec::kChTypeMax;      // 8
 
-// The set of MaxPacket phase bounds we decode/encode against. Covers the
-// StatelessConnect handshake (8), the server's S2C send size (1500) and the
-// established C2S/NMT size (2048) - the brief's "both S2C and C2S MaxPacket
-// bounds" plus the handshake default.
+// The set of MaxPacket bounds we decode/encode against. Covers the legacy
+// StatelessConnect helper bound (8), server S2C (1500), and retail C2S (1280).
 const uint32_t kPhaseBounds[] = {
     PacketCodec::kHandshakeMaxPacketBytes,   // 8
     PacketCodec::kServerSendMaxPacketBytes,  // 1500 (S2C)
-    PacketCodec::kNmtMaxPacketBytes,         // 2048 (C2S/NMT)
+    PacketCodec::kClientSendMaxPacketBytes,  // 1280 (C2S)
 };
 
 // ---------------------------------------------------------------------------

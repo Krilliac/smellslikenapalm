@@ -1,16 +1,27 @@
 # RS2V Post-Join World / Actor Replication Spec (EngineVersion 7258)
 
 Reverse-engineered from the real client<->server loopback capture
-`D:\RE-Tools\rs2_handshake_capture.pcapng`, decoded byte-exact with the validated
-UE3 FBitReader framing at **MaxPacket = 2048** (`BunchDataBits = ReadInt(16384)`).
+`D:\RE-Tools\rs2_handshake_capture.pcapng`, decoded byte-exact with UE3 FBitReader
+framing and the sender-direction `BunchDataBits = ReadInt(MaxPacket*8)` bound.
+Retail C2S uses MaxPacket 1280; the captured dedicated-server S2C stream uses the
+1500-byte MTU choice.
 
-Decoder: `tools/mock_client.py` framing, re-run with the 2048 bunch-width fix
-(the mock's `bd = r.rint(64)` is wrong for this phase — it must be `r.rint(16384)`).
-Scratch decoder used here: `decode2048.py` (LSB-first, terminator = high set bit of
-last byte, per-entry bIsAck/bunch parse exactly as documented in MEMORY).
+The historical `tools/mock_client.py` analysis first replaced its incorrect
+`rint(64)` with the compatible `rint(16384)` bound. The scratch decoder was named
+`decode2048.py`; those names record the investigation, not the resolved production
+MaxPacket. Later saturated traffic and the terminal f185 shape pinned the directional
+bounds documented below.
 
 This document covers the S2C stream **from NMT_Welcome (f162) onward** — the part
 that takes a real client off the loading screen and into the map.
+
+> **Capture/runtime boundary (2026-07-15):** the packet tables below preserve two
+> historical retail captures and their original channel assignments. Production
+> `SendActorBootstrap` no longer replays those session actors. It authors owning
+> PC ch2, GRI ch3, TeamInfo ch4/ch5, and owning PRI ch26 per connection. The
+> populated canonical Resort capture is available only through the exact
+> `RS2V_REPLAY_CAPTURE_WORLD=1` reverse-engineering diagnostic. `docs/NETCODE.md`
+> is authoritative for current runtime behavior.
 
 ---
 
@@ -53,7 +64,7 @@ channel opened and replicated.
 
 `ct` = ChType (1 = control channel, 2 = actor channel, 0 = subsequent/continued
 actor bunch on an already-open channel). Flags `O/Cl/R` = bOpen/bClose/bReliable.
-`sq` = reliable ChSequence (connection-global). All decodes are `trail=0` (clean)
+`sq` = reliable ChSequence (per-channel, modulo 1024). All decodes are `trail=0` (clean)
 unless noted.
 
 | Frame | PacketId | ChIndex | ct | O/Cl/R | sq | Bits  | First byte | Decode |
@@ -333,12 +344,12 @@ separate complete bunches), never at the bunch layer.
   ChIndex=0, ChType=1, bPartial=N/A`. One bunch per UDP datagram (the retail server
   coalesces a couple of tiny ones, e.g. f183 carried chSeq 21+22, but one-per-packet
   is fine). Each payload is ≤ ~1260 bytes and fits inside MaxPacket. Increment the
-  connection-global `ChSequence` per bunch. The 20th bunch (chSeq 24) is just
+  control-channel `ChSequence` per bunch. The 20th bunch (chSeq 24) is just
   another such bunch carrying the last 8 package records + the 153-byte control
   trailer — **no special partial handling needed**. The simplest correct emulator
   loop: for each captured chunk payload in `packagemap_chunks.json` (sorted by
   chSeq), call the existing reliable-control-bunch send with that payload.
-- ACK discipline is unchanged: each is a reliable bunch with a connection-global
+- ACK discipline is unchanged: each is a reliable bunch with a ch0-local
   ChSequence; the client ACKs them and the server must hold the resend window (the
   capture shows the client bulk-ACKing via f186+).
 
@@ -380,68 +391,32 @@ table at `0x141014508`; payload shape = per-package {GUID,name,flags,generation}
 
 ---
 
-## 5. Implementation roadmap (prioritized)
+## 5. Current implementation status
 
-Goal: get a real client from the loading screen into the map after Join.
+The original roadmap is complete for the bounded bootstrap surface:
 
-### STRICTLY REQUIRED (in this order)
-1. **NMT_Welcome (ch0)** — already implemented/validated (f162). Sends Map URL +
-   GameClass. Without it the client never starts loading.
-2. **PackageMap / NetGUID export (ch0, NMT byte 0x07 = NMT_Uses)** — THE missing
-   piece. The server must push the package list the map depends on. Each package is
-   one self-contained NMT_Uses record (§4.2): `0x07 + FGuid(16) + PackageName(FString)
-   + Extension(FString "u"/"upk") + flags(u32) + generation(u32) + "None"(FString) +
-   8 zero bytes`. These are sent as **20 independent reliable ch0 control bunches**
-   (NOT partial bunches — §4.3/§4.6), packing many records per bunch. The client
-   verifies it has every package (by name+GUID) before it will spawn. The exact
-   321-package list is captured to `data/packagemap_export_7258.bin` +
-   `data/packagemap_chunks.json` — replay those payloads verbatim.
-   - Sub-requirement: just send each chunk payload as a reliable control bunch with
-     the correct `BunchDataBits = SerializeInt(MaxPacket*8≈12000)`. NO partial-bunch
-     machinery is needed (the engine has none — §4.6).
-3. **Wait for client ready (C2S ch0 NMT 0x09)** before opening actor channels.
-4. **Open the bootstrap actor channels (ChType 2, bOpen=1, bReliable=1)** in this
-   order, mirroring f231:
-   a. **ch2 = ROGameReplicationInfo** (REQUIRED — client needs game state to leave
-      loading; the GRI is the world's root replicated object).
-   b. **ch3 (+ch4,ch5) = TeamInfo** (REQUIRED — GRI.Teams[] must resolve or the HUD
-      / team select cannot init).
-   c. **ch6 = local ROPlayerController** (REQUIRED — until the client's own PC
-      channel opens and replicates, the client has no pawn/possession path and
-      stays on the loading/spawn screen).
-   d. **ch7/ch8 = PlayerReplicationInfo** (REQUIRED for the local player's PRI; bot
-      PRIs are optional).
-   Each open bunch must carry a valid `SerializeNewActor` (NetGUID + class NetGUID
-   that resolves against the PackageMap we just sent) + the actor's bNetInitial
-   property block.
-5. **ACK discipline** — the server ACKs the client's packets aggressively
-   (f159/f160/f186 etc. are pure/bulk ACK packets). Reliable channel sequencing is
-   connection-global; our emulator must already do this (handshake works), but the
-   replication phase generates far more reliable bunches, so the resend/ack window
-   must hold.
+1. `NMT_Welcome` and the complete PackageMap/NMT_Uses stream publish reliably on
+   ch0 with the sender-direction MaxPacket bound.
+2. Join completion waits for all earlier ch0 work to drain before exposing
+   `HandshakeComplete`, actor traffic, or the Game callback.
+3. The live actor builder opens owning PC ch2 first and places NMT `0x24` in the
+   same retry-ledger packet.
+4. On normal live-authored bootstrap, GRI ch3, TeamInfo ch4/ch5, and PRI ch26 are
+   authored from the frozen profile, artifact layout, LoginBridge PlayerID, player
+   name, tickets, and live game state.
+   GRI h24 carries `[General].server_name`, with the defensive retail-facing fallback
+   `Rising Storm 2: Vietnam Server` when configuration is unavailable or invalid.
+5. That live path's GRI baseline publishes applicable active-match, timer, and mode
+   scalars even when the map has zero cooked objective mappings. Such maps omit
+   objective arrays and capper structs instead of omitting the entire scalar baseline.
+6. The ch2 h23 link to PRI ch26 is retry-owned and precedes the reliable team-menu
+   RPCs in ch2 sequence order.
+7. Exact-profile/artifact/layout failures are connection-local and fail closed.
 
-### OPTIONAL / steady-state (after the client is in the map)
-6. ch0 NMT 0x23 periodic heartbeat (f252+). Keeps connection alive; not required to
-   *enter* the map but required to *stay* in cleanly.
-7. Property delta updates (unreliable ChType 0 bunches, first byte 0x17/0x29/0x38)
-   on the open actor channels — needed for live gameplay, not for the initial
-   transition.
-8. Opening additional actor channels for other players/pawns/world actors as they
-   become net-relevant.
-
-### Minimal viable "client leaves loading screen" set
-`NMT_Welcome` -> full `PackageMap export` (20 independent reliable bunches) -> on
-client NMT 0x09 -> open `ch2 GRI` + `ch3 TeamInfo` + `ch6 PlayerController` (+ PRI on
-ch7/ch8) with valid initial actor bunches. That is the critical path; everything
-in §5.6-5.8 can follow.
-
-### Biggest unknowns to resolve next
-- ~~Exact byte layout of a single PackageMap export entry~~ — DONE (§4.2).
-- ~~Exact partial-bunch flag bit positions~~ — RESOLVED: there are none (§4.3/§4.6).
-- The `SerializeNewActor` NetGUID/class-NetGUID encoding so our actor opens
-  resolve against the package map (decode ch2/ch6 opens from f231 bit-exact).
-- Property block layout per class (handle index + conditional props) for the GRI,
-  TeamInfo, PlayerController initial bunches.
+Steady-state work remains broader than bootstrap: additional relevant actors,
+complete movement/combat state, and mode-specific role/deployment coverage continue
+to grow independently. The raw capture tables above remain evidence, not an emitter
+recipe for normal sessions.
 
 ---
 
@@ -453,9 +428,9 @@ in §5.6-5.8 can follow.
   -Y "udp.srcport==7777" -T fields -e frame.number -e data.data
 ```
 Two decoder fixes vs the original `tools/mock_client.py`:
-1. Handshake phase uses `bd = r.rint(64)`; the established (NMT/replication) phase
-   uses `bd = r.rint(MaxPacket*8)`.
-2. The established-phase `BunchDataBits` bound is **MaxPacket*8 ≈ 12000**
+1. Use the sender-direction bound from the first packet: **12000 for captured S2C**
+   and **10240 for retail C2S**. Do not switch to `rint(64)` for handshake traffic.
+2. The captured S2C `BunchDataBits` bound is **MaxPacket*8 ≈ 12000**
    (MaxPacket ≈ 1500), **NOT 16384**. With 16384 every export frame decodes EXCEPT
    f185, which over-reads its `BunchDataBits` by one bit (the false "partial bunch").
    With the correct ~12000 bound, all 20 export bunches (f167-f185) decode with

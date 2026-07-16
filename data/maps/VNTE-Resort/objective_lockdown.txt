@@ -1,0 +1,7 @@
+# VNTE-Resort cooked ROObjective lockdown metadata
+# clientSlot enabled LockDownTime16 LockDownTime32 LockDownTime64
+0 1 500 500 500
+1 1 240 240 240
+2 1 240 240 240
+3 1 240 240 240
+4 0 500 500 500

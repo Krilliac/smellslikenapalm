@@ -37,13 +37,18 @@ PacketCodec::Decode  ───────────────────�
   └─ ch≥2 bunches → DecodeInboundActorBunch              (actor-channel RPCs: SelectTeam…)
 ```
 
-Outbound is the mirror: a caller builds bunches → `PacketAssembler::BuildRawBunches…` stamps
-PacketId/ChSequence/acks → `PacketCodec::Encode` → `UDPSocket::SendRaw`.
+Outbound is the mirror: a caller builds a complete ch0 message or actor bunches,
+and `PacketAssembler` stamps the monotonic internal PacketId (projected to 14 bits
+on the wire). Every builder validates the complete framed packet against the
+direction-correct MaxPacket and packs only the largest FIFO prefix of queued ACKs
+that fits. The ch0 path additionally owns the modulo-1024 sequence plus 127-record
+ACK window. `PacketCodec::Encode` then feeds the already-bounded wire image to
+`UDPSocket::SendRaw`.
 
 Three things never mix:
 1. **Framing** (`PacketCodec`) — PacketId, acks, bunch headers, BunchDataBits. Knows nothing about NMT or actors.
 2. **Control messages** (`ControlChannel` / `HandshakeState`) — the NMT byte-stream carried on ch0.
-3. **Replication** (`ActorReplication`, the bootstrap replays, the ch2 RPC path) — actor channels (ch≥2).
+3. **Replication** (`ActorReplication`, the live actor bootstrap, the explicit capture diagnostic, the ch2 RPC path) — actor channels (ch≥2).
 
 All bit IO is **LSB-first within each byte**; bounded ints use `SerializeInt`/`ReadInt`
 (UE3 `FBitReader::SerializeInt`). Multi-byte fixed values are little-endian.
@@ -122,7 +127,7 @@ The decoded `Bunch` is `{bControl,bOpen,bClose,bReliable,chIndex,chSequence,chTy
 (`PacketCodec.h:64`). `payload` holds the bunch data bits packed LSB-first; `payloadBits` is
 the exact count.
 
-### 1.3 BunchDataBits / MaxPacket — the phase- and direction-dependent bound
+### 1.3 BunchDataBits / MaxPacket — the direction-dependent bound
 
 `BunchDataBits = SerializeInt(MaxPacket*8)`. The **width** of that `SerializeInt`, and thus
 where the payload starts, depends on `MaxPacket`. This is the single most error-prone
@@ -130,24 +135,24 @@ constant in the codec. Values (`PacketCodec.h:38-60`):
 
 | Constant | Value | Bound | Used for |
 |---|---|---|---|
-| `kHandshakeMaxPacketBytes` | 8 | 64 | historical StatelessConnect default (see note) |
-| `kNmtMaxPacketBytes` | 2048 | 16384 | **DECODE all inbound (C2S)** |
+| `kHandshakeMaxPacketBytes` | 8 | 64 | legacy codec/fixture default only (see note) |
+| `kClientSendMaxPacketBytes` / `kNmtMaxPacketBytes` | 1280 | 10240 | **DECODE all inbound (C2S)** |
 | `kServerSendMaxPacketBytes` | 1500 | 12000 | **ENCODE all outbound (S2C, we are the server)** |
 
 Key facts, hard-won (see the long comments at `PacketCodec.h:29-60` and
 `ConnectionManager.cpp:1029-1040`):
 
-- **MaxPacket is asymmetric.** The retail client encodes its C2S bunches at MaxPacket 2048
-  (bound 16384 — proven byte-exact against the Login version fields 7038/7258, the SteamID,
-  rate 80000, and the login URL). A dedicated server encodes S2C at ~MTU (1500 → bound
-  12000), which is what the client expects from a server. So: **decode inbound at 16384,
-  encode outbound at 12000.**
+- **MaxPacket is asymmetric.** Saturated retail package-inventory traffic pins the
+  client's C2S MaxPacket at 1280 (bound 10240); smaller handshake/Login packets were
+  ambiguous across several bounds. A dedicated server encodes S2C at ~MTU
+  (1500 → bound 12000), which is what the client expects from a server. So:
+  **decode inbound at 10240, encode outbound at 12000.**
 - **There is no small-bound "handshake phase" on decode.** The client frames BunchDataBits
-  at 2048 from the very first packet, including the StatelessConnect bunches. Decoding the
+  at 1280 from the very first packet, including the StatelessConnect bunches. Decoding the
   handshake bunches at the old bound 64 misaligned them (the NMT byte landed in the 2nd
   byte) and mis-keyed HandshakeStart/Response. `ParseIncomingControl` therefore **always**
-  decodes at `kNmtMaxPacketBytes` (`ConnectionManager.cpp:1038`). `kHandshakeMaxPacketBytes`
-  is retained only as the codec's API default.
+  decodes at `kClientSendMaxPacketBytes`. `kHandshakeMaxPacketBytes` is retained only as
+  the codec's legacy fixture/API default.
 - One bit too narrow (1024 → bound 8192, width 13) right-shifts the entire NMT payload by
   one bit per bunch and mis-reads every byte (Hello `0x00`→`0x20`, Login `0x10`→`0x08`).
 
@@ -160,8 +165,15 @@ never alters the wire bytes or parse result — observability only.
 ## 2. The StatelessConnect handshake
 
 Driven by `HandshakeState` (`src/Network/HandshakeState.{h,cpp}`), one instance per
-connection, fed complete ch0 control messages by the reassembler. It **uses** the
-`ControlChannel` message codec; it never re-implements framing.
+connection, fed ordered/deduplicated ch0 bunch payloads by the reassembler. The
+current retail path treats each bunch payload as one handshake/NMT callback and
+does no cross-bunch concatenation. It **uses** the `ControlChannel` message codec;
+it never re-implements framing.
+
+Outbound ch0 uses the same UE3 `RELIABLE_BUFFER=128` rule as actor channels: at most
+127 ordinary reliable records may occupy the issuance window. Out-of-order ACKed
+successors remain tombstones until the oldest gap clears, so retransmission cannot let
+the sender lap an unacknowledged control message across modulo-1024 wrap.
 
 There are two sub-phases. Until the StatelessConnect handshake completes, inbound control
 messages route by **subtype** (the payload's first byte), not the NMT switch
@@ -209,49 +221,100 @@ see §4.
 
 UE3 reliability rule: a reliable bunch must be re-sent until the client acks the *packet*
 that carried it. Without this, one dropped reliable bunch in the bootstrap burst stalls that
-channel forever and the client soft-locks (can't even disconnect). State and the three
-operations live in `ConnectionManager`:
+channel forever and the client soft-locks (can't even disconnect). The send and retry state
+lives in `ConnectionManager`:
 
-**Per-channel send state** (`ControlState`, `ConnectionManager.h:91-118`): `outbound`
-(`PacketAssembler` — assigns PacketId/ChSequence, drains queued acks), the inbound
-`reassembler`, ch2 RPC bookkeeping (`ch2OutReliable`, `actorChType`, `teamSelected`), and
-`pendingReliable` — the list of un-acked reliable bunch-sets:
+**Per-channel send state** (`ControlState`): `outbound` (`PacketAssembler` — assigns
+PacketIds and drains queued acks), the inbound `reassembler`, ch2 RPC bookkeeping
+(`ch2Reliable`, `actorChType`, `teamSelected`), and `pendingReliable` — the list of
+un-acked reliable bunch-sets. `ch2Reliable` is an `OutboundReliableSequencer` instance
+owned by that connection's PlayerController channel; it allocates the explicit
+ChSequence values used by ch2 actor bunches:
 
 ```cpp
 struct SentReliable {
-    std::vector<uint32_t> packetIds;          // every PacketId this set has gone out in
+    std::vector<int64_t> packetSerials;       // every monotonic PacketId attempt
     uint64_t lastSendMs;
     int      resendCount;
     std::vector<PacketCodec::Bunch> bunches;  // the reliable bunches, verbatim
 };
 ```
 
-**Record — `SendReliableBunches`** (`ConnectionManager.cpp:792`): the single choke-point for
-sending actor bunches. Builds ONE packet from the bunches (`outbound.BuildRawBunchesPacket`),
-encodes at `kServerSendMaxPacketBytes`, sends it, then records the **reliable** bunches
-(filters `b.bReliable`) as a `SentReliable` tagged with this packet's PacketId.
+**ch0 prepare, record, and commit.** `PacketAssembler::PrepareControlMessagePackets`
+reserves one ch0 sequence without publishing it, constructs exactly one complete bunch,
+and verifies the encoded packet (headers, queued ACKs, terminator, and padding included)
+against the 1500-byte S2C MaxPacket. It includes only the largest FIFO prefix of queued
+ACKs that fits; the suffix remains queued. `TryPublishControlMessage` first inserts a
+`SentReliable` entry keyed by the prepared packet's monotonic serial, then commits the
+sequence/PacketId/ACK transaction and sends the already-bounded wire image. A failed
+first UDP handoff is still recoverable because the retry ledger already owns the message.
 
-**Ack-clear — `OnClientAck`** (`:814`): when a client ack names a PacketId, drop any pending
-`SentReliable` whose `packetIds` contains it (`erase`/`remove_if`). Called from
-`ParseIncomingControl` for every `pkt.acks` entry (`:1066-1068`).
+When the 127-record ch0 window is full, required messages enter a per-connection FIFO
+bounded to 127 messages and 256 KiB. ACK processing flushes that FIFO only as capacity
+really reopens; out-of-order successor ACK tombstones do not bypass the oldest sequence
+gap. An ACK-free full-packet preflight runs before window/queue handling, so a message
+that can never fit fails immediately instead of becoming deferred poison. Queue
+exhaustion, an oversized complete control packet, or an inconsistent allocator transition
+fails the connection closed instead of dropping a required lifecycle message.
 
-**RTO resend — `RetransmitTick`** (`:825`): called every pump cycle from
-`PumpNetwork` (`:138`). For each pending set older than `kRtoMs = 250` and under
+**ch2 reserve and record.** `OutboundReliableSequencer::ReserveBatch` reserves a contiguous
+batch atomically in the modulo-1024 ch2 sequence space. Sequence **0 is valid after wrap**;
+there is no zero sentinel once the allocator has been initialized. At most **127** ordinary
+reliable records may span the issuance window from the oldest unresolved value through the
+cursor, matching UE3's `RELIABLE_BUFFER=128` send rule (the engine's 128th close-bunch
+exception is not modeled by this generic allocator). An out-of-order packet ACK stops
+retransmission but leaves a window tombstone until every older gap is ACKed; raw in-flight
+count therefore cannot reopen capacity prematurely. A failed reservation changes neither
+the cursor nor the in-flight/window state, so sequence pressure is transient backpressure
+rather than a manufactured gap. Only one unpublished reservation may exist, and its opaque
+monotonic token prevents an ancient same-shaped batch from cancelling a later modulo-lap
+reservation.
+
+`SendReservedCh2Bunches` verifies that the reliable ch2 bunches consume the reservation
+in order, then passes them to `SendReliableBunches`. The latter builds and encodes one
+packet, records its reliable bunches and monotonic packet serial in `pendingReliable`, and
+only then hands bytes to UDP. Once that retry ledger owns the batch, `CommitBatch` removes
+rollback eligibility. This commit is based on successful queueing in `pendingReliable`,
+not on the first UDP send succeeding; `RetransmitTick` can recover a failed first send. If
+a batch is rejected before queueing, the latest unpublished reservation is cancelled and
+the cursor is rewound without a gap.
+
+**Ack-clear — `OnClientAck`:** a raw 14-bit ACK is first expanded relative to a monotonic
+unwrap reference. That reference advances on a valid peer ACK or on local retirement of a
+bunch-less packet; the actual peer-ACK high-water is tracked separately. Pre-session,
+future, and exact-half-range ambiguous values are rejected without moving either value. A
+valid peer ACK then matches retry and reinforcement ledgers by exact full serial, so a
+wrapped wire value cannot retire an older generation. When it names a `SentReliable`, ch0
+sequences are released through `PacketAssembler` and tracked ch2 sequences through
+`ch2Reliable`, then the pending set is dropped.
+
+Bunch-bearing builders stop before their next identity reaches the exact 8192-packet
+ambiguous half-range from the unwrap reference. ACK-only and transport-keepalive packets
+carry no bunch and UE3 intentionally does not ACK them, so the assembler locally retires
+their identities. `ConnectionManager` permits that advance only when every live reliable
+and TeamInfo reinforcement ledger has a retry attempt strictly inside the new half-range;
+otherwise it fails closed before an old attempt can become ambiguous.
+
+**RTO resend — `RetransmitTick`:** called every pump cycle from `PumpNetwork`. For each
+pending set older than `kRtoMs = 250` and under
 `kMaxResends = 12`, it rebuilds a packet from the **same bunches verbatim** — same
-per-channel ChSequence — in a **NEW PacketId**, sends it, and appends the new PacketId to the
-set. The client fills the gap or ignores the duplicate.
+per-channel ChSequence — in a **new monotonic PacketId** (with its wrapped 14-bit wire
+projection), encodes it, appends the full packet serial to the retry set, and only then
+hands the datagram to UDP. A failed handoff therefore leaves a fully owned retry attempt.
+The client fills the gap or ignores the duplicate.
 
 **Critical invariant — never manufacture a sequence gap.** Resends keep the *original*
-ChSequence; a NEW PacketId is fine, a new ChSequence is not. The old "proof-of-life re-send"
+ChSequence; a new packet serial/wire PacketId is fine, a new ChSequence is not. The old "proof-of-life re-send"
 of ClientShowTeamSelect sent a fresh bunch at `seq+1`, which (if the original seq was
 dropped) created a ch2 reliable-sequence hole → permanent ch2 stall → soft-lock. That code
-was removed; retransmission now redelivers the original (`ConnectionManager.cpp:889-892`).
+was removed; retransmission now redelivers the original.
 
 **Ack policy (receive side).** We ack an inbound packet **only if it carried bunch data**
-(`ParseIncomingControl:1060-1062`). Acking a pure-ack packet makes the peer ack our ack, and
+(`ParseIncomingControl`). Acking a pure-ack packet makes the peer ack our ack, and
 us ack that, forever — an observed infinite ack ping-pong against the live client. The ack
 rides on the next outbound packet (drained by the PacketAssembler), or a standalone
-ack-only packet if nothing else is going out (`:1096-1098`).
+ack-only packet if nothing else is going out. Such bunch-less outbound identities are
+locally retired under the fresh-retry invariant above; they do not enter a peer-ACK loop.
 
 ---
 
@@ -275,37 +338,171 @@ control-channel message (e.g. an NMT 0x07 PackageMap chunk) sent as one reliable
 bunch via `SendRawToClient`. No-op (logged) if the file is absent — the handshake is
 unaffected.
 
+Every reliable control packet is also entered separately in the connection retransmission
+ledger. This is not optional even on loopback: the 29-datagram PackageMap burst repeatedly
+lost only its final ch0 sequence 33 while every earlier packet was acknowledged. The client
+then omitted the six packages carried by that packet and waited forever before `NMT_Join`.
+The original and official payloads were byte-identical; retrying the same bunch with a new
+PacketId produced the final six `NMT_Have` records and an immediate Join. Control traffic
+uses an 8-second retry delay with 64 seconds of cold-start headroom, while actor traffic
+retains its shorter retry schedule.
+
+The canonical artifact remains the unconditional default. For bounded installed-package
+GUID testing only, start the process with
+`RS2V_REPLICATION_BOOTSTRAP_VARIANT=installed` to select the separate
+`data/replication_bootstrap_installed.bin` candidate. The selector accepts only that exact
+lowercase value; every other non-empty value fails closed with post-Welcome replication
+disabled. Startup logs include the exact selected variant and artifact path, and a missing
+candidate never falls back to canonical implicitly.
+
+Both complete 34,199-byte PackageMap/control artifacts are identity-pinned before parsing:
+canonical SHA-256 `A8EA6DCA...D5E53D6`, installed SHA-256
+`519D7594...DA596F`. A swapped, corrupted, or merely structurally valid wrong artifact is
+rejected before it can be paired with the selected numeric object layout.
+
+This is an integrity pin for emulator-owned artifacts, **not client attestation**. The
+minimal retail `NMT_Hello` carries neither a binary hash nor package hashes, and the runtime
+does not read or authenticate the connected client's files. The installed cohort was
+rechecked against `VNGame.exe` SHA-256 `E578DDE4...AAF7E11` and `ROGame.u` SHA-256
+`AED4E60D...C44961`; the JSONL audit records package headers and paths but not those full-file
+hashes. A future installed-build gate must therefore compare an independently supplied
+local/build fingerprint and fail closed on mismatch; it still cannot prove a remote client
+without a new authenticated attestation protocol.
+
+This installed candidate is deliberately **not** treated as a new canonical capture. Its
+provenance is recorded in `data/replication_bootstrap_installed.audit.jsonl`: all 473
+package identities match the installed retail build after the nine GUID replacements, but
+the final generation rows grew by four network objects in `ROGame.u` and one in
+`OnlineSubsystemSteamworks.u`. Passing UE3's package-identity gate therefore proves only
+that the client may proceed past `NMT_Uses`; downstream `ObjectBase`/static references must
+still be validated from the retail packet trace before this artifact can be promoted.
+
+The 2026-07-14 retail dogfood runs prove this candidate clears PackageMap reconciliation,
+loads `VNTE-Resort`, reaches `NMT_Join`, and adopts ch2 as the local
+`ROPlayerController`. Source-grounded installed-package indices now feed the live actor
+builder under the same frozen `installed` selector. Actor opens reference their
+`Default__` archetypes, while HUD/GameInfo values are UClass refs:
+`Default__ROPlayerController=57522`, `Default__ROTeamInfo=90248`,
+`Default__ROPlayerReplicationInfo=86704`, `Default__ROGameReplicationInfo=70889`,
+embedded Territory `GameClass=69603`, and
+`ClientSetHUD`'s `ROHUD` UClass `76594`. The installed Resort PackageMap base is five
+objects later than the capture (`288295 -> 288300`), so six `MapBoundaries` plus the Axis
+and Allies spawn-protection references also move by exactly +5. Three of those eight stale
+map refs resolved to a wrong object of the expected class and produced no client warning;
+all eight are therefore patched as one decoded cohort. The older 19-patch derivation from
+canonical `data/actor_bootstrap.bin` remains validation evidence for that investigation,
+but normal installed sessions do not replay it. Installed full-world replay is rejected;
+the captured world is grounded only against the canonical Resort/Territories artifact.
+
+Authored `spawns.txt` h59 references follow that same canonical map layout. The
+connection's frozen artifact selection now carries a map-object offset (`0` for canonical,
+`+5` for installed), and `SendRetailSpawnLocations` rebases each nonzero
+`ROVolumePlayerStartGroup` reference with a widened, fail-closed bounds check. This keeps one
+grounded map fixture valid for both artifacts; it also prevents Compound's installed US SK
+slot from resolving five exports early as `ROVolumeMapBoundary_9`.
+
+The playable `ROTeamInfo` opens must also seed h62 `ReinforcementsRemaining` with a
+positive value before h59/h210 can open spawn selection. Retail
+`ROUISceneSpawnSelect.UpdateReinforcements()` treats the cooked/default zero as an
+exhausted team and closes the scene during initialization. Official opens carry h62
+(`243` and `299` in the grounded capture); the live builder publishes the authoritative
+`TicketSystem` count, clamped to `int32`. An initial-zero emulator pool means unlimited,
+so it uses a positive display sentinel instead of retail's destructive zero. On Skirmish
+maps such as Compound, the repaired scene intentionally auto-selects normal slot 0 and
+closes on first render; a persistent selection map is expected on Territories maps such
+as Resort.
+
+After either live or captured TeamInfo opens retire, the end-of-tick retail sync publishes
+dirty h62 values as the capture-grounded unreliable actor deltas on both viewer-local team
+channels (`4/5` live, `76/56` captured). The cache is indexed in retail order (NVA, US), so
+the emulator's inverted server ids cannot swap the pools. It also waits for each reliable
+actor open to be acknowledged. Each h62 remains dirty until the client ACKs a carrying
+packet; an unacknowledged wire-unreliable delta is retried at a bounded interval, while a
+failed socket handoff remains immediately retryable. Retirement state clears at
+ClientTravel. If authority returns to the last ACKed count while a conflicting value is
+still in flight, the sync forces a new corrective current-value delta rather than assuming
+the old datagram can be recalled. Deaths, bleed, rewards, finite depletion, refill, and
+reset therefore converge without emitting unchanged values every frame.
+
+Maps without an exact bounded retail profile no longer borrow Resort's Welcome/actor
+stream. Both PackageMap and actor bootstrap fail closed for such a map, preventing the
+client from loading Resort while the server is authoritative for a different world.
+
 ### 4.2 Actor channel burst — on ClientJoined
 
-`SendActorBootstrap` (`ConnectionManager.cpp:656`) is called from `FireClientJoined`
-(`:461`). It replays the official server's post-Join open burst from `data/actor_bootstrap.bin`,
-a stream of full bunch descriptors
-`[u16 chIndex][u8 chType][u8 flags][u16 chSeq][u32 bunchDataBits][payload]`
-(`GetActorBootstrapRecords`, `:613`; flags: b0 bOpen, b1 bClose, b2 bReliable, b3 bControl).
-Three deliberate framing decisions, each fixing a real soft-lock:
+`SendActorBootstrap` is called from `FireClientJoined` after the earlier reliable ch0
+stream and deferred ch0 FIFO have drained. Until that barrier clears,
+`HandshakeComplete`, actor/game traffic, and the Game callback remain gated. Normal
+sessions then author a connection-local cohort from the exact map/mode profile and the
+frozen canonical or installed PackageMap layout:
 
-1. **NMT 0x24 first** (`:678-679`). The real server sends one NMT 0x24 (`24 01 00 00 00`,
-   int32 LE = 1) on ch0 *immediately after Join and before any actor channel*. Our flow
-   lacked it; we now send it first.
-2. **ch2 (the PlayerController) opened first, standalone** (`:706-716`). The client adopts
-   ch2 (NetPlayerIndex==0) as its LOCAL PlayerController via `HandleClientPlayer`, and the
-   team menu only opens once that adoption succeeds (ShowTeamSelect's
-   `LocalPlayer(Player)!=none` gate). Burying ch2 in the middle of 138 other opens made
-   adoption intermittent; a clean standalone packet up front makes it reliable.
-3. **Batched opens** (`:683-744`). The rest of the opens are packed into
-   ~`kBatchBitBudget = 11000`-bit (~1400-byte) packets (≈10–14 opens each) instead of one
-   datagram per bunch. 139 back-to-back single-bunch datagrams overflow the client's UDP
-   receive buffer (even on loopback) and intermittently drop the ch2 open. Batching matches
-   how the real server frames its burst (multiple bunches per packet). A ch0 record in the
-   stream flushes the pending batch first (ordering) and rides the normal control path.
+| Channel | Live actor | Required initial state |
+|---|---|---|
+| 2 | owning `ROPlayerController` | artifact-specific class ref, `NetPlayerIndex=0` |
+| 3 | `ROGameReplicationInfo` | h24 `ServerName` from `[General].server_name` (defensive retail fallback when unavailable/invalid), profile-specific Territories/Supremacy/Skirmish `GameClass`, and menu scalars |
+| 4 / 5 | playable `ROTeamInfo` pair | retail TeamIndex 0/1 and authoritative reinforcements |
+| 26 | owning `ROPlayerReplicationInfo` | LoginBridge `PlayerID` and connection-local player name |
 
-Every actor bunch goes out through `SendReliableBunches`, so the whole burst is covered by
-the retransmission machinery in §3.
+The ordering is load-bearing:
 
-> The actor payloads in `actor_bootstrap.bin` are a **best-effort verbatim replay** — they
-> contain session-specific NetGUIDs and the recorded player's state. Correct per-session
-> actor replication (building these from live game state via `ActorReplication.h`) is a later
-> step. The *framing* (this doc) is correct and session-independent.
+1. **ch2 OPEN and NMT `0x24` share the entry packet.** Official f1484 places
+   `24 01 00 00 00` immediately after the owning-PC open. Both reliable bunches share
+   one PacketId and retry ledger, so loss cannot expose the ch0 transition without
+   `HandleClientPlayer` adoption.
+2. **GRI, TeamInfo x2, PRI, and the PC->PRI link form one retry-owned cohort.** The
+   h23 dynamic reference from ch2 to ch26 is published as ch2 reliable sequence 2.
+   `ClientShowTeamSelect` and `ClientGotoState` use the following ch2 sequences, so the
+   UI cannot overtake the PRI identity it dereferences.
+3. **Every prerequisite failure is terminal for that connection.** Unsupported map
+   profiles, invalid artifact selectors, incomplete class layouts, unresolved GameClass
+   values, or a failed cohort publication disconnect before the Game callback can expose
+   an actor-less joined session.
+
+The normal live-authored GRI open snapshots the current configured server name into
+initial property h24. Its retail-ANSI wire policy accepts 1 through 128 encoded bytes,
+each printable 7-bit ASCII (`0x20` through `0x7E`), with at least one non-space byte.
+Startup/reload rejects an invalid configuration candidate atomically, while this
+protocol boundary revalidates programmatic values and uses the defensive retail-facing
+fallback `Rising Storm 2: Vietnam Server` if configuration is unavailable or invalid.
+After that open, the reliable GRI baseline publishes all applicable active-match,
+timer, and mode scalar state even when the map has zero cooked objective mappings.
+In that case the live-authored path simply omits the objective mapping/state arrays
+(h174-h179) and h124 capper structs; the absence of mapped objectives does not
+suppress h31 match-start state, the phase clock, or mode scores/rules.
+
+`data/actor_bootstrap.bin` is no longer a gameplay default. It contains a populated
+retail Resort match with stale session actors and is reachable only when the process is
+started with the exact direct switch `RS2V_REPLAY_CAPTURE_WORLD=1`. That diagnostic is
+accepted only for the canonical artifact and exact Resort/Territories profile; installed
+or non-Resort combinations fail closed before queuing a bunch. The file format remains
+`[u16 ChIndex][u8 ChType][u8 flags][u16 ChSequence][u32 BunchDataBits][payload]`
+for reverse-engineering comparisons. This process switch is not an INI override and is
+not hot-reloaded. Unlike normal live-authored bootstrap, the diagnostic retains its
+captured h24 and captured objective arrays. If no cooked objective mapping is available,
+omitting array corrections from the scalar baseline does not erase that captured state.
+
+The live actor cohort has grounded class/GameClass refs for all four exact profiles
+across both artifact layouts. Actor-bootstrap compatibility and h175 role/spawn support
+are separate gates:
+
+| Exact profile | Canonical actor bootstrap | Installed actor bootstrap | Canonical h175 + spawn | Installed h175 + spawn |
+|---|---:|---:|---:|---:|
+| Resort / Territories | yes | yes | **yes** | no |
+| Cu Chi / Territories | yes | yes | **yes** | **yes** |
+| Hue City / Supremacy | yes | yes | no | no |
+| Compound / Skirmish | yes | yes | no | **yes** |
+
+Thus actor-bootstrap validation remains a full 4x2 matrix, while role/spawn validation
+accepts canonical Resort, canonical and installed Cu Chi, and installed Compound. Installed
+Resort, both Hue City layouts, and canonical Compound remain unsupported. They are decoded
+and rejected by the server before role, squad, PRI, or deployment authority can mutate; in
+particular, Hue City never falls through to Resort's captured role object. The mock client
+fails unsupported pairs even earlier, before opening a socket or authoring h175. It exposes
+the pairing explicitly as `--profile` plus `--artifact`, which must match the server's
+`RS2V_REPLICATION_BOOTSTRAP_VARIANT`; for example
+`spawn --profile cu-chi --artifact canonical`,
+`spawn --profile cu-chi --artifact installed`, or
+`spawn --profile compound --artifact installed`.
 
 ### 4.3 Open-bunch (SerializeNewActor) payload layout
 
@@ -352,9 +549,9 @@ Pinned `maxHandle` values (capture-verified, `MASTER` §0):
 | Class | maxHandle | Channel(s) |
 |---|---|---|
 | ROPlayerController | **531** | ch2 |
-| ROGameReplicationInfo | 184 | ch54 |
-| ROTeamInfo | 78 | ch21/56/76 |
-| ROPlayerReplicationInfo | 98 | PRI channels |
+| ROGameReplicationInfo | 184 | ch3 live; ch54 captured RE |
+| ROTeamInfo | 78 | ch4/ch5 live; ch21/ch56/ch76 captured RE |
+| ROPlayerReplicationInfo | 98 | ch26 owning PRI; remote PRI channels |
 | ROPawn / ROWeapon | 170 / 99 | spawn clusters |
 
 Triple-confirmed for ClientShowTeamSelect: NetIndex sort → handle 206; decoding the
@@ -408,18 +605,37 @@ SaveNum`+chars, UniqueNetId=64-bit LE SteamID64, etc.): `MASTER` §4 /
 
 ### 6.1 Server → client RPC (`SendCh2Rpc`)
 
-`SendCh2Rpc` (`ConnectionManager.cpp:851`) sends a reliable server→client function call on
-the PlayerController channel (ch2). The bunch is `bReliable=1, bOpen=0, bClose=0, chIndex=2,
-chType=actorChType`, ChSequence = `++ch2OutReliable` (seeded at the ch2 open's ChSequence in
-`SendActorBootstrap`, `:773-775`). The payload the caller packs is:
+`SendCh2Rpc` sends a reliable server→client function call on the PlayerController channel
+(ch2). The bunch is `bReliable=1, bOpen=0, bClose=0, chIndex=2,
+chType=actorChType`. Its ChSequence comes from a one-value atomic reservation in
+`ch2Reliable`, which adopts the externally assigned ch2-open sequence during actor
+bootstrap. Allocation advances modulo 1024, including sequence 0, and returns transient
+backpressure when the 127-record issuance window cannot accept the reservation. The payload
+the caller packs is:
 
 ```
 SerializeInt(handle, maxHandle)   +   [serialized params…]
 ```
 
-It goes out via `SendReliableBunches`, so it is retransmitted until acked. ClientShowTeamSelect
-is the simplest case: a `reliable client` function with **no params**, so the payload is just
-`SerializeInt(206, 531)` = `CE 00` (9 bits) and nothing else (`:776-780`).
+It goes out through the reserved-ch2 wrapper and `SendReliableBunches`, so the reservation
+is committed only after it enters `pendingReliable`, retransmissions reuse that same
+ChSequence, and the value is released only by an ACK for one of the packet attempts.
+ClientShowTeamSelect is the simplest case: a `reliable client` function with **no params**,
+so the payload is just `SerializeInt(206, 531)` = `CE 00` (9 bits) and nothing else.
+
+**Possession recovery is generation-bound.** A canonical standalone reliable 9-bit
+`AskForPawn` (handle 42) is only eligible while the owning pawn is alive and spawned and
+the open pawn graph, recovery binding, and authoritative owning-pawn life all name the
+same nonzero generation. Death, failed graph publication, team/deployment reset, and map
+travel invalidate that binding, so no response is emitted while lifecycle state is stale or
+unbound. The h42 request is parameterless and h44 names the stable ch209, however, so the wire
+does not identify which life originated a message that arrives only after a later generation is
+already bound. A matching `ServerAcknowledgePossession` is therefore applied only while the
+current generation is live; this is a lifecycle gate, not cryptographic correlation to a life.
+The recovery count and rate-limit timestamp are committed only after the three-reliable-bunch
+`GivePawn` response is successfully queued in `pendingReliable`. Allocator backpressure or
+a rejected queue therefore consumes neither the per-generation response budget nor its
+rate-limit interval.
 
 ### 6.2 Client → server RPC (`DecodeInboundActorBunch`)
 
@@ -479,7 +695,27 @@ fw.WriteBit(false);                       // bool bShowLobby (value bit)
 if Send==1; bool param ⇒ value bit only, no Send bit. This applies symmetrically to both the
 encode (`SendCh2Rpc` callers) and decode (`DecodeInboundActorBunch`) sides.
 
-### 6.4 The SelectTeam → role-select advance (server-side team persist)
+### 6.4 Compound h434 readiness bunches are ordered RPC sequences
+
+`ServerSetReadyToSpawn` (h434) is not always alone. A 2026-07-14 installed
+Compound trace carried the exact 41-bit payload `b2d192bd8900`:
+
+```text
+h434 Ready(default) + h180 ServerSetThirdPersonSpectate()
+  + h434 ForceOnly(explicit) + h275 ServerStopVoiceChat(false)
+```
+
+The local capture corpus also grounds a 62-bit variant ending in
+`h44 ServerAcknowledgePossession(dynamic ch209) + h284 ServerEnableFocus(false)`
+and a 65-bit `h434 NotReady + h89 ServerSetSpectatorLocation(Vector)` variant.
+`DeploymentReplication` validates only those exact schemas (plus standalone
+h434) before the coordinator mutates. Readiness transitions are applied in wire
+order, and deployment is deferred until the full sequence is processed. Thus
+the transient leading Ready in the 41/62-bit forms cannot briefly authorize a
+spawn before the final ForceOnly revokes it. Unknown companions, true companion
+bools, malformed object refs, truncation, and extra bits remain fail-closed.
+
+### 6.5 The SelectTeam → role-select advance (server-side team persist)
 
 When SelectTeam arrives, the server (`:927-1000`):
 1. Clamps `teamId` to 0/1 and sets `teamSelected`.
@@ -497,6 +733,51 @@ Full RPC timeline (chSeq order, capture-verified): `docs/re/pc_ch2_postjoin_time
 **ClientShowTeamSelect(206) → ClientGotoState(41)**. ChangedTeams/ClientSetHUD/ClientRestart
 are never sent in the menu phase.
 
+### 6.6 Cu Chi h175 uses live squad authority across both artifact layouts
+
+`VNTE-CuChi` Territories accepts only the artifact-exact, source-grounded
+class-0 role identity for the selected server team. Canonical compatibility
+keeps object 87490 for South/US Army Grunt and object 87398 for North/NLF
+Guerilla under historical role-registry token 39479. Those legacy references
+align to capture-era class-default-object exports; the canonical package's
+actual ObjectBase remains 39478, so they are deliberately not reinterpreted as
+current UClass references. The installed layout instead uses UClass objects
+87491 and 87399. They are constructed from current retail-client `ROGame.u`
+UClass NetIndices 48013 and 47921 plus installed ObjectBase 39478, and are
+cross-validated by the adjacent live Compound `_SK` role references.
+Cross-layout role objects fail closed. The final h175 close must be followed by
+`ServerAutoSelectSquad` in the same bunch.
+
+The canonical final requests remain 57-bit `af265c150080c301` (South) and
+`af6456150080c301` (North). Installed requests are the exact 57-bit
+`af365c150080c301` and `af7456150080c301`. The installed values are
+source-exact constructions in the already grounded h175+h451 wire shape, not a
+claim that a live Cu Chi exchange was captured.
+
+The server allocates the most populated active, unlocked, non-full retail squad
+and its first free one of six role slots. It then derives h210+h211 and owner-PRI
+h81/h80 from that live assignment; captured Resort occupancy is never copied.
+On a clean session, squad/slot 0/0 produces the exact 32-bit transition
+`d2fe731a`. A live pawn, wrong faction/team/object, locked/full squad set, or
+publication failure leaves deployment unauthorized.
+
+Leave `RS2V_REPLICATION_BOOTSTRAP_VARIANT` unset for canonical compatibility or
+set it to the exact value `installed` for the current retail-client layout. The
+installed artifact's broad `roleRegistryGrounded` flag remains false because a
+complete general role registry is not proven; the exact Cu Chi
+map/mode/artifact/class-0 pair is admitted through its narrower grounded
+profile. That exception does not unlock installed Resort, either Hue City
+layout, canonical Compound, or any other role class.
+
+The read-only `tools/audit_installed_role_refs.py` evidence path now resolves
+the other twelve effective first-round infantry UClasses from the pinned
+installed package, pinned Cu Chi map, and source force-substitution table. Its
+checked-in JSONL report authorizes no new runtime behavior, separately marks
+the two class-0 rows above as supported, and keeps the other twelve blocked.
+Every additional role still needs a live h175 plus a role/loadout-specific
+owning-pawn graph, and the current graph is fixed by team rather than selected
+role.
+
 ---
 
 ## 7. Quick reference — where each thing lives
@@ -509,7 +790,7 @@ are never sent in the menu phase.
 | Reliable retransmission | `SendReliableBunches`/`OnClientAck`/`RetransmitTick` (ConnectionManager.cpp:792/814/825), called from PumpNetwork:138 | (this doc §3) |
 | Ack policy | `ParseIncomingControl:1055-1068`, `:1096-1098` | — |
 | PackageMap export | `SendReplicationBootstrap` (:1004) ← FireClientLoggedIn:438 | `RS2V_PostJoin_Replication_7258.md` |
-| Actor burst (ch2-first, batched, NMT 0x24) | `SendActorBootstrap` (:656) ← FireClientJoined:461 | `RS2V_PostJoin_Replication_7258.md`, `re/postjoin_packet_timeline.md` |
+| Live actor cohort (ch2-first, NMT 0x24, retry-owned PRI link) | `SendActorBootstrap` / `SendLiveActorBootstrap` ← `FireClientJoined` | `RS2V_PostJoin_Replication_7258.md`, `re/postjoin_packet_timeline.md` |
 | Open-bunch layout | `ActorReplication.h` (`WriteActorOpenHeader`/`WriteProp*`) | `re/open_bunch_structure.md`, `MASTER` §2 |
 | Handle / maxHandle derivation | `tools/netfields_from_u.ps1` → `tools/netfields_u_<Class>.txt` | `UE3_ClassNetCache_HandleOrder.md`, `MASTER` §5 |
 | Object-ref / compressed-vector codecs | `BitReader`/`BitWriter`, `ActorReplication.h` | `MASTER` §2–4, `re/ue3_property_value_codec.md` |
@@ -522,15 +803,15 @@ are never sent in the menu phase.
 
 1. **Bunch header conditionals**: ChSequence only if `bReliable`; ChType only if
    `bReliable||bOpen`. Wrong condition = whole-datagram bit shift.
-2. **Decode at 16384, encode at 12000.** MaxPacket is asymmetric; never decode inbound at the
+2. **Decode at 10240, encode at 12000.** MaxPacket is asymmetric; never decode inbound at the
    server-send bound.
-3. **A reliable resend keeps the original ChSequence** (new PacketId only). A new ChSequence
+3. **A reliable resend keeps the original ChSequence** (new packet serial/wire PacketId only). A new ChSequence
    manufactures a gap → channel stall → soft-lock.
 4. **Only ack packets that carried bunches.** Acking acks = infinite ping-pong.
 5. **Non-bool RPC params have a Send bit; bools don't.** Send==0 ⇒ value omitted. (§6.3.)
 6. **Property/open bunches must end exactly on the last bit** — no trailing pad, or the next
    "handle" is garbage.
 7. **Dynamic channel / object-ref bound is 1024 on this build**, not 2048.
-8. **ch2 opens standalone and first**; the rest batch under ~11000 bits/packet.
+8. **ch2 OPEN and NMT 0x24 share the first packet**; the rest batch under 8192 bits/packet.
 9. **PackageMap goes on ClientLoggedIn (pre-Join); the actor burst on ClientJoined.** Swapping
    the order deadlocks a real client.

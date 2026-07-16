@@ -8,6 +8,7 @@
 #include "Network/NetworkManager.h"
 #include "Utils/Logger.h"
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 
 CommanderAbilities::CommanderAbilities(GameServer* server)
@@ -92,7 +93,14 @@ bool CommanderAbilities::RequestAbility(uint32_t commanderId, AbilityType type,
                                          const Vector3& target, const Vector3& direction) {
     Logger::Trace("[CommanderAbilities::RequestAbility] Entry: commanderId=%u, type=%d, target=(%.1f,%.1f,%.1f), direction=(%.1f,%.1f,%.1f)",
                   commanderId, static_cast<int>(type), target.x, target.y, target.z, direction.x, direction.y, direction.z);
-    auto* tm = m_server->GetTeamManager();
+    auto* tm = m_server ? m_server->GetTeamManager() : nullptr;
+    if (!tm || !std::isfinite(target.x) || !std::isfinite(target.y) ||
+        !std::isfinite(target.z) || !std::isfinite(direction.x) ||
+        !std::isfinite(direction.y) || !std::isfinite(direction.z)) {
+        Logger::Warn("Commander %u submitted an ability without a valid team "
+                     "manager or finite target", commanderId);
+        return false;
+    }
     uint32_t teamId = tm->GetPlayerTeam(commanderId);
     if (teamId == 0) {
         Logger::Warn("Commander %u not on any team", commanderId);
@@ -141,6 +149,12 @@ bool CommanderAbilities::RequestAbility(uint32_t commanderId, AbilityType type,
 void CommanderAbilities::Update(float deltaSeconds) {
     // Note: This is a hot-loop tick function. We avoid per-iteration Trace logging for cooldowns/effects
     // to prevent excessive log spam, but log significant state changes.
+
+    if (!std::isfinite(deltaSeconds) || deltaSeconds <= 0.0f) return;
+
+    // Bound recovery work after a debugger pause or malformed caller input.
+    // The game loop normally supplies a much smaller fixed-step delta.
+    deltaSeconds = std::min(deltaSeconds, 1.0f);
 
     // Update cooldowns
     for (auto& [teamId, abilities] : m_teamCooldowns) {
@@ -202,8 +216,8 @@ void CommanderAbilities::Update(float deltaSeconds) {
 
 void CommanderAbilities::ApplyFireSupportDamage(const ActiveFireSupport& effect) {
     Logger::Trace("[CommanderAbilities::ApplyFireSupportDamage] Entry: effectId=%u, type=%s", effect.id, GetAbilityName(effect.type).c_str());
-    auto* pm = m_server->GetPlayerManager();
-    auto* tm = m_server->GetTeamManager();
+    auto* pm = m_server ? m_server->GetPlayerManager() : nullptr;
+    auto* tm = m_server ? m_server->GetTeamManager() : nullptr;
     if (!pm || !tm) {
         Logger::Error("[CommanderAbilities::ApplyFireSupportDamage] PlayerManager or TeamManager is null");
         Logger::Trace("[CommanderAbilities::ApplyFireSupportDamage] Exit (null manager)");
@@ -212,6 +226,10 @@ void CommanderAbilities::ApplyFireSupportDamage(const ActiveFireSupport& effect)
 
     int playersHit = 0;
     for (auto& player : pm->GetAlivePlayers()) {
+        if (!player || !player->GetConnection() ||
+            !std::isfinite(effect.radius) || effect.radius <= 0.0f) {
+            continue;
+        }
         uint32_t pid = player->GetConnection()->GetClientId();
         uint32_t playerTeam = tm->GetPlayerTeam(pid);
 
@@ -266,7 +284,13 @@ void CommanderAbilities::BroadcastFireSupportEvent(const ActiveFireSupport& effe
                 reinterpret_cast<const uint8_t*>(&effect.duration) + sizeof(float));
 
     Logger::Debug("[CommanderAbilities::BroadcastFireSupportEvent] Broadcasting %zu bytes for effect %u", data.size(), effect.id);
-    m_server->GetNetworkManager()->BroadcastPacket("FIRE_SUPPORT_EVENT", data);
+    NetworkManager* network = m_server ? m_server->GetNetworkManager() : nullptr;
+    if (!network) {
+        Logger::Debug("[CommanderAbilities::BroadcastFireSupportEvent] "
+                      "No network manager; event not broadcast");
+        return;
+    }
+    network->BroadcastPacket("FIRE_SUPPORT_EVENT", data);
     Logger::Trace("[CommanderAbilities::BroadcastFireSupportEvent] Exit");
 }
 

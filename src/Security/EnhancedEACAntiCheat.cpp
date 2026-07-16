@@ -18,9 +18,15 @@ EnhancedEACAntiCheat::~EnhancedEACAntiCheat() {
     Logger::Trace("[EnhancedEACAntiCheat::~EnhancedEACAntiCheat] Destructor completed");
 }
 
-bool EnhancedEACAntiCheat::Initialize() {
-    Logger::Trace("[EnhancedEACAntiCheat::Initialize] Entry");
-    Logger::Info("[EnhancedEACAntiCheat::Initialize] Beginning EnhancedEACAntiCheat initialization");
+bool EnhancedEACAntiCheat::Initialize(uint16_t listenPort) {
+    Logger::Trace("[EnhancedEACAntiCheat::Initialize] Entry, listenPort=%u", listenPort);
+    if (listenPort == 0) {
+        Logger::Error("[EnhancedEACAntiCheat::Initialize] EAC listen port must be in range 1-65535");
+        Logger::Trace("[EnhancedEACAntiCheat::Initialize] Exit, returning false (invalid listen port)");
+        return false;
+    }
+    Logger::Info("[EnhancedEACAntiCheat::Initialize] Beginning EnhancedEACAntiCheat initialization on port %u",
+                 listenPort);
 
     Logger::Debug("[EnhancedEACAntiCheat::Initialize] Initializing ClientEACDetector...");
     if (!m_detector.Initialize()) {
@@ -57,14 +63,16 @@ bool EnhancedEACAntiCheat::Initialize() {
     });
     Logger::Debug("[EnhancedEACAntiCheat::Initialize] Memory scanner scan callback registered");
 
-    Logger::Debug("[EnhancedEACAntiCheat::Initialize] Initializing EACServerEmulator on port 7957...");
-    if (!m_emulator.Initialize(7957)) {
+    Logger::Debug("[EnhancedEACAntiCheat::Initialize] Initializing EACServerEmulator on port %u...", listenPort);
+    if (!m_emulator.Initialize(listenPort)) {
         Logger::Error("EnhancedEACAntiCheat: Emulator init failed");
-        Logger::Error("[EnhancedEACAntiCheat::Initialize] EACServerEmulator initialization failed on port 7957 - aborting");
+        Logger::Error("[EnhancedEACAntiCheat::Initialize] EACServerEmulator initialization failed on port %u - aborting",
+                      listenPort);
         Logger::Trace("[EnhancedEACAntiCheat::Initialize] Exit, returning false (emulator init failed)");
         return false;
     }
-    Logger::Debug("[EnhancedEACAntiCheat::Initialize] EACServerEmulator initialized successfully on port 7957");
+    Logger::Debug("[EnhancedEACAntiCheat::Initialize] EACServerEmulator initialized successfully on port %u",
+                  listenPort);
     // Note: EACServerEmulator does not expose a detection callback;
     // emulator results are handled via ProcessRequests/polling.
 

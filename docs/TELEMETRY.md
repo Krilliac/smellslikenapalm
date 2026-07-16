@@ -123,10 +123,13 @@ if (!tm.Initialize(cfg)) {
     return EXIT_FAILURE;
 }
 
-// Add standard reporters
+// Add newly constructed reporters. TelemetryManager owns initialization and
+// shutdown; do not call reporter->Initialize() directly.
 auto reporters = Telemetry::ReporterFactory::CreateStandardReporters();
-for (auto& r : reporters)
-    tm.AddReporter(std::move(r));
+for (auto& r : reporters) {
+    if (!tm.AddReporter(std::move(r)))
+        Logger::Warn("Telemetry reporter initialization failed");
+}
 
 // Start sampling loop
 tm.StartSampling();

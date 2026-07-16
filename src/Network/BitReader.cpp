@@ -161,7 +161,14 @@ std::string BitReader::ReadString() {
     std::string out;
     out.reserve(units > 0 ? units - 1 : 0);
     for (size_t i = 0; i < units; ++i) {
-        const uint16_t cu = static_cast<uint16_t>(ReadByte() | (ReadByte() << 8));
+        // Keep the cursor-advancing reads in explicit wire order.  Combining
+        // both ReadByte() calls as operands of one `|` expression leaves their
+        // evaluation order unspecified; optimized builds may read the high
+        // byte first, turning ordinary ASCII UTF-16LE units into 0xXX00 and
+        // therefore NUL when narrowed below.
+        const uint16_t low = ReadByte();
+        const uint16_t high = ReadByte();
+        const uint16_t cu = static_cast<uint16_t>(low | (high << 8));
         if (i + 1 < units) {
             // Narrow: preserve the low byte (lossy for >0xFF, acceptable here -
             // handshake strings are ASCII session ids / map names).

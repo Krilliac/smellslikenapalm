@@ -12,7 +12,7 @@ enum class ObjectiveType {
     HoldArea
 };
 
-struct ObjectiveState {
+struct ObjectiveSnapshot {
     uint32_t          id;
     ObjectiveType     type;
     Vector3           position;

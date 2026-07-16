@@ -48,6 +48,10 @@ void Player::Reset() {
 void Player::SetState(PlayerState state) {
     Logger::Trace("[Player::SetState] Entry: id=%u, newState=%d, oldState=%d", m_id, static_cast<int>(state), static_cast<int>(m_state));
     Logger::Debug("[Player::SetState] Player %u state transition: %d -> %d", m_id, static_cast<int>(m_state), static_cast<int>(state));
+    if (state == PlayerState::Alive && m_state != PlayerState::Alive) {
+        ++m_lifecycleGeneration;
+        if (m_lifecycleGeneration == 0u) m_lifecycleGeneration = 1u;
+    }
     m_state = state;
     Logger::Trace("[Player::SetState] Exit");
 }

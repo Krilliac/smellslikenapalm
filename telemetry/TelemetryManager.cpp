@@ -3,6 +3,7 @@
 
 #include "TelemetryManager.h"
 #include "MetricsReporter.h"
+#include "NetworkMetricsPlatform.h"
 #include "Utils/Logger.h"
 
 #include <filesystem>
@@ -13,9 +14,12 @@
 
 // Platform-specific includes for system metrics
 #ifdef _WIN32
+    #include <winsock2.h>
     #include <windows.h>
+    #include <iphlpapi.h>
     #include <psapi.h>
     #include <pdh.h>
+    #pragma comment(lib, "iphlpapi.lib")
     #pragma comment(lib, "pdh.lib")
     #pragma comment(lib, "psapi.lib")
 #elif defined(__linux__)
@@ -34,6 +38,146 @@
 #endif
 
 namespace Telemetry {
+
+namespace {
+
+template <typename Function>
+class ScopeExit {
+public:
+    explicit ScopeExit(Function function) : m_function(std::move(function)) {}
+    ~ScopeExit() { RunNow(); }
+    ScopeExit(const ScopeExit&) = delete;
+    ScopeExit& operator=(const ScopeExit&) = delete;
+
+    void RunNow() {
+        if (!m_active) return;
+        m_active = false;
+        m_function();
+    }
+
+private:
+    Function m_function;
+    bool m_active = true;
+};
+
+template <typename Function>
+ScopeExit<Function> MakeScopeExit(Function function) {
+    return ScopeExit<Function>(std::move(function));
+}
+
+enum class ReporterCallbackPhase {
+    None,
+    Initialize,
+    Report,
+    Shutdown,
+};
+
+thread_local TelemetryManager* g_callbackManager = nullptr;
+thread_local ReporterCallbackPhase g_callbackPhase = ReporterCallbackPhase::None;
+
+class ReporterCallbackScope {
+public:
+    ReporterCallbackScope(TelemetryManager* manager, ReporterCallbackPhase phase)
+        : m_previousManager(g_callbackManager),
+          m_previousPhase(g_callbackPhase) {
+        g_callbackManager = manager;
+        g_callbackPhase = phase;
+    }
+
+    ~ReporterCallbackScope() {
+        g_callbackManager = m_previousManager;
+        g_callbackPhase = m_previousPhase;
+    }
+
+private:
+    TelemetryManager* m_previousManager;
+    ReporterCallbackPhase m_previousPhase;
+};
+
+bool IsInsideReporterCallback(const TelemetryManager* manager) {
+    return g_callbackManager == manager &&
+           g_callbackPhase != ReporterCallbackPhase::None;
+}
+
+bool IsRestrictedLifecycleCallback(const TelemetryManager* manager) {
+    return g_callbackManager == manager &&
+           (g_callbackPhase == ReporterCallbackPhase::Initialize ||
+            g_callbackPhase == ReporterCallbackPhase::Shutdown);
+}
+
+bool IsShutdownReporterCallback(const TelemetryManager* manager) {
+    return g_callbackManager == manager &&
+           g_callbackPhase == ReporterCallbackPhase::Shutdown;
+}
+
+TelemetryConfig SanitizeConfig(TelemetryConfig config) {
+    if (config.samplingInterval <= std::chrono::milliseconds::zero()) {
+        Logger::Warn("Telemetry sampling interval must be positive; clamping to 1ms");
+        config.samplingInterval = std::chrono::milliseconds(1);
+    }
+    if (config.maxSamplesInMemory == 0) {
+        Logger::Warn("Telemetry snapshot capacity must be positive; clamping to 1");
+        config.maxSamplesInMemory = 1;
+    }
+    return config;
+}
+
+} // namespace
+
+struct TelemetryManager::ReporterRecord {
+    explicit ReporterRecord(std::shared_ptr<MetricsReporter> value)
+        : reporter(std::move(value)) {}
+
+    std::mutex mutex;
+    std::shared_ptr<MetricsReporter> reporter;
+    bool initializing = false;
+    bool initialized = false;
+    bool shutdownRequested = false;
+    bool shutdownStarted = false;
+    size_t activeReports = 0;
+};
+
+#ifdef _WIN32
+struct TelemetryManager::WindowsCpuCounterState {
+    ~WindowsCpuCounterState() {
+        if (query != nullptr) PdhCloseQuery(query);
+    }
+
+    double Sample() {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (!initialized && !Initialize()) return 0.0;
+        if (PdhCollectQueryData(query) != ERROR_SUCCESS) return 0.0;
+        PDH_FMT_COUNTERVALUE value{};
+        return PdhGetFormattedCounterValue(
+                   counter, PDH_FMT_DOUBLE, nullptr, &value) == ERROR_SUCCESS
+                   ? value.doubleValue
+                   : 0.0;
+    }
+
+    bool Initialize() {
+        if (PdhOpenQuery(nullptr, 0, &query) != ERROR_SUCCESS) {
+            query = nullptr;
+            return false;
+        }
+        if (PdhAddEnglishCounter(
+                query, "\\Processor(_Total)\\% Processor Time", 0,
+                &counter) != ERROR_SUCCESS ||
+            PdhCollectQueryData(query) != ERROR_SUCCESS) {
+            PdhCloseQuery(query);
+            query = nullptr;
+            counter = nullptr;
+            return false;
+        }
+        initialized = true;
+        return true;
+    }
+
+    std::mutex mutex;
+    PDH_HQUERY query = nullptr;
+    PDH_HCOUNTER counter = nullptr;
+    bool initialized = false;
+};
+#endif
 
 // Static instance
 TelemetryManager& TelemetryManager::Instance() {
@@ -54,274 +198,606 @@ bool TelemetryManager::Initialize(const TelemetryConfig& config) {
                  config.enabled, config.enableFileReporter, config.enableSystemMetrics, config.enableApplicationMetrics,
                  config.maxSamplesInMemory, config.samplingInterval.count(), config.metricsDirectory.c_str());
 
-    if (m_initialized.exchange(true)) {
-        Logger::Warn("TelemetryManager already initialized");
-        Logger::Debug("[TelemetryManager::Initialize] Skipping initialization because m_initialized was already true");
-        Logger::Trace("[TelemetryManager::Initialize] Exit - returning true (already initialized)");
-        return true;
+    if (IsInsideReporterCallback(this)) {
+        ReportError("Cannot initialize telemetry from a reporter lifecycle callback");
+        return false;
     }
 
-    Logger::Info("Initializing TelemetryManager...");
-
-    m_config = config;
-    m_startTime = std::chrono::steady_clock::now();
-    Logger::Debug("[TelemetryManager::Initialize] Configuration stored, start time recorded");
-
-    // Create metrics directory if enabled
-    if (m_config.enableFileReporter) {
-        Logger::Debug("[TelemetryManager::Initialize] File reporter is enabled, creating metrics directory: %s", m_config.metricsDirectory.c_str());
-        try {
-            std::filesystem::create_directories(m_config.metricsDirectory);
-            Logger::Info("Created telemetry directory: %s", m_config.metricsDirectory.c_str());
-        } catch (const std::exception& ex) {
-            Logger::Error("[TelemetryManager::Initialize] Exception while creating metrics directory '%s': %s", m_config.metricsDirectory.c_str(), ex.what());
-            ReportError("Failed to create metrics directory: " + std::string(ex.what()));
-            Logger::Trace("[TelemetryManager::Initialize] Exit - returning false (directory creation failed)");
+    {
+        std::lock_guard<std::mutex> lifecycleLock(m_lifecycleMutex);
+        if (m_shutdownPending.load() || m_shuttingDown.load() || m_initializing ||
+            m_removingReporters || m_updatingConfig) {
+            Logger::Warn("TelemetryManager cannot initialize during another lifecycle transition");
             return false;
         }
-    } else {
-        Logger::Debug("[TelemetryManager::Initialize] File reporter is disabled, skipping directory creation");
+        if (m_initialized.load()) {
+            Logger::Warn("TelemetryManager already initialized");
+            return true;
+        }
+        m_initializing = true;
     }
+    // A completed prior lifecycle must never strand the next generation behind
+    // its sample-drain gate.  Reset it only after this Initialize transition has
+    // been admitted (so no shutdown is active/pending) and before publishing the
+    // new initialized state.  A shutdown that arrives during initialization will
+    // subsequently latch the gate again and is still processed by the guard.
+    UnblockSamples();
+    auto initializingGuard = MakeScopeExit([this]() {
+        {
+            std::lock_guard<std::mutex> lifecycleLock(m_lifecycleMutex);
+            m_initializing = false;
+        }
+        ProcessPendingShutdown();
+    });
+
+    const TelemetryConfig sanitized = SanitizeConfig(config);
+    Logger::Info("Initializing TelemetryManager...");
+
+    // Perform fallible filesystem work before publishing the configuration.
+    if (sanitized.enableFileReporter) {
+        Logger::Debug("[TelemetryManager::Initialize] File reporter is enabled, creating metrics directory: %s", sanitized.metricsDirectory.c_str());
+        try {
+            std::filesystem::create_directories(sanitized.metricsDirectory);
+            Logger::Info("Created telemetry directory: %s", sanitized.metricsDirectory.c_str());
+        } catch (const std::exception& ex) {
+            Logger::Error("[TelemetryManager::Initialize] Exception while creating metrics directory '%s': %s", sanitized.metricsDirectory.c_str(), ex.what());
+            ReportError("Failed to create metrics directory: " + std::string(ex.what()));
+            return false;
+        }
+    }
+
+    {
+        std::lock_guard<std::mutex> configLock(m_configMutex);
+        m_config = sanitized;
+    }
+    m_configGeneration.fetch_add(1);
 
     // Initialize snapshot storage
     {
-        Logger::Debug("[TelemetryManager::Initialize] Initializing snapshot storage with capacity %zu", m_config.maxSamplesInMemory);
+        Logger::Debug("[TelemetryManager::Initialize] Initializing snapshot storage with capacity %zu", sanitized.maxSamplesInMemory);
         std::lock_guard<std::mutex> lock(m_snapshotMutex);
         m_snapshots.clear();
-        m_snapshots.reserve(m_config.maxSamplesInMemory);
+        m_snapshots.reserve(sanitized.maxSamplesInMemory);
         m_snapshotIndex = 0;
-        Logger::Trace("[TelemetryManager::Initialize] Snapshot storage cleared and reserved, snapshotIndex reset to 0");
+        m_snapshotCapacity = sanitized.maxSamplesInMemory;
     }
 
-    // Initialize reporters
+    std::vector<std::shared_ptr<ReporterRecord>> reporters;
     {
         std::lock_guard<std::mutex> lock(m_reporterMutex);
-        Logger::Debug("[TelemetryManager::Initialize] Initializing %zu registered reporters", m_reporters.size());
-        for (size_t i = 0; i < m_reporters.size(); ++i) {
-            auto& reporter = m_reporters[i];
-            try {
-                Logger::Trace("[TelemetryManager::Initialize] Initializing reporter %zu with directory '%s'", i, m_config.metricsDirectory.c_str());
-                reporter->Initialize(m_config.metricsDirectory);
-                Logger::Info("Initialized telemetry reporter");
-                Logger::Debug("[TelemetryManager::Initialize] Reporter %zu initialized successfully", i);
-            } catch (const std::exception& ex) {
-                Logger::Error("[TelemetryManager::Initialize] Exception initializing reporter %zu: %s", i, ex.what());
-                ReportError("Failed to initialize reporter: " + std::string(ex.what()));
-            }
-        }
+        reporters = m_reporters;
     }
 
+    std::vector<std::shared_ptr<ReporterRecord>> failedReporters;
+    for (const auto& reporter : reporters) {
+        if (!InitializeReporter(reporter, sanitized.metricsDirectory)) {
+            failedReporters.push_back(reporter);
+        }
+    }
+    if (!failedReporters.empty()) {
+        std::lock_guard<std::mutex> lock(m_reporterMutex);
+        m_reporters.erase(
+            std::remove_if(m_reporters.begin(), m_reporters.end(),
+                           [&failedReporters](const auto& candidate) {
+                               return std::find(failedReporters.begin(),
+                                                failedReporters.end(),
+                                                candidate) != failedReporters.end();
+                           }),
+            m_reporters.end());
+    }
+
+    {
+        std::lock_guard<std::mutex> lifecycleLock(m_lifecycleMutex);
+        m_startTime = std::chrono::steady_clock::now();
+        m_initialized.store(true);
+    }
     Logger::Info("TelemetryManager initialized successfully");
-    Logger::Trace("[TelemetryManager::Initialize] Exit - returning true (success)");
     return true;
 }
 
 void TelemetryManager::Shutdown() {
     Logger::Trace("[TelemetryManager::Shutdown] Entry");
 
-    if (!m_initialized.exchange(false)) {
-        Logger::Debug("[TelemetryManager::Shutdown] Not initialized, nothing to shut down");
-        Logger::Trace("[TelemetryManager::Shutdown] Exit - early return (was not initialized)");
+    if (IsShutdownReporterCallback(this)) {
+        // The enclosing shutdown already owns this request.
         return;
     }
 
-    Logger::Info("Shutting down TelemetryManager...");
-
-    // Stop sampling
-    Logger::Debug("[TelemetryManager::Shutdown] Stopping sampling thread");
-    StopSampling();
-
-    // Take final snapshot
-    if (m_config.enabled) {
-        Logger::Debug("[TelemetryManager::Shutdown] Telemetry is enabled, taking final snapshot");
-        try {
-            ForceSample();
-            Logger::Info("[TelemetryManager::Shutdown] Final telemetry snapshot captured successfully");
-        } catch (const std::exception& ex) {
-            Logger::Error("Failed to take final telemetry sample: %s", ex.what());
-            Logger::Error("[TelemetryManager::Shutdown] Exception details during final sample: %s", ex.what());
-        }
-    } else {
-        Logger::Debug("[TelemetryManager::Shutdown] Telemetry is disabled, skipping final snapshot");
+    if (IsCurrentSampleOperationOwner()) {
+        LatchPendingShutdown();
+        return;
     }
 
-    // Shutdown reporters
+    bool wasInitialized = false;
+    bool deferShutdown = false;
     {
-        std::lock_guard<std::mutex> lock(m_reporterMutex);
-        Logger::Debug("[TelemetryManager::Shutdown] Shutting down %zu reporters", m_reporters.size());
-        for (size_t i = 0; i < m_reporters.size(); ++i) {
-            auto& reporter = m_reporters[i];
-            try {
-                Logger::Trace("[TelemetryManager::Shutdown] Shutting down reporter %zu", i);
-                reporter->Shutdown();
-                Logger::Debug("[TelemetryManager::Shutdown] Reporter %zu shut down successfully", i);
-            } catch (const std::exception& ex) {
-                Logger::Error("Error shutting down telemetry reporter: %s", ex.what());
-                Logger::Error("[TelemetryManager::Shutdown] Exception shutting down reporter %zu: %s", i, ex.what());
-            }
-        }
-        m_reporters.clear();
-        Logger::Debug("[TelemetryManager::Shutdown] All reporters cleared");
-    }
-
-    // Clear snapshots
-    {
-        std::lock_guard<std::mutex> lock(m_snapshotMutex);
-        Logger::Debug("[TelemetryManager::Shutdown] Clearing %zu stored snapshots", m_snapshots.size());
-        m_snapshots.clear();
-    }
-
-    Logger::Info("TelemetryManager shutdown complete");
-    Logger::Trace("[TelemetryManager::Shutdown] Exit");
-}
-
-void TelemetryManager::AddReporter(std::unique_ptr<MetricsReporter> reporter) {
-    Logger::Trace("[TelemetryManager::AddReporter] Entry - reporter=%p", (void*)reporter.get());
-    std::lock_guard<std::mutex> lock(m_reporterMutex);
-    if (m_initialized.load()) {
-        Logger::Debug("[TelemetryManager::AddReporter] Manager is initialized, initializing new reporter with directory '%s'", m_config.metricsDirectory.c_str());
-        try {
-            reporter->Initialize(m_config.metricsDirectory);
-            Logger::Debug("[TelemetryManager::AddReporter] New reporter initialized successfully");
-        } catch (const std::exception& ex) {
-            Logger::Error("[TelemetryManager::AddReporter] Exception initializing new reporter: %s", ex.what());
-            ReportError("Failed to initialize new reporter: " + std::string(ex.what()));
-            Logger::Trace("[TelemetryManager::AddReporter] Exit - early return (reporter init failed)");
+        std::lock_guard<std::mutex> lifecycleLock(m_lifecycleMutex);
+        if (m_shuttingDown.load()) {
             return;
         }
-    } else {
-        Logger::Debug("[TelemetryManager::AddReporter] Manager not yet initialized, deferring reporter initialization");
+        if (m_initializing || m_removingReporters || m_updatingConfig) {
+            deferShutdown = true;
+        } else {
+            wasInitialized = m_initialized.exchange(false);
+            m_shutdownPending.store(false);
+            m_shuttingDown.store(true);
+        }
     }
-    m_reporters.push_back(std::move(reporter));
-    Logger::Info("Added telemetry reporter");
-    Logger::Debug("[TelemetryManager::AddReporter] Total reporters now: %zu", m_reporters.size());
-    Logger::Trace("[TelemetryManager::AddReporter] Exit");
+    if (deferShutdown) {
+        LatchPendingShutdown();
+        return;
+    }
+    auto shutdownGuard = MakeScopeExit([this]() {
+        {
+            std::lock_guard<std::mutex> lifecycleLock(m_lifecycleMutex);
+            m_shutdownPending.store(false);
+            m_shuttingDown.store(false);
+        }
+        UnblockSamples();
+    });
+
+    m_running.store(false);
+    m_samplingWaitCv.notify_all();
+    m_sampleGateCv.notify_all();
+    BlockAndDrainSamples();
+    StopSampling();
+
+    std::vector<std::shared_ptr<ReporterRecord>> reporters;
+    {
+        std::lock_guard<std::mutex> lock(m_reporterMutex);
+        reporters.swap(m_reporters);
+    }
+    if (wasInitialized) {
+        for (const auto& reporter : reporters) {
+            RequestReporterShutdown(reporter);
+        }
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(m_snapshotMutex);
+        m_snapshots.clear();
+        m_snapshotIndex = 0;
+    }
+
+    if (wasInitialized) Logger::Info("TelemetryManager shutdown complete");
+}
+
+bool TelemetryManager::AddReporter(std::unique_ptr<MetricsReporter> reporter) {
+    Logger::Trace("[TelemetryManager::AddReporter] Entry - reporter=%p", (void*)reporter.get());
+    if (!reporter) {
+        Logger::Warn("[TelemetryManager::AddReporter] Ignoring null reporter");
+        ReportError("Cannot add a null telemetry reporter");
+        return false;
+    }
+
+    if (IsRestrictedLifecycleCallback(this)) {
+        ReportError("Cannot add telemetry reporter from a reporter lifecycle callback");
+        return false;
+    }
+
+    auto sharedReporter = std::shared_ptr<MetricsReporter>(std::move(reporter));
+    auto record = std::make_shared<ReporterRecord>(std::move(sharedReporter));
+    bool initializeNow = false;
+    std::string outputDirectory;
+    {
+        std::lock_guard<std::mutex> lifecycleLock(m_lifecycleMutex);
+        if (m_shutdownPending.load() || m_shuttingDown.load() || m_initializing ||
+            m_removingReporters || m_updatingConfig) {
+            ReportError("Cannot add telemetry reporter during a lifecycle transition");
+            return false;
+        }
+        initializeNow = m_initialized.load();
+        if (!initializeNow) {
+            std::lock_guard<std::mutex> reporterLock(m_reporterMutex);
+            m_reporters.push_back(record);
+            return true;
+        }
+    }
+
+    outputDirectory = GetConfig().metricsDirectory;
+    if (!InitializeReporter(record, outputDirectory)) return false;
+
+    bool accepted = false;
+    {
+        std::lock_guard<std::mutex> lifecycleLock(m_lifecycleMutex);
+        bool configurationMatches = false;
+        {
+            std::lock_guard<std::mutex> configLock(m_configMutex);
+            configurationMatches = m_config.metricsDirectory == outputDirectory;
+        }
+        if (m_initialized.load() && !m_shutdownPending.load() &&
+            !m_shuttingDown.load() && !m_initializing &&
+            !m_removingReporters && !m_updatingConfig && configurationMatches) {
+            std::lock_guard<std::mutex> reporterLock(m_reporterMutex);
+            m_reporters.push_back(record);
+            accepted = true;
+        }
+    }
+    if (!accepted) RequestReporterShutdown(record);
+    return accepted;
 }
 
 void TelemetryManager::RemoveAllReporters() {
     Logger::Trace("[TelemetryManager::RemoveAllReporters] Entry");
-    std::lock_guard<std::mutex> lock(m_reporterMutex);
-    Logger::Debug("[TelemetryManager::RemoveAllReporters] Shutting down and removing %zu reporters", m_reporters.size());
-    for (size_t i = 0; i < m_reporters.size(); ++i) {
-        auto& reporter = m_reporters[i];
-        try {
-            Logger::Trace("[TelemetryManager::RemoveAllReporters] Shutting down reporter %zu", i);
-            reporter->Shutdown();
-            Logger::Debug("[TelemetryManager::RemoveAllReporters] Reporter %zu shut down successfully", i);
-        } catch (const std::exception& ex) {
-            Logger::Error("Error shutting down telemetry reporter: %s", ex.what());
-            Logger::Error("[TelemetryManager::RemoveAllReporters] Exception shutting down reporter %zu: %s", i, ex.what());
+    if (IsRestrictedLifecycleCallback(this)) {
+        Logger::Warn("[TelemetryManager::RemoveAllReporters] Ignoring reentrant reporter lifecycle removal");
+        return;
+    }
+
+    bool initialized = false;
+    {
+        std::lock_guard<std::mutex> lifecycleLock(m_lifecycleMutex);
+        if (m_shuttingDown.load() || m_initializing || m_removingReporters ||
+            m_updatingConfig) {
+            return;
+        }
+        m_removingReporters = true;
+        initialized = m_initialized.load();
+    }
+    auto removalGuard = MakeScopeExit([this]() {
+        {
+            std::lock_guard<std::mutex> lifecycleLock(m_lifecycleMutex);
+            m_removingReporters = false;
+        }
+        ProcessPendingShutdown();
+    });
+
+    std::vector<std::shared_ptr<ReporterRecord>> reporters;
+    {
+        std::lock_guard<std::mutex> reporterLock(m_reporterMutex);
+        reporters.swap(m_reporters);
+    }
+    if (initialized) {
+        for (const auto& reporter : reporters) {
+            RequestReporterShutdown(reporter);
         }
     }
-    m_reporters.clear();
+
     Logger::Info("Removed all telemetry reporters");
-    Logger::Trace("[TelemetryManager::RemoveAllReporters] Exit");
+}
+
+bool TelemetryManager::InitializeReporter(
+    const std::shared_ptr<ReporterRecord>& record,
+    const std::string& outputDirectory) {
+    if (!record) return false;
+
+    std::shared_ptr<MetricsReporter> reporter;
+    {
+        std::lock_guard<std::mutex> lock(record->mutex);
+        if (!record->reporter || record->initializing || record->initialized ||
+            record->shutdownRequested) {
+            return record->initialized;
+        }
+        record->initializing = true;
+        reporter = record->reporter;
+    }
+
+    bool initialized = false;
+    bool failureReported = false;
+    try {
+        ReporterCallbackScope callbackScope(this, ReporterCallbackPhase::Initialize);
+        initialized = reporter->Initialize(outputDirectory);
+    } catch (const std::exception& ex) {
+        ReportError("Failed to initialize telemetry reporter: " + std::string(ex.what()));
+        failureReported = true;
+    } catch (...) {
+        ReportError("Failed to initialize telemetry reporter: unknown exception");
+        failureReported = true;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(record->mutex);
+        record->initializing = false;
+        record->initialized = initialized;
+        if (!initialized) record->reporter.reset();
+    }
+    if (!initialized && !failureReported) {
+        ReportError("Telemetry reporter initialization returned false");
+    }
+    return initialized;
+}
+
+bool TelemetryManager::BeginReporterReport(
+    const std::shared_ptr<ReporterRecord>& record,
+    std::shared_ptr<MetricsReporter>& reporter) {
+    if (!record) return false;
+    std::lock_guard<std::mutex> lock(record->mutex);
+    if (!record->initialized || record->shutdownRequested ||
+        record->shutdownStarted || !record->reporter) {
+        return false;
+    }
+    ++record->activeReports;
+    reporter = record->reporter;
+    return true;
+}
+
+void TelemetryManager::EndReporterReport(
+    const std::shared_ptr<ReporterRecord>& record) {
+    bool shutdown = false;
+    {
+        std::lock_guard<std::mutex> lock(record->mutex);
+        if (record->activeReports > 0) --record->activeReports;
+        shutdown = record->activeReports == 0 && record->shutdownRequested &&
+                   !record->shutdownStarted;
+    }
+    if (shutdown) InvokeReporterShutdown(record);
+}
+
+void TelemetryManager::RequestReporterShutdown(
+    const std::shared_ptr<ReporterRecord>& record) {
+    if (!record) return;
+    bool shutdown = false;
+    {
+        std::lock_guard<std::mutex> lock(record->mutex);
+        record->shutdownRequested = true;
+        if (!record->initialized) {
+            record->reporter.reset();
+            return;
+        }
+        shutdown = record->activeReports == 0 && !record->shutdownStarted;
+    }
+    if (shutdown) InvokeReporterShutdown(record);
+}
+
+void TelemetryManager::InvokeReporterShutdown(
+    const std::shared_ptr<ReporterRecord>& record) {
+    std::shared_ptr<MetricsReporter> reporter;
+    {
+        std::lock_guard<std::mutex> lock(record->mutex);
+        if (!record->initialized || record->shutdownStarted ||
+            record->activeReports != 0) {
+            return;
+        }
+        record->shutdownStarted = true;
+        reporter = record->reporter;
+    }
+
+    try {
+        ReporterCallbackScope callbackScope(this, ReporterCallbackPhase::Shutdown);
+        reporter->Shutdown();
+    } catch (const std::exception& ex) {
+        ReportError("Telemetry reporter shutdown failed: " + std::string(ex.what()));
+    } catch (...) {
+        ReportError("Telemetry reporter shutdown failed: unknown exception");
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(record->mutex);
+        record->initialized = false;
+        record->reporter.reset();
+    }
+}
+
+bool TelemetryManager::BeginSampleOperation() {
+    std::unique_lock<std::mutex> lock(m_sampleGateMutex);
+    if (m_sampleOperationActive &&
+        m_sampleOperationOwner == std::this_thread::get_id()) {
+        return false;
+    }
+    m_sampleGateCv.wait(lock, [this]() {
+        return !m_sampleOperationActive &&
+               (!m_samplesBlocked || !m_initialized.load());
+    });
+    if (m_samplesBlocked) return false;
+    m_sampleOperationActive = true;
+    m_sampleOperationOwner = std::this_thread::get_id();
+    return true;
+}
+
+void TelemetryManager::EndSampleOperation() {
+    {
+        std::lock_guard<std::mutex> lock(m_sampleGateMutex);
+        m_sampleOperationActive = false;
+        m_sampleOperationOwner = std::thread::id{};
+    }
+    m_sampleGateCv.notify_all();
+}
+
+bool TelemetryManager::IsCurrentSampleOperationOwner() const {
+    std::lock_guard<std::mutex> lock(m_sampleGateMutex);
+    return m_sampleOperationActive &&
+           m_sampleOperationOwner == std::this_thread::get_id();
+}
+
+void TelemetryManager::BlockAndDrainSamples() {
+    std::unique_lock<std::mutex> lock(m_sampleGateMutex);
+    m_samplesBlocked = true;
+    m_sampleGateCv.notify_all();
+    if (m_sampleOperationActive &&
+        m_sampleOperationOwner == std::this_thread::get_id()) {
+        return;
+    }
+    m_sampleGateCv.wait(lock, [this]() { return !m_sampleOperationActive; });
+}
+
+void TelemetryManager::UnblockSamples() {
+    {
+        std::lock_guard<std::mutex> lock(m_sampleGateMutex);
+        m_samplesBlocked = false;
+    }
+    m_sampleGateCv.notify_all();
+}
+
+void TelemetryManager::LatchPendingShutdown() {
+    m_shutdownPending.store(true);
+    m_running.store(false);
+    {
+        std::lock_guard<std::mutex> lock(m_sampleGateMutex);
+        m_samplesBlocked = true;
+    }
+    m_samplingWaitCv.notify_all();
+    m_sampleGateCv.notify_all();
+}
+
+void TelemetryManager::ProcessPendingShutdown() {
+    if (m_shutdownPending.load() && !IsInsideReporterCallback(this)) {
+        Shutdown();
+    }
 }
 
 void TelemetryManager::StartSampling() {
     Logger::Trace("[TelemetryManager::StartSampling] Entry");
-    if (!m_config.enabled) {
-        Logger::Info("Telemetry disabled, not starting sampling");
-        Logger::Debug("[TelemetryManager::StartSampling] config.enabled is false, skipping sampling start");
-        Logger::Trace("[TelemetryManager::StartSampling] Exit - early return (telemetry disabled)");
+    if (IsInsideReporterCallback(this)) {
+        ReportError("Cannot start telemetry sampling from a reporter callback");
         return;
     }
 
-    if (m_running.exchange(true)) {
-        Logger::Warn("Telemetry sampling already running");
-        Logger::Debug("[TelemetryManager::StartSampling] m_running was already true, skipping");
-        Logger::Trace("[TelemetryManager::StartSampling] Exit - early return (already running)");
+    std::lock_guard<std::mutex> threadLock(m_samplingThreadMutex);
+    const TelemetryConfig config = GetConfig();
+    if (m_shutdownPending.load() || !m_initialized.load() || !config.enabled) {
+        Logger::Info("Telemetry disabled, not starting sampling");
         return;
+    }
+
+    if (m_running.load()) {
+        Logger::Warn("Telemetry sampling already running");
+        return;
+    }
+
+    if (m_samplingThread.joinable()) {
+        if (m_samplingThread.get_id() == std::this_thread::get_id()) {
+            Logger::Error("Telemetry sampling cannot be restarted from its own sampling thread");
+            return;
+        }
+        m_samplingThread.join();
     }
 
     Logger::Info("Starting telemetry sampling (interval: %lldms)",
-                m_config.samplingInterval.count());
-    Logger::Debug("[TelemetryManager::StartSampling] Launching sampling thread");
-
-    m_samplingThread = std::thread(&TelemetryManager::SamplingLoop, this);
-    Logger::Debug("[TelemetryManager::StartSampling] Sampling thread launched successfully");
-    Logger::Trace("[TelemetryManager::StartSampling] Exit");
+                 config.samplingInterval.count());
+    m_running.store(true);
+    try {
+        m_samplingThread = std::thread(&TelemetryManager::SamplingLoop, this);
+    } catch (const std::exception& ex) {
+        m_running.store(false);
+        ReportError("Failed to start telemetry sampling thread: " + std::string(ex.what()));
+    } catch (...) {
+        m_running.store(false);
+        ReportError("Failed to start telemetry sampling thread: unknown exception");
+    }
 }
 
 void TelemetryManager::StopSampling() {
     Logger::Trace("[TelemetryManager::StopSampling] Entry");
-    if (!m_running.exchange(false)) {
-        Logger::Debug("[TelemetryManager::StopSampling] Sampling was not running, nothing to stop");
-        Logger::Trace("[TelemetryManager::StopSampling] Exit - early return (was not running)");
+    if (IsInsideReporterCallback(this)) {
+        // Never join a sampler from a callback: a forced sample can own the
+        // sample lease while the background sampler waits for it.
+        m_running.store(false);
+        m_samplingWaitCv.notify_all();
         return;
     }
 
-    Logger::Info("Stopping telemetry sampling...");
+    std::lock_guard<std::mutex> threadLock(m_samplingThreadMutex);
+    const bool wasRunning = m_running.exchange(false);
+
+    // Wake a sampling thread immediately even when the configured interval is
+    // minutes or hours. A plain sleep_for made shutdown block for the entire
+    // remaining interval.
+    m_samplingWaitCv.notify_all();
+
+    if (wasRunning) Logger::Info("Stopping telemetry sampling...");
 
     if (m_samplingThread.joinable()) {
+        if (m_samplingThread.get_id() == std::this_thread::get_id()) {
+            Logger::Warn("Telemetry sampler requested its own stop; join deferred to its owner thread");
+            return;
+        }
         Logger::Debug("[TelemetryManager::StopSampling] Waiting for sampling thread to join");
         m_samplingThread.join();
         Logger::Debug("[TelemetryManager::StopSampling] Sampling thread joined successfully");
     } else {
-        Logger::Debug("[TelemetryManager::StopSampling] Sampling thread is not joinable");
+        Logger::Debug("[TelemetryManager::StopSampling] Sampling was not running and no thread needs joining");
     }
 
-    Logger::Info("Telemetry sampling stopped");
-    Logger::Trace("[TelemetryManager::StopSampling] Exit");
+    if (wasRunning) Logger::Info("Telemetry sampling stopped");
 }
 
 void TelemetryManager::ForceSample() {
     Logger::Trace("[TelemetryManager::ForceSample] Entry");
-    if (!m_config.enabled) {
+    if (IsInsideReporterCallback(this)) {
+        ReportError("Ignoring reentrant telemetry sample from a reporter callback");
+        return;
+    }
+    if (!BeginSampleOperation()) {
+        ReportError("Ignoring reentrant telemetry sample");
+        return;
+    }
+    auto sampleGuard = MakeScopeExit([this]() {
+        EndSampleOperation();
+        ProcessPendingShutdown();
+    });
+
+    const TelemetryConfig config = GetConfig();
+    if (!m_initialized.load() || !config.enabled) {
         Logger::Debug("[TelemetryManager::ForceSample] Telemetry disabled, skipping forced sample");
-        Logger::Trace("[TelemetryManager::ForceSample] Exit - early return (disabled)");
         return;
     }
 
     try {
         Logger::Debug("[TelemetryManager::ForceSample] Collecting metrics snapshot");
-        MetricsSnapshot snapshot = CollectSnapshot();
+        MetricsSnapshot snapshot = CollectSnapshot(config);
         Logger::Trace("[TelemetryManager::ForceSample] Snapshot collected successfully");
 
         // Store snapshot
         {
             std::lock_guard<std::mutex> lock(m_snapshotMutex);
-            if (m_snapshots.size() < m_config.maxSamplesInMemory) {
+            const size_t capacity = m_snapshotCapacity;
+            if (m_snapshots.size() < capacity) {
                 m_snapshots.push_back(snapshot);
-                Logger::Trace("[TelemetryManager::ForceSample] Snapshot appended to storage (size now %zu/%zu)", m_snapshots.size(), m_config.maxSamplesInMemory);
+                Logger::Trace("[TelemetryManager::ForceSample] Snapshot appended to storage (size now %zu/%zu)", m_snapshots.size(), capacity);
             } else {
                 m_snapshots[m_snapshotIndex] = snapshot;
                 Logger::Trace("[TelemetryManager::ForceSample] Snapshot stored at circular buffer index %zu (buffer full, overwriting)", m_snapshotIndex);
-                m_snapshotIndex = (m_snapshotIndex + 1) % m_config.maxSamplesInMemory;
+                m_snapshotIndex = (m_snapshotIndex + 1) % capacity;
                 Logger::Trace("[TelemetryManager::ForceSample] Circular buffer index advanced to %zu", m_snapshotIndex);
             }
         }
 
-        // Report to all reporters
+        std::vector<std::shared_ptr<ReporterRecord>> reporters;
         {
             std::lock_guard<std::mutex> lock(m_reporterMutex);
-            Logger::Debug("[TelemetryManager::ForceSample] Reporting snapshot to %zu reporters", m_reporters.size());
-            for (size_t i = 0; i < m_reporters.size(); ++i) {
-                auto& reporter = m_reporters[i];
-                try {
-                    Logger::Trace("[TelemetryManager::ForceSample] Sending snapshot to reporter %zu", i);
-                    reporter->Report(snapshot);
-                    Logger::Trace("[TelemetryManager::ForceSample] Reporter %zu accepted snapshot successfully", i);
-                } catch (const std::exception& ex) {
-                    Logger::Error("[TelemetryManager::ForceSample] Reporter %zu failed with exception: %s", i, ex.what());
-                    ReportError("Reporter failed: " + std::string(ex.what()));
-                }
+            reporters = m_reporters;
+        }
+        Logger::Debug("[TelemetryManager::ForceSample] Reporting snapshot to %zu reporters", reporters.size());
+        for (const auto& record : reporters) {
+            std::shared_ptr<MetricsReporter> reporter;
+            if (!BeginReporterReport(record, reporter)) continue;
+            auto reportGuard = MakeScopeExit([this, record]() {
+                EndReporterReport(record);
+            });
+            try {
+                ReporterCallbackScope callbackScope(this, ReporterCallbackPhase::Report);
+                reporter->Report(snapshot);
+            } catch (const std::exception& ex) {
+                ReportError("Reporter failed: " + std::string(ex.what()));
+            } catch (...) {
+                ReportError("Reporter failed: unknown exception");
             }
+            reportGuard.RunNow();
+            if (m_shutdownPending.load() || m_shuttingDown.load()) break;
         }
 
         auto totalNow = m_totalSamples.fetch_add(1, std::memory_order_relaxed) + 1;
         Logger::Debug("[TelemetryManager::ForceSample] Total samples collected: %llu", (unsigned long long)totalNow);
-        Logger::Info("[TelemetryManager::ForceSample] Metrics snapshot #%llu collected and reported successfully", (unsigned long long)totalNow);
+        // One info line per second drowns actionable server/network events.
+        // Keep an initial health marker and a minute cadence; detailed samples
+        // remain available at trace level and through the reporters.
+        if (totalNow == 1 || totalNow % 60 == 0) {
+            Logger::Info("[TelemetryManager::ForceSample] Metrics snapshot #%llu collected and reported successfully", (unsigned long long)totalNow);
+        } else {
+            Logger::Trace("[TelemetryManager::ForceSample] Metrics snapshot #%llu collected and reported successfully", (unsigned long long)totalNow);
+        }
 
     } catch (const std::exception& ex) {
         Logger::Error("[TelemetryManager::ForceSample] Exception during snapshot collection: %s", ex.what());
         ReportError("Failed to collect metrics snapshot: " + std::string(ex.what()));
+    } catch (...) {
+        Logger::Error("[TelemetryManager::ForceSample] Unknown exception during snapshot collection");
+        ReportError("Failed to collect metrics snapshot: unknown exception");
     }
     Logger::Trace("[TelemetryManager::ForceSample] Exit");
 }
 
 void TelemetryManager::SamplingLoop() {
-    Logger::Trace("[TelemetryManager::SamplingLoop] Entry - sampling interval: %lldms", m_config.samplingInterval.count());
     Logger::Info("Telemetry sampling loop started");
 
     uint64_t iterationCount = 0;
@@ -345,16 +821,22 @@ void TelemetryManager::SamplingLoop() {
         // Calculate sleep time to maintain consistent interval
         auto loopEnd = std::chrono::steady_clock::now();
         auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(loopEnd - loopStart);
-        auto sleepTime = m_config.samplingInterval - elapsed;
+        const uint64_t configGeneration = m_configGeneration.load();
+        const auto interval = GetConfig().samplingInterval;
+        auto sleepTime = interval - elapsed;
 
         if (sleepTime > std::chrono::milliseconds(0)) {
             Logger::Trace("[TelemetryManager::SamplingLoop] Iteration %llu took %lldms, sleeping for %lldms", (unsigned long long)iterationCount, elapsed.count(), sleepTime.count());
-            std::this_thread::sleep_for(sleepTime);
-        } else if (elapsed > m_config.samplingInterval * 2) {
+            std::unique_lock<std::mutex> waitLock(m_samplingWaitMutex);
+            m_samplingWaitCv.wait_for(waitLock, sleepTime, [this, configGeneration]() {
+                return !m_running.load() ||
+                       m_configGeneration.load() != configGeneration;
+            });
+        } else if (elapsed > interval * 2) {
             // Warn if sampling is taking too long
             Logger::Warn("Telemetry sampling took %lldms (interval: %lldms)",
-                        elapsed.count(), m_config.samplingInterval.count());
-            Logger::Debug("[TelemetryManager::SamplingLoop] Iteration %llu exceeded 2x interval: elapsed=%lldms, interval=%lldms", (unsigned long long)iterationCount, elapsed.count(), m_config.samplingInterval.count());
+                        elapsed.count(), interval.count());
+            Logger::Debug("[TelemetryManager::SamplingLoop] Iteration %llu exceeded 2x interval: elapsed=%lldms, interval=%lldms", (unsigned long long)iterationCount, elapsed.count(), interval.count());
         } else {
             Logger::Debug("[TelemetryManager::SamplingLoop] Iteration %llu took %lldms, no sleep needed (exceeded interval)", (unsigned long long)iterationCount, elapsed.count());
         }
@@ -365,14 +847,14 @@ void TelemetryManager::SamplingLoop() {
     Logger::Trace("[TelemetryManager::SamplingLoop] Exit");
 }
 
-MetricsSnapshot TelemetryManager::CollectSnapshot() {
+MetricsSnapshot TelemetryManager::CollectSnapshot(const TelemetryConfig& config) {
     Logger::Trace("[TelemetryManager::CollectSnapshot] Entry");
     MetricsSnapshot snapshot;
     snapshot.timestamp = std::chrono::system_clock::now();
     Logger::Trace("[TelemetryManager::CollectSnapshot] Timestamp set for snapshot");
 
     try {
-        if (m_config.enableSystemMetrics) {
+        if (config.enableSystemMetrics) {
             Logger::Debug("[TelemetryManager::CollectSnapshot] System metrics collection enabled, collecting system metrics");
             CollectSystemMetrics(snapshot);
             Logger::Debug("[TelemetryManager::CollectSnapshot] System metrics collected successfully");
@@ -380,7 +862,7 @@ MetricsSnapshot TelemetryManager::CollectSnapshot() {
             Logger::Debug("[TelemetryManager::CollectSnapshot] System metrics collection is disabled, skipping");
         }
 
-        if (m_config.enableApplicationMetrics) {
+        if (config.enableApplicationMetrics) {
             Logger::Debug("[TelemetryManager::CollectSnapshot] Application metrics collection enabled, collecting application metrics");
             CollectApplicationMetrics(snapshot);
             Logger::Debug("[TelemetryManager::CollectSnapshot] Application metrics collected successfully");
@@ -531,38 +1013,10 @@ double TelemetryManager::GetCPUUsage() {
 
 #elif defined(_WIN32)
     Logger::Trace("[TelemetryManager::GetCPUUsage] Platform: Windows, using PDH counters");
-    static PDH_HQUERY query = nullptr;
-    static PDH_HCOUNTER counter = nullptr;
-    static bool initialized = false;
-
-    if (!initialized) {
-        Logger::Debug("[TelemetryManager::GetCPUUsage] PDH not yet initialized, initializing CPU counter");
-        if (PdhOpenQuery(nullptr, 0, &query) == ERROR_SUCCESS) {
-            if (PdhAddEnglishCounter(query, "\\Processor(_Total)\\% Processor Time", 0, &counter) == ERROR_SUCCESS) {
-                PdhCollectQueryData(query);
-                initialized = true;
-                Logger::Debug("[TelemetryManager::GetCPUUsage] PDH CPU counter initialized successfully");
-            } else {
-                Logger::Error("[TelemetryManager::GetCPUUsage] Failed to add PDH CPU counter");
-            }
-        } else {
-            Logger::Error("[TelemetryManager::GetCPUUsage] Failed to open PDH query");
-        }
+    if (!m_windowsCpuCounter) {
+        m_windowsCpuCounter = std::make_unique<WindowsCpuCounterState>();
     }
-
-    if (initialized) {
-        PdhCollectQueryData(query);
-        PDH_FMT_COUNTERVALUE value;
-        if (PdhGetFormattedCounterValue(counter, PDH_FMT_DOUBLE, nullptr, &value) == ERROR_SUCCESS) {
-            Logger::Trace("[TelemetryManager::GetCPUUsage] Exit - returning %.2f%% (Windows PDH)", value.doubleValue);
-            return value.doubleValue;
-        } else {
-            Logger::Warn("[TelemetryManager::GetCPUUsage] PdhGetFormattedCounterValue failed");
-        }
-    }
-
-    Logger::Trace("[TelemetryManager::GetCPUUsage] Exit - returning 0.0 (Windows fallback)");
-    return 0.0;
+    return m_windowsCpuCounter->Sample();
 
 #else
     // macOS or other platforms - simplified implementation
@@ -687,10 +1141,60 @@ std::pair<uint64_t, uint64_t> TelemetryManager::GetNetworkStats() {
     return {totalSent, totalReceived};
 
 #elif defined(_WIN32)
-    // Windows implementation would use GetIfTable2 or similar
-    Logger::Debug("[TelemetryManager::GetNetworkStats] Windows network stats not implemented, returning {0, 0}");
-    Logger::Trace("[TelemetryManager::GetNetworkStats] Exit - returning {0, 0} (Windows not implemented)");
-    return {0, 0};
+    Logger::Trace("[TelemetryManager::GetNetworkStats] Platform: Windows, querying GetIfTable2");
+
+    MIB_IF_TABLE2* rawTable = nullptr;
+    const NETIO_STATUS status = GetIfTable2(&rawTable);
+    if (status != NO_ERROR) {
+        Logger::Warn("[TelemetryManager::GetNetworkStats] GetIfTable2 failed with status %lu",
+                     static_cast<unsigned long>(status));
+        ReportError("GetIfTable2 failed with status " + std::to_string(status));
+        return {0, 0};
+    }
+    if (rawTable == nullptr) {
+        Logger::Warn("[TelemetryManager::GetNetworkStats] GetIfTable2 succeeded without returning a table");
+        ReportError("GetIfTable2 succeeded without returning a table");
+        return {0, 0};
+    }
+
+    struct MibTableReleaser {
+        void operator()(MIB_IF_TABLE2* table) const noexcept {
+            FreeMibTable(table);
+        }
+    };
+    const std::unique_ptr<MIB_IF_TABLE2, MibTableReleaser> table(rawTable);
+
+    Detail::NetworkInterfaceCounterTotals totals;
+    size_t includedInterfaces = 0;
+    size_t excludedInterfaces = 0;
+    for (ULONG index = 0; index < table->NumEntries; ++index) {
+        const MIB_IF_ROW2& row = table->Table[index];
+        const Detail::NetworkInterfaceCounterSample sample{
+            row.Type == IF_TYPE_SOFTWARE_LOOPBACK,
+            row.InterfaceAndOperStatusFlags.FilterInterface != FALSE,
+            static_cast<uint64_t>(row.OutOctets),
+            static_cast<uint64_t>(row.InOctets),
+        };
+
+        if (sample.isLoopback || sample.isFilterInterface) {
+            ++excludedInterfaces;
+        } else {
+            ++includedInterfaces;
+        }
+        Detail::AccumulateNetworkInterfaceCounters(totals, sample);
+    }
+
+    // Do not filter by the interface's current OperStatus. These are cumulative
+    // counters, so removing an interface when it transitions down would make the
+    // machine total regress and create false negative byte rates.
+    Logger::Debug("[TelemetryManager::GetNetworkStats] Windows interfaces: included=%zu, excluded=%zu, sent=%llu, received=%llu",
+                  includedInterfaces, excludedInterfaces,
+                  static_cast<unsigned long long>(totals.bytesSent),
+                  static_cast<unsigned long long>(totals.bytesReceived));
+    Logger::Trace("[TelemetryManager::GetNetworkStats] Exit - returning {%llu, %llu} (Windows GetIfTable2)",
+                  static_cast<unsigned long long>(totals.bytesSent),
+                  static_cast<unsigned long long>(totals.bytesReceived));
+    return {totals.bytesSent, totals.bytesReceived};
 
 #else
     Logger::Debug("[TelemetryManager::GetNetworkStats] Platform not supported for network metrics, returning {0, 0}");
@@ -759,13 +1263,14 @@ MetricsSnapshot TelemetryManager::GetLatestSnapshot() const {
         return MetricsSnapshot{};
     }
 
-    if (m_snapshots.size() < m_config.maxSamplesInMemory) {
+    const size_t capacity = m_snapshotCapacity;
+    if (m_snapshots.size() < capacity) {
         Logger::Debug("[TelemetryManager::GetLatestSnapshot] Linear storage mode, returning last snapshot (index %zu of %zu)", m_snapshots.size() - 1, m_snapshots.size());
         Logger::Trace("[TelemetryManager::GetLatestSnapshot] Exit - returning snapshot from back of linear storage");
         return m_snapshots.back();
     } else {
-        size_t latest = (m_snapshotIndex + m_config.maxSamplesInMemory - 1) % m_config.maxSamplesInMemory;
-        Logger::Debug("[TelemetryManager::GetLatestSnapshot] Circular buffer mode, returning snapshot at index %zu (snapshotIndex=%zu, maxSamples=%zu)", latest, m_snapshotIndex, m_config.maxSamplesInMemory);
+        size_t latest = (m_snapshotIndex + capacity - 1) % capacity;
+        Logger::Debug("[TelemetryManager::GetLatestSnapshot] Circular buffer mode, returning snapshot at index %zu (snapshotIndex=%zu, maxSamples=%zu)", latest, m_snapshotIndex, capacity);
         Logger::Trace("[TelemetryManager::GetLatestSnapshot] Exit - returning snapshot from circular buffer index %zu", latest);
         return m_snapshots[latest];
     }
@@ -786,7 +1291,8 @@ std::vector<MetricsSnapshot> TelemetryManager::GetRecentSnapshots(size_t count) 
     result.reserve(available);
     Logger::Debug("[TelemetryManager::GetRecentSnapshots] Requested %zu snapshots, %zu available, returning %zu", count, m_snapshots.size(), available);
 
-    if (m_snapshots.size() < m_config.maxSamplesInMemory) {
+    const size_t capacity = m_snapshotCapacity;
+    if (m_snapshots.size() < capacity) {
         // Linear storage
         size_t start = m_snapshots.size() >= available ? m_snapshots.size() - available : 0;
         Logger::Debug("[TelemetryManager::GetRecentSnapshots] Using linear storage mode, reading from index %zu to %zu", start, m_snapshots.size() - 1);
@@ -795,9 +1301,9 @@ std::vector<MetricsSnapshot> TelemetryManager::GetRecentSnapshots(size_t count) 
         }
     } else {
         // Circular buffer
-        Logger::Debug("[TelemetryManager::GetRecentSnapshots] Using circular buffer mode, snapshotIndex=%zu, maxSamples=%zu", m_snapshotIndex, m_config.maxSamplesInMemory);
+        Logger::Debug("[TelemetryManager::GetRecentSnapshots] Using circular buffer mode, snapshotIndex=%zu, maxSamples=%zu", m_snapshotIndex, capacity);
         for (size_t i = 0; i < available; ++i) {
-            size_t index = (m_snapshotIndex + m_config.maxSamplesInMemory - available + i) % m_config.maxSamplesInMemory;
+            size_t index = (m_snapshotIndex + capacity - available + i) % capacity;
             Logger::Trace("[TelemetryManager::GetRecentSnapshots] Reading circular buffer at index %zu", index);
             result.push_back(m_snapshots[index]);
         }
@@ -810,24 +1316,69 @@ std::vector<MetricsSnapshot> TelemetryManager::GetRecentSnapshots(size_t count) 
 void TelemetryManager::UpdateConfig(const TelemetryConfig& config) {
     Logger::Trace("[TelemetryManager::UpdateConfig] Entry - config.enabled=%d, config.samplingInterval=%lldms, config.enableSystemMetrics=%d, config.enableApplicationMetrics=%d",
                  config.enabled, config.samplingInterval.count(), config.enableSystemMetrics, config.enableApplicationMetrics);
-    bool needsRestart = (m_config.samplingInterval != config.samplingInterval) && m_running.load();
-    Logger::Debug("[TelemetryManager::UpdateConfig] Sampling interval change: %lldms -> %lldms, running=%d, needsRestart=%d",
-                 m_config.samplingInterval.count(), config.samplingInterval.count(), m_running.load(), needsRestart);
-
-    m_config = config;
-    Logger::Debug("[TelemetryManager::UpdateConfig] Configuration stored");
-
-    if (needsRestart) {
-        Logger::Info("[TelemetryManager::UpdateConfig] Sampling interval changed while running, restarting sampling");
-        StopSampling();
-        StartSampling();
-        Logger::Debug("[TelemetryManager::UpdateConfig] Sampling restarted with new interval");
-    } else {
-        Logger::Debug("[TelemetryManager::UpdateConfig] No sampling restart needed");
+    if (IsInsideReporterCallback(this)) {
+        ReportError("Cannot update telemetry configuration from a reporter callback");
+        return;
     }
 
+    {
+        std::lock_guard<std::mutex> lifecycleLock(m_lifecycleMutex);
+        if (m_shuttingDown.load() || m_initializing || m_removingReporters ||
+            m_updatingConfig) {
+            ReportError("Cannot update telemetry configuration during a lifecycle transition");
+            return;
+        }
+        m_updatingConfig = true;
+    }
+    auto transitionGuard = MakeScopeExit([this]() {
+        {
+            std::lock_guard<std::mutex> lifecycleLock(m_lifecycleMutex);
+            m_updatingConfig = false;
+        }
+        ProcessPendingShutdown();
+    });
+
+    if (!BeginSampleOperation()) {
+        ReportError("Ignoring reentrant telemetry configuration update");
+        return;
+    }
+    auto sampleGuard = MakeScopeExit([this]() { EndSampleOperation(); });
+
+    const TelemetryConfig sanitized = SanitizeConfig(config);
+    const TelemetryConfig previous = GetConfig();
+    {
+        std::lock_guard<std::mutex> configLock(m_configMutex);
+        m_config = sanitized;
+    }
+    m_configGeneration.fetch_add(1);
+
+    if (previous.maxSamplesInMemory != sanitized.maxSamplesInMemory) {
+        std::lock_guard<std::mutex> snapshotLock(m_snapshotMutex);
+        m_snapshots.clear();
+        m_snapshots.reserve(sanitized.maxSamplesInMemory);
+        m_snapshotIndex = 0;
+        m_snapshotCapacity = sanitized.maxSamplesInMemory;
+    }
+
+    m_samplingWaitCv.notify_all();
+    sampleGuard.RunNow();
+
+    // Always issue the stop after publishing a disabled configuration. This
+    // closes the race where StartSampling read the old enabled value just
+    // before this update was published.
+    if (!sanitized.enabled) StopSampling();
+
     Logger::Info("Telemetry configuration updated");
-    Logger::Trace("[TelemetryManager::UpdateConfig] Exit");
+}
+
+TelemetryConfig TelemetryManager::GetConfig() const {
+    std::lock_guard<std::mutex> lock(m_configMutex);
+    return m_config;
+}
+
+std::chrono::steady_clock::time_point TelemetryManager::GetStartTime() const {
+    std::lock_guard<std::mutex> lock(m_lifecycleMutex);
+    return m_startTime;
 }
 
 std::vector<std::string> TelemetryManager::GetLastErrors() const {

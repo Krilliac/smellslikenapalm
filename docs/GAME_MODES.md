@@ -495,12 +495,46 @@ GameServer
       └── Report results, transition to next map
 ```
 
+### Retail-native RS2 mode drivers
+
+Retail map prefixes select one authoritative native driver in `GameServer`:
+Territories, Supremacy, or Skirmish. These drivers own their round clocks and
+objective rules; the generic `GameMode`/`RoundManager` path is not layered on top
+unless the server explicitly opts into that alternate round manager.
+
+With `[Gameplay] wait_for_ready_player=true` (the default), these drivers keep
+their authoritative round clock in Preparation until a joined retail client has
+finished the handshake and map travel and finalized a role. The complete native
+preparation countdown starts only after that readiness point; existing phase
+gates keep bot play, objective capture, combat, respawns, and ticket progression
+inactive while waiting. Set the option to `false` only when intentional headless
+or empty-server progression is required.
+
+Skirmish uses the retail five-opportunity deployment schedule. Initial deployment
+is followed by four synchronized team respawn waves at 25-second intervals.
+`SkirmishMode`'s window policy is authoritative: `PlayerManager` does not apply
+its generic per-player respawn delay in this mode, and `SpawnSystem` keeps players
+dead when the finite window has closed or sudden death has begun. The boundary-
+aware release check permits the final wave exactly at the replicated close time
+without allowing a loaded tick to release it afterward. Capturing an objective
+can move only the capturing team's next wave and close time.
+
+Supremacy uses retail's single signed score and counts only objectives connected
+to their team's home base when both valid HQ markers exist. If either marker is
+missing or malformed, supply lines are disabled globally and every controlled
+objective scores, matching `ROGameInfoSupremacy.Reset` and `UpdatePointsHeld`.
+Exhausting reinforcements does not enter a separate sudden-death phase: the
+round clock, captures, and signed score remain active for surviving players,
+while respawn closes only for the depleted team. The round resolves when that
+team has no living human or bot participant; simultaneous last-ticket
+elimination is a draw regardless of death-publication order.
+
 ### Key Source Files
 
 | File | Responsibility |
 |---|---|
 | `src/Game/GameMode.cpp` | Abstract base class for all game modes |
-| `src/Game/SkirmishMode.cpp` | Elimination-style mode implementation |
+| `src/Game/SkirmishMode.cpp` | Five-wave Skirmish rounds, lockdown, and sudden death |
 | `src/Game/SupremacyMode.cpp` | Territory/zone control implementations |
 | `src/Game/TerritoryMode.cpp` | Multi-zone territory implementation |
 | `src/Game/MapManager.cpp` | Map loading and objective registry |

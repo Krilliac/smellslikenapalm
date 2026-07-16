@@ -9,15 +9,28 @@
 #include "Utils/CrashHandler.h"
 
 #include <iostream>
+#include <atomic>
+#include <chrono>
+#include <future>
+#include <mutex>
 #include <string>
+#include <utility>
 
 #ifndef _WIN32
 #include <sys/select.h>
 #include <unistd.h>
 #endif
 
+struct ConsoleInput::State {
+    explicit State(GameServer* initialServer) : server(initialServer) {}
+
+    std::atomic<bool> running{false};
+    std::mutex serverMutex;
+    GameServer* server = nullptr; // guarded by serverMutex
+};
+
 ConsoleInput::ConsoleInput(GameServer* server)
-    : m_server(server)
+    : m_state(std::make_shared<State>(server))
 {
     Logger::Trace("[ConsoleInput::ConsoleInput] Entry");
 }
@@ -29,9 +42,10 @@ ConsoleInput::~ConsoleInput()
 
 void ConsoleInput::Start()
 {
-    if (m_running.exchange(true)) return;
+    const std::shared_ptr<State> state = m_state;
+    if (!state || state->running.exchange(true)) return;
     Logger::Info("[ConsoleInput] Console command input ready (type 'help')");
-    m_thread = std::thread([this] { ReadLoop(); });
+    m_thread = std::thread([state] { ReadLoop(state); });
 }
 
 void ConsoleInput::Stop()
@@ -40,7 +54,15 @@ void ConsoleInput::Stop()
     // EOF (clearing m_running itself), but it is still joinable. Destroying a
     // joinable std::thread calls std::terminate, so a guard that skipped the
     // join here would abort the process at shutdown.
-    m_running.store(false);
+    const std::shared_ptr<State> state = m_state;
+    if (state) {
+        state->running.store(false);
+        // Serialize with the worker's GetCommandManager()/Enqueue sequence. Once
+        // this lock is released the detached Windows reader can no longer reach
+        // GameServer, even if getline eventually returns after server teardown.
+        std::lock_guard<std::mutex> lock(state->serverMutex);
+        state->server = nullptr;
+    }
     if (m_thread.joinable()) {
 #ifndef _WIN32
         // The POSIX read loop wakes from select() within its timeout, so a clean
@@ -55,9 +77,9 @@ void ConsoleInput::Stop()
     Logger::Info("[ConsoleInput] Console command input stopped");
 }
 
-void ConsoleInput::ReadLoop()
+void ConsoleInput::ReadLoop(const std::shared_ptr<State>& state)
 {
-    while (m_running.load()) {
+    while (state && state->running.load()) {
 #ifndef _WIN32
         // Wait briefly for input so the loop can re-check m_running and exit on
         // Stop() instead of blocking forever inside getline.
@@ -79,21 +101,34 @@ void ConsoleInput::ReadLoop()
 
         line = StringUtils::Trim(line);
         if (line.empty()) continue;
-        if (!m_server) break;
-
-        CommandManager* cmdMgr = m_server->GetCommandManager();
-        if (!cmdMgr) continue;
 
         CommandContext ctx;
         ctx.source  = CommandSource::Console;
         ctx.level   = CommandLevel::Console; // local console is fully trusted
         ctx.invoker = "console";
-        ctx.server  = m_server;
-        ctx.out     = [](std::string_view s) { std::cout << s << "\n"; };
-        // Guarded so a throwing command can't take down the reader thread (an
-        // uncaught exception in a std::thread calls std::terminate).
-        rs2v::Guard("console command", [&] { cmdMgr->Execute(ctx, line); });
+        std::future<QueuedCommandResult> resultFuture;
+        {
+            std::lock_guard<std::mutex> lock(state->serverMutex);
+            if (!state->running.load() || !state->server) break;
+            CommandManager* cmdMgr = state->server->GetCommandManager();
+            if (!cmdMgr) continue;
+            resultFuture = cmdMgr->Enqueue(std::move(ctx), std::move(line));
+        }
+
+        // Poll rather than blocking indefinitely so Stop() can always join on
+        // POSIX and safely detach on Windows even if the game loop is stalled.
+        while (state->running.load() &&
+               resultFuture.wait_for(std::chrono::milliseconds(100)) !=
+                   std::future_status::ready) {
+        }
+        if (resultFuture.wait_for(std::chrono::milliseconds(0)) ==
+            std::future_status::ready) {
+            rs2v::Guard("console command result", [&] {
+                QueuedCommandResult result = resultFuture.get();
+                if (!result.output.empty()) std::cout << result.output;
+            });
+        }
         std::cout.flush();
     }
-    m_running.store(false);
+    if (state) state->running.store(false);
 }

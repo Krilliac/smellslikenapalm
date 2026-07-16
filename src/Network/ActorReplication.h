@@ -16,9 +16,11 @@
 
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <string>
+#include <vector>
 
 #include "Network/BitReader.h"
 #include "Network/BitWriter.h"
@@ -33,20 +35,19 @@ namespace ActorRepl {
 //   flag bit == 0  -> STATIC object (class / archetype / CDO / static actor):
 //                     SerializeInt(index, 0x80000000), index = package.ObjectBase +
 //                     Object->NetIndex (deterministic from our PackageMap export).
-//   flag bit == 1  -> DYNAMIC actor: SerializeInt(index, 2048), index = the actor's
+//   flag bit == 1  -> DYNAMIC actor: SerializeInt(index, 1024), index = the actor's
 //                     OPEN ACTOR-CHANNEL INDEX. The actor IS its channel; there is no
 //                     persistent id - opening a channel is the "assignment".
 // (Verified against the ch2 PlayerController open `60 c1 01 00`: byte0 bit0 = 0 =>
 //  STATIC = the archetype ref. A reference to an unopened channel / bad class ref =>
 //  NMT_ActorChannelFailure and the client CLOSES the channel - our observed failure.)
 constexpr uint32_t kStaticObjectMax   = 0x80000000u; // MAX_OBJECT_INDEX (static index)
-constexpr uint32_t kDynamicChannelMax = 2048;        // UE3 MAX_CHANNELS = MAX_NET_CHANNELS = 2048
-                                                     // (UnConn.h:143/153). A dynamic objref index
-                                                     // is SerializeInt(ChIndex, 2048) = 11 bits.
-                                                     // (Was wrongly 1024 -> 10 bits: the client read
-                                                     // 1 bit past the bunch, FInBunch error, and
-                                                     // SerializeObject returned NULL - the PC->PRI
-                                                     // link + every dynamic ref silently failed.)
+// RS2's cooked build uses 1024 even though the generic UE3 source tree defaults
+// MAX_NET_CHANNELS to 2048. Capture authority: the real PC->PRI payload `176a00`
+// is exactly 20 bits = handle23[9] + selector[1] + channel26[10]. A 2048 bound
+// needs 21 bits and makes the retail client interpret the extra bit as another
+// property handle.
+constexpr uint32_t kDynamicChannelMax = 1024;
 
 struct NetGUIDRef {
     bool     isDynamic = false;  // true => flag bit 1, value is an actor channel index
@@ -82,7 +83,7 @@ void ReadCompressedRotator(BitReader& r, uint16_t& pitch, uint16_t& yaw, uint16_
 // The opening bunch of an actor channel (bOpen=1, ChType=2) begins with, in order
 // (UnChan.cpp ReplicateActor / ReceivedBunch, doc UE3_ActorChannel.md):
 //   [class static-ref] [compressed Location] [compressed Rotation if bNetInitialRotation]
-//   [NetPlayerIndex (ranged int, max MAX_CHANNELS) if PlayerController]
+//   [NetPlayerIndex (raw byte) if PlayerController]
 // then the bNetInitial property block. There is NO per-actor object ref - the
 // channel index IS the actor's identity. For the OWNING client's PlayerController,
 // NetPlayerIndex MUST be 0 (UnConn.cpp HandleClientPlayer adopts it as the local
@@ -98,6 +99,58 @@ struct ActorOpenHeader {
 };
 
 void WriteActorOpenHeader(BitWriter& w, const ActorOpenHeader& hdr);
+
+// Structurally rewrite the mandatory [static class/archetype reference] and
+// [compressed Location] prefix of a captured actor-opening payload. The source
+// must begin with exactly expectedClassRef; this fail-closed check prevents a
+// PackageMap offset from being applied to a drifted or wrong capture template.
+// replacementClassRef is emitted with the normal static-object codec, and every
+// meaningful bit after the original Location is copied verbatim.
+//
+// Both class references must be non-zero members of the static object range.
+// Returns false and clears both outputs for invalid refs, a source mismatch,
+// dynamic/zero/truncated source refs, malformed Location data, an unsafe target
+// Location, or an output that would exceed the sane UE3 bunch limit.
+bool RewriteCapturedActorOpenClassAndLocation(
+    const uint8_t* payload, size_t payloadBytes, uint32_t payloadBits,
+    uint32_t expectedClassRef, uint32_t replacementClassRef,
+    float locX, float locY, float locZ,
+    std::vector<uint8_t>& rewrittenPayload, uint32_t& rewrittenPayloadBits);
+
+// Rewrite only the mandatory [compressed Location] in a captured actor-opening
+// payload. The leading static class reference is validated and copied unchanged;
+// every meaningful bit after the original Location is copied verbatim. This is
+// intended for capture-backed pawn/inventory templates whose bNetInitial property
+// tail must remain opaque and bit-exact while the spawn point changes.
+//
+// Returns false (and clears both outputs) when the source is null, truncated,
+// larger than a sane UE3 bunch, does not begin with a static class reference, or
+// when any target component is non-finite/outside the compressed-vector range.
+bool RewriteCapturedActorOpenLocation(
+    const uint8_t* payload, size_t payloadBytes, uint32_t payloadBits,
+    float locX, float locY, float locZ,
+    std::vector<uint8_t>& rewrittenPayload, uint32_t& rewrittenPayloadBits);
+
+// One capture-proven dynamic object reference to retarget. bitOffset points at
+// the selector bit of UE3's [1][SerializeInt(channel,1024)] encoding, not at a
+// byte boundary. expectedChannel makes every rewrite fail closed if the
+// template drifts or an offset is accidentally reused for a different field.
+struct CapturedDynamicChannelRewrite {
+    size_t bitOffset = 0;
+    uint32_t expectedChannel = 0;
+    uint32_t replacementChannel = 0;
+};
+
+// Retarget fixed-width dynamic channel references inside a captured payload
+// without interpreting or rebuilding the surrounding property stream. RS2's
+// PackageMap uses a 1024-channel bound, so every dynamic reference is exactly
+// 11 bits and replacement cannot move any following field. All entries are
+// validated before a temporary copy is modified; failures clear the output and
+// leave the source untouched. Overlapping/duplicate entries are rejected.
+bool RewriteCapturedDynamicChannelRefs(
+    const uint8_t* payload, size_t payloadBytes, uint32_t payloadBits,
+    const std::vector<CapturedDynamicChannelRewrite>& rewrites,
+    std::vector<uint8_t>& rewrittenPayload);
 
 // ---- Replicated-property serialization ---------------------------------------
 // Each replicated property on the wire is `SerializeInt(handle, maxHandle)` then

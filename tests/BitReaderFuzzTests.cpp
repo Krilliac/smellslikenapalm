@@ -343,6 +343,23 @@ TEST(BitReaderRoundTrip, AnsiAndUcs2Strings) {
     }
 }
 
+TEST(BitReaderRoundTrip, Ucs2FixedWireReadsLowByteBeforeHighByte) {
+    // FString length -3: two UTF-16LE characters plus the trailing NUL.  This
+    // fixed wire fixture deliberately does not use BitWriter, so it catches a
+    // reader that advances the cursor in high-byte/low-byte order in optimized
+    // builds instead of merely proving that two codecs share the same bug.
+    const std::vector<uint8_t> bytes = {
+        0xFD, 0xFF, 0xFF, 0xFF, // int32 -3
+        0x48, 0x00,             // 'H'
+        0x69, 0x00,             // 'i'
+        0x00, 0x00              // trailing NUL
+    };
+    BitReader r(bytes.data(), bytes.size());
+    EXPECT_EQ(r.ReadString(), std::string("Hi"));
+    EXPECT_FALSE(r.IsOverflowed());
+    EXPECT_EQ(r.BitsLeft(), 0u);
+}
+
 // ===========================================================================
 // 4. MUTATION fuzz: take a valid record, flip/truncate/extend, never crash.
 // ===========================================================================

@@ -48,9 +48,10 @@ enum class NMT : uint8_t {
     Login     = 5,   // C->S  {FStr ClientResponse, FStr URL}  ("Login request: %s")   [CB]
     Failure   = 6,   // S->C  {FStr ErrorKey}                                   [CB-anc]
 
-    // --- RS2 inserted messages after slot 6 (this is why Join is 9, not 7) ---
-    JoinGuidRebind = 8,  // C->S  Join-family GUID-rebind path, SpawnPlayActor; no
-                         //       log string. Distinct from Join (0x09). [CB presence, name ?]
+    // --- Canonical package negotiation / join block -------------------------
+    Uses      = 7,   // S->C  package requirement descriptor
+    Have      = 8,   // C->S  {FGuid PackageGuid, INT Generation}; package inventory,
+                     //       NOT a join request (UE3 UnChan.h FNetControlMessage<NMT_Have>)
     Join      = 9,   // C->S  (empty/URL) -> PostLogin/spawn  ("Join request: %s")   [CB]
     JoinSplit = 10,  // C->S  split-screen  ("JOINSPLIT: Join request: URL=%s")       [CB]
     Skip      = 12,  // C->S  ("User skipped download of '%s'")                        [CB]

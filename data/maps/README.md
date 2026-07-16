@@ -77,13 +77,94 @@ Each map directory (`maps//`) may include:
   Core UE3 map file. Must match the `file` entry in `maps.ini`.
 
 - **`spawns.txt`**  
-  Defines spawn points in world coordinates:
+  Defines spawn points in world coordinates. The optional Territory objective
+  phase bounds are inclusive; use `-1` (or omit the field) for an unbounded
+  side. Non-Territory modes ignore phase bounds:
 
+  ```text
+  # x y z [teamId [minTerritoryPhase [maxTerritoryPhase [retailSpawnVolumeRef]]]]
+  1234.5 67.2 -89.0 1          # legacy/unbounded
+  1278.0 65.1 -89.0 1 0 0     # phase 0 only
+  2200.0 80.0 -75.0 1 1 3     # phases 1 through 3
+  3400.0 95.0 -60.0 2 2 -1 301195 # phase 2 onward + cooked spawn volume
   ```
-  # x y z (one per line)
-  1234.5 67.2 -89.0
-  1278.0 65.1 -89.0
+
+  `retailSpawnVolumeRef` is the optional **canonical** static PackageMap object
+  index for the cooked `ROVolumePlayerStartGroup` represented by the row. It is
+  map-build specific and must be capture/package grounded; use `0` or omit it
+  when the reference is unknown. At send time, the emulator rebases nonzero
+  refs through the connection's frozen replication-artifact layout (for
+  example, the installed layout currently contributes `+5`). The authored
+  fixture remains canonical, and the emulator never fabricates an index.
+
+- **`objectives.txt`**
+  Defines server capture zones and, optionally, the retail client's cooked
+  `ROObjective` identity:
+
+  ```text
+  # name x y z radius phase tunnel [tunnelX tunnelY tunnelZ]
+  #      [clientSlot cookedRepIndex] [enabled] [connectedToBase]
+  #      [initialOwner] [captureSeconds] [pointValue] [homeTeam]
+  #      [adjacentClientSlotsCsv]
+  Beach -11950.55 5238.709 -544.122 35 0 0 0 0 1 0
+  "Governor's House" 1810.98 -2897.73 191.09 30 0 0 2 3 1 0 0 10
   ```
+
+  `clientSlot` is `ROObjective.ObjIndex` (0-15) and `cookedRepIndex` is
+  `ROObjective.ObjRepIndex` (0-254). They must be supplied as a pair and be
+  unique within the map. Omit both for server-only fallback zones. For a
+  non-tunnel objective that supplies retail metadata, keep the explicit `0`
+  tunnel field before the pair. Quote names containing spaces. `enabled`,
+  `connectedToBase`, and `initialOwner` default to `1`, `0`, and neutral (`0`)
+  respectively. `initialOwner` accepts `0` (neutral), `1` (South/US), or `2`
+  (North/NVA). A positive `captureSeconds` sets the one-player capture time;
+  omitting it keeps the default 10 seconds. Supremacy maps may then specify an
+  objective `pointValue`, a `homeTeam` (`0`, `1`, or `2`), and comma-separated
+  adjacent client slots (for example `0,1,3,4`; use `-` for none).
+
+- **`objective_lockdown.txt`** (optional)
+  Supplies package-grounded cooked `ROObjective` lockdown properties without
+  extending the positional objective format:
+
+  ```text
+  # clientSlot enabled LockDownTime16 LockDownTime32 LockDownTime64
+  0 1 500 500 500
+  4 0 500 500 500
+  ```
+
+  `clientSlot` must identify an objective mapped by that map's
+  `objectives.txt`; `enabled` is `0` or `1`; each time is an integer number of
+  seconds in the inclusive range 0-86400. The file is parsed transactionally:
+  an invalid, duplicate, trailing, or unmapped row rejects the whole file and
+  leaves all lockdown metadata unknown. There is intentionally no global
+  fallback because these values belong to a specific cooked map package.
+
+- **`bot_navigation.txt`** (optional)
+  Supplies one exact-map/exact-mode deterministic waypoint graph for headless
+  bots. There is intentionally no global fallback. The format is strict and
+  versioned:
+
+  ```text
+  version 1
+  mode Supremacy
+  # maxEdgeLength maxEndpointSnapDistance maxDirectRouteLength allowDirectFallback
+  config 6000 3500 0 0
+  node 1 1969.750 645.147 30.355
+  node 2 -1891.356 -639.598 58.494
+  edge 1 2 1
+  ```
+
+  `edge` rows are directed unless their final value is `1`, which installs both
+  directions. Node ids must be unique nonzero 32-bit values. Every edge must
+  reference two different declared nodes and fit `maxEdgeLength`.
+  `maxEndpointSnapDistance` independently bounds the un-authored chord from a
+  bot or objective to its nearest node. `allowDirectFallback` is `0` or `1`; a
+  zero `maxDirectRouteLength` intentionally disables direct routing. Unknown
+  directives, duplicate singleton rows, duplicate directed arcs, trailing
+  tokens, non-finite values, unsupported modes, oversized graphs, or any invalid row reject the
+  complete sidecar. Missing/rejected metadata preserves the server's legacy
+  bounded direct-routing behavior; a graph is activated only when its declared
+  mode matches the effective game mode.
 
 - **`lighting.json`** (optional)  
   Overrides global lighting/time-of-day settings:

@@ -7,10 +7,16 @@
 #include "Network/BandwidthManager.h"
 #include "Network/Packet.h"
 #include "Network/HandshakeState.h"  // ClientLoggedIn/Joined event + callback types
+#include "Network/ClientTravelReplication.h"
+#include "Game/ParticipantRoster.h"
+#include "Math/Vector3.h"
 
 class GameServer;
 class ConnectionManager;
 class ClientConnection;
+namespace WeaponCombatRepl {
+struct M61VisualSnapshot;
+}
 
 class NetworkManager {
 public:
@@ -29,6 +35,44 @@ public:
     bool SendPacket(uint32_t clientId, const Packet& pkt);
     void BroadcastPacket(const Packet& pkt);
     void BroadcastPacket(const std::string& tag, const std::vector<uint8_t>& data);
+
+    // Retail UE3 path for ROGameReplicationInfo objective arrays. Unlike the
+    // legacy OBJECTIVE_UPDATE packet, this is actor-channel replication.
+    void BroadcastRetailObjectiveState();
+
+    // Reliable UE3 map-rotation seam. The RPC is pre-encoded so GameServer can
+    // validate it before committing the local map load.
+    size_t BroadcastRetailClientTravel(
+        const ClientTravelRepl::EncodedRpc& rpc,
+        const std::string& mapUrl);
+    bool CanBroadcastRetailClientTravel(
+        const ClientTravelRepl::EncodedRpc& rpc,
+        const std::string& mapUrl,
+        size_t* eligibleClients = nullptr) const;
+
+    // Advance the retail deployment/countdown RPC state after the native game
+    // mode clock has ticked for this frame.
+    void UpdateRetailDeploymentCountdown();
+    bool ShouldAdvanceRetailRoundClock() const;
+
+    void ReplicateRetailCombatState(uint32_t clientId, int health, int kills,
+                                    int deaths, int score, bool isDead,
+                                    bool sendHealth, bool sendDeathRpc);
+    bool ResetRetailMovementValidation(
+        uint32_t clientId, const Vector3& authoritativePosition);
+    void ReplicateRetailParticipantCombatState(
+        const ParticipantId& participant, int health, int kills, int deaths,
+        int score, bool isDead, bool sendHealth, bool sendDeathRpc);
+    void RemoveRetailParticipant(const ParticipantId& participant);
+    void BroadcastRetailM61Spawn(
+        uint64_t projectileKey, uint32_t shooterClientId,
+        const WeaponCombatRepl::M61VisualSnapshot& snapshot);
+    void BroadcastRetailM61Update(
+        uint64_t projectileKey,
+        const WeaponCombatRepl::M61VisualSnapshot& snapshot);
+    void BroadcastRetailM61Detonate(uint64_t projectileKey,
+                                    float fuseSeconds);
+    void BroadcastRetailM61Remove(uint64_t projectileKey);
 
     uint32_t GetClientId(const ClientAddress& addr) const;
     uint32_t FindClientBySteamID(const std::string& steamId) const;

@@ -3,6 +3,7 @@
 #include "Game/TeamManager.h"
 #include "Game/GameServer.h"
 #include "Game/PlayerManager.h"
+#include "Game/BotManager.h"
 #include "Utils/Logger.h"
 #include <algorithm>
 
@@ -45,7 +46,13 @@ void TeamManager::EnsureTeamExists(uint32_t teamId, const std::string& name)
 
 void TeamManager::AddPlayerToTeam(uint32_t playerId, uint32_t teamId)
 {
-    auto pl = m_server->GetPlayerManager()->GetPlayer(playerId);
+    PlayerManager* players = m_server ? m_server->GetPlayerManager() : nullptr;
+    if (!players) {
+        Logger::Warn("TeamManager: Cannot assign player %u to team %u without "
+                     "a PlayerManager", playerId, teamId);
+        return;
+    }
+    auto pl = players->GetPlayer(playerId);
     if (!pl) return;
     RemovePlayer(playerId);
     EnsureTeamExists(teamId);
@@ -130,9 +137,16 @@ uint32_t TeamManager::GetObjectivesCaptured(uint32_t teamId) const
 
 bool TeamManager::HasEnoughPlayers() const
 {
-    // Require at least one player per team to start
+    // Require at least one participant per playable team. Headless bots are
+    // deliberately not inserted into playerIds, but they still satisfy the
+    // native mode's team-presence start gate.
     for (auto& kv : m_teams) {
-        if (kv.second.playerIds.empty()) return false;
+        if (kv.first != 1 && kv.first != 2) continue;
+        const bool hasHuman = !kv.second.playerIds.empty();
+        const BotManager* bots = m_server ? m_server->GetBotManager() : nullptr;
+        if (!hasHuman && (!bots || bots->CountBots(static_cast<uint8_t>(kv.first)) == 0)) {
+            return false;
+        }
     }
     return true;
 }

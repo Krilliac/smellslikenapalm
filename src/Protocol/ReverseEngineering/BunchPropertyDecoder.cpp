@@ -100,7 +100,10 @@ bool DecodeValue(BitReader& r, const NetField& f, uint32_t maxChannels,
         case NetValueType::String: {
             std::string s = r.ReadString();
             if (r.IsOverflowed()) return false;
-            if (s.size() > 48) s = s.substr(0, 48) + "...";
+            if (s.size() > 48) {
+                s.resize(48);
+                s += "...";
+            }
             summary = "\"" + s + "\"";
             return true;
         }

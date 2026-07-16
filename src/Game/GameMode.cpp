@@ -115,14 +115,16 @@ void GameMode::AdvancePhase()
             Logger::Debug("[GameMode::AdvancePhase] Transitioned Active -> PostRound");
             break;
         case Phase::PostRound:
-            Logger::Debug("[GameMode::AdvancePhase] PostRound complete, ending GameMode and triggering map change");
-            OnEnd();
+            Logger::Debug("[GameMode::AdvancePhase] PostRound complete, requesting deferred map change");
             if (m_server) {
-                m_server->ChangeMap();  // trigger map rotation
+                // ChangeMap destroys/replaces the current GameMode. Queue it so
+                // GameServer performs that work only after Update() returns;
+                // deleting this object from its own call stack is undefined.
+                m_server->RequestMapChange();
             } else {
                 Logger::Error("[GameMode::AdvancePhase] Null server, cannot trigger map change");
             }
-            Logger::Trace("[GameMode::AdvancePhase] Exit (PostRound -> map change)");
+            Logger::Trace("[GameMode::AdvancePhase] Exit (PostRound -> queued map change)");
             return;
     }
     BroadcastPhase();

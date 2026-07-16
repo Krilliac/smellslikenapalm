@@ -1,6 +1,7 @@
 #pragma once
 
 #include <memory>
+#include <atomic>
 #include <unordered_map>
 #include <vector>
 #include <mutex>
@@ -20,6 +21,10 @@ public:
 
     // Shutdown and cleanup
     void Shutdown();
+
+    // Lifecycle diagnostics used by startup/status reporting and focused tests.
+    bool IsInitialized() const { return m_initialized.load(); }
+    bool IsEACInitialized() const { return m_eacInitialized.load(); }
 
     // Handle a new client connection
     void OnClientConnect(std::shared_ptr<ClientConnection> conn);
@@ -54,10 +59,15 @@ private:
     BanManager                             m_banManager;
     EnhancedEACAntiCheat                   m_eac;
     NetworkBlocker                         m_blocker;
+    std::atomic<bool>                      m_eacInitialized{false};
+    std::atomic<bool>                      m_initialized{false};
+    std::atomic<bool>                      m_shutdownComplete{false};
 
     // Map clientId → connection
     std::unordered_map<uint32_t, std::shared_ptr<ClientConnection>> m_connections;
     mutable std::mutex                     m_mutex;
+    mutable std::mutex                     m_authMutex;
+    mutable std::mutex                     m_banMutex;
 
     // Internal helpers
     void HandleEACReport(const EnhancedEACReport& report);

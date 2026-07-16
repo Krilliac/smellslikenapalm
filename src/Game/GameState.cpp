@@ -10,8 +10,51 @@
 #include "Utils/Logger.h"
 #include "Network/NetworkManager.h"
 #include <algorithm>
+#include <bit>
+#include <cstdint>
 #include <cstring>
-#include <cstring>
+#include <type_traits>
+#include <utility>
+
+namespace {
+
+template <typename T>
+void AppendScalar(std::vector<uint8_t>& data, const T& value)
+{
+    static_assert(std::is_trivially_copyable_v<T>);
+    const auto* begin = reinterpret_cast<const uint8_t*>(&value);
+    data.insert(data.end(), begin, begin + sizeof(T));
+}
+
+bool CanRead(const std::vector<uint8_t>& data, size_t offset, size_t size)
+{
+    return offset <= data.size() && size <= data.size() - offset;
+}
+
+template <typename T>
+bool ReadScalar(const std::vector<uint8_t>& data, size_t& offset, T& value)
+{
+    static_assert(std::is_trivially_copyable_v<T>);
+    if (!CanRead(data, offset, sizeof(T))) {
+        return false;
+    }
+
+    std::memcpy(&value, data.data() + offset, sizeof(T));
+    offset += sizeof(T);
+    return true;
+}
+
+// GAME_STATE predates the structured retail replication path and originally
+// copied MSVC x64 structs directly. Freeze that legacy byte contract explicitly
+// so future host ABI changes cannot silently alter the wire format.
+constexpr size_t kTeamScoreWireSize = 20u;
+constexpr size_t kObjectiveStateWireSize = 24u;
+static_assert(sizeof(uint32_t) == 4u);
+static_assert(sizeof(float) == 4u);
+static_assert(sizeof(int64_t) == 8u);
+static_assert(std::endian::native == std::endian::little);
+
+} // namespace
 
 GameState::GameState(GameServer* server)
     : m_server(server),
@@ -530,95 +573,134 @@ void GameState::BroadcastObjectiveUpdate(uint32_t objectiveId)
 std::vector<uint8_t> GameState::SerializeGameState() const
 {
     std::vector<uint8_t> data;
-    
+
     // Add phase
-    data.push_back(static_cast<uint8_t>(m_currentPhase));
-    data.push_back(static_cast<uint8_t>(m_matchState));
-    
+    AppendScalar(data, static_cast<uint8_t>(m_currentPhase));
+    AppendScalar(data, static_cast<uint8_t>(m_matchState));
+
     // Add round info
-    data.insert(data.end(), reinterpret_cast<const uint8_t*>(&m_currentRound),
-                reinterpret_cast<const uint8_t*>(&m_currentRound) + sizeof(m_currentRound));
-    
+    AppendScalar(data, m_currentRound);
+
     // Add remaining time
-    auto remaining = GetRemainingTime().count();
-    data.insert(data.end(), reinterpret_cast<const uint8_t*>(&remaining),
-                reinterpret_cast<const uint8_t*>(&remaining) + sizeof(remaining));
-    
+    const int64_t remaining = static_cast<int64_t>(GetRemainingTime().count());
+    AppendScalar(data, remaining);
+
     // Add team scores
-    uint32_t teamCount = static_cast<uint32_t>(m_teamScores.size());
-    data.insert(data.end(), reinterpret_cast<const uint8_t*>(&teamCount),
-                reinterpret_cast<const uint8_t*>(&teamCount) + sizeof(teamCount));
-    
+    const uint32_t teamCount = static_cast<uint32_t>(m_teamScores.size());
+    AppendScalar(data, teamCount);
+
     for (const auto& score : m_teamScores) {
-        data.insert(data.end(), reinterpret_cast<const uint8_t*>(&score),
-                    reinterpret_cast<const uint8_t*>(&score) + sizeof(score));
+        AppendScalar(data, score.teamId);
+        AppendScalar(data, score.score);
+        AppendScalar(data, score.kills);
+        AppendScalar(data, score.deaths);
+        AppendScalar(data, score.objectivesCaptured);
     }
-    
+
     // Add objectives
-    uint32_t objCount = static_cast<uint32_t>(m_objectives.size());
-    data.insert(data.end(), reinterpret_cast<const uint8_t*>(&objCount),
-                reinterpret_cast<const uint8_t*>(&objCount) + sizeof(objCount));
-    
+    const uint32_t objCount = static_cast<uint32_t>(m_objectives.size());
+    AppendScalar(data, objCount);
+
     for (const auto& obj : m_objectives) {
-        data.insert(data.end(), reinterpret_cast<const uint8_t*>(&obj),
-                    reinterpret_cast<const uint8_t*>(&obj) + sizeof(obj));
+        AppendScalar(data, obj.objectiveId);
+        AppendScalar(data, obj.controllingTeam);
+        AppendScalar(data, obj.captureProgress);
+        AppendScalar(data, static_cast<uint8_t>(obj.isNeutral));
+
+        // The former raw-struct wire format placed the clock value at the next
+        // eight-byte boundary. Keep those bytes for compatibility, but make
+        // their value deterministic rather than copying struct padding.
+        data.insert(data.end(), 3, uint8_t{0});
+
+        const int64_t captureTicks = static_cast<int64_t>(
+            obj.lastCaptureTime.time_since_epoch().count());
+        AppendScalar(data, captureTicks);
     }
-    
+
     return data;
 }
 
 void GameState::DeserializeGameState(const std::vector<uint8_t>& data)
 {
-    if (data.empty()) return;
-    
+    if (data.empty()) {
+        return;
+    }
+
     size_t offset = 0;
-    
-    // Read phase
-    if (offset < data.size()) {
-        m_currentPhase = static_cast<GamePhase>(data[offset++]);
-    }
-    if (offset < data.size()) {
-        m_matchState = static_cast<MatchState>(data[offset++]);
-    }
-    
-    // Read round info
-    if (offset + sizeof(m_currentRound) <= data.size()) {
-        std::memcpy(&m_currentRound, &data[offset], sizeof(m_currentRound));
-        offset += sizeof(m_currentRound);
-    }
-    
-    // Skip remaining time (read-only on client)
-    offset += sizeof(int64_t);
-    
-    // Read team scores
+
+    // Decode into temporaries so a truncated packet cannot partially replace
+    // live game state.
+    uint8_t phaseValue = 0;
+    uint8_t matchStateValue = 0;
+    uint32_t currentRound = 0;
     uint32_t teamCount = 0;
-    if (offset + sizeof(teamCount) <= data.size()) {
-        std::memcpy(&teamCount, &data[offset], sizeof(teamCount));
-        offset += sizeof(teamCount);
-        
-        m_teamScores.clear();
-        for (uint32_t i = 0; i < teamCount && offset + sizeof(TeamScore) <= data.size(); ++i) {
-            TeamScore score;
-            std::memcpy(&score, &data[offset], sizeof(score));
-            m_teamScores.push_back(score);
-            offset += sizeof(score);
-        }
+    if (!ReadScalar(data, offset, phaseValue) ||
+        !ReadScalar(data, offset, matchStateValue) ||
+        !ReadScalar(data, offset, currentRound) ||
+        !CanRead(data, offset, sizeof(int64_t))) {
+        return;
     }
-    
-    // Read objectives
+
+    offset += sizeof(int64_t); // Remaining time is read-only on this side.
+    if (!ReadScalar(data, offset, teamCount)) {
+        return;
+    }
+
+    if (teamCount > (data.size() - offset) / kTeamScoreWireSize) {
+        return;
+    }
+
+    std::vector<TeamScore> teamScores;
+    teamScores.reserve(teamCount);
+    for (uint32_t i = 0; i < teamCount; ++i) {
+        TeamScore score{};
+        if (!ReadScalar(data, offset, score.teamId) ||
+            !ReadScalar(data, offset, score.score) ||
+            !ReadScalar(data, offset, score.kills) ||
+            !ReadScalar(data, offset, score.deaths) ||
+            !ReadScalar(data, offset, score.objectivesCaptured)) {
+            return;
+        }
+        teamScores.push_back(score);
+    }
+
     uint32_t objCount = 0;
-    if (offset + sizeof(objCount) <= data.size()) {
-        std::memcpy(&objCount, &data[offset], sizeof(objCount));
-        offset += sizeof(objCount);
-        
-        m_objectives.clear();
-        for (uint32_t i = 0; i < objCount && offset + sizeof(ObjectiveState) <= data.size(); ++i) {
-            ObjectiveState obj;
-            std::memcpy(&obj, &data[offset], sizeof(obj));
-            m_objectives.push_back(obj);
-            offset += sizeof(obj);
-        }
+    if (!ReadScalar(data, offset, objCount) ||
+        objCount > (data.size() - offset) / kObjectiveStateWireSize) {
+        return;
     }
+
+    std::vector<ObjectiveState> objectives;
+    objectives.reserve(objCount);
+    for (uint32_t i = 0; i < objCount; ++i) {
+        ObjectiveState obj{};
+        uint8_t isNeutral = 0;
+        int64_t captureTicks = 0;
+        if (!ReadScalar(data, offset, obj.objectiveId) ||
+            !ReadScalar(data, offset, obj.controllingTeam) ||
+            !ReadScalar(data, offset, obj.captureProgress) ||
+            !ReadScalar(data, offset, isNeutral) ||
+            !CanRead(data, offset, 3)) {
+            return;
+        }
+
+        offset += 3; // Reserved alignment bytes in the legacy wire layout.
+        if (!ReadScalar(data, offset, captureTicks)) {
+            return;
+        }
+
+        obj.isNeutral = isNeutral != 0;
+        using ClockDuration = std::chrono::steady_clock::duration;
+        obj.lastCaptureTime = std::chrono::steady_clock::time_point(
+            ClockDuration(static_cast<ClockDuration::rep>(captureTicks)));
+        objectives.push_back(obj);
+    }
+
+    m_currentPhase = static_cast<GamePhase>(phaseValue);
+    m_matchState = static_cast<MatchState>(matchStateValue);
+    m_currentRound = currentRound;
+    m_teamScores = std::move(teamScores);
+    m_objectives = std::move(objectives);
 }
 
 // Private helper methods

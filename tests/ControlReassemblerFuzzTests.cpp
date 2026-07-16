@@ -2,7 +2,7 @@
 //
 // MALFORMED-INPUT / FUZZ tests for the inbound control-channel reassembler
 // (src/Network/ControlReassembler). These complement ControlReassemblerTests.cpp
-// (which proves the happy-path ordering/dedup/skip-gap contract) by proving the
+// (which proves the happy-path strict ordering/dedup/wrap contract) by proving the
 // reassembler SURVIVES HOSTILE input:
 //
 //   * no crash / no out-of-bounds read on any bunch shape
@@ -44,9 +44,12 @@ namespace {
 
 // The reassembler's own documented DoS caps (mirror of the constants in
 // ControlReassembler.cpp). These are the invariants the fuzz asserts.
-constexpr size_t kDocPendingCountCap = 128;          // kMaxPending
-constexpr size_t kDocPendingByteCap  = 256 * 1024;   // kMaxPendingBytes
-constexpr uint32_t kDocMaxSeqAhead   = 64;           // kMaxSeqAhead
+constexpr size_t kDocPendingCountCap =
+    ControlReassembler::kMaximumPendingBunches;
+constexpr size_t kDocPendingByteCap =
+    ControlReassembler::kMaximumPendingPayloadBytes;
+constexpr uint32_t kDocMaxSeqAhead =
+    ControlReassembler::kMaximumForwardDistance;
 
 // ---------------------------------------------------------------------------
 // Watchdog: run `fn` on a worker thread; if it does not finish within `budget`,
@@ -139,7 +142,10 @@ TEST(ControlReassemblerFuzz, RandomBunchesStayBounded) {
             switch (rng() % 6) {
                 case 0: seq = 0; break;
                 case 1: seq = rng() % 8; break;
-                case 2: seq = re.NextSequence() + (rng() % 200); break;  // straddles the 64-ahead cap
+                case 2:
+                    seq = PacketCodec::AdvanceChSequence(
+                        re.NextSequence(), rng() % 200);
+                    break; // straddles the RELIABLE_BUFFER window
                 case 3: seq = rng() % 1024; break;                       // UE3 channel-seq range
                 case 4: seq = 0xFFFFFFFFu - (rng() % 4); break;          // near uint32 max
                 default: seq = rng(); break;                             // anywhere
@@ -165,8 +171,8 @@ TEST(ControlReassemblerFuzz, RandomBunchesStayBounded) {
             ASSERT_LE(re.PendingBunchCount(), kDocPendingCountCap)
                 << "pending bunch count exceeded the documented cap at iter " << iter;
         }
-        // No unbounded buffering: the skip-gap + caps keep pending tiny no matter
-        // how the attacker scatters sequences. (Empirically << kDocPendingCountCap.)
+        // No unbounded buffering: the modular window + caps keep pending bounded
+        // no matter how the attacker scatters sequences.
         EXPECT_LE(maxPending, kDocPendingCountCap);
         std::fprintf(stderr, "[fuzz] random: deliveries=%zu maxPending=%zu\n",
                      deliveries, maxPending);
@@ -234,15 +240,18 @@ TEST(ControlReassemblerFuzz, RejectsPayloadBitsOverrun) {
 // ===========================================================================
 // Huge / far-future ChSequence flood: an attacker spraying sequences far ahead
 // of m_nextSeq (and near the uint32 top, to bait wrap) must never buffer them.
-// Proves the kMaxSeqAhead window + caps bound memory.
+// Proves the modular forward window + caps bound memory.
 // ===========================================================================
 TEST(ControlReassemblerFuzz, HugeSequenceFloodNeverBuffers) {
     ControlReassembler re([&](const std::vector<uint8_t>&) {});
 
-    // Sequences beyond m_nextSeq(=1)+64 must be ignored, including uint32 max
-    // (which would WRAP a naive m_nextSeq+kMaxSeqAhead comparison).
+    // Wire-valid sequences beyond the forward window must be ignored, along with
+    // values outside the 10-bit wire domain.
     for (uint32_t i = 0; i < 5000; ++i) {
-        uint32_t seq = 1 + kDocMaxSeqAhead + 1 + i;        // just past the window and up
+        const uint32_t distance =
+            kDocMaxSeqAhead + 1u + (i %
+                (PacketCodec::kMaxChSequence / 2u - kDocMaxSeqAhead - 1u));
+        const uint32_t seq = PacketCodec::AdvanceChSequence(1u, distance);
         re.OnBunch(MakeValidBunch(seq, {0xAA, 0xBB}));
         re.OnBunch(MakeValidBunch(0xFFFFFFFFu - (i % 7), {0xCC}));  // near-top, wrap bait
         ASSERT_EQ(re.PendingBunchCount(), 0u) << "far-future seq must not buffer (i=" << i << ")";
@@ -263,12 +272,14 @@ TEST(ControlReassemblerFuzz, ScatteredOversizedStormStaysCapped) {
     RunWithWatchdog([&] {
         ControlReassembler re([&](const std::vector<uint8_t>&) {});
         // Never deliver seq 1: hold a permanent gap so buffering is exercised.
-        // Spray large (8 KiB) bunches at scattered sequences inside the 64-window.
+        // Spray large (8 KiB) bunches at scattered sequences inside the bounded
+        // RELIABLE_BUFFER window.
         std::vector<uint8_t> big(8192, 0xEE);
         for (int iter = 0; iter < 50000; ++iter) {
             uint32_t base = re.NextSequence();
-            // Scatter within [base+1, base+kMaxSeqAhead]; skip base to keep a gap.
-            uint32_t seq = base + 1 + (rng() % kDocMaxSeqAhead);
+            // Scatter within the modular forward window; skip base to keep a gap.
+            uint32_t seq = PacketCodec::AdvanceChSequence(
+                base, 1u + (rng() % kDocMaxSeqAhead));
             re.OnBunch(MakeValidBunch(seq, big));
             maxPending = std::max(maxPending, re.PendingBunchCount());
             ASSERT_LE(re.PendingBunchCount(), kDocPendingCountCap) << "iter " << iter;

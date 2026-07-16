@@ -25,6 +25,31 @@
 
 namespace Telemetry {
 
+namespace {
+
+// Keep every tracked path in one native, absolute form.  In particular,
+// directory_iterator::path().string() uses backslashes on Windows while the old
+// filename builder appended a literal '/'.  Mixing those spellings made the
+// retention sort treat the newly opened file as the oldest entry.
+std::string NormalizeTrackedPath(const std::filesystem::path& input) {
+    std::error_code ec;
+    std::filesystem::path normalized = std::filesystem::absolute(input, ec);
+    if (ec) normalized = input;
+    normalized = normalized.lexically_normal();
+    normalized.make_preferred();
+    return normalized.string();
+}
+
+std::string FileRetentionKey(const std::string& path) {
+    return std::filesystem::path(path).filename().generic_string();
+}
+
+bool SameTrackedPath(const std::string& lhs, const std::string& rhs) {
+    return NormalizeTrackedPath(lhs) == NormalizeTrackedPath(rhs);
+}
+
+} // namespace
+
 FileMetricsReporter::FileMetricsReporter(const FileReporterConfig& config)
     : m_config(config), m_healthy(true), m_reportsGenerated(0), m_reportsFailed(0),
       m_currentFileSize(0) {
@@ -66,7 +91,7 @@ bool FileMetricsReporter::Initialize(const std::string& outputDirectory) {
     std::lock_guard<std::mutex> lock(m_fileMutex);
 
     try {
-        m_outputDirectory = outputDirectory;
+        m_outputDirectory = NormalizeTrackedPath(outputDirectory);
 
         // Create output directory if it doesn't exist
         if (!std::filesystem::exists(m_outputDirectory)) {
@@ -78,7 +103,8 @@ bool FileMetricsReporter::Initialize(const std::string& outputDirectory) {
         }
 
         // Validate directory is writable
-        std::string testFile = m_outputDirectory + "/.write_test";
+        const std::string testFile = NormalizeTrackedPath(
+            std::filesystem::path(m_outputDirectory) / ".write_test");
         std::ofstream test(testFile);
         if (!test.is_open()) {
             Logger::Error("[FileMetricsReporter::Initialize] Output directory is not writable: '%s'", m_outputDirectory.c_str());
@@ -335,7 +361,8 @@ std::string FileMetricsReporter::GenerateFilename() const {
              << "_" << std::setfill('0') << std::setw(3) << ms.count()
              << m_config.fileExtension;
 
-    std::string result = m_outputDirectory + "/" + filename.str();
+    const std::string result = NormalizeTrackedPath(
+        std::filesystem::path(m_outputDirectory) / filename.str());
     Logger::Debug("[FileMetricsReporter::GenerateFilename] Generated filename: '%s'", result.c_str());
     Logger::Trace("[FileMetricsReporter::GenerateFilename] Exit: returning '%s'", result.c_str());
     return result;
@@ -344,7 +371,7 @@ std::string FileMetricsReporter::GenerateFilename() const {
 bool FileMetricsReporter::CreateNewFile() {
     Logger::Trace("[FileMetricsReporter::CreateNewFile] Entry");
     try {
-        m_currentFilePath = GenerateFilename();
+        m_currentFilePath = NormalizeTrackedPath(GenerateFilename());
         Logger::Debug("[FileMetricsReporter::CreateNewFile] Creating file: '%s'", m_currentFilePath.c_str());
         m_currentFile = std::make_unique<std::ofstream>(m_currentFilePath,
                                                        std::ios::out | std::ios::trunc);
@@ -363,7 +390,14 @@ bool FileMetricsReporter::CreateNewFile() {
         // Add to generated files list
         {
             std::lock_guard<std::mutex> lock(m_fileListMutex);
-            m_generatedFiles.push_back(m_currentFilePath);
+            const auto existing = std::find_if(
+                m_generatedFiles.begin(), m_generatedFiles.end(),
+                [this](const std::string& path) {
+                    return SameTrackedPath(path, m_currentFilePath);
+                });
+            if (existing == m_generatedFiles.end()) {
+                m_generatedFiles.push_back(m_currentFilePath);
+            }
             Logger::Debug("[FileMetricsReporter::CreateNewFile] Added to generated files list, total=%zu", m_generatedFiles.size());
         }
 
@@ -533,10 +567,12 @@ void FileMetricsReporter::CompressFile(const std::string& filepath) {
     Logger::Trace("[FileMetricsReporter::CompressFile] Entry: filepath='%s'", filepath.c_str());
 #ifdef ENABLE_COMPRESSION
     try {
-        std::string compressedPath = filepath + ".gz";
+        const std::string normalizedFilepath = NormalizeTrackedPath(filepath);
+        const std::string compressedPath =
+            NormalizeTrackedPath(normalizedFilepath + ".gz");
         Logger::Debug("[FileMetricsReporter::CompressFile] Compressing to: '%s'", compressedPath.c_str());
 
-        std::ifstream input(filepath, std::ios::binary);
+        std::ifstream input(normalizedFilepath, std::ios::binary);
         if (!input.is_open()) {
             Logger::Error("[FileMetricsReporter::CompressFile] Failed to open file for compression: '%s'", filepath.c_str());
             ReportError("Failed to open file for compression: " + filepath);
@@ -564,13 +600,17 @@ void FileMetricsReporter::CompressFile(const std::string& filepath) {
         Logger::Debug("[FileMetricsReporter::CompressFile] Compressed %zu bytes", totalBytesWritten);
 
         // Remove original file
-        std::filesystem::remove(filepath);
+        std::filesystem::remove(normalizedFilepath);
         Logger::Debug("[FileMetricsReporter::CompressFile] Removed original file: '%s'", filepath.c_str());
 
         // Update file list
         {
             std::lock_guard<std::mutex> lock(m_fileListMutex);
-            auto it = std::find(m_generatedFiles.begin(), m_generatedFiles.end(), filepath);
+            auto it = std::find_if(
+                m_generatedFiles.begin(), m_generatedFiles.end(),
+                [&normalizedFilepath](const std::string& path) {
+                    return SameTrackedPath(path, normalizedFilepath);
+                });
             if (it != m_generatedFiles.end()) {
                 *it = compressedPath;
                 Logger::Debug("[FileMetricsReporter::CompressFile] Updated file list entry to compressed path");
@@ -596,6 +636,14 @@ void FileMetricsReporter::CleanupOldFiles() {
     try {
         std::lock_guard<std::mutex> lock(m_fileListMutex);
 
+        for (std::string& path : m_generatedFiles) {
+            path = NormalizeTrackedPath(path);
+        }
+        std::sort(m_generatedFiles.begin(), m_generatedFiles.end());
+        m_generatedFiles.erase(
+            std::unique(m_generatedFiles.begin(), m_generatedFiles.end()),
+            m_generatedFiles.end());
+
         if (m_generatedFiles.size() <= m_config.maxFiles) {
             Logger::Debug("[FileMetricsReporter::CleanupOldFiles] No cleanup needed: %zu files <= maxFiles=%zu",
                           m_generatedFiles.size(), m_config.maxFiles);
@@ -603,31 +651,57 @@ void FileMetricsReporter::CleanupOldFiles() {
             return; // No cleanup needed
         }
 
-        // Sort files by creation time (oldest first)
-        std::sort(m_generatedFiles.begin(), m_generatedFiles.end());
+        // Timestamped basenames are the retention key.  Sorting entire path
+        // strings is separator-sensitive and made '/' sort before '\\' on
+        // Windows.  The current open file is never a cleanup candidate, even if
+        // an externally-created file has a future timestamp.
+        std::sort(m_generatedFiles.begin(), m_generatedFiles.end(),
+                  [](const std::string& lhs, const std::string& rhs) {
+                      return FileRetentionKey(lhs) < FileRetentionKey(rhs);
+                  });
 
         size_t filesToRemove = m_generatedFiles.size() - m_config.maxFiles;
         Logger::Info("[FileMetricsReporter::CleanupOldFiles] Removing %zu old files (total=%zu, max=%zu)",
                      filesToRemove, m_generatedFiles.size(), m_config.maxFiles);
 
-        for (size_t i = 0; i < filesToRemove; ++i) {
-            const std::string& fileToRemove = m_generatedFiles[i];
-
-            try {
-                if (std::filesystem::exists(fileToRemove)) {
-                    std::filesystem::remove(fileToRemove);
-                    Logger::Info("Removed old metrics file: %s", fileToRemove.c_str());
-                } else {
-                    Logger::Debug("[FileMetricsReporter::CleanupOldFiles] File does not exist, skipping: '%s'", fileToRemove.c_str());
-                }
-            } catch (const std::exception& ex) {
-                Logger::Error("Failed to remove old metrics file %s: %s",
-                             fileToRemove.c_str(), ex.what());
+        const bool hasOpenCurrentFile =
+            m_currentFile && m_currentFile->is_open() &&
+            !m_currentFilePath.empty();
+        for (auto it = m_generatedFiles.begin();
+             it != m_generatedFiles.end() && filesToRemove > 0;) {
+            if (hasOpenCurrentFile &&
+                SameTrackedPath(*it, m_currentFilePath)) {
+                ++it;
+                continue;
             }
-        }
 
-        // Remove from tracking list
-        m_generatedFiles.erase(m_generatedFiles.begin(), m_generatedFiles.begin() + filesToRemove);
+            const std::string fileToRemove = *it;
+            std::error_code ec;
+            const bool exists = std::filesystem::exists(fileToRemove, ec);
+            bool removed = !exists && !ec;
+            if (exists && !ec) {
+                removed = std::filesystem::remove(fileToRemove, ec);
+            }
+
+            if (removed) {
+                if (exists) {
+                    Logger::Info("Removed old metrics file: %s",
+                                 fileToRemove.c_str());
+                } else {
+                    Logger::Debug(
+                        "[FileMetricsReporter::CleanupOldFiles] File does not "
+                        "exist, removing stale tracking entry: '%s'",
+                        fileToRemove.c_str());
+                }
+                it = m_generatedFiles.erase(it);
+                --filesToRemove;
+                continue;
+            }
+
+            Logger::Error("Failed to remove old metrics file %s: %s",
+                          fileToRemove.c_str(), ec.message().c_str());
+            ++it;
+        }
         Logger::Debug("[FileMetricsReporter::CleanupOldFiles] Remaining files in tracking list: %zu", m_generatedFiles.size());
 
     } catch (const std::exception& ex) {
@@ -660,14 +734,23 @@ void FileMetricsReporter::ScanExistingFiles() {
             if (entry.is_regular_file()) {
                 std::string filename = entry.path().filename().string();
                 if (std::regex_match(filename, fileRegex)) {
-                    m_generatedFiles.push_back(entry.path().string());
+                    const std::string normalizedPath =
+                        NormalizeTrackedPath(entry.path());
+                    if (std::find(m_generatedFiles.begin(),
+                                  m_generatedFiles.end(), normalizedPath) ==
+                        m_generatedFiles.end()) {
+                        m_generatedFiles.push_back(normalizedPath);
+                    }
                     Logger::Debug("[FileMetricsReporter::ScanExistingFiles] Found matching file: '%s'", filename.c_str());
                 }
             }
         }
 
-        // Sort by filename (which includes timestamp)
-        std::sort(m_generatedFiles.begin(), m_generatedFiles.end());
+        // Sort by timestamped filename, independently of directory spelling.
+        std::sort(m_generatedFiles.begin(), m_generatedFiles.end(),
+                  [](const std::string& lhs, const std::string& rhs) {
+                      return FileRetentionKey(lhs) < FileRetentionKey(rhs);
+                  });
 
         Logger::Info("Found %zu existing metrics files in directory", m_generatedFiles.size());
 

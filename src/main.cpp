@@ -7,11 +7,14 @@
 #include <thread>
 #include <chrono>
 #include <atomic>
+#include <string>
+#include <vector>
 
 // Core systems
 #include "Config/ConfigManager.h"
 #include "Config/ServerConfig.h"
 #include "Config/SecurityConfig.h"
+#include "Config/StartupOptions.h"
 #include "Utils/Logger.h"
 #include "Utils/CrashHandler.h"
 #include "Utils/FileUtils.h"
@@ -24,16 +27,12 @@
 // Network systems
 #include "Network/SocketFactory.h"
 
-// Security / EAC emulator
-#include "Security/EACServerEmulator.h"
-
 // Telemetry system
 #include "../telemetry/TelemetryManager.h"
 #include "../telemetry/MetricsReporter.h"
 
 // Global server and subsystems for signal handling
 static std::unique_ptr<GameServer>         g_server;
-static std::unique_ptr<EACServerEmulator>  g_eacServer;
 static GameClock*                          g_gameClock = nullptr;
 static std::atomic<bool>                   g_shutdownRequested{false};
 
@@ -82,8 +81,7 @@ bool InitializeLogging(const std::string& configPath)
     try {
         auto cfgMgr = std::make_shared<ConfigManager>();
         // Don't fail hard on init — we may not have a config dir yet
-        cfgMgr->Initialize();
-        cfgMgr->LoadConfiguration(configPath);
+        cfgMgr->Initialize(configPath);
 
         ServerConfig cfg(cfgMgr);
         std::string logfile  = cfg.GetLogDirectory() + "/" + cfg.GetLogFileName();
@@ -120,50 +118,10 @@ void PrintUsage(const char* prog)
                  "Options:\n"
                  "  -c, --config <file>    Config file (default: config/server.ini)\n"
                  "  -p, --port <port>      Override server port\n"
+                 "      --eac-port <port>  Override EAC emulator port\n"
+                 "  -m, --map <name>       Override initial map without editing config\n"
                  "  -h, --help             Show help\n"
                  "  -v, --version          Show version\n\n";
-}
-
-// Command-line parsing
-struct CmdArgs {
-    std::string configFile = "config/server.ini";
-    uint16_t    port       = 0;
-    bool        help       = false;
-    bool        version    = false;
-};
-
-CmdArgs ParseArgs(int argc, char* argv[])
-{
-    Logger::Trace("[main::ParseArgs] Entering ParseArgs with argc=%d", argc);
-    CmdArgs a;
-    for (int i = 1; i < argc; ++i) {
-        std::string arg = argv[i];
-        Logger::Trace("[main::ParseArgs] Processing argument [%d]: '%s'", i, arg.c_str());
-        if (arg == "-h" || arg == "--help") {
-            Logger::Debug("[main::ParseArgs] Help flag detected");
-            a.help = true;
-        }
-        else if (arg == "-v" || arg == "--version") {
-            Logger::Debug("[main::ParseArgs] Version flag detected");
-            a.version = true;
-        }
-        else if ((arg == "-c" || arg == "--config") && i+1<argc) {
-            a.configFile = argv[++i];
-            Logger::Debug("[main::ParseArgs] Config file set to: '%s'", a.configFile.c_str());
-        }
-        else if ((arg == "-p" || arg == "--port")   && i+1<argc) {
-            a.port = (uint16_t)std::stoi(argv[++i]);
-            Logger::Debug("[main::ParseArgs] Port override set to: %u", a.port);
-        }
-        else {
-            std::cerr << "Unknown argument: " << arg << "\n";
-            Logger::Warn("[main::ParseArgs] Unknown argument encountered: '%s'", arg.c_str());
-            a.help = true;
-        }
-    }
-    Logger::Debug("[main::ParseArgs] Parsed args: config='%s', port=%u, help=%d, version=%d",
-                  a.configFile.c_str(), a.port, a.help, a.version);
-    return a;
 }
 
 int main(int argc, char* argv[])
@@ -174,7 +132,17 @@ int main(int argc, char* argv[])
     rs2v::InstallCrashHandler();
 
     // Pre-logging initialization: parse args first since logging depends on config
-    auto args = ParseArgs(argc, argv);
+    std::vector<std::string> rawArguments;
+    rawArguments.reserve(argc > 1 ? static_cast<std::size_t>(argc - 1) : 0u);
+    for (int index = 1; index < argc; ++index) {
+        rawArguments.emplace_back(argv[index] ? argv[index] : "");
+    }
+    const StartupOptions args = ParseStartupOptions(rawArguments);
+    if (!args.valid) {
+        std::cerr << "Invalid command line: " << args.error << "\n\n";
+        PrintUsage(argv[0]);
+        return EXIT_FAILURE;
+    }
     if (args.help) {
         PrintUsage(argv[0]);
         return 0;
@@ -191,6 +159,7 @@ int main(int argc, char* argv[])
     Logger::Info("RS2V Custom Server v1.0.0 Starting");
     Logger::Info("Configuration file: %s", args.configFile.c_str());
     Logger::Info("Command-line port override: %s", args.port ? std::to_string(args.port).c_str() : "none");
+    Logger::Info("Command-line EAC port override: %s", args.eacPort ? std::to_string(args.eacPort).c_str() : "none");
     Logger::Info("Build date: %s %s", __DATE__, __TIME__);
     Logger::Info("================================================================");
 
@@ -202,6 +171,9 @@ int main(int argc, char* argv[])
     Logger::Info("[main] Initializing networking platform via SocketFactory::Initialize()...");
     if (!SocketFactory::Initialize()) {
         Logger::Error("[main] Networking platform initialization FAILED - cannot continue");
+        // Logger owns background state and must be stopped while its static
+        // lifetime is still valid, even on an early startup failure.
+        Logger::Shutdown();
         return EXIT_FAILURE;
     }
     Logger::Info("[main] Networking platform initialized successfully");
@@ -209,33 +181,23 @@ int main(int argc, char* argv[])
     // Start GameServer — it internally loads configs and creates subsystems
     Logger::Info("[main] Creating GameServer instance...");
     g_server = std::make_unique<GameServer>();
-    Logger::Debug("[main] GameServer instance created at %p, calling Initialize()...", (void*)g_server.get());
-    if (!g_server->Initialize()) {
+    Logger::Debug("[main] GameServer instance created at %p, calling Initialize(config, port, map, eacPort)...", (void*)g_server.get());
+    if (!g_server->Initialize(
+            args.configFile, args.port, args.mapName, args.eacPort)) {
         Logger::Error("[main] GameServer::Initialize() FAILED - shutting down networking and exiting");
+        // Do not leave the partially initialized global GameServer for static
+        // destruction after Logger has begun tearing down. Its destructor logs
+        // and shuts down singleton helpers, so ordering this explicitly avoids
+        // the observed Windows startup-failure exit hang.
+        g_server.reset();
         SocketFactory::Shutdown();
+        Logger::Shutdown();
         return EXIT_FAILURE;
     }
     Logger::Info("[main] GameServer initialized successfully");
 
     auto serverCfg = g_server->GetServerConfig();
     Logger::Debug("[main] Retrieved ServerConfig pointer: %p", (void*)serverCfg.get());
-
-    // Override port if specified on command line
-    if (args.port && g_server->GetConfigManager()) {
-        Logger::Info("[main] Overriding server port to %u from command-line argument", args.port);
-        g_server->GetConfigManager()->SetInt("Network.port", args.port);
-    }
-
-    // Start EAC emulator on configured port (default 7957)
-    uint16_t eacPort = (uint16_t)g_server->GetConfigManager()->GetInt("EAC.listen_port", 7957);
-    Logger::Info("[main] Starting EAC Server Emulator on port %u...", eacPort);
-    g_eacServer = std::make_unique<EACServerEmulator>();
-    Logger::Debug("[main] EACServerEmulator instance created at %p", (void*)g_eacServer.get());
-    if (!g_eacServer->Initialize(eacPort)) {
-        Logger::Warn("[main] EAC emulator FAILED to start on port %u; continuing without EAC anti-cheat", eacPort);
-    } else {
-        Logger::Info("[main] EAC emulator started successfully on port %u", eacPort);
-    }
 
     // Initialize telemetry system
     Logger::Info("[main] Initializing telemetry system...");
@@ -254,38 +216,42 @@ int main(int argc, char* argv[])
         if (telemetry.Initialize(telemetryCfg)) {
             // Add file reporter
             if (telemetryCfg.enableFileReporter) {
-                auto fileReporter = Telemetry::ReporterFactory::CreateFileReporter("rs2v_metrics");
-                if (fileReporter->Initialize(telemetryCfg.metricsDirectory)) {
-                    telemetry.AddReporter(std::move(fileReporter));
+                if (telemetry.AddReporter(
+                        Telemetry::ReporterFactory::CreateFileReporter("rs2v_metrics"))) {
                     Logger::Info("[main] File metrics reporter enabled in '%s'", telemetryCfg.metricsDirectory.c_str());
+                } else {
+                    Logger::Warn("[main] File metrics reporter failed to initialize");
                 }
             }
 
             // Add CSV reporter
             {
-                auto csvReporter = Telemetry::ReporterFactory::CreateCSVReporter("rs2v_metrics.csv");
-                if (csvReporter->Initialize(telemetryCfg.metricsDirectory)) {
-                    telemetry.AddReporter(std::move(csvReporter));
+                if (telemetry.AddReporter(
+                        Telemetry::ReporterFactory::CreateCSVReporter("rs2v_metrics.csv"))) {
                     Logger::Info("[main] CSV metrics reporter enabled");
+                } else {
+                    Logger::Warn("[main] CSV metrics reporter failed to initialize");
                 }
             }
 
             // Add in-memory reporter
             {
-                auto memReporter = Telemetry::ReporterFactory::CreateMemoryReporter(3600);
-                if (memReporter->Initialize(telemetryCfg.metricsDirectory)) {
-                    telemetry.AddReporter(std::move(memReporter));
+                if (telemetry.AddReporter(
+                        Telemetry::ReporterFactory::CreateMemoryReporter(3600))) {
                     Logger::Info("[main] In-memory metrics reporter enabled");
+                } else {
+                    Logger::Warn("[main] In-memory metrics reporter failed to initialize");
                 }
             }
 
             // Add Prometheus reporter if configured
             if (telemetryCfg.enablePrometheusReporter) {
-                auto promReporter = Telemetry::ReporterFactory::CreatePrometheusReporter(
-                    telemetryCfg.prometheusPort, "rs2v_server");
-                if (promReporter->Initialize(telemetryCfg.metricsDirectory)) {
-                    telemetry.AddReporter(std::move(promReporter));
+                if (telemetry.AddReporter(
+                        Telemetry::ReporterFactory::CreatePrometheusReporter(
+                            telemetryCfg.prometheusPort, "rs2v_server"))) {
                     Logger::Info("[main] Prometheus metrics reporter enabled on port %d", telemetryCfg.prometheusPort);
+                } else {
+                    Logger::Warn("[main] Prometheus metrics reporter failed to initialize on port %d", telemetryCfg.prometheusPort);
                 }
             }
 
@@ -309,9 +275,10 @@ int main(int argc, char* argv[])
                 alertCfg.rules.push_back(connRule);
 
                 auto alertReporter = std::make_unique<Telemetry::AlertMetricsReporter>(alertCfg);
-                if (alertReporter->Initialize(telemetryCfg.metricsDirectory)) {
-                    telemetry.AddReporter(std::move(alertReporter));
+                if (telemetry.AddReporter(std::move(alertReporter))) {
                     Logger::Info("[main] Alert metrics reporter enabled with %zu rules", alertCfg.rules.size());
+                } else {
+                    Logger::Warn("[main] Alert metrics reporter failed to initialize");
                 }
             }
 
@@ -330,16 +297,19 @@ int main(int argc, char* argv[])
     Logger::Debug("[main] Creating GameClock for fixed-timestep game loop...");
     GameClock gameClock;
     g_gameClock = &gameClock;
-    int tickRate = serverCfg ? serverCfg->GetTickRate() : 60;
+    // GameServer validates and normalizes the configured value during
+    // initialization; use that same rate for the wall-clock scheduler.
+    int tickRate = g_server ? g_server->GetTickRate() : 60;
     Logger::Info("[main] Setting tick rate to %d ticks/sec", tickRate);
     gameClock.SetTickRate(tickRate);
 
     // Let the `tickrate` command reach the GameClock without GameServer having to
-    // depend on it. Invoked from the console/remote command threads.
+    // depend on it. CommandManager drains console/remote work on this same game
+    // thread before invoking the hook.
     g_server->SetTickRateHook([&gameClock](int r) { gameClock.SetTickRate(static_cast<uint32_t>(r)); });
 
     Logger::Trace("[main] Registering tick callback for main game loop...");
-    gameClock.RegisterTickCallback([&](GameClock::Duration /*delta*/) {
+    gameClock.RegisterTickCallback([&](GameClock::Duration delta) {
         if (g_shutdownRequested || (g_server && g_server->IsShutdownRequested())) {
             Logger::Debug("[main::TickCallback] Shutdown requested, stopping game clock");
             gameClock.Stop();
@@ -350,12 +320,9 @@ int main(int argc, char* argv[])
         // recoverable exception from hostile input or a subsystem) is logged via
         // the crash handler and the loop continues, instead of escaping the
         // GameClock callback into std::terminate and killing the whole server.
-        rs2v::Guard("game tick", [] { g_server->Run(); });
+        const float elapsedSeconds = std::chrono::duration<float>(delta).count();
+        rs2v::Guard("game tick", [elapsedSeconds] { g_server->Run(elapsedSeconds); });
 
-        // Process EAC requests (no-op if threaded mode active)
-        if (g_eacServer) {
-            rs2v::Guard("eac process", [] { g_eacServer->ProcessRequests(); });
-        }
     });
 
     Logger::Info("[main] ========================================");
@@ -380,15 +347,6 @@ int main(int argc, char* argv[])
     }
 
     // Shutdown sequence
-    Logger::Debug("[main] Shutting down EAC emulator...");
-    if (g_eacServer) {
-        g_eacServer->Shutdown();
-        g_eacServer.reset();
-        Logger::Info("[main] EAC emulator shut down successfully");
-    } else {
-        Logger::Debug("[main] No EAC emulator to shut down");
-    }
-
     Logger::Debug("[main] Shutting down GameServer...");
     if (g_server) {
         g_server->Shutdown();

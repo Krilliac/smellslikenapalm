@@ -1,0 +1,14 @@
+# VNSK-Compound cooked ROObjective metadata
+# Retail package GUID: BCF3B0B34FFC0FBFF30A908128BD6DDA
+# Evidence package SHA-256: 68ED477061DFC44AA31D079D77D6DDD32244D164CEAA4F38F4E901B2E83D9D6E
+#
+# Positions are exact ROPlaceableVolume.VolumeCenter values extracted from the
+# retail map. A 30 m radius approximates each cooked brush volume. All three
+# Skirmish objectives are active concurrently, begin neutral, and use the retail
+# ten-second capture duration.
+#
+# Format: "name" x y z radius phase tunnel clientSlot cookedRepIndex
+#         enabled connectedToBase initialOwner captureSeconds
+"MACV Compound"  -300.664  1526.234  12.682 30.0 0 0 0 1 1 0 0 10.0
+"Admin Building" 3065.359  2138.193 128.790 30.0 0 0 1 2 1 0 0 10.0
+"Courtyard"      2763.493 -1621.068  44.115 30.0 0 0 2 3 1 0 0 10.0

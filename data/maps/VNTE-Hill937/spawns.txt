@@ -1,0 +1,59 @@
+# VNTE-Hill937 cooked deployment starts
+#
+# Format: x y z teamId minTerritoryPhase maxTerritoryPhase
+# Server team 1 = US/Allies; server team 2 = NVA/Axis. Bounds are inclusive.
+# Coordinates are exact cooked ROPlayerStart locations selected from the start
+# clusters at the Kismet-enabled deployment-volume origins for each durable
+# Territory phase. The optional retailSpawnVolumeRef field is deliberately
+# omitted: cooked export indices are not client PackageMap static references.
+#
+# The opening Kismet sequence has a separate ten-second staging deployment and
+# pilot flow. Those actors are not normal infantry starts and are not encoded
+# here. Axis group 7's brush overlaps another start cluster and cannot be
+# assigned without reconstructing brush geometry, so only unambiguous group 12
+# represents the phase-zero Axis deployment.
+
+# Phase 0: Abandoned Settlement and Trenchline active
+# Axis/NVA group 12
+  1110.000 -1331.998 3610.000 2 0 0
+  1201.996 -1312.006 3610.000 2 0 0
+  1020.000 -1235.000 3610.000 2 0 0
+
+# Allies/US groups 17 and 18
+-13324.120 -6268.065 1138.955 1 0 0
+-13378.840 -6152.354 1142.555 1 0 0
+-13443.250 -6315.562 1125.057 1 0 0
+-14220.390 12659.270 596.5482 1 0 0
+-14335.580 12715.640 580.8654 1 0 0
+-14171.410 12777.530  585.738 1 0 0
+
+# Phase 1: Trenchline 2 and Supply Bunkers active
+# Axis/NVA groups 11 and 10
+ 8184.000 2652.998 5370.000 2 1 1
+ 8054.000 2652.998 5370.000 2 1 1
+ 8184.000 2564.998 5370.000 2 1 1
+ 8398.998 7563.002 5346.000 2 1 1
+ 8271.004 7563.001 5346.000 2 1 1
+ 8527.000 7554.998 5346.000 2 1 1
+
+# Allies/US groups 16 and 15
+-7334.000 -4170.000 1893.000 1 1 1
+-7414.000 -4226.000 1893.000 1 1 1
+-7190.000 -4058.000 1907.094 1 1 1
+-7275.896  9535.762 1823.497 1 1 1
+-7433.219  9458.085 1785.313 1 1 1
+-7396.063  9580.574 1769.708 1 1 1
+
+# Phase 2: HeadQuarters active
+# Axis/NVA group 9
+13480.000 5071.996 5346.000 2 2 2
+13608.000 5064.000 5346.000 2 2 2
+13352.000 5072.000 5346.000 2 2 2
+
+# Allies/US groups 1 and 2
+-607.6982 -948.8932 3390.831 1 2 2
+-620.2444 -821.5096 3402.713 1 2 2
+-480.3145 -936.3470 3444.422 1 2 2
+-601.0465 7580.2200 3623.759 1 2 2
+-576.0752 7705.7600 3573.490 1 2 2
+-452.0952 7672.9430 3652.042 1 2 2

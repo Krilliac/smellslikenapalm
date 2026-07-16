@@ -1,0 +1,34 @@
+# VNTE-Resort cooked deployment groups
+#
+# Format: x y z teamId minTerritoryPhase maxTerritoryPhase retailSpawnVolumeRef
+# Server team 1 = US/Allies; server team 2 = NVA/Axis. Bounds are inclusive.
+# Coordinates below are exact ROPlayerStart positions selected from the cooked
+# Kismet Enable/Disable deployment groups for each durable Territory phase.
+#
+# Retail phase 0 enables US group4 on the offshore island
+#   infantry: -92368.33 6117.922 -491
+#   pilot metadata only (not a normal infantry selection):
+#            -93592.41 7556.469 -491
+# and six helicopter factories. The active normal infantry entry below now uses
+# the authentic group4 island start. Vehicle/pilot deployment remains separate
+# work and must not reuse the pilot coordinate as a normal spawn slot.
+
+# Phase 0: Beach active (US island group4; NVA groups 1 and 3)
+-92368.330  6117.922 -491.0000 1 0 0 301195
+  5339.000  3800.391   66.0000 2 0 0 301185
+  5689.000 10170.000   67.0000 2 0 0 301194
+
+# Phase 1: Beach captured, Temple active (US groups 0/10; NVA group 16)
+ -8049.000  3739.000 -433.8125 1 1 1 301184
+-10431.820 15187.560 -540.3362 1 1 1 301186
+  5689.000 10170.000   67.0000 2 1 1 301191
+
+# Phase 2: Temple captured, Villa and Farm active (US group 5; NVA group 14)
+ -5959.000  7802.000 -427.5624 1 2 2 301196
+  9625.000  7367.999  676.0000 2 2 2 301190
+
+# Phase 3: Villa and Farm captured, Hotel active (US groups 12/13; NVA 17/18)
+  1424.000  2696.000   70.0001 1 3 3 301188
+  1564.000 12478.000   15.0000 1 3 3 301189
+ 15803.000  9919.000   31.0000 2 3 3 301192
+ 16418.000  6338.000  137.0000 2 3 3 301193

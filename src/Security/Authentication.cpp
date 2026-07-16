@@ -19,6 +19,20 @@ Authentication::~Authentication() {
 
 bool Authentication::SendChallenge(std::shared_ptr<ClientConnection> conn) {
     Logger::Trace("[Authentication::SendChallenge] Entry, conn=%p", static_cast<void*>(conn.get()));
+    if (!conn) {
+        Logger::Warn("[Authentication::SendChallenge] Null connection; challenge not created");
+        return false;
+    }
+    // AUTH_CHALLENGE is the emulator's legacy Packet envelope, not a UE3/NMT
+    // message. Sending it to retail corrupts packet framing, and even creating
+    // a pending session is misleading because retail can never answer it. UE3
+    // login/authentication is handled by the control-channel handshake path.
+    if (conn->IsUE3Client()) {
+        Logger::Debug("[Authentication::SendChallenge] Client %u is UE3; legacy "
+                      "AUTH_CHALLENGE is not applicable",
+                      conn->GetClientId());
+        return true;
+    }
     uint32_t clientId = conn->GetClientId();
     Logger::Debug("[Authentication::SendChallenge] Client ID resolved to %u", clientId);
     CleanupExpired();
@@ -36,11 +50,14 @@ bool Authentication::SendChallenge(std::shared_ptr<ClientConnection> conn) {
     pkt.WriteString(session.challenge);
     Logger::Debug("[Authentication::SendChallenge] Built AUTH_CHALLENGE packet for client %u", clientId);
     bool ok = conn->SendPacket(pkt);
-    Logger::Info("Sent auth challenge to client %u", clientId);
     if (ok) {
+        Logger::Info("Sent auth challenge to client %u", clientId);
         Logger::Debug("[Authentication::SendChallenge] AUTH_CHALLENGE packet sent successfully to client %u", clientId);
     } else {
         Logger::Error("[Authentication::SendChallenge] Failed to send AUTH_CHALLENGE packet to client %u", clientId);
+        // A challenge the peer never received cannot have a valid response.
+        // Remove it now instead of retaining a misleading pending session.
+        m_sessions.erase(clientId);
     }
     Logger::Trace("[Authentication::SendChallenge] Exit, returning %s", ok ? "true" : "false");
     return ok;
@@ -51,6 +68,10 @@ AuthResult Authentication::ValidateResponse(std::shared_ptr<ClientConnection> co
 {
     Logger::Trace("[Authentication::ValidateResponse] Entry, conn=%p, responseToken length=%zu",
                   static_cast<void*>(conn.get()), responseToken.size());
+    if (!conn) {
+        Logger::Warn("[Authentication::ValidateResponse] Null connection; rejecting response");
+        return AuthResult::Error;
+    }
     uint32_t clientId = conn->GetClientId();
     Logger::Debug("[Authentication::ValidateResponse] Validating response for client %u", clientId);
     CleanupExpired();
@@ -110,8 +131,11 @@ bool Authentication::IsAuthenticated(uint32_t clientId) const {
 
 std::string Authentication::GenerateChallenge() {
     Logger::Trace("[Authentication::GenerateChallenge] Entry");
-    static std::mt19937 rng(std::random_device{}());
-    static std::uniform_int_distribution<uint64_t> dist;
+    // Challenge generation can be reached by more than one network worker.
+    // A shared PRNG would introduce a data race; keep independent engine state
+    // per thread while retaining random_device seeding.
+    thread_local std::mt19937_64 rng(std::random_device{}());
+    std::uniform_int_distribution<uint64_t> dist;
     uint64_t token = dist(rng);
     std::ostringstream oss;
     oss << std::hex << token;
@@ -126,6 +150,11 @@ AuthResult Authentication::BackendValidate(uint32_t clientId,
 {
     Logger::Trace("[Authentication::BackendValidate] Entry, clientId=%u, responseToken length=%zu",
                   clientId, responseToken.size());
+    if (!m_config) {
+        Logger::Error("[Authentication::BackendValidate] Missing security configuration; "
+                      "failing closed for client %u", clientId);
+        return AuthResult::ServiceUnavailable;
+    }
     // Simplified validation: check if auth is enabled
     if (!m_config->IsAntiCheatEnabled()) {
         // If anti-cheat/auth is disabled, allow all

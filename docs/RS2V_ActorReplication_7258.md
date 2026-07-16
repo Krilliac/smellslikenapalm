@@ -7,13 +7,19 @@ client actually spawns, deploys, moves and fights:
   - Session A (primary): `udp.port==57867 && udp.port==7777` (~59k frames).
   - Session B (corroboration): `udp.port==56400 && udp.port==7777`.
 
-Decoder: `tools/mock_client.py` (`mc.decode_packet(data, bd_max=BD)`), **bd_max=16384
+Decoder: `tools/mock_client.py` (`mc.decode_packet(data, bd_max=BD)`), **bd_max=10240
 for C->S, bd_max=12000 for S->C** (asymmetric MaxPacket, already RE'd). Bunch framing
 and the control-channel handshake are documented in
 `docs/RS2V_ControlChannel_WireSpec_7258.md` and
 `docs/RS2V_PostJoin_Replication_7258.md`; this document picks up **after the
 PackageMap export** and covers the part that turns a frozen, camera-locked client
 into a controllable player.
+
+> **Capture/runtime boundary (2026-07-15):** capture channel tables and payloads
+> below remain reverse-engineering evidence. The current runtime authors a smaller
+> per-connection cohort: owning PC ch2, GRI ch3, TeamInfo ch4/ch5, and owning PRI
+> ch26. `docs/NETCODE.md` is authoritative for current emission policy; the
+> populated capture is never a normal gameplay bootstrap.
 
 Confidence tags: **[H]** bit-exact from capture and/or reproduced across both
 sessions; **[M]** strong inference from capture + source; **[L]** plausible, not yet
@@ -420,8 +426,9 @@ ch0 `NMT 0x23` heartbeat, and opening new actor channels as actors become releva
 - **RESOLVED [H]:** NetGUID codec = 1 flag bit + minimal-bit `SerializeInt` (max 1023
   static / 0x80000000 export), `SerializeObject @0x140696070` (§2.1). Property/function
   handle = `SerializeInt(handle, max = ClassNetCache field count)` (per-class runtime
-  max, §3.1). Bunch `BunchDataBits` max = `[NetConnection+0x10c] << 3` (negotiated
-  MaxPacket*8, runtime — read conn+0x10c live; it is **not** a hardcoded 1500/2048).
+  max, §3.1). The retail engine reads BunchDataBits max from
+  `[NetConnection+0x10c] << 3`; this captured build is pinned directionally from the
+  first packet to C2S 10240 and S2C 12000, with no small handshake-phase switch.
   Bunch header field maxes: ChIndex `SerializeInt(1023)`, ChSequence `SerializeInt(1024)`,
   ChType `SerializeInt(8)` (`SendRawBunch @0x1404a79d0`).
 - **OPEN [M]:** whether `SerializeNewActor` reads Location/Rotation inside the header
@@ -443,7 +450,7 @@ PCAP="D:\RE-Tools\rs2_realserver_capture.pcapng"
 ```
 ```python
 import sys; sys.path.insert(0, r"D:\smellslikenapalm\tools"); import mock_client as mc
-mc.decode_packet(data, bd_max=16384)   # C->S
+mc.decode_packet(data, bd_max=10240)   # C->S
 mc.decode_packet(data, bd_max=12000)   # S->C  (srcport==7777)
 # milestone landmarks (session A): join f1477, actor burst f1484, first ServerMove f1522
 # session B: join f60857, burst f60859, first ServerMove f60867
@@ -599,12 +606,19 @@ milestone after the menu (needs the Pawn open + `ClientRestart`), and is separab
 
 ### 6.6 Emitter checklist for `MakeOpeningActorBunch`
 
-1. On C->S `NMT 0x09`: open **ch2** with the §6.1 PC template (verbatim). 
-2. Open the **GRI** (§6.2) with our ServerName/GameClass spliced into the FStrings.
-3. Open **2-3 TeamInfos** (§6.3) — the tiny 81-bit form is enough; set TeamIndex 0/1.
-4. Open the **local PRI** (§6.4) with our PlayerName + a `Team` ref into a TeamInfo above.
-5. Each open: `bControl=1,bOpen=1,bReliable=1,ChType=2`, ascending `ChIndex` from 2,
-   `ChSeq=1`. After this set the client should present the team-select menu.
-6. (Later, for control) spawn+possess a Pawn, open its channel, send `ClientRestart` on
-   ch2 (§5 Phase 3).
-```
+1. After the Join drain barrier, open owning **PC ch2** with the selected
+   PackageMap's class ref and `NetPlayerIndex=0`.
+2. Put NMT `0x24` immediately after that open in the same reliable packet.
+3. On normal live-authored bootstrap, open **GRI ch3**, **TeamInfo ch4/ch5**, and
+   **PRI ch26** from live profile, ticket, LoginBridge identity, and player-name state.
+   GRI h24 carries
+   `[General].server_name`, or the defensive retail-facing fallback
+   `Rising Storm 2: Vietnam Server` when configuration is unavailable or invalid.
+4. Publish the applicable active-match, timer, and mode scalar baseline even when
+   there are zero cooked objective mappings; omit objective arrays/capper structs in
+   that case rather than suppressing the whole GRI baseline.
+5. Publish PC h23 -> dynamic ch26 as retry-owned ch2 sequence 2; queue menu RPCs
+   only on later ch2 sequences.
+6. Fail the connection closed if any exact profile, artifact class ref, GameClass,
+   or load-bearing publication is unavailable.
+7. Spawn and possess the pawn later, then send `ClientRestart` on ch2 (§5 Phase 3).

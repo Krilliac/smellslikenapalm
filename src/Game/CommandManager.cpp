@@ -14,7 +14,9 @@
 #include "Utils/CrashHandler.h"
 
 #include <algorithm>
+#include <deque>
 #include <sstream>
+#include <utility>
 
 CommandManager::CommandManager(GameServer* server)
     : m_server(server)
@@ -25,11 +27,13 @@ CommandManager::CommandManager(GameServer* server)
 CommandManager::~CommandManager()
 {
     Logger::Trace("[CommandManager::~CommandManager] Entry");
+    StopAccepting("command manager destroyed");
 }
 
 void CommandManager::Initialize()
 {
     Logger::Trace("[CommandManager::Initialize] Entry");
+    StopAccepting("command manager reinitialized");
     m_commands.clear();
     RegisterBuiltins();
 
@@ -42,6 +46,11 @@ void CommandManager::Initialize()
         [this](CommandContext& ctx) { return CmdHelp(ctx); }
     });
 
+    {
+        std::lock_guard<std::mutex> lock(m_queueMutex);
+        m_acceptingQueuedCommands = true;
+    }
+
     Logger::Info("CommandManager: registered %zu commands", m_commands.size());
     Logger::Trace("[CommandManager::Initialize] Exit");
 }
@@ -49,6 +58,7 @@ void CommandManager::Initialize()
 void CommandManager::Shutdown()
 {
     Logger::Trace("[CommandManager::Shutdown] Entry");
+    StopAccepting("server shutting down");
     m_commands.clear();
     Logger::Trace("[CommandManager::Shutdown] Exit");
 }
@@ -118,6 +128,95 @@ bool CommandManager::Execute(CommandContext& ctx, std::string_view commandLine)
     const std::string name = tokens.front();
     ctx.args.assign(tokens.begin() + 1, tokens.end());
     return ExecuteParsed(ctx, name);
+}
+
+std::future<QueuedCommandResult> CommandManager::Enqueue(
+    CommandContext ctx, std::string commandLine)
+{
+    // Never retain a transport-owned callback or a possibly stale caller-supplied
+    // server pointer across threads. ProcessQueued installs both authoritative
+    // values immediately before dispatch.
+    ctx.args.clear();
+    ctx.out = {};
+    ctx.server = nullptr;
+
+    PendingCommand pending{
+        std::move(ctx), std::move(commandLine),
+        std::promise<QueuedCommandResult>{}};
+    std::future<QueuedCommandResult> future = pending.completion.get_future();
+
+    std::lock_guard<std::mutex> lock(m_queueMutex);
+    if (!m_acceptingQueuedCommands) {
+        pending.completion.set_value(
+            QueuedCommandResult{false, false,
+                                "Command rejected: server shutting down.\n"});
+        return future;
+    }
+    if (m_queuedCommands.size() >= MAX_QUEUED_COMMANDS) {
+        pending.completion.set_value(
+            QueuedCommandResult{false, false,
+                                "Command rejected: command queue full.\n"});
+        return future;
+    }
+
+    m_queuedCommands.push_back(std::move(pending));
+    return future;
+}
+
+size_t CommandManager::ProcessQueued(size_t limit)
+{
+    if (limit == 0) return 0;
+
+    std::deque<PendingCommand> work;
+    {
+        std::lock_guard<std::mutex> lock(m_queueMutex);
+        const size_t count = std::min(limit, m_queuedCommands.size());
+        for (size_t i = 0; i < count; ++i) {
+            work.push_back(std::move(m_queuedCommands.front()));
+            m_queuedCommands.pop_front();
+        }
+    }
+
+    for (PendingCommand& pending : work) {
+        QueuedCommandResult result;
+        result.executed = true;
+        pending.context.server = m_server;
+        pending.context.out = [&result](std::string_view line) {
+            result.output.append(line.data(), line.size());
+            result.output.push_back('\n');
+        };
+
+        // Execute() guards handlers, while this outer guard also covers parsing,
+        // lookup, logging, and output collection. Every accepted promise is
+        // fulfilled even if non-handler dispatch code throws.
+        const bool completed = rs2v::Guard("queued command dispatch", [&] {
+            result.ok = Execute(pending.context, pending.commandLine);
+        });
+        if (!completed) {
+            result.ok = false;
+            result.output.append("Command failed: internal dispatch error.\n");
+        }
+        pending.completion.set_value(std::move(result));
+    }
+    return work.size();
+}
+
+void CommandManager::StopAccepting(std::string_view reason)
+{
+    std::deque<PendingCommand> rejected;
+    {
+        std::lock_guard<std::mutex> lock(m_queueMutex);
+        m_acceptingQueuedCommands = false;
+        rejected.swap(m_queuedCommands);
+    }
+
+    std::string output = "Command rejected: ";
+    output.append(reason.data(), reason.size());
+    output.append(".\n");
+    for (PendingCommand& pending : rejected) {
+        pending.completion.set_value(
+            QueuedCommandResult{false, false, output});
+    }
 }
 
 bool CommandManager::ExecuteParsed(CommandContext& ctx, std::string_view name)

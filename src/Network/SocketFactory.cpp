@@ -83,7 +83,8 @@ SocketHandle SocketFactory::CreateTcpListenSocket(uint16_t localPort, int backlo
     }
     Logger::Debug("[SocketFactory::CreateTcpListenSocket] TCP socket created: fd=%d", sock);
     int opt = 1;
-    setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, (char*)&opt, sizeof(opt));
+    setsockopt(sock, SOL_SOCKET, SO_REUSEADDR,
+               reinterpret_cast<const char*>(&opt), sizeof(opt));
     Logger::Debug("[SocketFactory::CreateTcpListenSocket] SO_REUSEADDR set on fd=%d", sock);
 
     if (!ConfigureSocket(sock, cfg)) {
@@ -165,19 +166,23 @@ bool SocketFactory::ConfigureSocket(SocketHandle sock, const SocketConfig& cfg) 
     timeval tout{};
     tout.tv_sec  = cfg.recvTimeout.count() / 1000;
     tout.tv_usec = (cfg.recvTimeout.count() % 1000) * 1000;
-    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (char*)&tout, sizeof(tout));
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO,
+               reinterpret_cast<const char*>(&tout), sizeof(tout));
     Logger::Debug("[SocketFactory::ConfigureSocket] Set SO_RCVTIMEO: %ld sec, %ld usec on fd=%d",
                   tout.tv_sec, tout.tv_usec, sock);
     tout.tv_sec  = cfg.sendTimeout.count() / 1000;
     tout.tv_usec = (cfg.sendTimeout.count() % 1000) * 1000;
-    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, (char*)&tout, sizeof(tout));
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO,
+               reinterpret_cast<const char*>(&tout), sizeof(tout));
     Logger::Debug("[SocketFactory::ConfigureSocket] Set SO_SNDTIMEO: %ld sec, %ld usec on fd=%d",
                   tout.tv_sec, tout.tv_usec, sock);
 
     // Buffer sizes
-    setsockopt(sock, SOL_SOCKET, SO_RCVBUF, (char*)&cfg.recvBufferSize, sizeof(cfg.recvBufferSize));
+    setsockopt(sock, SOL_SOCKET, SO_RCVBUF,
+               reinterpret_cast<const char*>(&cfg.recvBufferSize), sizeof(cfg.recvBufferSize));
     Logger::Debug("[SocketFactory::ConfigureSocket] Set SO_RCVBUF=%d on fd=%d", cfg.recvBufferSize, sock);
-    setsockopt(sock, SOL_SOCKET, SO_SNDBUF, (char*)&cfg.sendBufferSize, sizeof(cfg.sendBufferSize));
+    setsockopt(sock, SOL_SOCKET, SO_SNDBUF,
+               reinterpret_cast<const char*>(&cfg.sendBufferSize), sizeof(cfg.sendBufferSize));
     Logger::Debug("[SocketFactory::ConfigureSocket] Set SO_SNDBUF=%d on fd=%d", cfg.sendBufferSize, sock);
 
     // Non-blocking

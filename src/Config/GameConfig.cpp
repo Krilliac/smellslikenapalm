@@ -122,6 +122,13 @@ bool GameConfig::IsVehicleSpawningEnabled() const {
     return result;
 }
 
+bool GameConfig::WaitForReadyPlayer() const {
+    Logger::Trace("[GameConfig::WaitForReadyPlayer] Entry");
+    bool result = m_cfg.GetManager()->GetBool("Gameplay.wait_for_ready_player", true);
+    Logger::Trace("[GameConfig::WaitForReadyPlayer] Exit - returning %s", result ? "true" : "false");
+    return result;
+}
+
 // Paths to dedicated data files
 std::string GameConfig::GetMapsIniPath() const {
     Logger::Trace("[GameConfig::GetMapsIniPath] Entry");

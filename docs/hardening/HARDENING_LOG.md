@@ -51,8 +51,9 @@ fixes one per tick. Full result: tasks/w9luafrwc.output. Confirmed-real backlog 
 - ✔ HIGH Limb damage flat *0.4/0.5 vs source per-zone ZoneHealth cap (hand/foot=10, forearm/calf=20, thigh=35)
 - ✔ HIGH Respawn not blocked when reinforcements depleted (PlayerManager) - added the gate (death already debits)
 - ✔ HIGH Auto-respawn ignores ready-to-deploy state (force-deploys dead players) (PlayerManager) - added ready-gate wired to deploy RPC
-- [ ] HIGH Supremacy win model: two 250 pools drain-to-0 vs source single signed TotalMapScore +/-TargetScore(50)
-- [ ] (more in tasks/w9luafrwc.output - linked-objective HQ graph, etc.)
+- [x] HIGH Supremacy win model: replaced two draining pools with the source-exact signed TotalMapScore +/-TargetScore model
+- [x] Supremacy linked-objective HQ graph, including retail's global no-supply-lines fallback when both valid home bases are not present
+- [x] Supremacy reinforcement depletion stays Active, gates respawn per team, and resolves only after depleted-team elimination (mutual last-ticket wipe is order-independent)
 
 2026-06-26 | Capture contest logic (game-logic finding) | FIXED: ObjectiveSystem::ProcessCapture froze ALL capture progress whenever both teams had a capper in the zone (one defender stalls any attacking force). Source ROGameInfoTerritories.CaptureTimer compares TeamCapValue[0] vs [1] - the greater force keeps capturing ('>'=attackers advance, '<'=defenders regain, '=='=standoff). Rewrote contested branch to advance/regain by net force (diminishing returns), only a true tie stalls. Additive (capper-count approximation; squad/leader bonus inputs not tracked at this layer). Build green, mock react PASS. | 5c591fd
 2026-06-26 | Hit-zone double-scaling (game-logic finding) | FIXED: hit zone was scaled TWICE - WeaponDatabase::CalculateDamage multiplied by ballistics.headshot/limbMultiplier AND DamageSystem::CalculateFinalDamage multiplied by GetHitZoneMultiplier on the same hit (headshots ~10x*10x=~100x, limbs ~0.4x*0.4x). Source applies the zone effect once in ROPawn.TakeDamage (weapon yields base damage). Removed the zone block from the weapon layer; DamageSystem (full HitZone) is now the single zone-application point. Explosions (Chest, bypass CalculateDamage) unaffected. Build green, mock react PASS. | 2f9f387
