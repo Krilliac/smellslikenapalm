@@ -21,7 +21,7 @@ EACProxy::EACProxy(std::shared_ptr<SecurityConfig> config)
 
 EACProxy::~EACProxy() {
     Logger::Trace("[EACProxy::~EACProxy] Entry");
-    Shutdown();
+    EACProxy::Shutdown();
     Logger::Trace("[EACProxy::~EACProxy] Exit");
 }
 

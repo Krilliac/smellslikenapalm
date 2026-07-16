@@ -1364,7 +1364,7 @@ GameServer::GameServer() {
 
 GameServer::~GameServer() {
     Logger::Trace("[GameServer::~GameServer] Entry");
-    Shutdown();
+    GameServer::Shutdown();
     StopAutoRegen();
     GetProtocolDecoder().Shutdown();
     HandlerLibraryManager::Instance().Shutdown();

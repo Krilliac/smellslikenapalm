@@ -82,7 +82,7 @@ FileMetricsReporter::FileMetricsReporter(const FileReporterConfig& config)
 
 FileMetricsReporter::~FileMetricsReporter() {
     Logger::Trace("[FileMetricsReporter::~FileMetricsReporter] Entry");
-    Shutdown();
+    FileMetricsReporter::Shutdown();
     Logger::Trace("[FileMetricsReporter::~FileMetricsReporter] Exit");
 }
 
