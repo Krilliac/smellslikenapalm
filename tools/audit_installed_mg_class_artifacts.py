@@ -1354,6 +1354,17 @@ def validate_final_report(records: Sequence[Mapping[str, object]]) -> None:
             }
             if class_range != expected_range:
                 raise AuditError("sanitized class handle range drift")
+            for override in expected_range["overriddenNetworkFunctions"]:
+                inherited_matches = [
+                    row
+                    for row in handles[:cursor]
+                    if row.get("kind") == "function"
+                    and row.get("name") == override["name"]
+                ]
+                if len(inherited_matches) != 1:
+                    raise AuditError(
+                        "sanitized overridden function has no unique inherited handle"
+                    )
             if expected_count:
                 for row in handles[cursor : cursor + expected_count]:
                     if row.get("declaringClassPath") != expected_path:
@@ -1415,6 +1426,16 @@ def validate_final_report(records: Sequence[Mapping[str, object]]) -> None:
         ]
         if spots != expected_spots:
             raise AuditError("sanitized spot handle facts drift")
+        for spot in expected_spots:
+            row = handles[spot["handle"]]
+            actual = {
+                "handle": row.get("handle"),
+                "declaringClassPath": row.get("declaringClassPath"),
+                "name": row.get("name"),
+                "uobjectNetIndex": row.get("uobjectNetIndex"),
+            }
+            if actual != spot:
+                raise AuditError("sanitized spot handle does not match handle table")
 
     expected_checked_classes = sorted(set(M60_CHAIN) | set(M61_CHAIN))
     for field, expected in (

@@ -573,6 +573,19 @@ class JsonBoundaryTests(unittest.TestCase):
         gap[1]["handles"][0]["handle"] = 2
         mutations.append(("gap", gap))
 
+        spot_mismatch = copy.deepcopy(base)
+        spot_mismatch[1]["handles"][4]["name"] = "NotInstigator"
+        mutations.append(("spot handle mismatch", spot_mismatch))
+
+        missing_inherited_override = copy.deepcopy(base)
+        inherited = next(
+            row
+            for row in missing_inherited_override[1]["handles"]
+            if row["kind"] == "function" and row["name"] == "ClientGivenTo"
+        )
+        inherited["name"] = "ClientGivenToChanged"
+        mutations.append(("missing inherited override", missing_inherited_override))
+
         forbidden = copy.deepcopy(base)
         forbidden[1]["handles"][0]["wireReference"] = 1
         mutations.append(("forbidden", forbidden))
