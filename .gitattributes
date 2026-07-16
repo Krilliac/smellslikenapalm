@@ -6,3 +6,4 @@ tools/audit_installed_role_refs.py text eol=lf
 tools/tests/CookedMapMetadataExtractor.Tests.ps1 text eol=lf
 tools/tests/test_audit_installed_role_refs.py text eol=lf
 data/installed_cuchi_role_refs.jsonl text eol=lf
+data/installed_mg_class_artifacts.jsonl text eol=lf
