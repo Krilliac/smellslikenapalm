@@ -361,6 +361,40 @@ mislabeling intact transport as corrupt. `packageMapGrounded`,
 `complete` remain hard false until their missing artifact and owning-graph
 proofs are supplied.
 
+Build the separate cooked-class and replication-handle report from the exact
+capture-compatible server packages with:
+
+```powershell
+python tools\audit_installed_mg_class_artifacts.py `
+  --package-root 'D:\rs2dedicatedserver\ROGame\BrewedPCServer' `
+  --output data\installed_mg_class_artifacts.jsonl `
+  --overwrite
+```
+
+This audit force-rebuilds and hash-checks the pinned extractor once, then reads
+Core.u, Engine.u, ROGame.u, and ROGameContent.u sequentially. It requires exact
+package GUIDs, flags, versions, generations, UClass/CDO links, declared network
+members, and direct `bNetInitialRotation` tags. Temporary raw JSONL is deleted;
+the checked report contains no local paths, serial offsets, CDO object flags,
+object-base arithmetic, static references, or wire references.
+
+The sanitized report publishes the full zero-based M60 and M61 ContentSingle
+handle tables, including each declaring class and UObject.NetIndex. Network
+functions with a `Super` are recorded as overrides but do not receive a second
+handle. `maxHandle` is the exclusive upper bound: the exact results retain M60
+h0-h111 (`maxHandle=112`) and M61 ContentSingle h0-h100 (`maxHandle=101`), with
+spot checks at h4 `Actor.Instigator`, h21 `Actor.bHidden`, and h96
+`ROWeapon.bUserConfigApplied`. The M61 chain ends at
+`ROWeap_M61_Grenade_ContentSingle`; `ROWeap_M61_GrenadeSingle` is not part of
+the installed chain.
+
+`Actor.bNetInitialRotation` is audited separately from replication handles. It
+must remain the one scalar Const/non-CPF_Net `UBoolProperty`, and every class in
+both exact chains must have no direct serialized override. That proves the UE3
+implicit zero default is effectively false for these chains. It does not prove
+the PackageMap candidate, live h175 application, loadout/owning-pawn graph, or
+runtime role path, so every runtime-authorization field remains false.
+
 Passing capture safety checks proves only that the input is bounded and
 provenance-stable. It does not type the Machine Gunner actor graph or authorize
 any runtime role/loadout path.
