@@ -108,7 +108,7 @@ jobs:
 
   static-analysis:
     name: Static Analysis
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: build-linux
 
     steps:
@@ -125,13 +125,13 @@ jobs:
             --suppress=missingIncludeSystem \
             --inline-suppr \
             --error-exitcode=1 \
-            -I src/ -I include/ -I telemetry/ \
+            -I src/ -I telemetry/ \
             --std=c++23 \
             src/ telemetry/
 
   docker:
     name: Docker Build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: build-linux
 
     steps:

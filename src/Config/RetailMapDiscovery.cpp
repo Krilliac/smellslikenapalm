@@ -482,12 +482,17 @@ std::optional<std::wstring> ReadRegistryString(
         const DWORD expandedSize =
             ExpandEnvironmentStringsW(value.c_str(), nullptr, 0);
         if (expandedSize == 0u || expandedSize > 32768u) return std::nullopt;
-        std::vector<wchar_t> expanded(expandedSize, L'\0');
-        if (ExpandEnvironmentStringsW(
-                value.c_str(), expanded.data(), expandedSize) == 0u) {
+        std::wstring expanded(expandedSize, L'\0');
+        const DWORD written = ExpandEnvironmentStringsW(
+            value.c_str(), expanded.data(), expandedSize);
+        if (written == 0u || written > expandedSize) {
             return std::nullopt;
         }
-        value.assign(expanded.data());
+        // The successful count includes the trailing NUL. Keep the expansion
+        // self-owned and explicitly bounded; the required size can also grow
+        // if the environment changes between the two API calls.
+        expanded.resize(written - 1u);
+        value = std::move(expanded);
     }
     return value.empty() ? std::nullopt
                          : std::optional<std::wstring>(std::move(value));
