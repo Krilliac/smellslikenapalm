@@ -323,6 +323,44 @@ synthetic packet fixtures may be committed. Re-run the safety harness with:
 powershell -NoProfile -File tools\tests\capture_realserver_smoke.ps1
 ```
 
+Audit a completed capture without publishing its endpoint, adapter, local
+paths, or raw payloads with:
+
+```powershell
+$pcap = 'D:\captures\VNTE-CuChi-South-MG.pcapng'
+$captureBytes = (Get-Item -LiteralPath $pcap).Length
+$captureSha256 = (Get-FileHash -LiteralPath $pcap -Algorithm SHA256).Hash
+
+python tools\extract_mg_capture_evidence.py `
+  --pcap $pcap `
+  --expected-bytes $captureBytes `
+  --expected-sha256 $captureSha256 `
+  --server-port 7777 `
+  --output "$env:TEMP\VNTE-CuChi-South-MG-structural.jsonl"
+
+if ($LASTEXITCODE -ne 67) {
+  throw "MG capture audit failed unexpectedly with exit code $LASTEXITCODE"
+}
+```
+
+The adjacent `<pcap>.manifest.json` is required by default. The auditor pins
+that manifest, the pcap, and the installed TShark identity before parsing. It
+keeps C2S and S2C NMT_Uses streams separate, checks packet/reliable/channel
+lifecycle structure, hashes unknown package labels, replaces endpoint identity
+with capture-local session ordinals, and replaces payload bytes with hashes. A
+real sanitized JSONL report still needs a privacy review before it is committed;
+the raw capture and manifest never enter the work tree.
+
+Exit 67 is intentional for a successfully parsed but still non-authorizing
+report. `captureStructurallyComplete` describes transport evidence only.
+`candidateIdentityComplete` and `candidateApplicationComplete` separately
+describe the exact direction-local package candidate and application record;
+unknown or partial application layouts lower candidate completeness without
+mislabeling intact transport as corrupt. `packageMapGrounded`,
+`candidateRecordsGrounded`, `owningGraphProven`, `runtimeAuthorizes`, and
+`complete` remain hard false until their missing artifact and owning-graph
+proofs are supplied.
+
 Passing capture safety checks proves only that the input is bounded and
 provenance-stable. It does not type the Machine Gunner actor graph or authorize
 any runtime role/loadout path.
