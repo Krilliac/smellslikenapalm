@@ -22,7 +22,7 @@ The repository uses **CMake** as its single build system and **GitHub Actions** 
 | Tool | Minimum Version | Install Hint |
 |------|-----------------|--------------|
 | **CMake** | 3.20 | `brew install cmake` / `apt install cmake` |
-| **Compiler (C++23)** | GCC 12 / Clang 15 / MSVC VS 2022 | Set `CXX=clang++` if you have multiple |
+| **Compiler (C++23)** | GCC 14 + libstdc++ 14 / Clang 18 + libc++ 18 / MSVC VS 2022 | Match the compiler and standard-library pair |
 | **Conan** (optional) | 2.0 | Dependency cache |
 | **.NET SDK** | 7.0 | Required for C# scripting |
 | **Python** | 3.9 | Build scripts |
@@ -177,10 +177,10 @@ void OnChat(Player p, string msg)
 
 ## 8 · Continuous Integration
 
-* **GitHub Actions**  
-  * Linux (gcc 12 / clang 15) debug + release  
-  * Windows (MSVC v143) release  
-  * macOS (Apple Clang 14) release  
+* **GitHub Actions**
+  * Linux Ubuntu 24.04 release: GCC 14/libstdc++ 14 and Clang 18/libc++ 18
+  * Windows (MSVC v143) release
+  * Static analysis, CodeQL, and a Docker build after the Linux matrix
 * Steps  
   1. Cache Conan/NuGet  
   2. Configure CMake  

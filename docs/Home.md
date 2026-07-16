@@ -65,7 +65,7 @@ These documents cover building from source, the internal architecture, the API s
 
 | Requirement | Minimum | Recommended |
 |---|---|---|
-| C++ Compiler (C++23) | GCC 12, Clang 15, or MSVC VS 2022 | GCC 13+, Clang 18+ |
+| C++ Compiler + stdlib (C++23) | GCC 14/libstdc++ 14, Clang 18/libc++ 18, or MSVC VS 2022 | Same pinned pairs |
 | CMake | 3.20 | 3.25+ |
 | OpenSSL | 1.1.0 (optional) | 3.0+ |
 | zlib | 1.2.11 (optional) | 1.3+ |

@@ -24,6 +24,24 @@ Format:
 
 ---
 
+## 2026-07-15 — Pin compiler and standard-library pairs for C++23
+**Context:** The code now uses `std::expected`. The old Linux matrix paired
+Clang 15 with whichever libstdc++ headers `ubuntu-latest` provided and retained
+GCC 12 as a nominal minimum. On Ubuntu 24.04, neither pairing supplied the full
+C++23 library surface the project consumes.
+**Decision:** Supersede the Linux toolchain floors from the 2026-06-27 decision.
+Pin CI to Ubuntu 24.04 and verify GCC 14 with libstdc++ 14 plus Clang 18 with
+libc++ 18. Treat the compiler and standard library as one supported toolchain.
+Keep MSVC VS 2022 as the Windows baseline.
+**Rules out:** Floating `ubuntu-latest` as the Linux compiler contract; pairing
+Clang 18 with an unverified libstdc++; claiming support from language-mode flags
+alone when required library types are absent.
+**Consequences:** The supported floors are GCC 14/libstdc++ 14, Clang 18/libc++
+18, and MSVC VS 2022. Future compiler bumps must name and test the standard
+library too.
+
+---
+
 ## 2026-06-27 — C++23 is the mandated language baseline
 **Context:** The project was pinned to C++17 (`CMAKE_CXX_STANDARD 17`) with
 compatibility shims for old toolchains (e.g. `stdc++fs` linkage for GCC < 9). The
