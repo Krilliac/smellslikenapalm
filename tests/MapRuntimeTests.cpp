@@ -17,6 +17,7 @@
 #include "Game/TeamMapping.h"
 #include "Network/RetailBootstrap.h"
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstdint>
