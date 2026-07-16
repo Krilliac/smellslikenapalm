@@ -204,6 +204,72 @@ std::optional<CombatRole> ResolveCompoundCombatRole(Faction faction,
     return std::nullopt;
 }
 
+struct OwningPawnGraphRoleKey {
+    RoleSelectionRepl::GroundedRoleProfile profile;
+    uint32_t serverTeam;
+    uint32_t roleInfoObjectRef;
+    uint8_t classIndex;
+    uint8_t primaryWeaponIndex;
+    uint8_t secondaryWeaponIndex;
+};
+
+// Owning pawn publication is narrower than cooked role grounding. Each entry
+// identifies a role/loadout whose complete owner-only actor graph is available;
+// grounded role metadata which is absent here must remain non-authoritative.
+constexpr std::array<OwningPawnGraphRoleKey, 8> kOwningPawnGraphRoleKeys{{
+    {RoleSelectionRepl::GroundedRoleProfile::CanonicalResort,
+     RoleSelectionRepl::kResortUsServerTeam,
+     RoleSelectionRepl::kResortSouthGruntRoleInfoObjectRef,
+     RoleSelectionRepl::kResortSouthGruntClassIndex, 0u, 0u},
+    {RoleSelectionRepl::GroundedRoleProfile::CanonicalResort,
+     RoleSelectionRepl::kResortNvaServerTeam,
+     RoleSelectionRepl::kResortNorthRiflemanRoleInfoObjectRef,
+     RoleSelectionRepl::kResortNvaRiflemanClassIndex, 0u, 0u},
+    {RoleSelectionRepl::GroundedRoleProfile::CanonicalCuChi,
+     RoleSelectionRepl::kCuChiUsServerTeam,
+     RoleSelectionRepl::kCuChiSouthGruntRoleInfoObjectRef,
+     RoleSelectionRepl::kCuChiInfantryClassIndex, 0u, 0u},
+    {RoleSelectionRepl::GroundedRoleProfile::CanonicalCuChi,
+     RoleSelectionRepl::kCuChiNlfServerTeam,
+     RoleSelectionRepl::kCuChiNorthGuerillaRoleInfoObjectRef,
+     RoleSelectionRepl::kCuChiInfantryClassIndex, 0u, 0u},
+    {RoleSelectionRepl::GroundedRoleProfile::InstalledCuChi,
+     RoleSelectionRepl::kCuChiUsServerTeam,
+     RoleSelectionRepl::kInstalledCuChiSouthGruntRoleInfoObjectRef,
+     RoleSelectionRepl::kCuChiInfantryClassIndex, 0u, 0u},
+    {RoleSelectionRepl::GroundedRoleProfile::InstalledCuChi,
+     RoleSelectionRepl::kCuChiNlfServerTeam,
+     RoleSelectionRepl::kInstalledCuChiNorthGuerillaRoleInfoObjectRef,
+     RoleSelectionRepl::kCuChiInfantryClassIndex, 0u, 0u},
+    {RoleSelectionRepl::GroundedRoleProfile::InstalledCompound,
+     RoleSelectionRepl::kCompoundUsServerTeam,
+     RoleSelectionRepl::kCompoundSouthGruntRoleClassRef,
+     RoleSelectionRepl::kCompoundRiflemanClassIndex, 0u, 0u},
+    // The live installed Compound North final request selects primary index 1;
+    // an omitted/default index 0 request is semantically grounded but has no
+    // matching owning loadout graph and therefore is deliberately absent.
+    {RoleSelectionRepl::GroundedRoleProfile::InstalledCompound,
+     RoleSelectionRepl::kCompoundNlfServerTeam,
+     RoleSelectionRepl::kCompoundNorthGuerillaRoleClassRef,
+     RoleSelectionRepl::kCompoundRiflemanClassIndex, 1u, 0u},
+}};
+
+bool HasGroundedOwningPawnGraph(
+    RoleSelectionRepl::GroundedRoleProfile profile, uint32_t serverTeam,
+    uint32_t roleInfoObjectRef, uint8_t classIndex,
+    uint8_t primaryWeaponIndex, uint8_t secondaryWeaponIndex) noexcept {
+    return std::any_of(
+        kOwningPawnGraphRoleKeys.begin(), kOwningPawnGraphRoleKeys.end(),
+        [&](const OwningPawnGraphRoleKey& candidate) {
+            return candidate.profile == profile &&
+                   candidate.serverTeam == serverTeam &&
+                   candidate.roleInfoObjectRef == roleInfoObjectRef &&
+                   candidate.classIndex == classIndex &&
+                   candidate.primaryWeaponIndex == primaryWeaponIndex &&
+                   candidate.secondaryWeaponIndex == secondaryWeaponIndex;
+        });
+}
+
 std::vector<const SpawnLocation*> BuildAdvertisedSpawnRepresentatives(
     const std::vector<const SpawnLocation*>& available) {
     std::vector<const SpawnLocation*> advertised;
@@ -5337,6 +5403,18 @@ bool ConnectionManager::ExecutePreparedDeployment(
             clientId, "invalid authoritative deployment team");
         return false;
     }
+    // Deployment authorization is not permission to substitute a faction
+    // default for an unsupported role/loadout. Check the immutable h175 graph
+    // key before the lifecycle gate can close/reopen actor channels or install
+    // a deferred deployment token. ProcessPawnSpawn repeats the check at
+    // publication time to catch any later internal-state drift.
+    if (!HasAcceptedGroundedOwningPawnGraph(clientId, deploymentTeam)) {
+        Logger::Error(
+            "[Deployment] client %u has no accepted exact owning graph "
+            "for team %u; graph and deployment state unchanged",
+            clientId, deploymentTeam);
+        return false;
+    }
     if (TicketSystem* tickets = m_server->GetTicketSystem()) {
         const bool depleted =
             tickets->GetInitialTickets(deploymentTeam) > 0u &&
@@ -6979,6 +7057,33 @@ bool ConnectionManager::PreflightPawnSpawn(
         /*preflightOnly=*/true);
 }
 
+bool ConnectionManager::HasAcceptedGroundedOwningPawnGraph(
+    uint32_t clientId, uint32_t serverTeam) const {
+    const auto stateIt = m_controlState.find(clientId);
+    if (stateIt == m_controlState.end()) return false;
+    const ControlState& cs = stateIt->second;
+    if (!cs.roleSelectionAccepted ||
+        !cs.retailArtifactSelectionResolved ||
+        !cs.retailArtifactSelection ||
+        !cs.retailBootstrapProfile) {
+        return false;
+    }
+    const RetailBootstrap::ArtifactSelection& artifact =
+        *cs.retailArtifactSelection;
+    const RetailBootstrap::Profile& profile =
+        *cs.retailBootstrapProfile;
+    const RoleSelectionRepl::GroundedRoleProfile roleProfile =
+        RoleSelectionRepl::ClassifyGroundedRoleProfile(
+            profile.mapUrl, profile.modeName, profile.roGameObjectBase,
+            artifact.variant, artifact.roGame.actualObjectBase,
+            artifact.roGame.roleRegistryGrounded);
+    return HasGroundedOwningPawnGraph(
+        roleProfile, serverTeam, cs.selectedRoleInfoObjectRef,
+        cs.selectedRoleClassIndex,
+        cs.selectedRolePrimaryWeaponIndex,
+        cs.selectedRoleSecondaryWeaponIndex);
+}
+
 bool ConnectionManager::SendPawnSpawn(uint32_t clientId,
                                       uint64_t expectedPawnGeneration) {
     PlayerManager* players =
@@ -7059,6 +7164,18 @@ bool ConnectionManager::ProcessPawnSpawn(
         return false;
     }
     const RetailBootstrap::ArtifactSelection& artifact = *selectedArtifact;
+    if (!HasAcceptedGroundedOwningPawnGraph(clientId, graphTeamId)) {
+        Logger::Error(
+            "[ConnectionManager::SendPawnSpawn] client %u has no exact "
+            "owning graph for accepted role class %u object %u loadout "
+            "%u/%u team %u",
+            clientId, static_cast<unsigned>(cs.selectedRoleClassIndex),
+            cs.selectedRoleInfoObjectRef,
+            static_cast<unsigned>(cs.selectedRolePrimaryWeaponIndex),
+            static_cast<unsigned>(cs.selectedRoleSecondaryWeaponIndex),
+            graphTeamId);
+        return false;
+    }
     constexpr uint32_t kCanonicalInventoryManagerClassRef = 82735u;
     const uint32_t canonicalPawnClassRef = northGraph ? 286147u : 286151u;
     const std::optional<uint32_t> wirePawnClassRef =
@@ -9357,6 +9474,8 @@ void ConnectionManager::DecodeInboundActorBunch(uint32_t clientId,
         cs.roleClassReplicated = false;
         cs.selectedRoleInfoObjectRef = 0;
         cs.selectedRoleClassIndex = 255;
+        cs.selectedRolePrimaryWeaponIndex = 255;
+        cs.selectedRoleSecondaryWeaponIndex = 255;
         cs.selectedChangedRole.reset();
         cs.selectedRoleSquadIndex = 255;
         cs.selectedRoleIndex = 255;
@@ -9583,6 +9702,30 @@ void ConnectionManager::DecodeInboundActorBunch(uint32_t clientId,
             return;
         }
 
+        // Semantic h175 grounding is necessary but not sufficient to mutate
+        // role authority. The owning pawn/loadout graph is a separate captured
+        // contract, keyed by the exact profile, team, UClass reference, and
+        // protocol class. Until a role has that graph, hold both interim and
+        // final requests before RoleSystem, squad, PRI, deployment, or control
+        // state can change.
+        if (!HasGroundedOwningPawnGraph(
+                roleProfile, serverTeam,
+                grounded.role.roleInfoObjectRef,
+                grounded.role.classIndex,
+                grounded.role.primaryWeaponIndex,
+                grounded.role.secondaryWeaponIndex)) {
+            Logger::Warn(
+                "[RoleSelection] client %u rejected class %u object %u: "
+                "no exact owning pawn/loadout graph for loadout %u/%u "
+                "profile %u team %u; authority unchanged",
+                clientId, static_cast<unsigned>(grounded.role.classIndex),
+                grounded.role.roleInfoObjectRef,
+                static_cast<unsigned>(grounded.role.primaryWeaponIndex),
+                static_cast<unsigned>(grounded.role.secondaryWeaponIndex),
+                static_cast<unsigned>(roleProfile), serverTeam);
+            return;
+        }
+
         if (isCompoundRoleProfile || isCuChiRoleProfile) {
             const char* roleProfileName =
                 isCompoundRoleProfile ? "Compound" : "Cu Chi";
@@ -9716,6 +9859,10 @@ void ConnectionManager::DecodeInboundActorBunch(uint32_t clientId,
             cs.roleSelectionAccepted = true;
             cs.selectedRoleInfoObjectRef = grounded.role.roleInfoObjectRef;
             cs.selectedRoleClassIndex = grounded.role.classIndex;
+            cs.selectedRolePrimaryWeaponIndex =
+                grounded.role.primaryWeaponIndex;
+            cs.selectedRoleSecondaryWeaponIndex =
+                grounded.role.secondaryWeaponIndex;
             cs.selectedChangedRole.reset();
 
             if (!cs.roleClassReplicated || previousClass != grounded.role.classIndex) {
@@ -9818,6 +9965,9 @@ void ConnectionManager::DecodeInboundActorBunch(uint32_t clientId,
         cs.roleSelectionAccepted = true;
         cs.selectedRoleInfoObjectRef = grounded.role.roleInfoObjectRef;
         cs.selectedRoleClassIndex = grounded.role.classIndex;
+        cs.selectedRolePrimaryWeaponIndex = grounded.role.primaryWeaponIndex;
+        cs.selectedRoleSecondaryWeaponIndex =
+            grounded.role.secondaryWeaponIndex;
         cs.selectedChangedRole = grounded.role.changedRole;
         cs.selectedRoleSquadIndex = grounded.role.squadIndex;
         cs.selectedRoleIndex = grounded.role.roleIndex;

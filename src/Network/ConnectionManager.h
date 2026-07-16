@@ -282,6 +282,11 @@ private:
         bool     roleClassReplicated = false;
         uint32_t selectedRoleInfoObjectRef = 0;
         uint8_t  selectedRoleClassIndex = 255;
+        // Persist the validated h175 loadout identity alongside the role.
+        // Pawn publication rechecks the same exact role/loadout graph key so
+        // later deployment cannot silently fall back to a faction default.
+        uint8_t  selectedRolePrimaryWeaponIndex = 255;
+        uint8_t  selectedRoleSecondaryWeaponIndex = 255;
         std::optional<RoleSelectionRepl::ChangedRoleEvidence>
             selectedChangedRole;
         uint8_t  selectedRoleSquadIndex = 255;
@@ -564,6 +569,8 @@ private:
     bool PreflightPawnSpawn(uint32_t clientId,
                             uint64_t expectedPawnGeneration,
                             const Vector3& spawnLocation);
+    bool HasAcceptedGroundedOwningPawnGraph(uint32_t clientId,
+                                            uint32_t serverTeam) const;
     bool ProcessPawnSpawn(uint32_t clientId,
                           uint64_t expectedPawnGeneration,
                           const Vector3& spawnLocation,

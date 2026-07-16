@@ -31,6 +31,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bitset>
 #include <chrono>
 #include <cstddef>
 #include <cstdlib>
@@ -253,6 +254,8 @@ public:
         bool priClassReplicated = false;
         uint32_t roleInfoObjectRef = 0;
         uint8_t classIndex = 255;
+        uint8_t primaryWeaponIndex = 255;
+        uint8_t secondaryWeaponIndex = 255;
         uint8_t squadIndex = 255;
         uint8_t roleIndex = 255;
         std::optional<RoleSelectionRepl::ChangedRoleEvidence> changedRole;
@@ -267,10 +270,21 @@ public:
             state.roleClassReplicated,
             state.selectedRoleInfoObjectRef,
             state.selectedRoleClassIndex,
+            state.selectedRolePrimaryWeaponIndex,
+            state.selectedRoleSecondaryWeaponIndex,
             state.selectedRoleSquadIndex,
             state.selectedRoleIndex,
             state.selectedChangedRole,
         };
+    }
+
+    static void SetSelectedRoleLoadout(ConnectionManager& manager,
+                                       uint32_t clientId,
+                                       uint8_t primaryWeaponIndex,
+                                       uint8_t secondaryWeaponIndex) {
+        auto& state = manager.m_controlState.at(clientId);
+        state.selectedRolePrimaryWeaponIndex = primaryWeaponIndex;
+        state.selectedRoleSecondaryWeaponIndex = secondaryWeaponIndex;
     }
 
     static void AddNullClientEntry(ConnectionManager& manager,
@@ -568,6 +582,96 @@ public:
         return std::nullopt;
     }
 
+    // Direct graph-lifecycle fixtures intentionally bypass the h175 decoder.
+    // Seed the same exact profile/team/role/loadout key production requires so
+    // those tests model an already accepted role rather than relying on a
+    // faction-default pawn graph.
+    static bool SeedGroundedOwningPawnGraphRole(
+        ConnectionManager& manager, uint32_t clientId) {
+        if (!manager.m_server) return false;
+        TeamManager* teams = manager.m_server->GetTeamManager();
+        if (!teams) return false;
+        auto& state = manager.m_controlState.at(clientId);
+        if (!state.retailBootstrapProfile ||
+            !state.retailArtifactSelection) {
+            return false;
+        }
+        const RetailBootstrap::Profile& profile =
+            *state.retailBootstrapProfile;
+        const RetailBootstrap::ArtifactSelection& artifact =
+            *state.retailArtifactSelection;
+        const auto roleProfile =
+            RoleSelectionRepl::ClassifyGroundedRoleProfile(
+                profile.mapUrl, profile.modeName,
+                profile.roGameObjectBase, artifact.variant,
+                artifact.roGame.actualObjectBase,
+                artifact.roGame.roleRegistryGrounded);
+        const uint32_t teamId = teams->GetPlayerTeam(clientId);
+        uint32_t roleInfoObjectRef = 0u;
+        uint8_t classIndex = 255u;
+        uint8_t primaryWeaponIndex = 0u;
+
+        switch (roleProfile) {
+            case RoleSelectionRepl::GroundedRoleProfile::CanonicalResort:
+                roleInfoObjectRef =
+                    teamId == RoleSelectionRepl::kResortUsServerTeam
+                        ? RoleSelectionRepl::
+                              kResortSouthGruntRoleInfoObjectRef
+                        : teamId == RoleSelectionRepl::kResortNvaServerTeam
+                              ? RoleSelectionRepl::
+                                    kResortNorthRiflemanRoleInfoObjectRef
+                              : 0u;
+                classIndex = RoleSelectionRepl::kResortSouthGruntClassIndex;
+                break;
+            case RoleSelectionRepl::GroundedRoleProfile::CanonicalCuChi:
+                roleInfoObjectRef =
+                    teamId == RoleSelectionRepl::kCuChiUsServerTeam
+                        ? RoleSelectionRepl::
+                              kCuChiSouthGruntRoleInfoObjectRef
+                        : teamId == RoleSelectionRepl::kCuChiNlfServerTeam
+                              ? RoleSelectionRepl::
+                                    kCuChiNorthGuerillaRoleInfoObjectRef
+                              : 0u;
+                classIndex = RoleSelectionRepl::kCuChiInfantryClassIndex;
+                break;
+            case RoleSelectionRepl::GroundedRoleProfile::InstalledCuChi:
+                roleInfoObjectRef =
+                    teamId == RoleSelectionRepl::kCuChiUsServerTeam
+                        ? RoleSelectionRepl::
+                              kInstalledCuChiSouthGruntRoleInfoObjectRef
+                        : teamId == RoleSelectionRepl::kCuChiNlfServerTeam
+                              ? RoleSelectionRepl::
+                                    kInstalledCuChiNorthGuerillaRoleInfoObjectRef
+                              : 0u;
+                classIndex = RoleSelectionRepl::kCuChiInfantryClassIndex;
+                break;
+            case RoleSelectionRepl::GroundedRoleProfile::InstalledCompound:
+                roleInfoObjectRef =
+                    teamId == RoleSelectionRepl::kCompoundUsServerTeam
+                        ? RoleSelectionRepl::kCompoundSouthGruntRoleClassRef
+                        : teamId == RoleSelectionRepl::kCompoundNlfServerTeam
+                              ? RoleSelectionRepl::
+                                    kCompoundNorthGuerillaRoleClassRef
+                              : 0u;
+                classIndex = RoleSelectionRepl::kCompoundRiflemanClassIndex;
+                primaryWeaponIndex =
+                    teamId == RoleSelectionRepl::kCompoundNlfServerTeam
+                        ? 1u
+                        : 0u;
+                break;
+            case RoleSelectionRepl::GroundedRoleProfile::Unsupported:
+                return false;
+        }
+        if (roleInfoObjectRef == 0u || classIndex == 255u) return false;
+
+        state.roleSelectionAccepted = true;
+        state.selectedRoleInfoObjectRef = roleInfoObjectRef;
+        state.selectedRoleClassIndex = classIndex;
+        state.selectedRolePrimaryWeaponIndex = primaryWeaponIndex;
+        state.selectedRoleSecondaryWeaponIndex = 0u;
+        return true;
+    }
+
     static void PrepareOwningPawnLifeForFactionSwitch(
         ConnectionManager& manager, uint32_t clientId) {
         auto& state = manager.m_controlState.at(clientId);
@@ -577,6 +681,15 @@ public:
         ConnectionManager::InvalidatePossessionRecovery(state);
         (void)ConnectionManager::AdvanceOwningPawnGeneration(state);
         state.owningPawnAlive = true;
+    }
+
+    static bool PrepareGroundedOwningPawnLifeForFactionSwitch(
+        ConnectionManager& manager, uint32_t clientId) {
+        if (!SeedGroundedOwningPawnGraphRole(manager, clientId)) {
+            return false;
+        }
+        PrepareOwningPawnLifeForFactionSwitch(manager, clientId);
+        return true;
     }
 
     static void ModelOwningPawnSpawnCallback(
@@ -751,10 +864,11 @@ public:
         return deferred.has_value() && deferred->roundStartAuthorization;
     }
 
-    static void UseCanonicalResortProfile(
+    static bool UseCanonicalResortProfile(
         ConnectionManager& manager, uint32_t clientId) {
         manager.m_controlState.at(clientId).retailBootstrapProfile =
             RetailBootstrap::CanonicalProfile();
+        return SeedGroundedOwningPawnGraphRole(manager, clientId);
     }
 
     static uint32_t NextCh2Reliable(
@@ -934,6 +1048,18 @@ public:
         const auto& channels =
             manager.m_controlState.at(clientId).outboundActorChannels;
         return channel < channels.size() && channels.test(channel);
+    }
+
+    static std::bitset<ActorRepl::kDynamicChannelMax> OutboundActorChannels(
+        const ConnectionManager& manager, uint32_t clientId) {
+        return manager.m_controlState.at(clientId).outboundActorChannels;
+    }
+
+    static std::bitset<ActorRepl::kDynamicChannelMax>
+    OwningPawnGraphActiveChannels(const ConnectionManager& manager,
+                                  uint32_t clientId) {
+        return manager.m_controlState.at(clientId)
+            .owningPawnGraphActiveChannels;
     }
 
     static std::vector<uint32_t> PendingReliablePacketIds(
@@ -1725,6 +1851,38 @@ protected:
         return MakeCapturedPcBunch(
             {0xaf, 0x56, 0x5c, 0x15, 0x00, 0x80, 0xc3, 0xb3, 0x00},
             67u);
+    }
+
+    static PacketCodec::Bunch InstalledCompoundNorthFinalRoleBunch() {
+        // Installed VNSK-Compound live capture: North class-0 primary index 1,
+        // final h175 + h451 + h89(false).
+        return MakeCapturedPcBunch(
+            {0xaf, 0x94, 0x56, 0x15, 0x00, 0x18, 0x00, 0x00,
+             0x00, 0x00, 0x80, 0xc3, 0xb3, 0x00},
+            107u);
+    }
+
+    static PacketCodec::Bunch SourceConstructedFinalRoleBunch(
+        bool south, uint32_t roleClassRef) {
+        BitWriter writer;
+        writer.SerializeInt(
+            RoleSelectionRepl::kSelectRoleByClassHandle,
+            RoleSelectionRepl::kRoPlayerControllerMaxHandle);
+        writer.WriteBit(south);
+        writer.WriteBit(true);
+        ActorRepl::WriteNetGUID(
+            writer,
+            ActorRepl::NetGUIDRef{/*isDynamic=*/false, roleClassRef});
+        writer.WriteBit(false); // default/omitted weapon selection
+        writer.WriteBit(false); // no tank selection
+        writer.WriteBit(false); // bAllowTeamTank
+        writer.WriteBit(false); // bDesiredContext
+        writer.WriteBit(true);  // bCloseMenu
+        writer.SerializeInt(
+            RoleSelectionRepl::kServerAutoSelectSquadHandle,
+            RoleSelectionRepl::kRoPlayerControllerMaxHandle);
+        return MakeCapturedPcBunch(
+            writer.GetBytes(), static_cast<uint32_t>(writer.NumBits()));
     }
 
     static PacketCodec::Bunch SpawnSelectBunch(uint8_t slot = 0u) {
@@ -2585,7 +2743,8 @@ TEST_F(ConnectionTravelCuChiRoleIntegrationTest,
         0u, kClientId, TeamMapping::kServerUs) != nullptr);
     ASSERT_TRUE(PublishCuChiSpawnSelection(
         0u, kClientId, /*south=*/true));
-    Harness::UseCanonicalResortProfile(manager_, kClientId);
+    ASSERT_TRUE(Harness::UseCanonicalResortProfile(
+        manager_, kClientId));
     Harness::ModelOwningPawnSpawnCallback(manager_, kClientId);
 
     Harness::DeliverActorBunch(manager_, kClientId, ReadyBunch());
@@ -2619,7 +2778,8 @@ TEST_F(ConnectionTravelCuChiRoleIntegrationTest,
     const std::shared_ptr<Player> player = players->GetPlayer(kClientId);
     ASSERT_TRUE(player != nullptr);
 
-    Harness::PrepareOwningPawnLifeForFactionSwitch(manager_, kClientId);
+    ASSERT_TRUE(Harness::PrepareGroundedOwningPawnLifeForFactionSwitch(
+        manager_, kClientId));
     const std::optional<uint32_t> southSpawn =
         Harness::PrepareDeploymentForCurrentTeam(manager_, kClientId);
     ASSERT_TRUE(southSpawn.has_value());
@@ -2630,7 +2790,8 @@ TEST_F(ConnectionTravelCuChiRoleIntegrationTest,
 
     players->OnPlayerDeath(kClientId);
     teams->AddPlayerToTeam(kClientId, kNorthTeam);
-    Harness::PrepareOwningPawnLifeForFactionSwitch(manager_, kClientId);
+    ASSERT_TRUE(Harness::PrepareGroundedOwningPawnLifeForFactionSwitch(
+        manager_, kClientId));
     const std::optional<uint32_t> northSpawn =
         Harness::PrepareDeploymentForCurrentTeam(manager_, kClientId);
     ASSERT_TRUE(northSpawn.has_value());
@@ -4293,6 +4454,8 @@ TEST_F(ConnectionTravelCuChiRoleIntegrationTest,
                           expectedRoleInfoRef) << caseLabel;
                 EXPECT_EQ(ledgerAfter.classIndex,
                           profile.expectedClassIndex) << caseLabel;
+                EXPECT_EQ(ledgerAfter.primaryWeaponIndex, 0u) << caseLabel;
+                EXPECT_EQ(ledgerAfter.secondaryWeaponIndex, 0u) << caseLabel;
                 EXPECT_EQ(ledgerAfter.squadIndex,
                           profile.expectedSquadIndex) << caseLabel;
                 EXPECT_EQ(ledgerAfter.roleIndex,
@@ -4362,6 +4525,10 @@ TEST_F(ConnectionTravelCuChiRoleIntegrationTest,
                           ledgerBefore.roleInfoObjectRef) << caseLabel;
                 EXPECT_EQ(ledgerAfter.classIndex, ledgerBefore.classIndex)
                     << caseLabel;
+                EXPECT_EQ(ledgerAfter.primaryWeaponIndex,
+                          ledgerBefore.primaryWeaponIndex) << caseLabel;
+                EXPECT_EQ(ledgerAfter.secondaryWeaponIndex,
+                          ledgerBefore.secondaryWeaponIndex) << caseLabel;
                 EXPECT_EQ(ledgerAfter.squadIndex, ledgerBefore.squadIndex)
                     << caseLabel;
                 EXPECT_EQ(ledgerAfter.roleIndex, ledgerBefore.roleIndex)
@@ -4406,6 +4573,459 @@ TEST_F(ConnectionTravelCuChiRoleIntegrationTest,
             (void)DrainDecodedPackets(artifactIndex);
         }
     }
+}
+
+TEST_F(ConnectionTravelCuChiRoleIntegrationTest,
+       UnsupportedRoleOrOwningGraphRequestsLeaveStateAtomic) {
+    using Harness = ConnectionTravelLifecycleTestHarness;
+    struct RejectedCase {
+        std::string_view label;
+        std::string_view mapUrl;
+        std::string_view mode;
+        Faction southFaction;
+        uint32_t teamId;
+        bool south;
+        uint32_t roleClassRef;
+        std::vector<uint8_t> expectedPayload;
+        bool semanticallyGrounded;
+    };
+    // 87497 is the source-extracted installed Cu Chi South MachineGunner
+    // UClass candidate. It is not represented as a live h175 capture here.
+    constexpr uint32_t kInstalledCuChiSouthMachineGunnerCandidateRef = 87497u;
+    const std::array<RejectedCase, 4> cases{{
+        {"Compound South class 2", "VNSK-Compound", "Skirmish",
+         Faction::USMC, RoleSelectionRepl::kCompoundUsServerTeam, true,
+         RoleSelectionRepl::kCompoundSouthMachineGunnerRoleClassRef,
+         {0xaf, 0xb6, 0x5c, 0x15, 0x00, 0x80, 0xc3, 0x01}, true},
+        {"Compound North class 2", "VNSK-Compound", "Skirmish",
+         Faction::USMC, RoleSelectionRepl::kCompoundNlfServerTeam, false,
+         RoleSelectionRepl::kCompoundNorthMachineGunnerRoleClassRef,
+         {0xaf, 0x14, 0x57, 0x15, 0x00, 0x80, 0xc3, 0x01}, true},
+        {"Compound North class 0 omitted loadout", "VNSK-Compound",
+         "Skirmish", Faction::USMC,
+         RoleSelectionRepl::kCompoundNlfServerTeam, false,
+         RoleSelectionRepl::kCompoundNorthGuerillaRoleClassRef,
+         {0xaf, 0x94, 0x56, 0x15, 0x00, 0x80, 0xc3, 0x01}, true},
+        {"Cu Chi South source class 2", "VNTE-CuChi", "Territories",
+         Faction::USArmy, RoleSelectionRepl::kCuChiUsServerTeam, true,
+         kInstalledCuChiSouthMachineGunnerCandidateRef,
+         {0xaf, 0x96, 0x5c, 0x15, 0x00, 0x80, 0xc3, 0x01}, false},
+    }};
+
+    RoleSystem* roles = server_.GetRoleSystem();
+    TeamManager* teams = server_.GetTeamManager();
+    PlayerManager* players = server_.GetPlayerManager();
+    ASSERT_TRUE(roles != nullptr);
+    ASSERT_TRUE(teams != nullptr);
+    ASSERT_TRUE(players != nullptr);
+
+    for (size_t index = 0u; index < cases.size(); ++index) {
+        const RejectedCase& entry = cases[index];
+        ASSERT_NE(roles->ConfigureRetailSquads(entry.mode, 64), 0u)
+            << entry.label;
+        roles->SetTeamFaction(RoleSelectionRepl::kCompoundUsServerTeam,
+                              entry.southFaction);
+        roles->SetTeamFaction(RoleSelectionRepl::kCompoundNlfServerTeam,
+                              Faction::NLFSV);
+
+        const uint32_t clientId = static_cast<uint32_t>(150u + index);
+        const size_t receiverIndex = index % 2u;
+        const std::shared_ptr<ClientConnection> connection =
+            Connect(receiverIndex, clientId, entry.teamId);
+        ASSERT_TRUE(connection != nullptr) << entry.label;
+        ASSERT_TRUE(Harness::FreezeRetailBootstrap(
+            manager_, clientId, "installed", entry.mapUrl, entry.mode))
+            << entry.label;
+        (void)DrainDecodedPackets(receiverIndex);
+
+        const std::shared_ptr<Player> player = players->GetPlayer(clientId);
+        ASSERT_TRUE(player != nullptr) << entry.label;
+        const Harness::RoleLedgerSnapshot ledgerBefore =
+            Harness::RoleLedger(manager_, clientId);
+        const std::optional<RetailSquadAssignment> assignmentBefore =
+            roles->GetRetailSquadAssignment(clientId);
+        const int riflemenBefore =
+            roles->GetRoleCount(entry.teamId, CombatRole::Rifleman);
+        const int machineGunnersBefore =
+            roles->GetRoleCount(entry.teamId, CombatRole::MachineGunner);
+        const uint32_t teamBefore = teams->GetPlayerTeam(clientId);
+        const uint32_t nextReliableBefore =
+            Harness::NextCh2Reliable(manager_, clientId);
+        const size_t pendingBefore =
+            Harness::PendingReliableCount(manager_, clientId);
+        const uint32_t packetIdBefore =
+            Harness::NextOutboundPacketId(manager_, clientId);
+        const size_t queuedBefore =
+            Harness::QueuedReliableBunches(manager_, clientId).size();
+        const auto deploymentBefore =
+            Harness::DeploymentState(manager_, clientId);
+        const bool aliveBefore = player->IsAlive();
+        const bool readyBefore = player->IsReadyToSpawn();
+        const bool spawnedBefore = Harness::Spawned(manager_, clientId);
+        const Harness::OwningGraphPhase graphPhaseBefore =
+            Harness::PawnGraphPhase(manager_, clientId);
+        const uint32_t graphTeamBefore =
+            Harness::PawnGraphTeam(manager_, clientId);
+        const uint64_t pawnGenerationBefore =
+            Harness::OwningPawnGeneration(manager_, clientId);
+        const bool owningPawnAliveBefore =
+            Harness::OwningPawnAlive(manager_, clientId);
+        const bool deferredBefore =
+            Harness::HasDeferredOwningPawnDeployment(manager_, clientId);
+        const auto actorChannelsBefore =
+            Harness::OutboundActorChannels(manager_, clientId);
+        const auto graphChannelsBefore =
+            Harness::OwningPawnGraphActiveChannels(manager_, clientId);
+
+        const PacketCodec::Bunch request =
+            SourceConstructedFinalRoleBunch(entry.south,
+                                            entry.roleClassRef);
+        ASSERT_EQ(request.payloadBits, 57u) << entry.label;
+        EXPECT_EQ(request.payload, entry.expectedPayload) << entry.label;
+        const auto decoded = RoleSelectionRepl::DecodeRoleSelectionBunch(
+            request.payload.data(), request.payload.size(),
+            request.payloadBits);
+        ASSERT_TRUE(decoded.valid()) << entry.label;
+        EXPECT_EQ(
+            decoded.following,
+            RoleSelectionRepl::FollowingRpcPattern::FinalAutoSelectSquad)
+            << entry.label;
+        const RoleSelectionRepl::GroundingResult directGrounding =
+            entry.mapUrl == "VNSK-Compound"
+                ? RoleSelectionRepl::ResolveGroundedCompoundRole(
+                      decoded.rpc, entry.mapUrl, entry.mode, "installed",
+                      RoleSelectionRepl::kInstalledRoGameObjectBase,
+                      entry.teamId)
+                : RoleSelectionRepl::ResolveGroundedCuChiInfantry(
+                      decoded.rpc, entry.mapUrl, entry.mode,
+                      RetailBootstrap::kCapturedRoGameObjectBase,
+                      "installed",
+                      RoleSelectionRepl::kInstalledRoGameObjectBase,
+                      entry.teamId);
+        EXPECT_EQ(directGrounding.valid(), entry.semanticallyGrounded)
+            << entry.label;
+        Harness::DeliverActorBunch(manager_, clientId, request);
+
+        const std::vector<PacketCodec::Packet> packets =
+            DrainDecodedPackets(receiverIndex);
+        const Harness::RoleLedgerSnapshot ledgerAfter =
+            Harness::RoleLedger(manager_, clientId);
+        const std::optional<RetailSquadAssignment> assignmentAfter =
+            roles->GetRetailSquadAssignment(clientId);
+        const auto deploymentAfter =
+            Harness::DeploymentState(manager_, clientId);
+
+        EXPECT_FALSE(connection->IsDisconnected()) << entry.label;
+        EXPECT_TRUE(packets.empty()) << entry.label;
+        EXPECT_EQ(roles->GetRoleCount(entry.teamId, CombatRole::Rifleman),
+                  riflemenBefore) << entry.label;
+        EXPECT_EQ(
+            roles->GetRoleCount(entry.teamId, CombatRole::MachineGunner),
+            machineGunnersBefore) << entry.label;
+        EXPECT_EQ(assignmentAfter.has_value(), assignmentBefore.has_value())
+            << entry.label;
+        if (assignmentBefore && assignmentAfter) {
+            EXPECT_EQ(assignmentAfter->teamId, assignmentBefore->teamId)
+                << entry.label;
+            EXPECT_EQ(assignmentAfter->squadIndex,
+                      assignmentBefore->squadIndex) << entry.label;
+            EXPECT_EQ(assignmentAfter->roleIndex,
+                      assignmentBefore->roleIndex) << entry.label;
+            EXPECT_EQ(assignmentAfter->generation,
+                      assignmentBefore->generation) << entry.label;
+        }
+        EXPECT_EQ(ledgerAfter.accepted, ledgerBefore.accepted) << entry.label;
+        EXPECT_EQ(ledgerAfter.finalized, ledgerBefore.finalized) << entry.label;
+        EXPECT_EQ(ledgerAfter.priClassReplicated,
+                  ledgerBefore.priClassReplicated) << entry.label;
+        EXPECT_EQ(ledgerAfter.roleInfoObjectRef,
+                  ledgerBefore.roleInfoObjectRef) << entry.label;
+        EXPECT_EQ(ledgerAfter.classIndex, ledgerBefore.classIndex)
+            << entry.label;
+        EXPECT_EQ(ledgerAfter.primaryWeaponIndex,
+                  ledgerBefore.primaryWeaponIndex) << entry.label;
+        EXPECT_EQ(ledgerAfter.secondaryWeaponIndex,
+                  ledgerBefore.secondaryWeaponIndex) << entry.label;
+        EXPECT_EQ(ledgerAfter.squadIndex, ledgerBefore.squadIndex)
+            << entry.label;
+        EXPECT_EQ(ledgerAfter.roleIndex, ledgerBefore.roleIndex)
+            << entry.label;
+        EXPECT_EQ(ledgerAfter.changedRole.has_value(),
+                  ledgerBefore.changedRole.has_value()) << entry.label;
+        EXPECT_EQ(teams->GetPlayerTeam(clientId), teamBefore) << entry.label;
+        EXPECT_EQ(Harness::NextCh2Reliable(manager_, clientId),
+                  nextReliableBefore) << entry.label;
+        EXPECT_EQ(Harness::PendingReliableCount(manager_, clientId),
+                  pendingBefore) << entry.label;
+        EXPECT_EQ(Harness::NextOutboundPacketId(manager_, clientId),
+                  packetIdBefore) << entry.label;
+        EXPECT_EQ(Harness::QueuedReliableBunches(manager_, clientId).size(),
+                  queuedBefore) << entry.label;
+        EXPECT_EQ(deploymentAfter.has_value(), deploymentBefore.has_value())
+            << entry.label;
+        if (deploymentBefore && deploymentAfter) {
+            EXPECT_EQ(deploymentAfter->generation,
+                      deploymentBefore->generation) << entry.label;
+            EXPECT_EQ(deploymentAfter->roleFinalized,
+                      deploymentBefore->roleFinalized) << entry.label;
+            EXPECT_EQ(deploymentAfter->selectedSlot,
+                      deploymentBefore->selectedSlot) << entry.label;
+            EXPECT_EQ(deploymentAfter->selectedSpawnId,
+                      deploymentBefore->selectedSpawnId) << entry.label;
+            EXPECT_EQ(deploymentAfter->readyStatus,
+                      deploymentBefore->readyStatus) << entry.label;
+            EXPECT_EQ(deploymentAfter->deploymentAuthorized,
+                      deploymentBefore->deploymentAuthorized) << entry.label;
+        }
+        EXPECT_EQ(player->IsAlive(), aliveBefore) << entry.label;
+        EXPECT_EQ(player->IsReadyToSpawn(), readyBefore) << entry.label;
+        EXPECT_EQ(Harness::Spawned(manager_, clientId), spawnedBefore)
+            << entry.label;
+        EXPECT_EQ(Harness::PawnGraphPhase(manager_, clientId),
+                  graphPhaseBefore) << entry.label;
+        EXPECT_EQ(Harness::PawnGraphTeam(manager_, clientId), graphTeamBefore)
+            << entry.label;
+        EXPECT_EQ(Harness::OwningPawnGeneration(manager_, clientId),
+                  pawnGenerationBefore) << entry.label;
+        EXPECT_EQ(Harness::OwningPawnAlive(manager_, clientId),
+                  owningPawnAliveBefore) << entry.label;
+        EXPECT_EQ(Harness::HasDeferredOwningPawnDeployment(
+                      manager_, clientId),
+                  deferredBefore) << entry.label;
+        EXPECT_EQ(Harness::OutboundActorChannels(manager_, clientId),
+                  actorChannelsBefore) << entry.label;
+        EXPECT_EQ(Harness::OwningPawnGraphActiveChannels(manager_, clientId),
+                  graphChannelsBefore) << entry.label;
+
+        Harness::RemoveClientSession(manager_, connection);
+        (void)DrainDecodedPackets(receiverIndex);
+    }
+}
+
+TEST_F(ConnectionTravelCuChiRoleIntegrationTest,
+       InstalledCompoundNorthCapturedLoadoutCompletesOwningPawnLifecycle) {
+    using Harness = ConnectionTravelLifecycleTestHarness;
+    constexpr uint32_t kClientId = 160u;
+    constexpr uint32_t kTeamId =
+        RoleSelectionRepl::kCompoundNlfServerTeam;
+
+    RoleSystem* roles = server_.GetRoleSystem();
+    PlayerManager* players = server_.GetPlayerManager();
+    ASSERT_TRUE(roles != nullptr);
+    ASSERT_TRUE(players != nullptr);
+    ASSERT_NE(roles->ConfigureRetailSquads("Skirmish", 64), 0u);
+    roles->SetTeamFaction(RoleSelectionRepl::kCompoundUsServerTeam,
+                          Faction::USMC);
+    roles->SetTeamFaction(RoleSelectionRepl::kCompoundNlfServerTeam,
+                          Faction::NLFSV);
+    ASSERT_TRUE(Harness::InstallActiveSupremacyMode(server_) != nullptr);
+
+    const std::shared_ptr<ClientConnection> connection =
+        Connect(0u, kClientId, kTeamId);
+    ASSERT_TRUE(connection != nullptr);
+    ASSERT_TRUE(Harness::FreezeRetailBootstrap(
+        manager_, kClientId, "installed", "VNSK-Compound", "Skirmish"));
+    (void)DrainDecodedPackets(0u);
+    const std::shared_ptr<Player> player = players->GetPlayer(kClientId);
+    ASSERT_TRUE(player != nullptr);
+    ASSERT_FALSE(player->IsAlive());
+    // This detached fixture does not receive the production NetworkManager's
+    // SpawnSystem callback, so establish the anticipated life boundary before
+    // driving the real captured h175 -> h261 -> h434 path.
+    Harness::PrepareOwningPawnLifeForFactionSwitch(manager_, kClientId);
+
+    const int roleCountBefore =
+        roles->GetRoleCount(kTeamId, CombatRole::Rifleman);
+    const uint32_t nextReliableBefore =
+        Harness::NextCh2Reliable(manager_, kClientId);
+    Harness::DeliverActorBunch(
+        manager_, kClientId, InstalledCompoundNorthFinalRoleBunch());
+
+    const std::vector<PacketCodec::Packet> packets = DrainDecodedPackets(0u);
+    ASSERT_FALSE(packets.empty());
+    for (const PacketCodec::Packet& packet : packets) {
+        EXPECT_TRUE(packet.ok);
+    }
+    const Harness::RoleLedgerSnapshot ledger =
+        Harness::RoleLedger(manager_, kClientId);
+    EXPECT_FALSE(connection->IsDisconnected());
+    EXPECT_TRUE(ledger.accepted);
+    EXPECT_TRUE(ledger.finalized);
+    EXPECT_TRUE(ledger.priClassReplicated);
+    EXPECT_EQ(ledger.roleInfoObjectRef,
+              RoleSelectionRepl::kCompoundNorthGuerillaRoleClassRef);
+    EXPECT_EQ(ledger.classIndex,
+              RoleSelectionRepl::kCompoundRiflemanClassIndex);
+    EXPECT_EQ(ledger.primaryWeaponIndex, 1u);
+    EXPECT_EQ(ledger.secondaryWeaponIndex, 0u);
+    EXPECT_TRUE(ledger.changedRole.has_value());
+    EXPECT_TRUE(roles->GetRetailSquadAssignment(kClientId).has_value());
+    EXPECT_EQ(roles->GetRoleCount(kTeamId, CombatRole::Rifleman),
+              roleCountBefore + 1);
+    EXPECT_EQ(Harness::NextCh2Reliable(manager_, kClientId),
+              nextReliableBefore + 1u);
+    EXPECT_EQ(Harness::PendingReliableCount(manager_, kClientId),
+              static_cast<size_t>(1));
+
+    Harness::AcknowledgeAllPendingReliables(manager_, kClientId);
+    Harness::DeliverActorBunch(manager_, kClientId, SpawnSelectBunch());
+    (void)DrainDecodedPackets(0u);
+    const auto selected = Harness::DeploymentState(manager_, kClientId);
+    ASSERT_TRUE(selected.has_value());
+    ASSERT_TRUE(selected->selectedSpawnId.has_value());
+    EXPECT_FALSE(selected->deploymentAuthorized);
+
+    Harness::DeliverActorBunch(manager_, kClientId, ReadyBunch());
+    const std::vector<PacketCodec::Packet> readyPackets =
+        DrainDecodedPackets(0u);
+    ASSERT_FALSE(readyPackets.empty());
+    for (const PacketCodec::Packet& packet : readyPackets) {
+        EXPECT_TRUE(packet.ok);
+    }
+    EXPECT_FALSE(connection->IsDisconnected());
+    EXPECT_TRUE(player->IsAlive());
+    EXPECT_TRUE(player->IsReadyToSpawn());
+    EXPECT_TRUE(Harness::Spawned(manager_, kClientId));
+    EXPECT_TRUE(Harness::OwningPawnAlive(manager_, kClientId));
+    EXPECT_EQ(Harness::PawnGraphPhase(manager_, kClientId),
+              Harness::OwningGraphPhase::Open);
+    EXPECT_EQ(Harness::PawnGraphTeam(manager_, kClientId), kTeamId);
+    EXPECT_TRUE(Harness::OutboundActorChannelOpen(
+        manager_, kClientId, 209u));
+    EXPECT_TRUE(Harness::OutboundActorChannelOpen(
+        manager_, kClientId, 219u));
+    const std::optional<uint32_t> graphPacket =
+        Harness::PendingOwningGraphPacket(
+            manager_, kClientId, 209u,
+            /*open=*/true, /*close=*/false);
+    ASSERT_TRUE(graphPacket.has_value());
+    Harness::AcknowledgeAllPendingReliables(manager_, kClientId);
+    EXPECT_EQ(Harness::PendingReliableCount(manager_, kClientId),
+              static_cast<size_t>(0));
+
+    Harness::RemoveClientSession(manager_, connection);
+    (void)DrainDecodedPackets(0u);
+}
+
+TEST_F(ConnectionTravelCuChiRoleIntegrationTest,
+       StalePersistedLoadoutCannotMutateDeploymentOrGraphGate) {
+    using Harness = ConnectionTravelLifecycleTestHarness;
+    constexpr uint32_t kClientId = 161u;
+    constexpr uint32_t kSouthTeam =
+        RoleSelectionRepl::kCuChiUsServerTeam;
+    constexpr uint32_t kNorthTeam =
+        RoleSelectionRepl::kCuChiNlfServerTeam;
+
+    const std::shared_ptr<ClientConnection> connection =
+        Connect(0u, kClientId, kSouthTeam);
+    ASSERT_TRUE(connection != nullptr);
+    ASSERT_TRUE(Harness::InstallActiveSupremacyMode(server_) != nullptr);
+    PlayerManager* players = server_.GetPlayerManager();
+    TeamManager* teams = server_.GetTeamManager();
+    ASSERT_TRUE(players != nullptr);
+    ASSERT_TRUE(teams != nullptr);
+    const std::shared_ptr<Player> player = players->GetPlayer(kClientId);
+    ASSERT_TRUE(player != nullptr);
+    ASSERT_FALSE(player->IsAlive());
+
+    ASSERT_TRUE(Harness::PrepareGroundedOwningPawnLifeForFactionSwitch(
+        manager_, kClientId));
+    const std::optional<uint32_t> southSpawn =
+        Harness::PrepareDeploymentForCurrentTeam(manager_, kClientId);
+    ASSERT_TRUE(southSpawn.has_value());
+    ASSERT_TRUE(Harness::ExecutePreparedDeployment(
+        manager_, kClientId, *southSpawn));
+    const std::optional<uint32_t> openPacket =
+        Harness::PendingOwningGraphPacket(
+            manager_, kClientId, 209u,
+            /*open=*/true, /*close=*/false);
+    ASSERT_TRUE(openPacket.has_value());
+    Harness::AcknowledgeAllPendingReliables(manager_, kClientId);
+    (void)DrainDecodedPackets(0u);
+    ASSERT_TRUE(player->IsAlive());
+    ASSERT_EQ(Harness::PawnGraphPhase(manager_, kClientId),
+              Harness::OwningGraphPhase::Open);
+    ASSERT_EQ(Harness::PawnGraphTeam(manager_, kClientId), kSouthTeam);
+    ASSERT_EQ(Harness::PendingReliableCount(manager_, kClientId),
+              static_cast<size_t>(0));
+
+    players->OnPlayerDeath(kClientId);
+    ASSERT_FALSE(player->IsAlive());
+    teams->AddPlayerToTeam(kClientId, kNorthTeam);
+    ASSERT_TRUE(Harness::PrepareGroundedOwningPawnLifeForFactionSwitch(
+        manager_, kClientId));
+    const std::optional<uint32_t> northSpawn =
+        Harness::PrepareDeploymentForCurrentTeam(manager_, kClientId);
+    ASSERT_TRUE(northSpawn.has_value());
+    const auto deploymentBefore =
+        Harness::DeploymentState(manager_, kClientId);
+    ASSERT_TRUE(deploymentBefore.has_value());
+    ASSERT_TRUE(deploymentBefore->deploymentAuthorized);
+    const uint32_t packetBefore =
+        Harness::NextOutboundPacketId(manager_, kClientId);
+    const size_t pendingBefore =
+        Harness::PendingReliableCount(manager_, kClientId);
+    const uint32_t graphCursorBefore =
+        Harness::NextOwningGraphReliable(manager_, kClientId, 209u);
+    const auto actorChannelsBefore =
+        Harness::OutboundActorChannels(manager_, kClientId);
+    const auto graphChannelsBefore =
+        Harness::OwningPawnGraphActiveChannels(manager_, kClientId);
+    ASSERT_EQ(Harness::PawnGraphPhase(manager_, kClientId),
+              Harness::OwningGraphPhase::Open);
+    ASSERT_EQ(Harness::PawnGraphTeam(manager_, kClientId), kSouthTeam);
+    ASSERT_FALSE(Harness::HasDeferredOwningPawnDeployment(
+        manager_, kClientId));
+
+    // Primary index 1 is not an authorized Cu Chi infantry graph key. Without
+    // the early role/loadout defense, the opposite-team graph gate would now
+    // queue a South close cohort and install a deferred North deployment.
+    Harness::SetSelectedRoleLoadout(
+        manager_, kClientId, /*primaryWeaponIndex=*/1u,
+        /*secondaryWeaponIndex=*/0u);
+    EXPECT_FALSE(Harness::ExecutePreparedDeployment(
+        manager_, kClientId, *northSpawn));
+
+    const auto deploymentAfter =
+        Harness::DeploymentState(manager_, kClientId);
+    ASSERT_TRUE(deploymentAfter.has_value());
+    EXPECT_EQ(deploymentAfter->generation, deploymentBefore->generation);
+    EXPECT_EQ(deploymentAfter->roleFinalized,
+              deploymentBefore->roleFinalized);
+    EXPECT_EQ(deploymentAfter->selectedSlot,
+              deploymentBefore->selectedSlot);
+    EXPECT_EQ(deploymentAfter->selectedSpawnId,
+              deploymentBefore->selectedSpawnId);
+    EXPECT_EQ(deploymentAfter->readyStatus,
+              deploymentBefore->readyStatus);
+    EXPECT_EQ(deploymentAfter->deploymentAuthorized,
+              deploymentBefore->deploymentAuthorized);
+    EXPECT_FALSE(connection->IsDisconnected());
+    EXPECT_FALSE(player->IsAlive());
+    EXPECT_FALSE(Harness::Spawned(manager_, kClientId));
+    EXPECT_EQ(Harness::PawnGraphPhase(manager_, kClientId),
+              Harness::OwningGraphPhase::Open);
+    EXPECT_EQ(Harness::PawnGraphTeam(manager_, kClientId), kSouthTeam);
+    EXPECT_FALSE(Harness::HasDeferredOwningPawnDeployment(
+        manager_, kClientId));
+    EXPECT_FALSE(Harness::PendingOwningGraphPacket(
+        manager_, kClientId, 209u,
+        /*open=*/false, /*close=*/true).has_value());
+    EXPECT_EQ(Harness::NextOutboundPacketId(manager_, kClientId),
+              packetBefore);
+    EXPECT_EQ(Harness::PendingReliableCount(manager_, kClientId),
+              pendingBefore);
+    EXPECT_EQ(Harness::NextOwningGraphReliable(
+                  manager_, kClientId, 209u),
+              graphCursorBefore);
+    EXPECT_EQ(Harness::OutboundActorChannels(manager_, kClientId),
+              actorChannelsBefore);
+    EXPECT_EQ(Harness::OwningPawnGraphActiveChannels(manager_, kClientId),
+              graphChannelsBefore);
+    EXPECT_TRUE(DrainDecodedPackets(0u).empty());
+
+    Harness::RemoveClientSession(manager_, connection);
+    (void)DrainDecodedPackets(0u);
 }
 
 TEST_F(ConnectionTravelCuChiRoleIntegrationTest,
@@ -4563,8 +5183,8 @@ TEST_F(ConnectionTravelCuChiRoleIntegrationTest,
     ASSERT_TRUE(player != nullptr);
     EXPECT_FALSE(player->IsAlive());
 
-    Harness::PrepareOwningPawnLifeForFactionSwitch(
-        manager_, kClientId);
+    ASSERT_TRUE(Harness::PrepareGroundedOwningPawnLifeForFactionSwitch(
+        manager_, kClientId));
     const std::optional<uint32_t> initialSouthSpawn =
         Harness::PrepareDeploymentForCurrentTeam(
             manager_, kClientId);
@@ -4625,8 +5245,8 @@ TEST_F(ConnectionTravelCuChiRoleIntegrationTest,
     players->OnPlayerDeath(kClientId);
     ASSERT_FALSE(player->IsAlive());
     teams->AddPlayerToTeam(kClientId, kNorthTeam);
-    Harness::PrepareOwningPawnLifeForFactionSwitch(
-        manager_, kClientId);
+    ASSERT_TRUE(Harness::PrepareGroundedOwningPawnLifeForFactionSwitch(
+        manager_, kClientId));
     const std::optional<uint32_t> northSpawn =
         Harness::PrepareDeploymentForCurrentTeam(
             manager_, kClientId);
@@ -4716,8 +5336,8 @@ TEST_F(ConnectionTravelCuChiRoleIntegrationTest,
     players->OnPlayerDeath(kClientId);
     ASSERT_FALSE(player->IsAlive());
     teams->AddPlayerToTeam(kClientId, kSouthTeam);
-    Harness::PrepareOwningPawnLifeForFactionSwitch(
-        manager_, kClientId);
+    ASSERT_TRUE(Harness::PrepareGroundedOwningPawnLifeForFactionSwitch(
+        manager_, kClientId));
     const std::optional<uint32_t> southSpawn =
         Harness::PrepareDeploymentForCurrentTeam(
             manager_, kClientId);
@@ -4797,7 +5417,8 @@ TEST_F(ConnectionTravelCuChiRoleIntegrationTest,
     const std::shared_ptr<Player> player = players->GetPlayer(kSwitcherId);
     ASSERT_TRUE(player != nullptr);
 
-    Harness::PrepareOwningPawnLifeForFactionSwitch(manager_, kSwitcherId);
+    ASSERT_TRUE(Harness::PrepareGroundedOwningPawnLifeForFactionSwitch(
+        manager_, kSwitcherId));
     const std::optional<uint32_t> southSpawn =
         Harness::PrepareDeploymentForCurrentTeam(manager_, kSwitcherId);
     ASSERT_TRUE(southSpawn.has_value());
@@ -4937,7 +5558,8 @@ TEST_F(ConnectionTravelCuChiRoleIntegrationTest,
     const std::shared_ptr<Player> player = players->GetPlayer(kClientId);
     ASSERT_TRUE(player != nullptr);
 
-    Harness::PrepareOwningPawnLifeForFactionSwitch(manager_, kClientId);
+    ASSERT_TRUE(Harness::PrepareGroundedOwningPawnLifeForFactionSwitch(
+        manager_, kClientId));
     const std::optional<uint32_t> southSpawn =
         Harness::PrepareDeploymentForCurrentTeam(manager_, kClientId);
     ASSERT_TRUE(southSpawn.has_value());
@@ -4952,7 +5574,8 @@ TEST_F(ConnectionTravelCuChiRoleIntegrationTest,
 
     players->OnPlayerDeath(kClientId);
     teams->AddPlayerToTeam(kClientId, kNorthTeam);
-    Harness::PrepareOwningPawnLifeForFactionSwitch(manager_, kClientId);
+    ASSERT_TRUE(Harness::PrepareGroundedOwningPawnLifeForFactionSwitch(
+        manager_, kClientId));
     const std::optional<uint32_t> northSpawn =
         Harness::PrepareDeploymentForCurrentTeam(manager_, kClientId);
     ASSERT_TRUE(northSpawn.has_value());
@@ -5031,7 +5654,8 @@ TEST_F(ConnectionTravelCuChiRoleIntegrationTest,
     ASSERT_TRUE(players != nullptr);
     ASSERT_TRUE(teams != nullptr);
 
-    Harness::PrepareOwningPawnLifeForFactionSwitch(manager_, kClientId);
+    ASSERT_TRUE(Harness::PrepareGroundedOwningPawnLifeForFactionSwitch(
+        manager_, kClientId));
     const std::optional<uint32_t> southSpawn =
         Harness::PrepareDeploymentForCurrentTeam(manager_, kClientId);
     ASSERT_TRUE(southSpawn.has_value());
@@ -5046,7 +5670,8 @@ TEST_F(ConnectionTravelCuChiRoleIntegrationTest,
 
     players->OnPlayerDeath(kClientId);
     teams->AddPlayerToTeam(kClientId, kNorthTeam);
-    Harness::PrepareOwningPawnLifeForFactionSwitch(manager_, kClientId);
+    ASSERT_TRUE(Harness::PrepareGroundedOwningPawnLifeForFactionSwitch(
+        manager_, kClientId));
     const std::optional<uint32_t> northSpawn =
         Harness::PrepareDeploymentForCurrentTeam(manager_, kClientId);
     ASSERT_TRUE(northSpawn.has_value());
@@ -5127,7 +5752,8 @@ TEST_F(ConnectionTravelCuChiRoleIntegrationTest,
     const std::shared_ptr<Player> player = players->GetPlayer(kClientId);
     ASSERT_TRUE(player != nullptr);
 
-    Harness::PrepareOwningPawnLifeForFactionSwitch(manager_, kClientId);
+    ASSERT_TRUE(Harness::PrepareGroundedOwningPawnLifeForFactionSwitch(
+        manager_, kClientId));
     const std::optional<uint32_t> spawn =
         Harness::PrepareDeploymentForCurrentTeam(manager_, kClientId);
     ASSERT_TRUE(spawn.has_value());
@@ -5192,8 +5818,8 @@ TEST_F(ConnectionTravelCuChiRoleIntegrationTest,
     const std::shared_ptr<Player> player = players->GetPlayer(kClientId);
     ASSERT_TRUE(player != nullptr);
 
-    Harness::PrepareOwningPawnLifeForFactionSwitch(
-        manager_, kClientId);
+    ASSERT_TRUE(Harness::PrepareGroundedOwningPawnLifeForFactionSwitch(
+        manager_, kClientId));
     const std::optional<uint32_t> initialSpawn =
         Harness::PrepareDeploymentForCurrentTeam(
             manager_, kClientId);
@@ -5211,8 +5837,8 @@ TEST_F(ConnectionTravelCuChiRoleIntegrationTest,
     players->OnPlayerDeath(kClientId);
     ASSERT_FALSE(player->IsAlive());
     teams->AddPlayerToTeam(kClientId, kNorthTeam);
-    Harness::PrepareOwningPawnLifeForFactionSwitch(
-        manager_, kClientId);
+    ASSERT_TRUE(Harness::PrepareGroundedOwningPawnLifeForFactionSwitch(
+        manager_, kClientId));
     const std::optional<uint32_t> northSpawn =
         Harness::PrepareDeploymentForCurrentTeam(
             manager_, kClientId);
@@ -5251,8 +5877,8 @@ TEST_F(ConnectionTravelCuChiRoleIntegrationTest,
     supremacy->StartRound();
     supremacy->Update(supremacy->GetPhaseTimeRemaining());
     ASSERT_EQ(supremacy->GetPhase(), SupremacyMode::Phase::Active);
-    Harness::PrepareOwningPawnLifeForFactionSwitch(
-        manager_, kClientId);
+    ASSERT_TRUE(Harness::PrepareGroundedOwningPawnLifeForFactionSwitch(
+        manager_, kClientId));
     const std::optional<uint32_t> retrySpawn =
         Harness::PrepareDeploymentForCurrentTeam(
             manager_, kClientId);
@@ -5504,8 +6130,8 @@ TEST_F(ConnectionTravelCuChiRoleIntegrationTest,
     const std::shared_ptr<Player> player = players->GetPlayer(kClientId);
     ASSERT_TRUE(player != nullptr);
 
-    Harness::PrepareOwningPawnLifeForFactionSwitch(
-        manager_, kClientId);
+    ASSERT_TRUE(Harness::PrepareGroundedOwningPawnLifeForFactionSwitch(
+        manager_, kClientId));
     const std::optional<uint32_t> selectedSpawn =
         Harness::PrepareDeploymentForCurrentTeam(
             manager_, kClientId);
@@ -5576,7 +6202,8 @@ TEST_F(ConnectionTravelCuChiRoleIntegrationTest,
     const std::shared_ptr<Player> player = players->GetPlayer(kClientId);
     ASSERT_TRUE(player != nullptr);
 
-    Harness::PrepareOwningPawnLifeForFactionSwitch(manager_, kClientId);
+    ASSERT_TRUE(Harness::PrepareGroundedOwningPawnLifeForFactionSwitch(
+        manager_, kClientId));
     const std::optional<uint32_t> initialSpawn =
         Harness::PrepareDeploymentForCurrentTeam(manager_, kClientId);
     ASSERT_TRUE(initialSpawn.has_value());
@@ -5766,7 +6393,8 @@ TEST_F(ConnectionTravelCuChiRoleIntegrationTest,
     const std::shared_ptr<Player> player = players->GetPlayer(kClientId);
     ASSERT_TRUE(player != nullptr);
 
-    Harness::PrepareOwningPawnLifeForFactionSwitch(manager_, kClientId);
+    ASSERT_TRUE(Harness::PrepareGroundedOwningPawnLifeForFactionSwitch(
+        manager_, kClientId));
     const std::optional<uint32_t> southSpawn =
         Harness::PrepareDeploymentForCurrentTeam(manager_, kClientId);
     ASSERT_TRUE(southSpawn.has_value());
@@ -5784,6 +6412,8 @@ TEST_F(ConnectionTravelCuChiRoleIntegrationTest,
         ParticipantId::Human(kClientId), 0, 0, 1, 0,
         /*isDead=*/true, /*sendHealth=*/false, /*sendDeathRpc=*/true);
     teams->AddPlayerToTeam(kClientId, kNorthTeam);
+    ASSERT_TRUE(Harness::SeedGroundedOwningPawnGraphRole(
+        manager_, kClientId));
     const std::optional<uint32_t> northSpawn =
         Harness::PrepareDeploymentForCurrentTeam(manager_, kClientId);
     ASSERT_TRUE(northSpawn.has_value());
@@ -6398,6 +7028,8 @@ TEST_F(ConnectionTravelCuChiRoleIntegrationTest,
         EXPECT_EQ(after.priClassReplicated, before.priClassReplicated);
         EXPECT_EQ(after.roleInfoObjectRef, before.roleInfoObjectRef);
         EXPECT_EQ(after.classIndex, before.classIndex);
+        EXPECT_EQ(after.primaryWeaponIndex, before.primaryWeaponIndex);
+        EXPECT_EQ(after.secondaryWeaponIndex, before.secondaryWeaponIndex);
         EXPECT_EQ(after.squadIndex, before.squadIndex);
         EXPECT_EQ(after.roleIndex, before.roleIndex);
         EXPECT_EQ(after.changedRole.has_value(), before.changedRole.has_value());
@@ -6663,6 +7295,10 @@ TEST_F(ConnectionTravelCuChiRoleIntegrationTest,
     EXPECT_FALSE(locked.finalized);
     EXPECT_FALSE(locked.priClassReplicated);
     EXPECT_FALSE(locked.changedRole.has_value());
+    EXPECT_EQ(locked.roleInfoObjectRef, 0u);
+    EXPECT_EQ(locked.classIndex, 255u);
+    EXPECT_EQ(locked.primaryWeaponIndex, 255u);
+    EXPECT_EQ(locked.secondaryWeaponIndex, 255u);
     EXPECT_EQ(locked.squadIndex, 255u);
     EXPECT_EQ(locked.roleIndex, 255u);
     EXPECT_EQ(Harness::NextCh2Reliable(manager_, 11u), lockedNextReliable);
@@ -6693,6 +7329,10 @@ TEST_F(ConnectionTravelCuChiRoleIntegrationTest,
     EXPECT_FALSE(full.finalized);
     EXPECT_FALSE(full.priClassReplicated);
     EXPECT_FALSE(full.changedRole.has_value());
+    EXPECT_EQ(full.roleInfoObjectRef, 0u);
+    EXPECT_EQ(full.classIndex, 255u);
+    EXPECT_EQ(full.primaryWeaponIndex, 255u);
+    EXPECT_EQ(full.secondaryWeaponIndex, 255u);
     EXPECT_EQ(full.squadIndex, 255u);
     EXPECT_EQ(full.roleIndex, 255u);
     EXPECT_EQ(Harness::NextCh2Reliable(manager_, 12u), fullNextReliable);
